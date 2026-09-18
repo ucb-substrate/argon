@@ -131,13 +131,42 @@ pub struct EnumDecl<S, T: AstMetadata> {
     pub metadata: T::EnumDecl,
 }
 
-/// One variant of an enum, with the types of its payload: `Some(T)` or `None`.
+/// One variant of an enum, with the types of its payload: `Some(T)`,
+/// `Circle { r: Float }`, or `None`.
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct EnumVariant<S, T: AstMetadata> {
     pub name: Ident<S, T>,
-    pub payload: Vec<TySpec<S, T>>,
+    pub payload: VariantPayload<S, T>,
     pub span: cfgrammar::Span,
     pub metadata: T::EnumVariant,
+}
+
+/// The declared payload of an [`EnumVariant`].
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub enum VariantPayload<S, T: AstMetadata> {
+    /// Positional types, `V(A, B)`; empty for a unit variant.
+    Tuple(Vec<TySpec<S, T>>),
+    /// Named fields, `V { a: A, b: B }`.
+    Struct(Vec<StructField<S, T>>),
+}
+
+impl<S, T: AstMetadata> VariantPayload<S, T> {
+    /// Whether this variant carries nothing.
+    pub fn is_unit(&self) -> bool {
+        matches!(self, Self::Tuple(payload) if payload.is_empty())
+    }
+
+    /// The payload types in declaration order.
+    pub fn tys(&self) -> impl Iterator<Item = &TySpec<S, T>> {
+        let (tuple, fields) = match self {
+            Self::Tuple(payload) => (Some(payload), None),
+            Self::Struct(fields) => (None, Some(fields)),
+        };
+        tuple
+            .into_iter()
+            .flatten()
+            .chain(fields.into_iter().flatten().map(|field| &field.ty))
+    }
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -351,6 +380,24 @@ pub enum Pattern<S, T: AstMetadata> {
         fields: Vec<Pattern<S, T>>,
         span: cfgrammar::Span,
     },
+    /// An enum variant with named fields, `E::V { f, g: name, .. }`.
+    StructVariant {
+        path: IdentPath<S, T>,
+        fields: Vec<FieldPattern<S, T>>,
+        /// Whether the pattern ended in `..`, ignoring the fields not listed.
+        rest: bool,
+        span: cfgrammar::Span,
+    },
+}
+
+/// One `field: pattern` entry of a [`Pattern::StructVariant`].
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct FieldPattern<S, T: AstMetadata> {
+    pub name: Ident<S, T>,
+    pub pattern: Pattern<S, T>,
+    /// Whether the field was written as a bare `f`, standing for `f: f`.
+    pub shorthand: bool,
+    pub span: cfgrammar::Span,
 }
 
 impl<S, T: AstMetadata> Pattern<S, T> {
@@ -358,7 +405,7 @@ impl<S, T: AstMetadata> Pattern<S, T> {
         match self {
             Self::Wildcard { span } => *span,
             Self::Binding { name, .. } => name.span,
-            Self::Variant { span, .. } => *span,
+            Self::Variant { span, .. } | Self::StructVariant { span, .. } => *span,
         }
     }
 }
@@ -572,7 +619,7 @@ pub trait AstTransformer {
         &mut self,
         input: &EnumVariant<Self::InputS, Self::InputMetadata>,
         name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        payload: &[TySpec<Self::OutputS, Self::OutputMetadata>],
+        payload: &VariantPayload<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::EnumVariant;
     fn dispatch_pattern_binding(
         &mut self,
@@ -861,11 +908,20 @@ pub trait AstTransformer {
         input: &EnumVariant<Self::InputS, Self::InputMetadata>,
     ) -> EnumVariant<Self::OutputS, Self::OutputMetadata> {
         let name = self.transform_ident(&input.name);
-        let payload = input
-            .payload
-            .iter()
-            .map(|ty| self.transform_ty_spec(ty))
-            .collect_vec();
+        let payload = match &input.payload {
+            VariantPayload::Tuple(payload) => VariantPayload::Tuple(
+                payload
+                    .iter()
+                    .map(|ty| self.transform_ty_spec(ty))
+                    .collect_vec(),
+            ),
+            VariantPayload::Struct(fields) => VariantPayload::Struct(
+                fields
+                    .iter()
+                    .map(|field| self.transform_struct_field(field))
+                    .collect_vec(),
+            ),
+        };
         let metadata = self.dispatch_enum_variant(input, &name, &payload);
         EnumVariant {
             name,
@@ -1106,6 +1162,31 @@ pub trait AstTransformer {
                     .collect(),
                 span: *span,
             },
+            Pattern::StructVariant {
+                path,
+                fields,
+                rest,
+                span,
+            } => Pattern::StructVariant {
+                path: self.transform_ident_path(path),
+                fields: fields
+                    .iter()
+                    .map(|field| self.transform_field_pattern(field))
+                    .collect(),
+                rest: *rest,
+                span: *span,
+            },
+        }
+    }
+    fn transform_field_pattern(
+        &mut self,
+        input: &FieldPattern<Self::InputS, Self::InputMetadata>,
+    ) -> FieldPattern<Self::OutputS, Self::OutputMetadata> {
+        FieldPattern {
+            name: self.transform_ident(&input.name),
+            pattern: self.transform_pattern(&input.pattern),
+            shorthand: input.shorthand,
+            span: input.span,
         }
     }
     fn transform_bin_op_expr(

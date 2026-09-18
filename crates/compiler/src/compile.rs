@@ -25,10 +25,11 @@ pub use result::{
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
-    ArithOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, EnumVariant, FieldAccessExpr, FnDecl,
-    ForLoop, IdentPath, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchArm,
-    MatchExpr, ModPath, Pattern, Scope, Span, StructDecl, StructField, StructLitExpr,
-    StructLitField, TyParam, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, WorkspaceAst,
+    ArithOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, EnumVariant, FieldAccessExpr,
+    FieldPattern, FnDecl, ForLoop, IdentPath, IndexExpr, IndexFieldAccessExpr, IntLiteral,
+    KwArgValue, MatchArm, MatchExpr, ModPath, Pattern, Scope, Span, StructDecl, StructField,
+    StructLitExpr, StructLitField, TyParam, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl,
+    VariantPayload, WorkspaceAst,
 };
 use crate::gds::{ImportedGdsElement, import_gds};
 use crate::parse::{CellInvocation, ParseOutput, WorkspaceParseAst};
@@ -658,7 +659,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         &mut self,
         _input: &EnumVariant<Self::InputS, Self::InputMetadata>,
         _name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        _payload: &[TySpec<Self::OutputS, Self::OutputMetadata>],
+        _payload: &VariantPayload<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::EnumVariant {
     }
 
@@ -1544,7 +1545,70 @@ pub struct VariantDef {
     /// The [`VarId`] the variant is bound to by `use`, the prelude, and the
     /// evaluator's global frame.
     pub id: VarId,
-    pub payload: Vec<Ty>,
+    pub payload: VariantTys,
+}
+
+/// The payload types of a [`VariantDef`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VariantTys {
+    /// Positional types; empty for a unit variant.
+    Tuple(Vec<Ty>),
+    /// Named fields in declaration order.
+    Struct(IndexMap<String, Ty>),
+}
+
+impl VariantTys {
+    /// Whether the variant carries nothing.
+    pub fn is_unit(&self) -> bool {
+        matches!(self, Self::Tuple(payload) if payload.is_empty())
+    }
+
+    /// How many values the variant carries.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Tuple(payload) => payload.len(),
+            Self::Struct(fields) => fields.len(),
+        }
+    }
+
+    /// Whether the variant carries nothing. A named payload with no fields is
+    /// empty without being a unit variant.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The payload types in declaration order.
+    pub fn tys(&self) -> impl Iterator<Item = &Ty> {
+        let (tuple, fields) = match self {
+            Self::Tuple(payload) => (Some(payload), None),
+            Self::Struct(fields) => (None, Some(fields)),
+        };
+        tuple
+            .into_iter()
+            .flatten()
+            .chain(fields.into_iter().flatten().map(|(_, ty)| ty))
+    }
+}
+
+/// A variant pattern's annotated path and the variant it resolved to, if any.
+type ResolvedPatternPath = (
+    IdentPath<Substr, VarIdTyMetadata>,
+    Option<(VarId, Arc<CtorTy>)>,
+);
+
+/// The checked form of a struct literal: the type it builds and, when the
+/// literal names an enum variant, that variant.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructLitTy {
+    pub ty: Ty,
+    pub variant: Option<String>,
+}
+
+impl StructLitTy {
+    /// The checked form of a literal that builds `ty` directly.
+    fn of(ty: Ty) -> Self {
+        Self { ty, variant: None }
+    }
 }
 
 /// A struct or enum definition.
@@ -2204,7 +2268,7 @@ impl AstMetadata for VarIdTyMetadata {
     type TupleExpr = Ty;
     /// The sequence type the literal was inferred to have.
     type SeqExpr = Ty;
-    type StructLitExpr = Ty;
+    type StructLitExpr = StructLitTy;
 }
 
 impl<'a> VarIdTyPass<'a> {
@@ -2912,11 +2976,23 @@ impl<'a> VarIdTyPass<'a> {
             return Ty::Unknown;
         };
         let explicit = explicit.or_else(|| (!ctor.args.is_empty()).then(|| ctor.args.clone()));
-        let is_unit = def
+        let payload = def
             .variants
             .get(&ctor.variant)
-            .is_some_and(|variant| variant.payload.is_empty());
-        if is_unit {
+            .map(|variant| &variant.payload);
+        if matches!(payload, Some(VariantTys::Struct(_))) {
+            // A named payload has no value form as a bare name; it is built
+            // with braces, which `dispatch_struct_lit_expr` checks.
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::StructVariantConstruction(format!(
+                    "{}::{}",
+                    ctor.enum_name, ctor.variant
+                )),
+            });
+            return Ty::Unknown;
+        }
+        if payload.is_some_and(VariantTys::is_unit) {
             let map = self.instantiate(&def.params, explicit, span, &ctor.enum_name);
             return Ty::Enum(Arc::new(EnumTy {
                 def: ctor.def,
@@ -3232,7 +3308,7 @@ impl<'a> VarIdTyPass<'a> {
                 name.to_owned(),
                 VariantDef {
                     id: self.alloc_id(),
-                    payload: Vec::new(),
+                    payload: VariantTys::Tuple(Vec::new()),
                 },
             );
         }
@@ -3268,18 +3344,34 @@ impl<'a> VarIdTyPass<'a> {
             .variants
             .iter()
             .map(|variant| {
-                let payload = variant
-                    .payload
-                    .iter()
-                    .map(|spec| self.ty_from_spec(spec))
-                    .collect_vec();
+                let payload = match &variant.payload {
+                    VariantPayload::Tuple(payload) => VariantTys::Tuple(
+                        payload
+                            .iter()
+                            .map(|spec| self.ty_from_spec(spec))
+                            .collect_vec(),
+                    ),
+                    VariantPayload::Struct(input) => {
+                        let mut fields = IndexMap::with_capacity(input.len());
+                        for field in input {
+                            let ty = self.ty_from_spec(&field.ty);
+                            if fields.insert(field.name.name.to_string(), ty).is_some() {
+                                self.errors.push(StaticError {
+                                    span: self.span(field.name.span),
+                                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                                });
+                            }
+                        }
+                        VariantTys::Struct(fields)
+                    }
+                };
                 (variant.name.name.as_str(), payload)
             })
             .collect_vec();
         self.bindings.pop();
         let all = payloads
             .iter()
-            .flat_map(|(_, payload)| payload.iter().cloned())
+            .flat_map(|(_, payload)| payload.tys().cloned())
             .collect_vec();
         let Some(AdtDef::Enum(def)) = self.local_defs.get_mut(&id) else {
             unreachable!("bound as an enum")
@@ -3610,7 +3702,7 @@ impl<'a> VarIdTyPass<'a> {
         };
         let map = param_map(&def.params, &enum_ty.args);
         for variant in def.variants.values() {
-            for payload in &variant.payload {
+            for payload in variant.payload.tys() {
                 match self.shallow(&subst(payload, &map)) {
                     Ty::Int | Ty::Bool | Ty::Nil | Ty::Unknown | Ty::Any | Ty::Infer(_) => {}
                     Ty::Float => return Err(EqualityFailure::Float),
@@ -3928,7 +4020,17 @@ impl<'a> VarIdTyPass<'a> {
         let Some(variant) = def.variants.get(&ctor.variant) else {
             return (None, Ty::Unknown);
         };
-        if variant.payload.is_empty() {
+        let VariantTys::Tuple(payload) = variant.payload.clone() else {
+            self.errors.push(StaticError {
+                span: self.span(call_span),
+                kind: StaticErrorKind::StructVariantConstruction(format!(
+                    "{}::{}",
+                    ctor.enum_name, ctor.variant
+                )),
+            });
+            return (None, Ty::Unknown);
+        };
+        if payload.is_empty() {
             self.errors.push(StaticError {
                 span: self.span(call_span),
                 kind: StaticErrorKind::CannotCall(format!("{}::{}", ctor.enum_name, ctor.variant)),
@@ -3943,17 +4045,17 @@ impl<'a> VarIdTyPass<'a> {
                 kind: StaticErrorKind::InvalidKwArg,
             });
         }
-        if args.posargs.len() != variant.payload.len() {
+        if args.posargs.len() != payload.len() {
             self.errors.push(StaticError {
                 span: self.span(call_span),
                 kind: StaticErrorKind::VariantPayloadArity {
                     variant: ctor.variant.clone(),
-                    expected: variant.payload.len(),
+                    expected: payload.len(),
                     found: args.posargs.len(),
                 },
             });
         }
-        for (arg, payload) in args.posargs.iter().zip(&variant.payload) {
+        for (arg, payload) in args.posargs.iter().zip(&payload) {
             self.assert_eq_ty(arg.span(), &arg.ty(), &subst(payload, &map));
         }
         let ty = Ty::Enum(Arc::new(EnumTy {
@@ -4099,7 +4201,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::Cast(cast) => cast.metadata.clone(),
             Expr::UnaryOp(unary_op_expr) => unary_op_expr.metadata.clone(),
             Expr::Tuple(t) => t.metadata.clone(),
-            Expr::StructLit(lit) => lit.metadata.clone(),
+            Expr::StructLit(lit) => lit.metadata.ty.clone(),
         }
     }
 }
@@ -4168,11 +4270,37 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             .iter()
             .map(|variant| EnumVariant {
                 name: self.transform_ident(&variant.name),
-                payload: variant
-                    .payload
-                    .iter()
-                    .map(|spec| self.transform_ty_spec(spec))
-                    .collect(),
+                // `dispatch_struct_field` is unreachable in this pass, so a
+                // named payload's fields are built here with the types
+                // `define_enum_decl` resolved.
+                payload: match &variant.payload {
+                    VariantPayload::Tuple(payload) => VariantPayload::Tuple(
+                        payload
+                            .iter()
+                            .map(|spec| self.transform_ty_spec(spec))
+                            .collect(),
+                    ),
+                    VariantPayload::Struct(fields) => VariantPayload::Struct(
+                        fields
+                            .iter()
+                            .map(|field| StructField {
+                                name: self.transform_ident(&field.name),
+                                ty: self.transform_ty_spec(&field.ty),
+                                span: field.span,
+                                metadata: def
+                                    .as_ref()
+                                    .and_then(|def| def.variants.get(variant.name.name.as_str()))
+                                    .and_then(|variant| match &variant.payload {
+                                        VariantTys::Struct(tys) => {
+                                            tys.get(field.name.name.as_str()).cloned()
+                                        }
+                                        VariantTys::Tuple(_) => None,
+                                    })
+                                    .unwrap_or_default(),
+                            })
+                            .collect(),
+                    ),
+                },
                 span: variant.span,
                 metadata: def
                     .as_ref()
@@ -4211,7 +4339,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         _input: &EnumVariant<Substr, Self::InputMetadata>,
         _name: &Ident<Substr, Self::OutputMetadata>,
-        _payload: &[TySpec<Substr, Self::OutputMetadata>],
+        _payload: &VariantPayload<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::EnumVariant {
         // `transform_enum_decl` builds the variants itself.
         unreachable!()
@@ -4313,22 +4441,30 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let lookup = if path.path.len() == 1 {
             self.lookup(name)
         } else {
-            let module = module_prefix(
-                self.current_path,
-                path.path.iter().map(|ident| ident.name.as_str()),
-                1,
-            );
-            self.module_item(&module, name)
+            // A qualified path is `Enum::Variant` or `module::item`, so the
+            // same resolution a variant pattern uses applies here.
+            match self.resolve_qualified(&path.path) {
+                Ok(binding) => Some(binding),
+                Err(error) => {
+                    self.report_qualified_error(error, path.span);
+                    None
+                }
+            }
         };
         let Some((_, ty)) = lookup else {
-            self.errors.push(StaticError {
-                span: self.span(path.span),
-                kind: StaticErrorKind::UndeclaredVar {
-                    name: name.to_string(),
-                },
-            });
-            return Ty::Unknown;
+            if path.path.len() == 1 {
+                self.errors.push(StaticError {
+                    span: self.span(path.span),
+                    kind: StaticErrorKind::UndeclaredVar {
+                        name: name.to_string(),
+                    },
+                });
+            }
+            return StructLitTy::default();
         };
+        if let Ty::Ctor(ctor) = ty {
+            return self.variant_lit(input, path, fields, base, &ctor);
+        }
         let Ty::Struct(struct_ty) = ty else {
             // An `Unknown` binding was already diagnosed where it was bound.
             if !matches!(ty, Ty::Unknown) {
@@ -4337,14 +4473,14 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     kind: StaticErrorKind::NotAStruct,
                 });
             }
-            return Ty::Unknown;
+            return StructLitTy::default();
         };
         let Some(def) = self
             .adt_def(struct_ty.def)
             .and_then(AdtDef::as_struct)
             .cloned()
         else {
-            return Ty::Unknown;
+            return StructLitTy::default();
         };
         let explicit = self.explicit_args(path);
         let map = self.instantiate(&def.params, explicit, path.span, &struct_ty.name);
@@ -4403,7 +4539,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 }
             }
         }
-        ty
+        StructLitTy::of(ty)
     }
 
     fn dispatch_cell_decl(
@@ -4619,7 +4755,9 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         // keep it from reaching an unmatched value.
         fn variant_ty(arm: &MatchArm<Substr, VarIdTyMetadata>) -> Option<&Ty> {
             match &arm.pattern {
-                Pattern::Variant { path, .. } => Some(&path.metadata.1),
+                Pattern::Variant { path, .. } | Pattern::StructVariant { path, .. } => {
+                    Some(&path.metadata.1)
+                }
                 _ => None,
             }
         }
@@ -4671,7 +4809,9 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 });
             } else {
                 match &arm.pattern {
-                    Pattern::Variant { path, .. } => {
+                    // A payload sub-pattern is a name or `_`, so an arm that
+                    // names a variant covers all of it.
+                    Pattern::Variant { path, .. } | Pattern::StructVariant { path, .. } => {
                         // All arms must belong to the same enum, whether or not
                         // the scrutinee's own type pinned that enum down.
                         self.assert_eq_ty(arm.pattern.span(), &path.metadata.1, &expected_ty);
@@ -5253,63 +5393,179 @@ impl<'a> VarIdTyPass<'a> {
                 }
             }
             Pattern::Variant { path, fields, span } => {
-                let resolved = if path.path.len() == 1 {
-                    match self.lookup(&path.path[0].name) {
-                        Some((id, Ty::Ctor(ctor))) => Some((id, ctor)),
-                        Some(_) | None => {
-                            self.errors.push(StaticError {
-                                span: self.span(path.span),
-                                kind: StaticErrorKind::UndeclaredVar {
-                                    name: path.path[0].name.to_string(),
-                                },
-                            });
-                            None
-                        }
-                    }
-                } else {
-                    match self.resolve_qualified(&path.path) {
-                        Ok((id, Ty::Ctor(ctor))) => Some((id, ctor)),
-                        Ok(_) => {
-                            self.errors.push(StaticError {
-                                span: self.span(path.span),
-                                kind: StaticErrorKind::NotAnEnum,
-                            });
-                            None
-                        }
-                        Err(error) => {
-                            self.report_qualified_error(error, path.span);
-                            None
-                        }
-                    }
-                };
-                let explicit = self.explicit_args(path);
-                let output = IdentPath {
-                    path: path
-                        .path
-                        .iter()
-                        .map(|ident| self.transform_ident(ident))
-                        .collect(),
-                    generic_args: path
-                        .generic_args
-                        .as_ref()
-                        .map(|args| self.transform_generic_args(args)),
-                    metadata: (None, Ty::Unknown),
-                    span: path.span,
-                };
-                let resolved = resolved.map(|(id, ctor)| {
-                    (
-                        id,
-                        match explicit {
-                            Some(args) => Arc::new(CtorTy {
-                                args,
-                                ..(*ctor).clone()
-                            }),
-                            None => ctor,
-                        },
-                    )
-                });
+                let (output, resolved) = self.resolve_pattern_path(path);
                 self.type_variant_pattern(output, resolved, fields, *span, scrutinee_ty)
             }
+            Pattern::StructVariant {
+                path,
+                fields,
+                rest,
+                span,
+            } => {
+                let (output, resolved) = self.resolve_pattern_path(path);
+                self.type_struct_variant_pattern(
+                    output,
+                    resolved,
+                    fields,
+                    *rest,
+                    *span,
+                    scrutinee_ty,
+                )
+            }
+        }
+    }
+
+    /// Resolves a variant pattern's path, reporting a name that is not a
+    /// variant, and returns the annotated path beside what it resolved to.
+    fn resolve_pattern_path(
+        &mut self,
+        path: &IdentPath<Substr, ParseMetadata>,
+    ) -> ResolvedPatternPath {
+        let resolved = if path.path.len() == 1 {
+            match self.lookup(&path.path[0].name) {
+                Some((id, Ty::Ctor(ctor))) => Some((id, ctor)),
+                Some(_) | None => {
+                    self.errors.push(StaticError {
+                        span: self.span(path.span),
+                        kind: StaticErrorKind::UndeclaredVar {
+                            name: path.path[0].name.to_string(),
+                        },
+                    });
+                    None
+                }
+            }
+        } else {
+            match self.resolve_qualified(&path.path) {
+                Ok((id, Ty::Ctor(ctor))) => Some((id, ctor)),
+                Ok(_) => {
+                    self.errors.push(StaticError {
+                        span: self.span(path.span),
+                        kind: StaticErrorKind::NotAnEnum,
+                    });
+                    None
+                }
+                Err(error) => {
+                    self.report_qualified_error(error, path.span);
+                    None
+                }
+            }
+        };
+        let explicit = self.explicit_args(path);
+        let output = IdentPath {
+            path: path
+                .path
+                .iter()
+                .map(|ident| self.transform_ident(ident))
+                .collect(),
+            generic_args: path
+                .generic_args
+                .as_ref()
+                .map(|args| self.transform_generic_args(args)),
+            metadata: (None, Ty::Unknown),
+            span: path.span,
+        };
+        let resolved = resolved.map(|(id, ctor)| {
+            (
+                id,
+                match explicit {
+                    Some(args) => Arc::new(CtorTy {
+                        args,
+                        ..(*ctor).clone()
+                    }),
+                    None => ctor,
+                },
+            )
+        });
+        (output, resolved)
+    }
+
+    /// Types a `E::V { f: v, g }` literal, which builds a value of `ctor`'s
+    /// enum from the variant's named fields.
+    fn variant_lit(
+        &mut self,
+        input: &StructLitExpr<Substr, ParseMetadata>,
+        path: &IdentPath<Substr, VarIdTyMetadata>,
+        fields: &[StructLitField<Substr, VarIdTyMetadata>],
+        base: &Option<Expr<Substr, VarIdTyMetadata>>,
+        ctor: &CtorTy,
+    ) -> StructLitTy {
+        let Some(def) = self.adt_def(ctor.def).and_then(AdtDef::as_enum).cloned() else {
+            return StructLitTy::default();
+        };
+        let ctor_ty = Ty::Ctor(Arc::new(ctor.clone()));
+        let payload = def.variants.get(&ctor.variant).map(|v| v.payload.clone());
+        let Some(VariantTys::Struct(payload)) = payload else {
+            // A unit variant is a value and a tuple variant is called, so
+            // neither is built with braces.
+            self.errors.push(StaticError {
+                span: self.span(path.span),
+                kind: StaticErrorKind::NotAStructVariant(format!(
+                    "{}::{}",
+                    ctor.enum_name, ctor.variant
+                )),
+            });
+            return StructLitTy::default();
+        };
+        let explicit = self.explicit_args(path);
+        let explicit = explicit.or_else(|| (!ctor.args.is_empty()).then(|| ctor.args.clone()));
+        let map = self.instantiate(&def.params, explicit, path.span, &ctor.enum_name);
+        let ty = Ty::Enum(Arc::new(EnumTy {
+            def: ctor.def,
+            name: ctor.enum_name.clone(),
+            args: def
+                .params
+                .iter()
+                .map(|param| map[&param.id].clone())
+                .collect(),
+        }));
+
+        let mut seen = IndexSet::new();
+        for field in fields {
+            let field_name = field.name.name.as_str();
+            let Some(expected) = payload.get(field_name) else {
+                self.no_field_on_ty(&field.name, ctor_ty.clone());
+                continue;
+            };
+            if !seen.insert(field_name) {
+                self.errors.push(StaticError {
+                    span: self.span(field.name.span),
+                    kind: StaticErrorKind::DuplicateStructField {
+                        field: field_name.to_string(),
+                    },
+                });
+                continue;
+            }
+            self.assert_eq_ty(
+                field.value.span(),
+                &field.value.ty(),
+                &subst(expected, &map),
+            );
+        }
+        // Unlike a struct literal, a variant has no `..base`: the base would
+        // have to be this very variant, which only a `match` can establish.
+        if let Some(base) = base {
+            self.errors.push(StaticError {
+                span: self.span(base.span()),
+                kind: StaticErrorKind::VariantLiteralBase,
+            });
+        }
+        let missing = payload
+            .keys()
+            .filter(|name| !seen.contains(name.as_str()))
+            .map(|name| format!("`{name}`"))
+            .collect_vec();
+        if !missing.is_empty() {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::MissingStructFields {
+                    ty: self.display(&ctor_ty),
+                    fields: missing.join(", "),
+                },
+            });
+        }
+        StructLitTy {
+            ty,
+            variant: Some(ctor.variant.clone()),
         }
     }
 
@@ -5337,8 +5593,61 @@ impl<'a> VarIdTyPass<'a> {
                 span,
             };
         };
-        // The scrutinee's arguments when it is this enum; fresh variables
-        // otherwise, which the arm's body or the scrutinee may then solve.
+        let (map, payload) =
+            self.variant_pattern_payload(&mut path, id, &ctor, &def, span, scrutinee_ty);
+        // Named fields are taken apart by a braced pattern; a `(..)` one here
+        // would bind by position.
+        let VariantTys::Tuple(payload) = payload else {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::StructVariantConstruction(format!(
+                    "{}::{}",
+                    ctor.enum_name, ctor.variant
+                )),
+            });
+            let fields = fields
+                .iter()
+                .map(|field| self.type_pattern(field, &Ty::Unknown))
+                .collect();
+            return Pattern::Variant { path, fields, span };
+        };
+        if fields.len() != payload.len() {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::VariantPayloadArity {
+                    variant: ctor.variant.clone(),
+                    expected: payload.len(),
+                    found: fields.len(),
+                },
+            });
+        }
+        let fields = fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let ty = payload
+                    .get(index)
+                    .map_or(Ty::Unknown, |payload| subst(payload, &map));
+                self.type_pattern(field, &ty)
+            })
+            .collect();
+        Pattern::Variant { path, fields, span }
+    }
+
+    /// Instantiates the enum of a variant pattern, annotates its path with the
+    /// enum type, and returns the substitution and the variant's payload.
+    ///
+    /// The type arguments are the scrutinee's when it is this enum, and fresh
+    /// variables otherwise, which the arm's body or the scrutinee may solve.
+    fn variant_pattern_payload(
+        &mut self,
+        path: &mut IdentPath<Substr, VarIdTyMetadata>,
+        id: VarId,
+        ctor: &CtorTy,
+        def: &EnumDef,
+        span: cfgrammar::Span,
+        scrutinee_ty: &Ty,
+    ) -> (HashMap<VarId, Ty>, VariantTys) {
         let args = match scrutinee_ty {
             Ty::Enum(enum_ty) if enum_ty.def == ctor.def && ctor.args.is_empty() => {
                 enum_ty.args.clone()
@@ -5365,28 +5674,105 @@ impl<'a> VarIdTyPass<'a> {
             .variants
             .get(&ctor.variant)
             .map(|variant| variant.payload.clone())
-            .unwrap_or_default();
-        if fields.len() != payload.len() {
+            .unwrap_or_else(|| VariantTys::Tuple(Vec::new()));
+        (map, payload)
+    }
+
+    /// Types a `E::V { f, g: name, .. }` pattern whose path resolved to
+    /// `resolved`, if it did.
+    fn type_struct_variant_pattern(
+        &mut self,
+        mut path: IdentPath<Substr, VarIdTyMetadata>,
+        resolved: Option<(VarId, Arc<CtorTy>)>,
+        fields: &[FieldPattern<Substr, ParseMetadata>],
+        rest: bool,
+        span: cfgrammar::Span,
+        scrutinee_ty: &Ty,
+    ) -> Pattern<Substr, VarIdTyMetadata> {
+        let unchecked = |this: &mut Self, path| {
+            let fields = fields
+                .iter()
+                .map(|field| FieldPattern {
+                    name: this.transform_ident(&field.name),
+                    pattern: this.type_pattern(&field.pattern, &Ty::Unknown),
+                    shorthand: field.shorthand,
+                    span: field.span,
+                })
+                .collect();
+            Pattern::StructVariant {
+                path,
+                fields,
+                rest,
+                span,
+            }
+        };
+        let Some((id, ctor)) = resolved else {
+            return unchecked(self, path);
+        };
+        let Some(def) = self.adt_def(ctor.def).and_then(AdtDef::as_enum).cloned() else {
+            return unchecked(self, path);
+        };
+        let (map, payload) =
+            self.variant_pattern_payload(&mut path, id, &ctor, &def, span, scrutinee_ty);
+        let ctor_ty = Ty::Ctor(Arc::new((*ctor).clone()));
+        let VariantTys::Struct(payload) = payload else {
             self.errors.push(StaticError {
                 span: self.span(span),
-                kind: StaticErrorKind::VariantPayloadArity {
-                    variant: ctor.variant.clone(),
-                    expected: payload.len(),
-                    found: fields.len(),
-                },
+                kind: StaticErrorKind::NotAStructVariant(format!(
+                    "{}::{}",
+                    ctor.enum_name, ctor.variant
+                )),
             });
-        }
+            return unchecked(self, path);
+        };
+        let mut seen = IndexSet::new();
         let fields = fields
             .iter()
-            .enumerate()
-            .map(|(index, field)| {
-                let ty = payload
-                    .get(index)
-                    .map_or(Ty::Unknown, |payload| subst(payload, &map));
-                self.type_pattern(field, &ty)
+            .map(|field| {
+                let name = field.name.name.as_str();
+                let ty = match payload.get(name) {
+                    Some(ty) if seen.insert(name.to_string()) => subst(ty, &map),
+                    Some(_) => {
+                        self.errors.push(StaticError {
+                            span: self.span(field.name.span),
+                            kind: StaticErrorKind::DuplicateStructField {
+                                field: name.to_string(),
+                            },
+                        });
+                        Ty::Unknown
+                    }
+                    None => self.no_field_on_ty(&field.name, ctor_ty.clone()),
+                };
+                FieldPattern {
+                    name: self.transform_ident(&field.name),
+                    pattern: self.type_pattern(&field.pattern, &ty),
+                    shorthand: field.shorthand,
+                    span: field.span,
+                }
             })
             .collect();
-        Pattern::Variant { path, fields, span }
+        if !rest {
+            let missing = payload
+                .keys()
+                .filter(|name| !seen.contains(name.as_str()))
+                .map(|name| format!("`{name}`"))
+                .collect_vec();
+            if !missing.is_empty() {
+                self.errors.push(StaticError {
+                    span: self.span(span),
+                    kind: StaticErrorKind::MissingPatternFields {
+                        ty: self.display(&ctor_ty),
+                        fields: missing.join(", "),
+                    },
+                });
+            }
+        }
+        Pattern::StructVariant {
+            path,
+            fields,
+            rest,
+            span,
+        }
     }
 }
 
@@ -5532,7 +5918,7 @@ impl AstTransformer for Zonker<'_> {
         &mut self,
         input: &EnumVariant<Substr, VarIdTyMetadata>,
         _name: &Ident<Substr, VarIdTyMetadata>,
-        _payload: &[TySpec<Substr, VarIdTyMetadata>],
+        _payload: &VariantPayload<Substr, VarIdTyMetadata>,
     ) -> Option<VarId> {
         input.metadata
     }
@@ -5702,8 +6088,11 @@ impl AstTransformer for Zonker<'_> {
         _path: &IdentPath<Substr, VarIdTyMetadata>,
         _fields: &[StructLitField<Substr, VarIdTyMetadata>],
         _base: &Option<Expr<Substr, VarIdTyMetadata>>,
-    ) -> Ty {
-        self.ty(&input.metadata, input.span)
+    ) -> StructLitTy {
+        StructLitTy {
+            ty: self.ty(&input.metadata.ty, input.span),
+            variant: input.metadata.variant.clone(),
+        }
     }
 
     fn dispatch_struct_lit_path(
@@ -5825,10 +6214,16 @@ pub enum CellArg {
     Int(i64),
     Bool(bool),
     String(String),
-    /// An enum value, like [`Value::Enum`]: its variant and payload.
+    /// A unit or tuple variant, like [`Value::Enum`]: its variant and payload.
     Enum {
         variant: String,
         payload: Vec<CellArg>,
+    },
+    /// A variant with named fields, like [`Value::Enum`]: its variant and its
+    /// fields in declaration order.
+    StructVariant {
+        variant: String,
+        fields: Vec<(String, CellArg)>,
     },
     Seq(Vec<CellArg>),
     /// A struct value: the qualified name of its type and its fields in
@@ -5868,6 +6263,18 @@ pub enum CellArg {
     Tuple(Vec<CellArg>),
 }
 
+/// The declared payload of `variant` of the enum `ty`, and the substitution
+/// of `ty`'s arguments for its parameters.
+fn variant_payload<'a>(
+    variant: &str,
+    ty: &EnumTy,
+    defs: &'a TypeDefs,
+) -> Option<(&'a VariantTys, HashMap<VarId, Ty>)> {
+    let def = defs.get(&ty.def).and_then(AdtDef::as_enum)?;
+    let variant = def.variants.get(variant)?;
+    Some((&variant.payload, param_map(&def.params, &ty.args)))
+}
+
 impl CellArg {
     /// Whether this argument inhabits `ty`. Struct and enum types are looked up
     /// in `defs`; a type parameter, like `Any`, admits anything.
@@ -5883,18 +6290,28 @@ impl CellArg {
             | (Self::Path { .. }, Ty::Path)
             | (Self::Point(..), Ty::Point) => true,
             (Self::Enum { variant, payload }, Ty::Enum(ty)) => {
-                let Some(def) = defs.get(&ty.def).and_then(AdtDef::as_enum) else {
+                let Some((VariantTys::Tuple(declared), map)) = variant_payload(variant, ty, defs)
+                else {
                     return false;
                 };
-                let Some(variant) = def.variants.get(variant) else {
-                    return false;
-                };
-                let map = param_map(&def.params, &ty.args);
-                payload.len() == variant.payload.len()
+                payload.len() == declared.len()
                     && payload
                         .iter()
-                        .zip(&variant.payload)
+                        .zip(declared)
                         .all(|(value, ty)| value.matches_ty(&subst(ty, &map), defs))
+            }
+            (Self::StructVariant { variant, fields }, Ty::Enum(ty)) => {
+                let Some((VariantTys::Struct(declared), map)) = variant_payload(variant, ty, defs)
+                else {
+                    return false;
+                };
+                fields.len() == declared.len()
+                    && fields
+                        .iter()
+                        .zip(declared)
+                        .all(|((name, value), (field, ty))| {
+                            name == field && value.matches_ty(&subst(ty, &map), defs)
+                        })
             }
             (Self::Seq(values), Ty::Seq(inner)) => {
                 values.iter().all(|value| value.matches_ty(inner, defs))
@@ -5930,7 +6347,7 @@ impl CellArg {
             Self::Int(_) => "Int",
             Self::Bool(_) => "Bool",
             Self::String(_) => "String",
-            Self::Enum { .. } => "enum value",
+            Self::Enum { .. } | Self::StructVariant { .. } => "enum value",
             Self::Seq(_) => "sequence",
             Self::Struct { .. } => "struct",
             Self::Rect { .. } => "Rect",
@@ -5959,6 +6376,8 @@ pub(crate) enum CellArgKey {
     String(String),
     /// The variant and its payload.
     Enum(String, Vec<CellArgKey>),
+    /// The variant and its named fields in declaration order.
+    StructVariant(String, Vec<(String, CellArgKey)>),
     Seq(Vec<CellArgKey>),
     Struct(String, Vec<(String, CellArgKey)>),
     /// Layer, drawability, and `x0, y0, x1, y1`.
@@ -6005,6 +6424,13 @@ impl From<&CellArg> for CellArgKey {
             CellArg::Enum { variant, payload } => {
                 Self::Enum(variant.clone(), payload.iter().map(Self::from).collect())
             }
+            CellArg::StructVariant { variant, fields } => Self::StructVariant(
+                variant.clone(),
+                fields
+                    .iter()
+                    .map(|(field, value)| (field.clone(), Self::from(value)))
+                    .collect(),
+            ),
             CellArg::Seq(v) => Self::Seq(v.iter().map(Self::from).collect()),
             CellArg::Struct { name, fields } => Self::Struct(
                 name.clone(),
@@ -8137,23 +8563,29 @@ impl<'a> ExecPass<'a> {
                         );
                     }
                     // A unit variant is a value; a tuple variant is a
-                    // constructor awaiting its payload.
+                    // constructor awaiting its payload. A variant with named
+                    // fields is built by a literal, so its name has no value
+                    // of its own and the type checker rejects every read.
                     Decl::Enum(e) => {
                         for variant in &e.variants {
                             let Some(id) = variant.metadata else {
                                 continue;
                             };
                             let name = variant.name.name.to_string();
-                            let value = if variant.payload.is_empty() {
-                                Value::Enum(Arc::new(EnumValue {
-                                    variant: name,
-                                    payload: Vec::new(),
-                                }))
-                            } else {
-                                Value::Ctor(Arc::new(CtorValue {
-                                    variant: name,
-                                    arity: variant.payload.len(),
-                                }))
+                            let value = match &variant.payload {
+                                VariantPayload::Struct(_) => Value::Poison,
+                                VariantPayload::Tuple(payload) if payload.is_empty() => {
+                                    Value::Enum(Arc::new(EnumValue {
+                                        variant: name,
+                                        payload: VariantValues::Tuple(Vec::new()),
+                                    }))
+                                }
+                                VariantPayload::Tuple(payload) => {
+                                    Value::Ctor(Arc::new(CtorValue {
+                                        variant: name,
+                                        arity: payload.len(),
+                                    }))
+                                }
                             };
                             let vid = self.new_ready_value(value);
                             assert!(
@@ -8649,11 +9081,16 @@ impl<'a> ExecPass<'a> {
             }),
             Expr::StructLit(lit) => {
                 // A static error aborts compilation before anything is
-                // executed, so the literal is known to name a struct.
-                let Ty::Struct(ty) = &lit.metadata else {
-                    unreachable!("struct literal was not resolved to a struct type")
+                // executed, so the literal is known to name a struct or a
+                // variant with named fields.
+                let target = match (&lit.metadata.ty, &lit.metadata.variant) {
+                    (Ty::Struct(ty), _) => StructLitTarget::Struct(ty.clone()),
+                    (Ty::Enum(ty), Some(variant)) => StructLitTarget::Variant {
+                        ty: ty.clone(),
+                        variant: variant.clone(),
+                    },
+                    _ => unreachable!("struct literal was not resolved to a struct or variant"),
                 };
-                let ty = ty.clone();
                 self.new_deferred_value(loc, |this| {
                     let fields = lit
                         .fields
@@ -8663,7 +9100,7 @@ impl<'a> ExecPass<'a> {
                     let base = lit.base.as_ref().map(|base| this.visit_expr(loc, base));
                     PartialEvalState::StructLit(Box::new(PartialStructLit {
                         expr: (**lit).clone(),
-                        ty,
+                        target,
                         fields,
                         base,
                     }))
@@ -8706,10 +9143,21 @@ impl<'a> ExecPass<'a> {
             CellArg::String(s) => Value::String(s.clone()),
             CellArg::Enum { variant, payload } => Value::Enum(Arc::new(EnumValue {
                 variant: variant.clone(),
-                payload: payload
-                    .iter()
-                    .map(|arg| self.bind_cell_arg(cell_id, span, arg))
-                    .collect(),
+                payload: VariantValues::Tuple(
+                    payload
+                        .iter()
+                        .map(|arg| self.bind_cell_arg(cell_id, span, arg))
+                        .collect(),
+                ),
+            })),
+            CellArg::StructVariant { variant, fields } => Value::Enum(Arc::new(EnumValue {
+                variant: variant.clone(),
+                payload: VariantValues::Struct(
+                    fields
+                        .iter()
+                        .map(|(field, arg)| (field.clone(), self.bind_cell_arg(cell_id, span, arg)))
+                        .collect(),
+                ),
             })),
             CellArg::Seq(v) => Value::Seq(
                 v.iter()
@@ -8868,19 +9316,34 @@ impl<'a> ExecPass<'a> {
             Value::Int(i) => Some(CellArg::Int(*i)),
             Value::Bool(b) => Some(CellArg::Bool(*b)),
             Value::String(s) => Some(CellArg::String(s.clone())),
-            Value::Enum(value) => {
-                let mut payload = Vec::with_capacity(value.payload.len());
-                for v in &value.payload {
-                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
-                        Some(arg) => payload.push(arg),
-                        None => return Ok(None),
+            Value::Enum(value) => match &value.payload {
+                VariantValues::Tuple(values) => {
+                    let mut payload = Vec::with_capacity(values.len());
+                    for v in values {
+                        match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                            Some(arg) => payload.push(arg),
+                            None => return Ok(None),
+                        }
                     }
+                    Some(CellArg::Enum {
+                        variant: value.variant.clone(),
+                        payload,
+                    })
                 }
-                Some(CellArg::Enum {
-                    variant: value.variant.clone(),
-                    payload,
-                })
-            }
+                VariantValues::Struct(values) => {
+                    let mut fields = Vec::with_capacity(values.len());
+                    for (name, v) in values {
+                        match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                            Some(arg) => fields.push((name.clone(), arg)),
+                            None => return Ok(None),
+                        }
+                    }
+                    Some(CellArg::StructVariant {
+                        variant: value.variant.clone(),
+                        fields,
+                    })
+                }
+            },
             Value::Seq(s) => {
                 let mut args = Vec::with_capacity(s.len());
                 for v in s.iter() {
@@ -11179,13 +11642,19 @@ impl<'a> ExecPass<'a> {
                     self.add_value_dependent(pending, vid);
                     false
                 } else {
+                    let struct_ty = match &lit.target {
+                        StructLitTarget::Struct(ty) => Some(ty.clone()),
+                        StructLitTarget::Variant { .. } => None,
+                    };
                     // The fields not listed come from the base, which the
                     // static check proved to be this struct unless it was
-                    // typed `Any`.
+                    // typed `Any`. A variant literal has no base.
                     let base = match lit.base {
                         None => None,
                         Some(base) => match self.values[&base].get_ready() {
-                            Some(Value::Struct(value)) if value.name == lit.ty.name => {
+                            Some(Value::Struct(value))
+                                if struct_ty.as_ref().is_some_and(|ty| value.name == ty.name) =>
+                            {
                                 Some(value.fields.clone())
                             }
                             _ => {
@@ -11199,14 +11668,31 @@ impl<'a> ExecPass<'a> {
                     // Declaration order, whatever order the literal used:
                     // `CellArg::Struct` fields are matched pairwise against
                     // the type's.
-                    let Some(def) = self.defs.get(&lit.ty.def).and_then(AdtDef::as_struct) else {
+                    let declared = match &lit.target {
+                        StructLitTarget::Struct(ty) => self
+                            .defs
+                            .get(&ty.def)
+                            .and_then(AdtDef::as_struct)
+                            .map(|def| def.fields.keys().cloned().collect_vec()),
+                        StructLitTarget::Variant { ty, variant } => self
+                            .defs
+                            .get(&ty.def)
+                            .and_then(AdtDef::as_enum)
+                            .and_then(|def| def.variants.get(variant))
+                            .and_then(|variant| match &variant.payload {
+                                VariantTys::Struct(fields) => {
+                                    Some(fields.keys().cloned().collect_vec())
+                                }
+                                VariantTys::Tuple(_) => None,
+                            }),
+                    };
+                    let Some(declared) = declared else {
                         let span = self.span(&vref.loc, lit.expr.span);
                         self.invalid_type(cell_id, &span);
                         return self.poison(cell_id, vid);
                     };
-                    let fields = def
-                        .fields
-                        .keys()
+                    let fields = declared
+                        .iter()
                         .map(|name| {
                             let explicit = lit
                                 .expr
@@ -11227,13 +11713,19 @@ impl<'a> ExecPass<'a> {
                         self.invalid_type(cell_id, &span);
                         return self.poison(cell_id, vid);
                     };
-                    self.values.insert(
-                        vid,
-                        DeferValue::Ready(Value::Struct(Box::new(StructValue {
-                            name: lit.ty.name.clone(),
+                    let value = match &lit.target {
+                        StructLitTarget::Struct(ty) => Value::Struct(Box::new(StructValue {
+                            name: ty.name.clone(),
                             fields,
-                        }))),
-                    );
+                        })),
+                        StructLitTarget::Variant { variant, .. } => {
+                            Value::Enum(Arc::new(EnumValue {
+                                variant: variant.clone(),
+                                payload: VariantValues::Struct(fields),
+                            }))
+                        }
+                    };
+                    self.values.insert(vid, DeferValue::Ready(value));
                     true
                 }
             }
@@ -11257,7 +11749,7 @@ impl<'a> ExecPass<'a> {
                         vid,
                         DeferValue::Ready(Value::Enum(Arc::new(EnumValue {
                             variant: ctor.variant.clone(),
-                            payload,
+                            payload: VariantValues::Tuple(payload),
                         }))),
                     );
                     true
@@ -11339,16 +11831,37 @@ impl<'a> ExecPass<'a> {
                 let Value::Enum(value) = value else {
                     return;
                 };
-                for (field, element) in fields.iter().zip(&value.payload) {
-                    match field {
-                        Pattern::Binding { metadata, .. } => {
-                            let vid = self.new_ready_value(element.clone());
-                            frame.bindings.insert(metadata.0, vid);
-                        }
-                        Pattern::Wildcard { .. } | Pattern::Variant { .. } => {}
-                    }
+                for (field, element) in fields.iter().zip(value.payload.values()) {
+                    self.bind_payload_element(field, element, frame);
                 }
             }
+            Pattern::StructVariant { fields, .. } => {
+                let Value::Enum(value) = value else {
+                    return;
+                };
+                let VariantValues::Struct(values) = &value.payload else {
+                    return;
+                };
+                for field in fields {
+                    let Some(element) = values.get(field.name.name.as_str()) else {
+                        continue;
+                    };
+                    self.bind_payload_element(&field.pattern, element, frame);
+                }
+            }
+        }
+    }
+
+    /// Binds one payload element of a variant pattern, which is a name or `_`.
+    fn bind_payload_element(
+        &mut self,
+        pattern: &Pattern<Substr, VarIdTyMetadata>,
+        element: &Value,
+        frame: &mut Frame,
+    ) {
+        if let Pattern::Binding { metadata, .. } = pattern {
+            let vid = self.new_ready_value(element.clone());
+            frame.bindings.insert(metadata.0, vid);
         }
     }
 
@@ -11536,8 +12049,43 @@ impl Value {
 #[derive(Debug, Clone)]
 pub struct EnumValue {
     pub variant: String,
-    /// Empty for a unit variant.
-    pub payload: Vec<Value>,
+    pub payload: VariantValues,
+}
+
+/// The payload of an [`EnumValue`].
+#[derive(Debug, Clone)]
+pub enum VariantValues {
+    /// Positional elements; empty for a unit variant.
+    Tuple(Vec<Value>),
+    /// Named fields in declaration order.
+    Struct(IndexMap<String, Value>),
+}
+
+impl VariantValues {
+    /// How many values the variant carries.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Tuple(payload) => payload.len(),
+            Self::Struct(fields) => fields.len(),
+        }
+    }
+
+    /// Whether the variant carries nothing.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The payload values in declaration order.
+    pub fn values(&self) -> impl Iterator<Item = &Value> {
+        let (tuple, fields) = match self {
+            Self::Tuple(payload) => (Some(payload), None),
+            Self::Struct(fields) => (None, Some(fields)),
+        };
+        tuple
+            .into_iter()
+            .flatten()
+            .chain(fields.into_iter().flatten().map(|(_, value)| value))
+    }
 }
 
 /// A tuple variant as a callable. See [`Value::Ctor`].
@@ -11552,19 +12100,41 @@ fn pattern_matches(pattern: &Pattern<Substr, VarIdTyMetadata>, value: &Value) ->
     match pattern {
         Pattern::Wildcard { .. } | Pattern::Binding { .. } => true,
         Pattern::Variant { path, fields, .. } => {
-            let Value::Enum(value) = value else {
+            let Some(value) = enum_value(path, value) else {
                 return false;
             };
-            path.path
-                .last()
-                .is_some_and(|name| *name.name == *value.variant)
-                && fields.len() == value.payload.len()
+            fields.len() == value.payload.len()
                 && fields
                     .iter()
-                    .zip(&value.payload)
+                    .zip(value.payload.values())
                     .all(|(field, element)| pattern_matches(field, element))
         }
+        Pattern::StructVariant { path, fields, .. } => {
+            let Some(value) = enum_value(path, value) else {
+                return false;
+            };
+            let VariantValues::Struct(values) = &value.payload else {
+                return false;
+            };
+            fields.iter().all(|field| {
+                values
+                    .get(field.name.name.as_str())
+                    .is_some_and(|element| pattern_matches(&field.pattern, element))
+            })
+        }
     }
+}
+
+/// `value` as the enum value the last segment of `path` names, if it is one.
+fn enum_value<'a>(
+    path: &IdentPath<Substr, VarIdTyMetadata>,
+    value: &'a Value,
+) -> Option<&'a EnumValue> {
+    let Value::Enum(value) = value else {
+        return None;
+    };
+    let variant = path.path.last()?;
+    (*variant.name == *value.variant).then_some(&**value)
 }
 
 /// Structural equality of two values, or `None` for a pair the evaluator
@@ -11582,7 +12152,7 @@ fn values_equal(left: &Value, right: &Value) -> Option<bool> {
                 return None;
             }
             let mut equal = true;
-            for (l, r) in l.payload.iter().zip(&r.payload) {
+            for (l, r) in l.payload.values().zip(r.payload.values()) {
                 equal &= values_equal(l, r)?;
             }
             Some(equal)
@@ -12296,12 +12866,23 @@ struct PartialSeqExpr {
 #[derive(Debug, Clone)]
 struct PartialStructLit<T: AstMetadata> {
     expr: StructLitExpr<Substr, T>,
-    /// The struct being built, from the literal's checked type; its
-    /// definition's field order is the order the value's fields take.
-    ty: Arc<StructTy>,
+    /// What the literal builds, from its checked type; the declaration's field
+    /// order is the order the value's fields take.
+    target: StructLitTarget,
     /// One value per entry of `expr.fields`.
     fields: Vec<ValueId>,
     base: Option<ValueId>,
+}
+
+/// What a [`PartialStructLit`] builds.
+#[derive(Debug, Clone)]
+enum StructLitTarget {
+    Struct(Arc<StructTy>),
+    /// A variant with named fields, and the enum it belongs to.
+    Variant {
+        ty: Arc<EnumTy>,
+        variant: String,
+    },
 }
 
 #[derive(Debug, Clone)]

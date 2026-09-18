@@ -294,7 +294,7 @@ impl Builder<'_> {
                         let mut deps = IndexSet::new();
                         if let Some(def) = self.defs.get(&var).and_then(|def| def.as_enum()) {
                             for variant in def.variants.values() {
-                                for payload in &variant.payload {
+                                for payload in variant.payload.tys() {
                                     self.ty(payload, &mut deps);
                                 }
                             }
@@ -416,6 +416,12 @@ impl Builder<'_> {
                     self.pattern(field, out);
                 }
             }
+            Pattern::StructVariant { path, fields, .. } => {
+                self.ident_path(path, out);
+                for field in fields {
+                    self.pattern(&field.pattern, out);
+                }
+            }
         }
     }
 
@@ -506,10 +512,10 @@ impl Builder<'_> {
                     self.expr(item, out);
                 }
             }
-            // The struct being built reaches us through the literal's checked
-            // type; its path carries no `VarId`.
+            // The struct or variant being built reaches us through the
+            // literal's checked type; its path carries no `VarId`.
             Expr::StructLit(e) => {
-                self.ty(&e.metadata, out);
+                self.ty(&e.metadata.ty, out);
                 for field in &e.fields {
                     self.expr(&field.value, out);
                 }
@@ -923,6 +929,19 @@ fn pick(m: Mode) -> Float { match m { Mode::Fast => 1., Mode::Slow => 2., Mode::
 fn untouched() -> Float { 5. }
 ";
         assert_eq!(changed(base, after), ["Mode", "pick"]);
+    }
+
+    /// A variant's named payload reaches the fingerprint like a tuple one, so
+    /// adding a field moves the enum and everything that matches on it.
+    #[test]
+    fn changing_a_variant_payload_invalidates_its_users() {
+        let base = "\
+enum Mode { Sized { w: Float }, Fast, }
+fn pick(m: Mode) -> Float { match m { Mode::Sized { w, .. } => w, Mode::Fast => 1., } }
+fn untouched() -> Float { 5. }
+";
+        let after = base.replace("{ w: Float }", "{ w: Float, h: Int }");
+        assert_eq!(changed(base, &after), ["Mode", "pick"]);
     }
 
     /// Reordering a struct's fields changes its text but keeps every user

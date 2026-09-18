@@ -566,6 +566,46 @@ cell top() {
         );
     }
 
+    /// A variant's braces nest like any other, so a declaration and a pattern
+    /// that spans lines indent from the enclosing block.
+    #[test]
+    fn formats_struct_variant_braces() {
+        let source = r#"
+enum Shape {
+ Circle { r: Float },
+ Box {
+ w: Float,
+ h: Float,
+ },
+}
+
+fn width(s: Shape) -> Float {
+ match s {
+ Shape::Circle { r } => r,
+ Shape::Box { w, .. } => w,
+ }
+}
+"#;
+        assert_eq!(
+            format_source(source),
+            r#"enum Shape {
+    Circle { r: Float },
+    Box {
+        w: Float,
+        h: Float,
+    },
+}
+
+fn width(s: Shape) -> Float {
+    match s {
+        Shape::Circle { r } => r,
+        Shape::Box { w, .. } => w,
+    }
+}
+"#
+        );
+    }
+
     #[test]
     fn formatting_check_does_not_write_files() {
         let directory = tempfile::tempdir().unwrap();

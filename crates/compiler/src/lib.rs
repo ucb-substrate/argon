@@ -233,6 +233,7 @@ mod tests {
     const ARGON_GENERICS_STRUCT: &str = concatcp!(EXAMPLES_DIR, "/generics_struct/lib.ar");
     const ARGON_OPTION: &str = concatcp!(EXAMPLES_DIR, "/option/lib.ar");
     const ARGON_ENUM_PAYLOAD: &str = concatcp!(EXAMPLES_DIR, "/enum_payload/lib.ar");
+    const ARGON_ENUM_STRUCT_PAYLOAD: &str = concatcp!(EXAMPLES_DIR, "/enum_struct_payload/lib.ar");
     const ARGON_RECURSIVE_STRUCT: &str = concatcp!(EXAMPLES_DIR, "/recursive_struct/lib.ar");
     const ARGON_GENERICS_CELL: &str = concatcp!(EXAMPLES_DIR, "/generics_cell/lib.ar");
 
@@ -5859,6 +5860,132 @@ cell top() {
     }
 
     #[test]
+    fn struct_variants_are_checked() {
+        let source = |body: &str| {
+            format!(
+                "enum Shape {{ Circle {{ r: Float }}, Box(Float, Float), Empty, }}\n\
+                 cell c() {{ {body} }}"
+            )
+        };
+        assert!(
+            generic_errors(&source(
+                "let r = 1.; let a = Shape::Circle { r }; let b = Shape::Circle { r: 2. };"
+            ))
+            .is_empty()
+        );
+        // Every field must be given exactly once, and only declared ones.
+        assert!(matches!(
+            generic_errors(&source("let a = Shape::Circle {};")).as_slice(),
+            [StaticErrorKind::MissingStructFields { ty, fields }]
+                if ty == "Shape::Circle" && fields == "`r`"
+        ));
+        assert!(matches!(
+            generic_errors(&source("let a = Shape::Circle { r: 1., r: 2. };")).as_slice(),
+            [StaticErrorKind::DuplicateStructField { field }] if field == "r"
+        ));
+        assert!(matches!(
+            generic_errors(&source("let a = Shape::Circle { r: 1., w: 2. };")).as_slice(),
+            [StaticErrorKind::NoFieldOnTy { field, ty }]
+                if field == "w" && ty == "Shape::Circle"
+        ));
+        assert!(matches!(
+            generic_errors(&source("let a = Shape::Circle { r: 1 };")).as_slice(),
+            [StaticErrorKind::IncorrectTy { expected, found }]
+                if expected == "Float" && found == "Int"
+        ));
+        // A variant has no `..base`, unlike a struct literal.
+        assert!(matches!(
+            generic_errors(&source(
+                "let a = Shape::Circle { r: 1. }; let b = Shape::Circle { ..a };"
+            ))
+            .as_slice(),
+            [
+                StaticErrorKind::VariantLiteralBase,
+                StaticErrorKind::MissingStructFields { .. }
+            ]
+        ));
+        // The two payload forms are not interchangeable.
+        assert!(matches!(
+            generic_errors(&source("let a = Shape::Circle(1.);")).as_slice(),
+            [StaticErrorKind::StructVariantConstruction(ty)] if ty == "Shape::Circle"
+        ));
+        assert!(matches!(
+            generic_errors(&source("let a: Shape = Shape::Circle;")).as_slice(),
+            [StaticErrorKind::StructVariantConstruction(ty)] if ty == "Shape::Circle"
+        ));
+        assert!(matches!(
+            generic_errors(&source("let a = Shape::Box { w: 1., h: 2. };")).as_slice(),
+            [StaticErrorKind::NotAStructVariant(ty)] if ty == "Shape::Box"
+        ));
+        assert!(matches!(
+            generic_errors(&source("let a = Shape::Empty {};")).as_slice(),
+            [StaticErrorKind::NotAStructVariant(ty)] if ty == "Shape::Empty"
+        ));
+    }
+
+    #[test]
+    fn struct_variant_patterns_are_checked() {
+        let source = |arm: &str| {
+            format!(
+                "enum Shape {{ Circle {{ r: Float }}, Box(Float, Float), Empty, }}\n\
+                 fn f(s: Shape) -> Float {{ match s {{ {arm} _ => 0., }} }}"
+            )
+        };
+        for arm in [
+            "Shape::Circle { r } => r,",
+            "Shape::Circle { r: radius } => radius,",
+            "Shape::Circle { r: _ } => 1.,",
+            "Shape::Circle { .. } => 1.,",
+            "Shape::Circle { r, .. } => r,",
+        ] {
+            assert!(generic_errors(&source(arm)).is_empty(), "{arm}");
+        }
+        // Without `..` every field must be named, and only declared ones.
+        assert!(matches!(
+            generic_errors(&source("Shape::Circle {} => 1.,")).as_slice(),
+            [StaticErrorKind::MissingPatternFields { ty, fields }]
+                if ty == "Shape::Circle" && fields == "`r`"
+        ));
+        assert!(matches!(
+            generic_errors(&source("Shape::Circle { w } => 1.,")).as_slice(),
+            [
+                StaticErrorKind::NoFieldOnTy { .. },
+                StaticErrorKind::MissingPatternFields { .. }
+            ]
+        ));
+        assert!(matches!(
+            generic_errors(&source("Shape::Circle { r, r } => r,")).as_slice(),
+            [StaticErrorKind::DuplicateStructField { field }] if field == "r"
+        ));
+        // The two payload forms are not interchangeable.
+        assert!(matches!(
+            generic_errors(&source("Shape::Circle(r) => r,")).as_slice(),
+            [StaticErrorKind::StructVariantConstruction(ty)] if ty == "Shape::Circle"
+        ));
+        assert!(matches!(
+            generic_errors(&source("Shape::Box { w, h } => w,")).as_slice(),
+            [StaticErrorKind::NotAStructVariant(ty)] if ty == "Shape::Box"
+        ));
+        // Naming a variant still covers it, so `..` does not weaken
+        // exhaustiveness.
+        assert!(
+            generic_errors(
+                "enum Shape { Circle { r: Float }, Empty, }\n\
+                 fn f(s: Shape) -> Float { match s { Shape::Circle { .. } => 1., Shape::Empty => 0., } }"
+            )
+            .is_empty()
+        );
+        assert!(matches!(
+            generic_errors(
+                "enum Shape { Circle { r: Float }, Empty, }\n\
+                 fn f(s: Shape) -> Float { match s { Shape::Circle { .. } => 1., } }"
+            )
+            .as_slice(),
+            [StaticErrorKind::MatchArmsNotComprehensive]
+        ));
+    }
+
+    #[test]
     fn match_arms_after_a_catch_all_are_unreachable() {
         let source = |arms: &str| {
             format!("enum E {{ A, B, }}\nfn f(e: E) -> Int {{ match e {{ {arms} }} }}")
@@ -6205,6 +6332,62 @@ cell top() {
              }",
         );
         assert_eq!(top_rect_sizes(&data), [(40., 150.)]);
+    }
+
+    /// A named payload is built in any field order, bound by name whatever
+    /// order the pattern uses, and compared field by field.
+    #[test]
+    fn struct_variant_payloads_are_matched_and_compared_at_run_time() {
+        let data = compile_top(
+            "enum Shape { Circle { r: Float }, Box { w: Float, h: Float }, Empty, }
+             enum Tag { Named { n: Int }, Bare, }
+             fn width(s: Shape) -> Float {
+                 match s {
+                     Shape::Circle { r } => 2. * r,
+                     Shape::Box { h: _, w } => w,
+                     Shape::Empty => 0.,
+                 }
+             }
+             fn height(s: Shape) -> Float {
+                 match s { Shape::Box { h: tall, .. } => tall, _ => 1., }
+             }
+             cell top() {
+                 let w = 30.;
+                 let boxed = Shape::Box { h: 7., w };
+                 let width = width(boxed) + width(Shape::Circle { r: 5. }) + width(Shape::Empty);
+                 let same = Tag::Named { n: 2 } == Tag::Named { n: 2 };
+                 let differs = Tag::Named { n: 2 } == Tag::Bare;
+                 let h = height(boxed) + if same { 100. } else { 0. } + if differs { 1000. } else { 0. };
+                 let r = rect(\"met1\", x0=0., y0=0., w=width, h=h);
+             }",
+        );
+        assert_eq!(top_rect_sizes(&data), [(40., 107.)]);
+    }
+
+    /// A variant with named fields crosses the cell boundary, where its
+    /// fields take declaration order whatever order the literal used.
+    #[test]
+    fn struct_variant_cell_arguments_keep_declaration_order() {
+        let data = compile_top(
+            "enum Shape { Box { w: Float, h: Float }, }
+             cell shape(s: Shape) {
+                 let r = rect(\"met1\", x0=0., y0=0., w=match s { Shape::Box { w, .. } => w, }, h=10.);
+             }
+             cell top() {
+                 let a = inst(shape(Shape::Box { w: 100., h: 1. }), x=0., y=0.);
+                 let b = inst(shape(Shape::Box { h: 1., w: 300. }), x=0., y=100.);
+             }",
+        );
+        assert_eq!(rect_widths_of(&data, "shape"), [100., 300.]);
+    }
+
+    #[test]
+    fn argon_enum_struct_payload() {
+        let data = compile_example(ARGON_ENUM_STRUCT_PAYLOAD);
+        // The circle contributes its diameter and the box its width; the
+        // outline's height is the box's.
+        assert_eq!(top_rect_sizes(&data), [(400., 20.)]);
+        assert_eq!(rect_widths_of(&data, "shape_rect"), [100., 300.]);
     }
 }
 pub mod cli;

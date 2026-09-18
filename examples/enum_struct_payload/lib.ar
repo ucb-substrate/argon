@@ -1,0 +1,37 @@
+enum Shape {
+    Circle { r: Float },
+    Box { w: Float, h: Float },
+    Empty,
+}
+
+// A variant with named fields is built with braces, like a struct literal, and
+// taken apart by a pattern that names the fields it binds. `f: name` renames a
+// binding, `f: _` drops one, and a trailing `..` ignores the rest.
+fn width(s: Shape) -> Float {
+    match s {
+        Shape::Circle { r } => 2. * r,
+        Shape::Box { w, .. } => w,
+        Shape::Empty => 0.,
+    }
+}
+
+fn height(s: Shape) -> Float {
+    match s {
+        Shape::Box { h: tall, w: _ } => tall,
+        _ => 100.,
+    }
+}
+
+cell shape_rect(layer: String, s: Shape) {
+    let r = rect(layer, x0=0., y0=0., w=width(s), h=height(s));
+}
+
+cell top() {
+    // Shorthand: `w` and `h` stand for `w: w` and `h: h`.
+    let w = 300.;
+    let h = 20.;
+    let shapes = cons(Shape::Circle { r: 50. }, cons(Shape::Box { w, h }, []));
+    let first = inst(shape_rect("met1", head(shapes)), x=0., y=0.);
+    let second = inst(shape_rect("met2", std::last(shapes)), x=0., y=200.);
+    let outline = rect("met1", x0=0., y0=0., w=width(head(shapes)) + width(std::last(shapes)), h=height(std::last(shapes)));
+}

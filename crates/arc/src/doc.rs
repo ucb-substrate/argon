@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use arcstr::Substr;
 use argonc::{
     WorkspaceConfig,
-    ast::{ArgDecl, Decl, ModPath, TyParam, TySpec, TySpecKind},
+    ast::{ArgDecl, Decl, ModPath, TyParam, TySpec, TySpecKind, VariantPayload},
     parse::{self, AnnotatedParseAst, ParseMetadata, WorkspaceParseAst},
 };
 
@@ -339,19 +339,35 @@ fn render_module(
                     .variants
                     .iter()
                     .map(|variant| {
-                        let payload = (!variant.payload.is_empty()).then(|| {
-                            let types = variant
-                                .payload
-                                .iter()
-                                .map(|ty| render_type(ty, module.path, targets))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            format!("({types})")
-                        });
+                        let payload = match &variant.payload {
+                            VariantPayload::Tuple(payload) if payload.is_empty() => String::new(),
+                            VariantPayload::Tuple(payload) => {
+                                let types = payload
+                                    .iter()
+                                    .map(|ty| render_type(ty, module.path, targets))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!("({types})")
+                            }
+                            VariantPayload::Struct(fields) => {
+                                let fields = fields
+                                    .iter()
+                                    .map(|field| {
+                                        format!(
+                                            "{}: {}",
+                                            escape(&field.name.name),
+                                            render_type(&field.ty, module.path, targets)
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!(" {{ {fields} }}")
+                            }
+                        };
                         format!(
                             "<li><code>{}{}</code></li>",
                             escape(&variant.name.name),
-                            payload.unwrap_or_default()
+                            payload
                         )
                     })
                     .collect::<Vec<_>>()
@@ -644,7 +660,7 @@ mod tests {
         fs::write(directory.path().join("Argon.toml"), "name = \"demo\"\n").unwrap();
         fs::write(
             directory.path().join("lib.ar"),
-            "//! Demo cells.\n/// Routing modes.\nenum Mode { Fast, Quiet, }\n/// Builds a route.\n/// # Arguments\n/// - `mode`: routing mode.\ncell route(mode: Mode) {}\n/// A mode or nothing.\nenum Maybe<T> { Just(T, Mode), Nothing, }\n/// Picks a mode.\nfn pick<T>(m: Maybe<T>, n: Option<Int>) -> Mode { Mode::Fast }\n",
+            "//! Demo cells.\n/// Routing modes.\nenum Mode { Fast, Quiet, }\n/// Builds a route.\n/// # Arguments\n/// - `mode`: routing mode.\ncell route(mode: Mode) {}\n/// A mode or nothing.\nenum Maybe<T> { Just(T, Mode), Sized { width: Int, mode: Mode }, Nothing, }\n/// Picks a mode.\nfn pick<T>(m: Maybe<T>, n: Option<Int>) -> Mode { Mode::Fast }\n",
         )
         .unwrap();
         let library = Library::load(directory.path().join("Argon.toml")).unwrap();
@@ -664,6 +680,10 @@ mod tests {
             "<li><code>Just(<span class=\"type\">T</span>, <a class=\"type\" href=\"module-root.html#enum.Mode\">Mode</a>)</code></li>"
         ));
         assert!(page.contains("<li><code>Nothing</code></li>"));
+        // A variant with named fields renders its fields, not a tuple.
+        assert!(page.contains(
+            "<li><code>Sized { width: <span class=\"type\">Int</span>, mode: <a class=\"type\" href=\"module-root.html#enum.Mode\">Mode</a> }</code></li>"
+        ));
         assert!(page.contains("<span class=\"name\">pick</span>&lt;T&gt;("));
         assert!(page.contains(
             "<a class=\"type\" href=\"module-root.html#enum.Maybe\">Maybe</a>&lt;<span class=\"type\">T</span>&gt;"

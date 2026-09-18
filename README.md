@@ -154,10 +154,10 @@ including on the command line:
 arc run --cell 'via(ViaParams { layer: "met1", size: Size { w: 100., h: 50. }, n: 1 })'
 ```
 
-Enum variants may carry values. A tuple variant is constructed like a call and
-taken apart by a `match` pattern that binds its payload; `_` skips an element,
-and a bare name or `_` arm matches anything. Every variant is also an item that
-`use` can import:
+Enum variants may carry values, either as a tuple or as named fields. A tuple
+variant is constructed like a call and taken apart by a `match` pattern that
+binds its payload; `_` skips an element, and a bare name or `_` arm matches
+anything. Every variant is also an item that `use` can import:
 
 ```rust
 enum Shape {
@@ -172,6 +172,36 @@ fn width(s: Shape) -> Float {
         Shape::Box(w, _) => w,
         _ => 0.,
     }
+}
+```
+
+A variant with named fields is written and constructed like a struct, with the
+same shorthand, and matched by a pattern that names the fields it binds. A
+pattern must name every field unless it ends in `..`, `field: name` renames a
+binding, and `field: _` drops one. Unlike a struct literal, a variant takes no
+`..base`, and like a struct literal it must be parenthesized in an `if`
+condition, a `match` scrutinee, or a `for` sequence:
+
+```rust
+enum Shape {
+    Circle { r: Float },
+    Box { w: Float, h: Float },
+    Empty,
+}
+
+fn width(s: Shape) -> Float {
+    match s {
+        Shape::Circle { r } => 2. * r,
+        Shape::Box { w, .. } => w,
+        Shape::Empty => 0.,
+    }
+}
+
+cell top() {
+    let w = 300.;
+    let h = 20.;
+    let boxed = Shape::Box { w, h };
+    let r = rect("met1", x0=0., y0=0., w=width(boxed), h=h);
 }
 ```
 

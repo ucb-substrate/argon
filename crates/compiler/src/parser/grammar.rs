@@ -18,11 +18,11 @@ use cfgrammar::Span;
 use crate::ast::{
     ArgDecl, Args, ArithOp, Ast, BinOp, BinOpExpr, BoolLiteral, BoolOp, CallExpr, CastExpr,
     CellDecl, ComparisonOp, ConstantDecl, Decl, EmitExpr, EnumDecl, EnumVariant, Expr,
-    FieldAccessExpr, FloatLiteral, FnDecl, ForLoop, GenericArgs, Ident, IdentPath, IfExpr,
-    IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, LetBinding, MatchArm, MatchExpr,
-    ModDecl, NilLiteral, Pattern, Scope, SeqLiteral, Statement, StringLiteral, StructDecl,
-    StructField, StructLitExpr, StructLitField, TupleExpr, TyParam, TySpec, TySpecKind, UnaryOp,
-    UnaryOpExpr, UseDecl,
+    FieldAccessExpr, FieldPattern, FloatLiteral, FnDecl, ForLoop, GenericArgs, Ident, IdentPath,
+    IfExpr, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, LetBinding, MatchArm,
+    MatchExpr, ModDecl, NilLiteral, Pattern, Scope, SeqLiteral, Statement, StringLiteral,
+    StructDecl, StructField, StructLitExpr, StructLitField, TupleExpr, TyParam, TySpec, TySpecKind,
+    UnaryOp, UnaryOpExpr, UseDecl, VariantPayload,
 };
 use crate::compile::BUILTINS;
 use crate::parse::ParseMetadata;
@@ -606,7 +606,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `enumVariant : ident (LPAREN tySpecList RPAREN)?`
+    /// `enumVariant : ident (LPAREN tySpecList RPAREN | LBRACE structFields RBRACE)?`
     fn parse_enum_variant(&mut self) -> EnumVariant<&'a str, Md> {
         let lo = self.cur.start;
         let name = self.ident(CompletionSite::NewIdentifier);
@@ -615,9 +615,16 @@ impl<'a> Parser<'a> {
                 p.parse_ty_spec()
             });
             self.expect(TokenKind::RParen);
-            payload
+            VariantPayload::Tuple(payload)
+        } else if self.eat(TokenKind::LBrace) {
+            let fields =
+                self.separated_list(TokenKind::RBrace, CompletionSite::NewIdentifier, |p| {
+                    p.parse_struct_field()
+                });
+            self.expect(TokenKind::RBrace);
+            VariantPayload::Struct(fields)
         } else {
-            Vec::new()
+            VariantPayload::Tuple(Vec::new())
         };
         EnumVariant {
             name,
@@ -1140,7 +1147,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `pattern : UNDERSCORE | identPath (LPAREN patternList RPAREN)?`
+    /// `pattern : UNDERSCORE | identPath (LPAREN patternList RPAREN | LBRACE fieldPatterns RBRACE)?`
     ///
     /// A bare name is a [`Pattern::Binding`]; whether it names a unit variant
     /// instead is decided by the type checker, as in Rust.
@@ -1152,6 +1159,9 @@ impl<'a> Parser<'a> {
         }
         let lo = self.cur.start;
         let path = self.parse_ident_path(CompletionSite::Pattern);
+        if self.at(TokenKind::LBrace) {
+            return self.parse_struct_variant_pattern(lo, path);
+        }
         if self.eat(TokenKind::LParen) {
             let fields = self.separated_list(TokenKind::RParen, CompletionSite::Pattern, |p| {
                 p.parse_sub_pattern()
@@ -1170,6 +1180,66 @@ impl<'a> Parser<'a> {
         Pattern::Variant {
             path,
             fields: Vec::new(),
+            span: self.finish_span(lo),
+        }
+    }
+
+    /// `fieldPatterns : (fieldPattern (COMMA fieldPattern)* (COMMA DOTDOT | COMMA)?)? | DOTDOT`
+    ///
+    /// The `..` comes last and may not be followed by a comma, the shape
+    /// [`Self::parse_struct_lit`] accepts for `..base`. Because the body has
+    /// two terminators (`}` and `..`) it does not go through
+    /// [`Self::separated_list`]; termination holds for the same reason, since
+    /// every iteration that does not `break` consumes the separator.
+    fn parse_struct_variant_pattern(
+        &mut self,
+        lo: u32,
+        path: IdentPath<&'a str, Md>,
+    ) -> Pattern<&'a str, Md> {
+        self.expect(TokenKind::LBrace);
+        let mut fields = Vec::new();
+        let mut rest = false;
+        self.record_completion_site(CompletionSite::Pattern);
+        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+            if self.eat(TokenKind::DotDot) {
+                rest = true;
+                break;
+            }
+            fields.push(self.parse_field_pattern());
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RBrace);
+        Pattern::StructVariant {
+            path,
+            fields,
+            rest,
+            span: self.finish_span(lo),
+        }
+    }
+
+    /// `fieldPattern : ident (COLON subPattern)?`
+    fn parse_field_pattern(&mut self) -> FieldPattern<&'a str, Md> {
+        let lo = self.cur.start;
+        self.record_completion_site(CompletionSite::Pattern);
+        let name = self.ident(CompletionSite::Pattern);
+        let (pattern, shorthand) = if self.eat(TokenKind::Colon) {
+            (self.parse_sub_pattern(), false)
+        } else {
+            // Shorthand: `f` stands for `f: f`. The binding is at the name's
+            // own span, so diagnostics and navigation on it point at the one
+            // token the user wrote.
+            let pattern = Pattern::Binding {
+                name: name.clone(),
+                metadata: (),
+            };
+            (pattern, true)
+        };
+        FieldPattern {
+            name,
+            pattern,
+            shorthand,
             span: self.finish_span(lo),
         }
     }
