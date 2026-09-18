@@ -192,6 +192,7 @@ fn key_bindings() -> Vec<KeyBinding> {
         KeyBinding::new(":", FocusInvokerCommandBar, Some("!TextInput")),
         KeyBinding::new("escape", Cancel, Some(CANVAS_CONTEXT)),
         KeyBinding::new("enter", Enter, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("backspace", Backspace, Some(CANVAS_CONTEXT)),
         KeyBinding::new("escape", Cancel, Some("TextInput")),
         KeyBinding::new("backspace", Backspace, Some("TextInput")),
         KeyBinding::new("delete", Delete, Some("TextInput")),
@@ -255,6 +256,35 @@ mod tests {
         zero_count: usize,
         one_count: usize,
         all_count: usize,
+        backspace_count: usize,
+    }
+
+    impl ShortcutTestView {
+        fn new(cx: &mut Context<Self>) -> Self {
+            ShortcutTestView {
+                canvas_focus: cx.focus_handle(),
+                input_focus: cx.focus_handle(),
+                undo_count: 0,
+                draw_rect_count: 0,
+                draw_polygon_count: 0,
+                command_bar_count: 0,
+                instantiate_count: 0,
+                open_cell_count: 0,
+                new_cell_count: 0,
+                rename_cell_count: 0,
+                focus_invoker_count: 0,
+                show_diagnostics_count: 0,
+                show_messages_count: 0,
+                save_count: 0,
+                pan_count: 0,
+                zoom_in_count: 0,
+                zoom_out_count: 0,
+                zero_count: 0,
+                one_count: 0,
+                all_count: 0,
+                backspace_count: 0,
+            }
+        }
     }
 
     impl Render for ShortcutTestView {
@@ -273,6 +303,7 @@ mod tests {
                 .on_action(cx.listener(|view, _: &Zero, _, _| view.zero_count += 1))
                 .on_action(cx.listener(|view, _: &One, _, _| view.one_count += 1))
                 .on_action(cx.listener(|view, _: &All, _, _| view.all_count += 1))
+                .on_action(cx.listener(|view, _: &Backspace, _, _| view.backspace_count += 1))
                 .on_action(
                     cx.listener(|view, _: &FocusInvokerCommandBar, _, _| {
                         view.command_bar_count += 1
@@ -311,34 +342,36 @@ mod tests {
     }
 
     #[gpui::test]
+    fn backspace_is_bound_in_the_canvas_as_well_as_text_inputs(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.bind_keys(key_bindings());
+            cx.open_window(Default::default(), |_, cx| cx.new(ShortcutTestView::new))
+                .unwrap()
+        });
+
+        window
+            .update(cx, |view, window, _| window.focus(&view.input_focus))
+            .unwrap();
+        cx.simulate_keystrokes(*window, "backspace");
+        window
+            .update(cx, |view, _, _| assert_eq!(view.backspace_count, 1))
+            .unwrap();
+
+        window
+            .update(cx, |view, window, _| window.focus(&view.canvas_focus))
+            .unwrap();
+        cx.simulate_keystrokes(*window, "backspace");
+        window
+            .update(cx, |view, _, _| assert_eq!(view.backspace_count, 2))
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn canvas_shortcuts_are_scoped_but_focus_shortcuts_are_global(cx: &mut TestAppContext) {
         let window = cx.update(|cx| {
             cx.bind_keys(key_bindings());
-            cx.open_window(Default::default(), |_, cx| {
-                cx.new(|cx| ShortcutTestView {
-                    canvas_focus: cx.focus_handle(),
-                    input_focus: cx.focus_handle(),
-                    undo_count: 0,
-                    draw_rect_count: 0,
-                    draw_polygon_count: 0,
-                    command_bar_count: 0,
-                    instantiate_count: 0,
-                    open_cell_count: 0,
-                    new_cell_count: 0,
-                    rename_cell_count: 0,
-                    focus_invoker_count: 0,
-                    show_diagnostics_count: 0,
-                    show_messages_count: 0,
-                    save_count: 0,
-                    pan_count: 0,
-                    zoom_in_count: 0,
-                    zoom_out_count: 0,
-                    zero_count: 0,
-                    one_count: 0,
-                    all_count: 0,
-                })
-            })
-            .unwrap()
+            cx.open_window(Default::default(), |_, cx| cx.new(ShortcutTestView::new))
+                .unwrap()
         });
 
         window

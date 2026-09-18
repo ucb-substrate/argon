@@ -27,6 +27,7 @@ description: Keyboard shortcuts, the configuration file, and troubleshooting.
 | <kbd>Ctrl</kbd>+<kbd>Backslash</kbd> | Switch between the GUI and Neovim |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> | Show diagnostics |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> | Show messages |
+| <kbd>Backspace</kbd> | Undo the last point or edge picked by the active tool |
 | <kbd>Esc</kbd> | Cancel the current operation |
 | <kbd>Enter</kbd> | Confirm or finish the current operation |
 

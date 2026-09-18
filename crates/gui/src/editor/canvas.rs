@@ -844,6 +844,27 @@ fn segment_constraint_with_end(
     }
 }
 
+fn segment_constraint_end(constraint: DrawSegmentConstraint) -> usize {
+    match constraint {
+        DrawSegmentConstraint::Horizontal(end)
+        | DrawSegmentConstraint::Vertical(end)
+        | DrawSegmentConstraint::DiagonalPositive(end)
+        | DrawSegmentConstraint::DiagonalNegative(end) => end,
+    }
+}
+
+/// Removes the most recently placed point along with the constraint, if any,
+/// that snapped the segment ending at it.
+fn undo_last_draw_point(
+    points: &mut Vec<Point<f32>>,
+    constraints: &mut Vec<DrawSegmentConstraint>,
+) {
+    if points.pop().is_none() {
+        return;
+    }
+    constraints.retain(|constraint| segment_constraint_end(*constraint) < points.len());
+}
+
 fn draw_source_coordinate(value: f32, grid: f64) -> f64 {
     argonc::tech::snap(f64::from(value), grid)
 }
@@ -8344,6 +8365,7 @@ impl Render for LayoutCanvas {
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::finish_draw_points))
             .on_action(cx.listener(Self::dark_mode))
             .on_action(cx.listener(Self::light_mode))
@@ -11021,6 +11043,45 @@ impl LayoutCanvas {
         self.keyboard_zoom(KEYBOARD_ZOOM_FACTOR.recip(), cx);
     }
 
+    /// Undoes the last point placed by the active tool. Tools with nothing left
+    /// to undo stay active in their starting state.
+    pub(crate) fn backspace(
+        &mut self,
+        _: &Backspace,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.read(cx).tool.clone().update(cx, |tool, cx| {
+            match tool {
+                ToolState::DrawPolygon(DrawPolygonToolState {
+                    points,
+                    constraints,
+                })
+                | ToolState::DrawPath(DrawPathToolState {
+                    points,
+                    constraints,
+                }) => {
+                    if points.is_empty() {
+                        return;
+                    }
+                    undo_last_draw_point(points, constraints);
+                }
+                ToolState::DrawRect(DrawRectToolState { p0 }) => {
+                    if p0.take().is_none() {
+                        return;
+                    }
+                }
+                ToolState::DrawDim(DrawDimToolState { edges }) => {
+                    if edges.pop().is_none() {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+            cx.notify();
+        });
+    }
+
     pub(crate) fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
         self.state.read(cx).tool.clone().update(cx, |tool, cx| {
             match tool {
@@ -13614,6 +13675,50 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                 DrawSegmentConstraint::DiagonalNegative(0)
             )
         );
+    }
+
+    #[test]
+    fn undoing_draw_points_drops_their_snapped_constraints() {
+        let mut points = vec![
+            Point::new(0., 0.),
+            Point::new(8., 0.),
+            Point::new(8., 8.),
+            Point::new(4., 8.),
+        ];
+        let mut constraints = vec![
+            DrawSegmentConstraint::Horizontal(1),
+            DrawSegmentConstraint::Vertical(2),
+        ];
+
+        // The unconstrained final point leaves both constraints in place.
+        undo_last_draw_point(&mut points, &mut constraints);
+        assert_eq!(
+            points,
+            [Point::new(0., 0.), Point::new(8., 0.), Point::new(8., 8.)]
+        );
+        assert_eq!(
+            constraints,
+            [
+                DrawSegmentConstraint::Horizontal(1),
+                DrawSegmentConstraint::Vertical(2)
+            ]
+        );
+
+        undo_last_draw_point(&mut points, &mut constraints);
+        assert_eq!(points, [Point::new(0., 0.), Point::new(8., 0.)]);
+        assert_eq!(constraints, [DrawSegmentConstraint::Horizontal(1)]);
+
+        undo_last_draw_point(&mut points, &mut constraints);
+        assert_eq!(points, [Point::new(0., 0.)]);
+        assert!(constraints.is_empty());
+
+        undo_last_draw_point(&mut points, &mut constraints);
+        assert!(points.is_empty());
+
+        // Undoing with nothing left to remove is a no-op.
+        undo_last_draw_point(&mut points, &mut constraints);
+        assert!(points.is_empty());
+        assert!(constraints.is_empty());
     }
 
     #[test]
