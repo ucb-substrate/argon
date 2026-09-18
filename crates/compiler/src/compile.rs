@@ -1867,7 +1867,11 @@ impl std::fmt::Display for Ty {
                 fmt_args(f, &e.args)
             }
             Ty::Seq(inner) => write!(f, "[{inner}]"),
-            Ty::Tuple(elements) => write!(f, "({})", elements.iter().format(", ")),
+            // A one-element tuple keeps its comma: `(T)` is the type `T`.
+            Ty::Tuple(elements) => match elements.as_slice() {
+                [element] => write!(f, "({element},)"),
+                _ => write!(f, "({})", elements.iter().format(", ")),
+            },
             Ty::Struct(s) => {
                 write!(f, "{}", s.name)?;
                 fmt_args(f, &s.args)

@@ -21,7 +21,7 @@ Structs, enums, functions, and cells may take type parameters, written in angle 
 | [`Point`](/language/types/point) | `shape.points[0]` | A polygon or path vertex |
 | [`Inst`](/language/types/instance) | `inst(child())` | A placed cell |
 | [`[T]`](/language/types/collections#sequences) | `[Float]` | A sequence of one type |
-| [`(A, B)`](/language/types/collections#tuples) | `(3, 5,)` | A fixed-size tuple of mixed types |
+| [`(A, B)`](/language/types/collections#tuples) | `(3, 5)` | A fixed-size tuple of mixed types |
 | [`Option<T>`](/language/std#option) | `Some(3)`, `None` | A value that may be absent |
 | [`Any`](/language/types/scalars#any) | — | A value of any type |
 | [`()`](/language/types/scalars#unit) | `()` | The unit value and type |
@@ -54,7 +54,7 @@ Write a sequence as a bracketed list, index it with brackets, and walk it with [
 ```argon
 let widths = [80., 120., 160.];
 let first = widths[0];
-let pair = (first, 3,);
+let pair = (first, 3);
 ```
 
 [`std::range`](/language/std#range) makes an integer sequence for loops.
