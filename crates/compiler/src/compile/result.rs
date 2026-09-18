@@ -124,7 +124,7 @@ pub enum StaticErrorKind {
     #[error("cannot perform greater/less than comparisons on nil")]
     NilNotOrd,
     /// Sequences may only be compared for equality against a written `[]`.
-    #[error("sequences can only be compared for equality/inequality to the literal `[]`")]
+    #[error("sequences can only be compared for equality/inequality to the empty literal `[]`")]
     SeqMustCompareEqEmpty,
     /// A type cannot be used in an arithmetic expression.
     ///
@@ -166,9 +166,6 @@ pub enum StaticErrorKind {
     /// A value does not belong to the expected type category.
     #[error("expected type category {expected}, found {found}")]
     IncorrectTyCategory { found: String, expected: String },
-    /// A list constructor was called without elements.
-    #[error("list constructors cannot be empty (use `[]` for an empty list)")]
-    EmptyListConstructor,
     /// A function or cell received the wrong number of positional arguments.
     #[error("expected {expected} position arguments, found {found}")]
     CallIncorrectPositionalArity { expected: usize, found: usize },

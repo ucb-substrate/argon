@@ -412,7 +412,8 @@ fn separated_list<T>(&mut self, close: TokenKind,
 ```
 
 Call sites: argument declarations, enum variants, struct fields, tuple-type
-elements, and keyword arguments. Centralizing the loop is what keeps
+elements, sequence-literal elements, and keyword arguments. Centralizing the
+loop is what keeps
 trailing-comma handling and the termination guarantee from drifting between them
 (that drift previously let an empty tuple type slip through silently).
 
@@ -522,8 +523,10 @@ level).
 - **`parse_primary`** parses an atomic operand (the Pratt "null denotation"):
   - `(` → `parse_paren`: `()` is `nil`; `(e)` is a parenthesized group
     (unwrapped, no node); `(e, …,)` is a tuple.
-  - `[` → `parse_seq_nil`: only the empty `[]` is an expression (the
-    sequence-nil literal). A non-empty `[…]` is *not* an expression.
+  - `[` → `parse_seq_literal`: `seqLiteral : LBRACK (expr (COMMA expr)*
+    COMMA?)? RBRACK`, the elements taken by `separated_list` (§8), so the
+    trailing comma is optional and `[]` is the zero-element case. Struct
+    literals are re-enabled inside the brackets, where they are unambiguous.
   - `if` / `match` / `{` → the block-form primaries `IfExpr`, `MatchExpr`,
     `Scope`. These are full expressions, so the Pratt loop can still attach
     trailing operators to them. An `if` reached here requires its `else`: only
