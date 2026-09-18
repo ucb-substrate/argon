@@ -1098,7 +1098,7 @@ mod tests {
         let b = f.args[1].default.as_ref().expect("`b` has a default");
         assert!(matches!(b, Expr::FloatLiteral(_)));
         assert_eq!(&src[b.span().start()..b.span().end()], "1.");
-        assert!(matches!(f.args[2].default, Some(Expr::SeqNil(_))));
+        assert!(matches!(&f.args[2].default, Some(Expr::Seq(s)) if s.items.is_empty()));
         let n = c.args[0].default.as_ref().expect("`n` has a default");
         assert_eq!(&src[n.span().start()..n.span().end()], "2 * 3");
 
@@ -1108,6 +1108,66 @@ mod tests {
             "fn f(a = 1.) {}",
         ] {
             assert!(parse(src).is_err(), "should be rejected: `{src}`");
+        }
+    }
+
+    #[test]
+    fn sequence_literals_parse() {
+        use crate::ast::{Decl, Expr, Statement};
+
+        let valid = [
+            "let xs = [];",
+            "let xs = [1., 2., 3.];",
+            "let xs = [1., 2., 3.,];",
+            "let xs = [1,];",
+            "let xs = [[1], [2]];",
+            "let xs = [Point { x: 1. }];",
+            "let w = [10., 20.][1];",
+            "let xs = [f(1), g(2,),];",
+            "for x in [1, 2] {}",
+            // A struct literal is allowed inside the brackets even in a head
+            // that forbids one outside them.
+            "for p in [Point { x: 1. }] {}",
+        ];
+        for body in valid {
+            assert!(snippet_ok(body), "should parse: `{body}`");
+        }
+        let invalid = [
+            "let xs = [1 2];",
+            "let xs = [, 1];",
+            "let xs = [1,, 2];",
+            "let xs = [1, 2;",
+        ];
+        for body in invalid {
+            assert!(!snippet_ok(body), "should be rejected: `{body}`");
+        }
+
+        // The elements are kept in order, and a trailing comma adds none.
+        for src in [
+            "cell c() { let xs = [1, 2, 3]; }",
+            "cell c() { let xs = [1, 2, 3,]; }",
+        ] {
+            let mut parser = super::grammar::Parser::new(src, 0);
+            let ast = parser.parse_root();
+            assert!(parser.errors.is_empty(), "{src}: {:?}", parser.errors);
+            let [Decl::Cell(cell)] = ast.decls.as_slice() else {
+                panic!("expected one cell");
+            };
+            let [Statement::LetBinding(binding)] = cell.scope.stmts.as_slice() else {
+                panic!("expected one let");
+            };
+            let Expr::Seq(seq) = &binding.value else {
+                panic!("expected a sequence literal, got {:?}", binding.value);
+            };
+            let values = seq
+                .items
+                .iter()
+                .map(|item| match item {
+                    Expr::IntLiteral(i) => i.value,
+                    other => panic!("expected an int literal, got {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(values, [1, 2, 3], "{src}");
         }
     }
 

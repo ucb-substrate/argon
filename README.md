@@ -85,7 +85,7 @@ library's scope, so they may call functions and build sequences:
 
 ```bash
 arc run --cell 'top(pitch * 4., -width / 2.)'
-arc run --cell 'array(cons(250., cons(350., [])), Mode::Fast)'
+arc run --cell 'array([250., 350.], Mode::Fast)'
 ```
 
 Parameters declared with a default value are keyword parameters. They are

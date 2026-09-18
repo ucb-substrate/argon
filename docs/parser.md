@@ -418,9 +418,9 @@ fn separated_list_trailing<T>(
 ```
 
 Call sites: argument declarations, enum variants, struct fields, tuple elements
-(in both types and expressions), and keyword arguments. Centralizing the loop is
-what keeps trailing-comma handling and the termination guarantee from drifting
-between them.
+(in both types and expressions), sequence-literal elements, and keyword
+arguments. Centralizing the loop is what keeps trailing-comma handling and the
+termination guarantee from drifting between them.
 
 `separated_list` is the thin wrapper that drops the `trailing` flag, and is what
 nearly every call site uses. Only the tuple type reads the flag, to tell `(A,)`
@@ -528,8 +528,10 @@ level).
     (unwrapped, no node); `(e, …)` is a tuple, with an optional trailing comma.
     The comma after the first element is what separates the one-tuple `(e,)`
     from the group `(e)`; the rest is an ordinary `separated_list`.
-  - `[` → `parse_seq_nil`: only the empty `[]` is an expression (the
-    sequence-nil literal). A non-empty `[…]` is *not* an expression.
+  - `[` → `parse_seq_literal`: `seqLiteral : LBRACK (expr (COMMA expr)*
+    COMMA?)? RBRACK`, the elements taken by `separated_list` (§8), so the
+    trailing comma is optional and `[]` is the zero-element case. Struct
+    literals are re-enabled inside the brackets, where they are unambiguous.
   - `if` / `match` / `{` → the block-form primaries `IfExpr`, `MatchExpr`,
     `Scope`. These are full expressions, so the Pratt loop can still attach
     trailing operators to them. An `if` reached here requires its `else`: only

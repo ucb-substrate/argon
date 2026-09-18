@@ -108,8 +108,7 @@ pub(crate) const MAX_TEXT_LEN: usize = 512;
 /// the literals directly and must be updated alongside this constant.
 pub const RESERVED_CELL_FIELDS: [&str; 2] = ["x", "y"];
 
-pub const BUILTINS: [&str; 15] = [
-    "list",
+pub const BUILTINS: [&str; 14] = [
     "cons",
     "head",
     "tail",
@@ -794,10 +793,11 @@ impl<'a> AstTransformer for ImportPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr {
     }
 
-    fn dispatch_seq_nil_expr(
+    fn dispatch_seq_expr(
         &mut self,
-        _input: &crate::ast::SeqNilLiteral<Self::InputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::SeqNilExpr {
+        _input: &crate::ast::SeqLiteral<Self::InputS, Self::InputMetadata>,
+        _items: &[Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::SeqExpr {
     }
 
     fn dispatch_field_access_expr(
@@ -2031,8 +2031,6 @@ mod builtin_sig {
     pub(super) static CONS: LazyLock<FnTy> = LazyLock::new(|| scheme([param(), seq()], seq()));
     pub(super) static HEAD: LazyLock<FnTy> = LazyLock::new(|| scheme([seq()], param()));
     pub(super) static TAIL: LazyLock<FnTy> = LazyLock::new(|| scheme([seq()], seq()));
-    /// `list` is variadic: every element is unified with `T`.
-    pub(super) static LIST: LazyLock<FnTy> = LazyLock::new(|| scheme([param()], seq()));
 
     /// The coordinate keywords every rectangle constructor accepts.
     fn coordinates() -> impl Iterator<Item = (&'static str, Ty)> {
@@ -2205,7 +2203,7 @@ impl AstMetadata for VarIdTyMetadata {
     type CastExpr = Ty;
     type TupleExpr = Ty;
     /// The sequence type the literal was inferred to have.
-    type SeqNilExpr = Ty;
+    type SeqExpr = Ty;
     type StructLitExpr = Ty;
 }
 
@@ -3682,7 +3680,8 @@ impl<'a> VarIdTyPass<'a> {
         // and none for ordering a sequence at all. The test is on the operand
         // rather than its type, which no longer distinguishes an empty
         // sequence from any other.
-        let against_empty = matches!(left, Expr::SeqNil(_)) || matches!(right, Expr::SeqNil(_));
+        let empty_literal = |expr: &Expr<_, _>| matches!(expr, Expr::Seq(s) if s.items.is_empty());
+        let against_empty = empty_literal(left) || empty_literal(right);
         if matches!(self.shallow(&join_ty), Ty::Seq(_)) && !(is_equality && against_empty) {
             self.errors.push(StaticError {
                 span: self.span(span),
@@ -4091,7 +4090,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             }
             Expr::Index(index_expr) => index_expr.metadata.clone(),
             Expr::Nil(_) => Ty::Nil,
-            Expr::SeqNil(lit) => lit.metadata.clone(),
+            Expr::Seq(lit) => lit.metadata.clone(),
             Expr::FloatLiteral(_) => Ty::Float,
             Expr::IntLiteral(_) => Ty::Int,
             Expr::BoolLiteral(_) => Ty::Bool,
@@ -4946,25 +4945,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "cons" => self.call_scheme(&builtin_sig::CONS, input.span, args),
                 "head" => self.call_scheme(&builtin_sig::HEAD, input.span, args),
                 "tail" => self.call_scheme(&builtin_sig::TAIL, input.span, args),
-                "list" => {
-                    self.typecheck_kwargs(&args.kwargs, &builtin_sig::LIST.sig.kwargs);
-                    if args.posargs.is_empty() {
-                        self.errors.push(StaticError {
-                            span: self.span(input.span),
-                            kind: StaticErrorKind::EmptyListConstructor,
-                        });
-                        (None, Ty::Nil)
-                    } else {
-                        // Every element is unified with one element type, so a
-                        // mismatch is reported at the element rather than
-                        // widened away.
-                        let element = self.fresh();
-                        for arg in &args.posargs {
-                            self.assert_eq_ty(arg.span(), &arg.ty(), &element);
-                        }
-                        (None, Ty::Seq(Box::new(element)))
-                    }
-                }
                 "range_full" => {
                     // Native builtin backing `std::range`/`std::range_full`: builds the
                     // whole `[Int]` in one pass instead of recursive `cons`.
@@ -5103,13 +5083,19 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         Ty::Tuple(items.iter().map(|i| i.ty()).collect())
     }
 
-    /// `[]` is a sequence of an element type its spelling leaves open, so it
-    /// takes a fresh variable that whatever the literal meets solves.
-    fn dispatch_seq_nil_expr(
+    /// Every element of a sequence literal unifies with one element type, so a
+    /// mismatch is reported at the element rather than widened away. An empty
+    /// `[]` leaves that type open for whatever the literal meets to solve.
+    fn dispatch_seq_expr(
         &mut self,
-        _input: &crate::ast::SeqNilLiteral<Self::InputMetadata>,
-    ) -> <Self::OutputMetadata as AstMetadata>::SeqNilExpr {
-        Ty::Seq(Box::new(self.fresh()))
+        _input: &crate::ast::SeqLiteral<Self::InputS, Self::InputMetadata>,
+        items: &[Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::SeqExpr {
+        let element = self.fresh();
+        for item in items {
+            self.assert_eq_ty(item.span(), &item.ty(), &element);
+        }
+        Ty::Seq(Box::new(element))
     }
 
     fn dispatch_kw_arg_value(
@@ -5702,7 +5688,11 @@ impl AstTransformer for Zonker<'_> {
         self.ty(&input.metadata, input.span)
     }
 
-    fn dispatch_seq_nil_expr(&mut self, input: &crate::ast::SeqNilLiteral<VarIdTyMetadata>) -> Ty {
+    fn dispatch_seq_expr(
+        &mut self,
+        input: &crate::ast::SeqLiteral<Substr, VarIdTyMetadata>,
+        _items: &[Expr<Substr, VarIdTyMetadata>],
+    ) -> Ty {
         self.ty(&input.metadata, input.span)
     }
 
@@ -6404,7 +6394,7 @@ struct ExecPass<'a> {
     value_dependents: IndexMap<ValueId, IndexSet<ValueId>>,
     frames: IndexMap<FrameId, Frame>,
     nil_value: ValueId,
-    seq_nil_value: ValueId,
+    empty_seq_value: ValueId,
     true_value: ValueId,
     false_value: ValueId,
     global_frame: FrameId,
@@ -6561,7 +6551,7 @@ impl<'a> ExecPass<'a> {
             nil_value: 1,
             true_value: 2,
             false_value: 3,
-            seq_nil_value: 4,
+            empty_seq_value: 4,
             global_frame: 5,
             next_id: 6,
             partial_cells: VecDeque::new(),
@@ -8398,7 +8388,12 @@ impl<'a> ExecPass<'a> {
     fn visit_expr(&mut self, loc: DynLoc, expr: &Expr<Substr, VarIdTyMetadata>) -> ValueId {
         match expr {
             Expr::Nil(_) => self.nil_value,
-            Expr::SeqNil(_) => self.seq_nil_value,
+            Expr::Seq(seq) if seq.items.is_empty() => self.empty_seq_value,
+            Expr::Seq(seq) => self.new_deferred_value(loc, |this| {
+                PartialEvalState::Seq(PartialSeqExpr {
+                    items: seq.items.iter().map(|i| this.visit_expr(loc, i)).collect(),
+                })
+            }),
             Expr::FloatLiteral(f) => self.new_ready_value(Value::Linear(LinearExpr::from(f.value))),
             Expr::IntLiteral(i) => self.new_ready_value(Value::Int(i.value)),
             Expr::BoolLiteral(b) => {
@@ -9744,28 +9739,6 @@ impl<'a> ExecPass<'a> {
                     } else {
                         self.add_value_dependent(c.state.posargs[0], vid);
                         self.add_value_dependent(c.state.posargs[1], vid);
-                        false
-                    }
-                }
-                "list" => {
-                    let (ready, unready): (Vec<_>, Vec<_>) =
-                        c.state.posargs.iter().partition_map(|v| {
-                            if let Defer::Ready(v) = &self.values[v] {
-                                Either::Left(v)
-                            } else {
-                                Either::Right(*v)
-                            }
-                        });
-                    if unready.is_empty() {
-                        self.values.insert(
-                            vid,
-                            Defer::Ready(Value::Seq(ready.iter().map(|v| (*v).clone()).collect())),
-                        );
-                        true
-                    } else {
-                        for arg_vid in unready {
-                            self.add_value_dependent(arg_vid, vid);
-                        }
                         false
                     }
                 }
@@ -11175,6 +11148,26 @@ impl<'a> ExecPass<'a> {
                     false
                 }
             }
+            PartialEvalState::Seq(seq) => {
+                let items = seq
+                    .items
+                    .iter()
+                    .map(|i| self.values[i].get_ready().cloned())
+                    .collect::<Option<Seq>>();
+                if let Some(items) = items {
+                    self.values
+                        .insert(vid, DeferValue::Ready(Value::Seq(items)));
+                    true
+                } else {
+                    let dep = seq
+                        .items
+                        .iter()
+                        .find(|&i| !self.values[i].is_ready())
+                        .unwrap();
+                    self.add_value_dependent(*dep, vid);
+                    false
+                }
+            }
             PartialEvalState::StructLit(lit) => {
                 let pending = lit
                     .fields
@@ -12116,6 +12109,7 @@ enum PartialEvalState<T: AstMetadata> {
     Constraint(PartialConstraint),
     Cast(Box<PartialCastExpr<T>>),
     Tuple(PartialTupleExpr),
+    Seq(PartialSeqExpr),
     StructLit(Box<PartialStructLit<T>>),
     ForLoop(Box<PartialForLoop<T>>),
     Ctor(PartialCtor),
@@ -12155,6 +12149,7 @@ impl<T: AstMetadata> PartialEvalState<T> {
             Self::Constraint(c) => vec![c.lhs, c.rhs],
             Self::Cast(e) => vec![e.state.value],
             Self::Tuple(e) => e.items.clone(),
+            Self::Seq(e) => e.items.clone(),
             Self::StructLit(e) => e.fields.iter().copied().chain(e.base).collect(),
             Self::ForLoop(f) => vec![f.seq],
             Self::Ctor(c) => c.args.clone(),
@@ -12289,6 +12284,12 @@ struct PartialCastExpr<T: AstMetadata> {
 
 #[derive(Debug, Clone)]
 struct PartialTupleExpr {
+    items: Vec<ValueId>,
+}
+
+/// A sequence literal being built from its elements.
+#[derive(Debug, Clone)]
+struct PartialSeqExpr {
     items: Vec<ValueId>,
 }
 

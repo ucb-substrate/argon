@@ -49,10 +49,10 @@ let offset = (index as Float) * pitch;
 
 ## Sequences and tuples
 
-Build a sequence with [`list`](/language/builtins/collections#list) or [`cons`](/language/builtins/collections#cons), index it with brackets, and walk it with [`head`](/language/builtins/collections#head) and [`tail`](/language/builtins/collections#tail).
+Write a sequence as a bracketed list, index it with brackets, and walk it with [`head`](/language/builtins/collections#head) and [`tail`](/language/builtins/collections#tail).
 
 ```argon
-let widths = list(80., 120., 160.);
+let widths = [80., 120., 160.];
 let first = widths[0];
 let pair = (first, 3);
 ```

@@ -7,12 +7,15 @@ description: Sequences of one type and fixed-size tuples of mixed types.
 
 ## Sequences
 
-`[T]` is an ordered sequence whose elements all have type `T`.
+`[T]` is an ordered sequence whose elements all have type `T`. Write one as a bracketed list of elements; the trailing comma is optional.
 
 ```argon
-let values: [Float] = list(10., 20., 30.);
+let values: [Float] = [10., 20., 30.];
+let trailing = [10., 20., 30.,];
 let first = values[0];
 ```
+
+Every element must have the same type, and that type is the sequence's element type.
 
 The empty literal `[]` takes its element type from its surroundings — a declared type, or whatever it is combined with. Where nothing fixes it, annotate the binding:
 
@@ -20,11 +23,11 @@ The empty literal `[]` takes its element type from its surroundings — a declar
 let empty: [Float] = [];
 ```
 
-Build and take apart sequences with [`list`, `cons`, `head`, and `tail`](/language/builtins/collections).
+Take sequences apart with [`head` and `tail`](/language/builtins/collections), and prepend to one with [`cons`](/language/builtins/collections#cons).
 
 ## Tuples
 
-`(A, B)` is a fixed-size tuple whose positions can have different types. A trailing comma is optional.
+`(A, B)` is a fixed-size tuple whose positions can have different types. As in a sequence literal, the trailing comma is optional.
 
 ```argon
 let placement = (100., 200., true);

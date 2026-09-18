@@ -543,22 +543,24 @@ mod tests {
         let source = r#"
 cell top() {
   // A comment containing } does not close the cell.
- let values = list(
+ let values = [
  "a { string",
- cons(
- 1,
- []));
+ head(
+ [
+ "x"]),
+ ];
 }
 "#;
         assert_eq!(
             format_source(source),
             r#"cell top() {
     // A comment containing } does not close the cell.
-    let values = list(
+    let values = [
         "a { string",
-        cons(
-            1,
-            []));
+        head(
+            [
+                "x"]),
+    ];
 }
 "#
         );

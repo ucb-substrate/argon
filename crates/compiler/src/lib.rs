@@ -3775,11 +3775,11 @@ cell top() {
         let root = parse_source_text(
             r#"
                 cell top() {
-                    let p = polygon("met1", list(
+                    let p = polygon("met1", [
                         (0., 0.,),
                         (10., 0.,),
                         (0., 10.,),
-                    ));
+                    ]);
                 }
             "#,
             PathBuf::from("/virtual/lib.ar"),
@@ -3963,6 +3963,9 @@ cell top() {
             // The operand has to be written `[]`; a binding that holds an
             // empty sequence has the same type as any other sequence.
             "s == empty",
+            // A populated literal is a literal, but not an empty one.
+            "s == [1]",
+            "[1] != s",
         ] {
             let errors = static_errors(&comparison_source(comparison));
             assert!(
@@ -4486,7 +4489,7 @@ cell top() {
 
     #[test]
     fn heterogeneous_list_elements_are_rejected() {
-        let errors = check_source("cell top() { let a = list(1., 2); }");
+        let errors = check_source("cell top() { let a = [1., 2]; }");
         assert!(
             errors
                 .iter()
@@ -4535,7 +4538,7 @@ cell top() {
             "cell top() {
                  let a = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);
                  let b = rect(\"met2\", x0=0., y0=0., x1=1., y1=1.);
-                 let s = list(a, b)!;
+                 let s = [a, b]!;
              }",
         ] {
             let errors = check_source(source);
@@ -5149,7 +5152,7 @@ cell top() {
              cell bot() {
                  let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);
                  let n = rect(\"met1\", x0=200., y0=0., x1=300., y1=100.);
-                 let both = list(m, n);
+                 let both = [m, n];
              }
              cell top() {
                  let i = inst(bot(), x=1000., y=0.);
@@ -6060,6 +6063,87 @@ cell top() {
             [StaticErrorKind::IncorrectTy { expected, found }]
                 if expected == "[Int]" && found == "[Float]"
         ));
+    }
+
+    /// A sequence literal evaluates its elements in order, and a trailing
+    /// comma adds none. Every element pins a different corner of one rect, so
+    /// the assertion reads the order rather than the multiset of values.
+    #[test]
+    fn sequence_literals_evaluate_their_elements_in_order() {
+        for literal in ["[100., 200., 300.]", "[100., 200., 300.,]"] {
+            let data = compile_top(&format!(
+                "cell top() {{
+                     let ws = {literal};
+                     let r = rect(\"met1\", x0=ws[0], y0=0., y1=ws[1], x1=ws[2]);
+                 }}"
+            ));
+            let r = layout_objects(&data, data.top)
+                .into_iter()
+                .find_map(SolvedValue::get_rect)
+                .unwrap();
+            assert_eq!((r.x0.0, r.y1.0, r.x1.0), (100., 200., 300.), "{literal}");
+        }
+
+        // Elements are arbitrary expressions, evaluated where they are written.
+        let data = compile_top(
+            "fn twice(x: Float) -> Float { 2. * x }
+             cell top() {
+                 let ws = [twice(50.), 40. + 60., [7., 300.][1]];
+                 let r = rect(\"met1\", x0=0., y0=0., x1=ws[0] + ws[1], y1=ws[2]);
+             }",
+        );
+        let r = layout_objects(&data, data.top)
+            .into_iter()
+            .find_map(SolvedValue::get_rect)
+            .unwrap();
+        assert_eq!((r.x1.0, r.y1.0), (200., 300.));
+    }
+
+    /// A literal holds values of any type, nests, and drives a `for` loop.
+    #[test]
+    fn sequence_literals_hold_rects_nest_and_iterate() {
+        let data = compile_top(
+            "cell top() {
+                 let a = rect(\"met1\", x0=0., y0=0., w=10., h=10.);
+                 let b = rect(\"met1\", x0=20., y0=0., w=30., h=10.);
+                 let rects = [a, b];
+                 let grid = [[10., 20.], [30.]];
+                 let last = std::last(rects);
+                 let wide = rect(\"met2\", x0=0., y0=20., w=last.w + grid[1][0], h=10.);
+                 for n in [100., 200.] {
+                     rect(\"met3\", x0=0., y0=n, w=n, h=10.)!;
+                 }
+             }",
+        );
+        let widths = |layer: &str| {
+            let mut widths = layout_objects(&data, data.top)
+                .into_iter()
+                .filter_map(SolvedValue::get_rect)
+                .filter(|rect| rect.layer.as_deref() == Some(layer))
+                .map(|rect| rect.x1.0 - rect.x0.0)
+                .collect::<Vec<_>>();
+            widths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            widths
+        };
+        // `last(rects)` is `b`, 30 wide; `grid[1][0]` is 30.
+        assert_eq!(widths("met2"), [60.]);
+        assert_eq!(widths("met3"), [100., 200.]);
+    }
+
+    /// One element type is inferred for the whole literal, so a mismatch is
+    /// reported once, at the element that does not fit.
+    #[test]
+    fn a_heterogeneous_sequence_literal_is_reported_at_the_element() {
+        let source = "cell top() { let a = [1., 2]; }";
+        let errors = check_source(source);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [StaticErrorKind::IncorrectTy { expected, found }]
+                    if expected == "Float" && found == "Int"
+            ),
+            "{source}\n{errors:#?}"
+        );
     }
 
     #[test]

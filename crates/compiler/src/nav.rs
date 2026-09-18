@@ -787,7 +787,6 @@ fn builtin_signature(name: &str) -> Option<SignatureInfo> {
         "h: Float",
     ];
     let result = match name {
-        "list" => signature("fn list(value: T, ...) -> [T]", &["value: T"], &[]),
         "cons" => signature(
             "fn cons(value: T, tail: [T]) -> [T]",
             &["value: T", "tail: [T]"],
@@ -2010,8 +2009,12 @@ impl<'a> Builder<'a> {
                     self.expr(base);
                 }
             }
+            Expr::Seq(seq) => {
+                for item in &seq.items {
+                    self.expr(item);
+                }
+            }
             Expr::Nil(_)
-            | Expr::SeqNil(_)
             | Expr::FloatLiteral(_)
             | Expr::IntLiteral(_)
             | Expr::StringLiteral(_)
