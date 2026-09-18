@@ -27,12 +27,18 @@ Take sequences apart with [`head` and `tail`](/language/builtins/collections), a
 
 ## Tuples
 
-`(A, B)` is a fixed-size tuple whose positions can have different types. Unlike a sequence literal, a tuple needs a comma after **every** element: that is what distinguishes the one-tuple `(a,)` from the parenthesized group `(a)`.
+`(A, B)` is a fixed-size tuple whose positions can have different types. As in a sequence literal, the trailing comma is optional.
 
 ```argon
-let placement = (100., 200., true,);
+let placement = (100., 200., true);
 let x = placement.0;
 let reflected = placement.2;
+```
+
+The comma is what makes a one-element tuple: `(x)` is just `x`, and `(x,)` is a tuple holding it. The same goes for types, where `(A)` is `A` and `(A,)` is a one-element tuple.
+
+```argon
+let single: (Float,) = (100.,);
 ```
 
 The empty tuple `()` is the [unit type](./scalars#unit).

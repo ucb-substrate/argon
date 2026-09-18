@@ -275,7 +275,9 @@ mod tests {
             "let x = 1.0.bar;",
             "let x = f();",
             "let x = (a,);",
+            "let x = (a, b);",
             "let x = (a, b,);",
+            "let x = (a, b, c);",
             "let x = a[i].b;",
             "let x = 1 + 2 * 3;",
             "let x = -a * b + c < d;",
@@ -349,7 +351,6 @@ mod tests {
     #[test]
     fn rejects_invalid_constructs() {
         let invalid = [
-            "let x = (a, b);",                 // tuple requires a trailing comma per element
             "let x = #old foo();",             // scope annotations are no longer syntax
             "let x = foo(x=1, 2);",            // positional after keyword
             "let x = ;",                       // missing expression
@@ -1047,16 +1048,38 @@ mod tests {
 
     #[test]
     fn tuple_types_parse() {
-        // Empty tuple type `()` (the unit type), trailing commas, and nesting all
-        // parse. Tuple types appear in `fn` signatures, so use whole programs (F2).
+        // Empty tuple type `()` (the unit type), optional trailing commas, a
+        // parenthesized type, and nesting all parse. Tuple types appear in `fn`
+        // signatures, so use whole programs (F2).
         for src in [
             "fn f() -> () {}",
             "fn f(x: ()) {}",
             "fn f(x: (Float, Int)) {}",
             "fn f(x: (Float, Int,)) {}",
+            "fn f(x: (Float, Int, Bool)) {}",
             "fn f(x: [(Float, Int)]) -> (Int,) {}",
+            "fn f(x: ((Int, Int), Bool)) {}",
         ] {
             assert!(parse(src).is_ok(), "should parse: `{src}`");
+        }
+
+        // `(T)` is the type `T`, not a one-element tuple; the comma in `(T,)` is
+        // what makes the tuple, exactly as in expressions.
+        for (src, tuple) in [
+            ("fn f(x: (Int)) {}", false),
+            ("fn f(x: ((Int))) {}", false),
+            ("fn f(x: (Int,)) {}", true),
+            ("fn f(x: ((Int),)) {}", true),
+        ] {
+            let ast = parse(src).expect("should parse");
+            let crate::ast::Decl::Fn(f) = &ast.ast.decls[0] else {
+                panic!("expected a fn decl, got {:?}", ast.ast.decls[0]);
+            };
+            assert_eq!(
+                matches!(f.args[0].ty.kind, crate::ast::TySpecKind::Tuple(_)),
+                tuple,
+                "`{src}`"
+            );
         }
     }
 

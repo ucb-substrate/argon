@@ -377,15 +377,18 @@ enum TySpecKind { Path { name: Ident, args: Vec<TySpec> }, Seq(Box<TySpec>), Tup
 
 - `Float` → `Path` with no arguments; `Option<Int>` → `Path` with one
 - `[T]` → `Seq` (a sequence/list type)
-- `(A, B)` → `Tuple`; `()` → empty `Tuple`; `(A,)` and `(A)` → 1-element `Tuple`
+- `(A, B)` → `Tuple`; `()` → empty `Tuple`; `(A,)` → 1-element `Tuple`;
+  `(A)` → `A` (unwrapped, no node)
 
 The tuple element list goes through `separated_list`, so **an empty `()` and a
-trailing comma both parse**. The empty tuple type is the **unit type**: the
-later TySpec→`Ty` lowering (`ty_from_spec` in `compile.rs`) maps an empty
-`Tuple` to `Ty::Nil` — the same type as the `()` *value* (`Expr::Nil`) — so `()`
-is a real, usable type rather than an unhandled edge case. `parse_ty_spec` is
-also guarded by `enter_depth`/`exit_depth` because `[`/`(`/`<` nest
-recursively.
+trailing comma both parse**. As in expressions, the comma is what makes a
+one-element tuple: `(A)` is the parenthesized type `A` (unwrapped, keeping the
+inner spec's own span) and `(A,)` is the one-element tuple. The empty tuple type
+is the **unit type**: the later TySpec→`Ty` lowering (`ty_from_spec` in
+`compile.rs`) maps an empty `Tuple` to `Ty::Nil` — the same type as the `()`
+*value* (`Expr::Nil`) — so `()` is a real, usable type rather than an unhandled
+edge case. `parse_ty_spec` is also guarded by `enter_depth`/`exit_depth` because
+`[`/`(`/`<` nest recursively.
 
 The one place a type takes no arguments is the target of `as`: `a as Float <
 b` is a comparison, so `parse_suffix` parses the cast target with
@@ -400,43 +403,43 @@ items with an **optional trailing comma**. That policy lives in exactly one
 place:
 
 ```rust
-fn separated_list<T>(&mut self, close: TokenKind,
-                     mut parse_item: impl FnMut(&mut Self) -> T) -> Vec<T> {
+fn separated_list_trailing<T>(
+    &mut self, close: TokenKind, mut parse_item: impl FnMut(&mut Self) -> T,
+) -> (Vec<T>, bool) {
     let mut items = Vec::new();
+    let mut trailing = false;
     while !self.at(close) && !self.at(TokenKind::Eof) {
         items.push(parse_item(self));
-        if !self.eat(TokenKind::Comma) { break; }
+        if !self.eat(TokenKind::Comma) { trailing = false; break; }
+        trailing = true;
     }
-    items
+    (items, trailing)
 }
 ```
 
-Call sites: argument declarations, enum variants, struct fields, tuple-type
-elements, sequence-literal elements, and keyword arguments. Centralizing the
-loop is what keeps
-trailing-comma handling and the termination guarantee from drifting between them
-(that drift previously let an empty tuple type slip through silently).
+Call sites: argument declarations, enum variants, struct fields, tuple elements
+(in both types and expressions), sequence-literal elements, and keyword
+arguments. Centralizing the loop is what keeps trailing-comma handling and the
+termination guarantee from drifting between them.
+
+`separated_list` is the thin wrapper that drops the `trailing` flag, and is what
+nearly every call site uses. Only the tuple type reads the flag, to tell `(A,)`
+from `(A)`.
 
 **Termination.** Every iteration that does not `break` consumes at least the
 separator comma, so the loop runs at most once per remaining comma — a
 non-consuming `parse_item` cannot spin.
 
-> **Not every list uses it.** Two constructs are *comma-terminated*, not
-> comma-separated — a comma after **every** element is mandatory — so they keep
-> their own loops:
+> **Not every list uses it.** Two constructs keep their own loops:
 >
-> - **Tuple expressions** (`tupleExpr : LPAREN tupleExprList RPAREN` where
->   `tupleExprList : expr COMMA (expr COMMA)*`). The mandatory comma is what
->   disambiguates a parenthesized group `(a)` (no node — the inner expression's
->   own span is kept) from a one-tuple `(a,)`. `(a, b)` is therefore a **syntax
->   error**; the tuple is `(a, b,)`.
-> - **Match arms** (`matchArm : pattern FAT_ARROW expr COMMA`). The comma is
->   part of each arm, and `matchArms : matchArm+` requires at least one arm, so
->   `match k {}` is a syntax error. A `pattern` is `_`, an `identPath`, or an
->   `identPath` followed by a parenthesised list of sub-patterns, each a name
->   or `_`; `parse_pattern` records `CompletionSite::Pattern`. A bare name
->   parses as a `Pattern::Binding`, and the type checker decides whether it
->   names a unit variant instead.
+> - **Match arms** (`matchArm : pattern FAT_ARROW expr COMMA`) are
+>   *comma-terminated*, not comma-separated: a comma after **every** arm is
+>   mandatory. The comma is part of each arm, and `matchArms : matchArm+`
+>   requires at least one arm, so `match k {}` is a syntax error. A `pattern` is
+>   `_`, an `identPath`, or an `identPath` followed by a parenthesised list of
+>   sub-patterns, each a name or `_`; `parse_pattern` records
+>   `CompletionSite::Pattern`. A bare name parses as a `Pattern::Binding`, and
+>   the type checker decides whether it names a unit variant instead.
 > - **Struct literal bodies** ([§9.5](#95-struct-literals)) are comma-separated
 >   with an optional trailing comma, but have two terminators — `}` and the
 >   `..base` — so they keep their own loop as well.
@@ -522,7 +525,9 @@ level).
   falls through to `parse_primary`.
 - **`parse_primary`** parses an atomic operand (the Pratt "null denotation"):
   - `(` → `parse_paren`: `()` is `nil`; `(e)` is a parenthesized group
-    (unwrapped, no node); `(e, …,)` is a tuple.
+    (unwrapped, no node); `(e, …)` is a tuple, with an optional trailing comma.
+    The comma after the first element is what separates the one-tuple `(e,)`
+    from the group `(e)`; the rest is an ordinary `separated_list`.
   - `[` → `parse_seq_literal`: `seqLiteral : LBRACK (expr (COMMA expr)*
     COMMA?)? RBRACK`, the elements taken by `separated_list` (§8), so the
     trailing comma is optional and `[]` is the zero-element case. Struct

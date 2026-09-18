@@ -362,32 +362,47 @@ impl<'a> Parser<'a> {
     ///
     /// This is the single source of truth for comma-list policy. Every
     /// comma-separated construct — arg decls, enum variants, struct fields,
-    /// tuple-type elements, keyword args — routes through it, so trailing-comma
-    /// handling and the termination guarantee cannot drift between call sites
-    /// (that drift is what silently accepted an empty tuple type and dropped
-    /// trailing commas on it). Note this is distinct from the *comma-terminated*
-    /// lists (tuple expressions, match arms) where a comma after **every**
-    /// element is mandatory; those keep their own loops.
-    ///
-    /// Termination: every iteration that does not `break` consumes at least the
-    /// separator, so at most one iteration runs per remaining comma — a
-    /// non-consuming `parse_item` cannot spin.
+    /// tuple elements, sequence-literal elements, keyword args — routes through
+    /// it, so trailing-comma handling and the termination guarantee cannot drift
+    /// between call sites.
+    /// Match arms are the one *comma-terminated* list, where a comma after
+    /// **every** arm is mandatory; they keep their own loop.
     fn separated_list<T>(
         &mut self,
         close: TokenKind,
         completion_site: CompletionSite,
-        mut parse_item: impl FnMut(&mut Self) -> T,
+        parse_item: impl FnMut(&mut Self) -> T,
     ) -> Vec<T> {
+        self.separated_list_trailing(close, completion_site, parse_item)
+            .0
+    }
+
+    /// [`Self::separated_list`], also reporting whether the list ended on a
+    /// trailing comma. That is what separates the one-element tuple type `(T,)`
+    /// from the parenthesized type `(T)`.
+    ///
+    /// Termination: every iteration that does not `break` consumes at least the
+    /// separator, so at most one iteration runs per remaining comma — a
+    /// non-consuming `parse_item` cannot spin.
+    fn separated_list_trailing<T>(
+        &mut self,
+        close: TokenKind,
+        completion_site: CompletionSite,
+        mut parse_item: impl FnMut(&mut Self) -> T,
+    ) -> (Vec<T>, bool) {
         let mut items = Vec::new();
+        let mut trailing = false;
         self.record_completion_site(completion_site);
         while !self.at(close) && !self.at(TokenKind::Eof) {
             items.push(parse_item(self));
             if !self.eat(TokenKind::Comma) {
+                trailing = false;
                 break;
             }
+            trailing = true;
             self.record_completion_site(completion_site);
         }
-        items
+        (items, trailing)
     }
 
     #[inline]
@@ -808,15 +823,21 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LParen => {
                 self.bump();
-                // `()` yields the empty (unit) tuple type; a trailing comma is
-                // allowed like every other comma list. `ty_from_spec` lowers the
-                // empty tuple to the unit type `Ty::Nil` (the type of the `()`
-                // value), so an empty tuple type is a real, usable type rather
-                // than an unhandled edge case.
-                let list = self.separated_list(TokenKind::RParen, CompletionSite::Type, |p| {
-                    p.parse_ty_spec()
-                });
+                // `()` yields the empty (unit) tuple type. `ty_from_spec` lowers
+                // it to `Ty::Nil` (the type of the `()` value), so an empty tuple
+                // type is a real, usable type rather than an unhandled edge case.
+                let (mut list, trailing) =
+                    self.separated_list_trailing(TokenKind::RParen, CompletionSite::Type, |p| {
+                        p.parse_ty_spec()
+                    });
                 self.expect(TokenKind::RParen);
+                if list.len() == 1 && !trailing {
+                    // Parenthesized type: no node, keep the inner spec's own
+                    // span. As in expressions, the comma is what makes `(T,)` a
+                    // one-element tuple rather than a grouping.
+                    self.exit_depth();
+                    return list.pop().expect("one element");
+                }
                 TySpecKind::Tuple(list)
             }
             TokenKind::Ident => {
@@ -1522,7 +1543,7 @@ impl<'a> Parser<'a> {
     }
 
     /// `( )` nil, `( expr )` parenthesized group (unwrapped), or
-    /// `( expr , (expr ,)* )` tuple (a comma after every element is required).
+    /// `( expr , expr? (, expr)* ,? )` tuple.
     fn parse_paren(&mut self) -> Expr<&'a str, Md> {
         self.with_struct_literals(true, |p| p.parse_paren_inner())
     }
@@ -1541,17 +1562,16 @@ impl<'a> Parser<'a> {
             // Parenthesized group: no node, keep the inner expr's own span.
             return first;
         }
-        // Tuple. `tupleExprList : expr COMMA (expr COMMA)*`.
+        // Tuple. The comma after the first element is what makes `(a,)` a
+        // one-tuple rather than a grouping; the rest is an ordinary comma list
+        // with an optional trailing comma.
         self.expect(TokenKind::Comma);
         let mut items = vec![first];
-        while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
-            let mark = self.ntok;
-            items.push(self.parse_expr(0));
-            self.expect(TokenKind::Comma);
-            if self.ntok == mark {
-                self.bump();
-            }
-        }
+        items.extend(
+            self.separated_list(TokenKind::RParen, CompletionSite::Expression, |p| {
+                p.parse_expr(0)
+            }),
+        );
         self.expect(TokenKind::RParen);
         Expr::Tuple(TupleExpr {
             items,

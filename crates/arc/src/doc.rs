@@ -533,14 +533,18 @@ fn render_type(
         }
         TySpecKind::Seq(inner) => format!("[{}]", render_type(inner, current_module, targets)),
         TySpecKind::Tuple(items) if items.is_empty() => "()".to_owned(),
-        TySpecKind::Tuple(items) => format!(
-            "({},)",
-            items
+        TySpecKind::Tuple(items) => {
+            let rendered = items
                 .iter()
                 .map(|item| render_type(item, current_module, targets))
                 .collect::<Vec<_>>()
-                .join(", ")
-        ),
+                .join(", ");
+            // A one-element tuple keeps its comma: `(T)` is the type `T`.
+            match items.len() {
+                1 => format!("({rendered},)"),
+                _ => format!("({rendered})"),
+            }
+        }
     }
 }
 

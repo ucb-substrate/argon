@@ -5,7 +5,7 @@ fn second<T>(items: [T]) -> T {
 }
 
 fn pair_up<A, B>(a: A, b: B) -> (A, B) {
-    (a, b,)
+    (a, b)
 }
 
 cell top() {

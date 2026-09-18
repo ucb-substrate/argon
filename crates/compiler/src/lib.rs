@@ -4020,6 +4020,9 @@ cell top() {
             "fn f() -> Int { E::A }",
             "fn f() -> [Int] { 1 }",
             "fn f() -> (Int, Int) { 1 }",
+            // A one-element tuple and the type it holds are distinct.
+            "fn f() -> (Int,) { (1) }",
+            "fn f() -> (Int) { (1,) }",
             "fn f() -> [Int] { cons(1., []) }",
             "fn f(x: Int) { x }",
         ] {
@@ -4045,7 +4048,11 @@ cell top() {
             "fn f() -> [Int] { cons(1, []) }",
             // `[]` takes its element type from the declared return type.
             "fn f() -> [Int] { [] }",
+            "fn f() -> (Int, Float) { (1, 2.) }",
             "fn f() -> (Int, Float) { (1, 2.,) }",
+            // The comma makes the one-element tuple; `(T)` is the type `T`.
+            "fn f() -> (Int,) { (1,) }",
+            "fn f() -> (Int) { (1) }",
             // A trailing semicolon makes the body's value `()`, matching no return type.
             "fn f() { let x = 1; }",
             "fn f() -> Any { 1 }",
