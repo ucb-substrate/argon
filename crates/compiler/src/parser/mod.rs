@@ -251,6 +251,12 @@ mod tests {
             ("cell top() { let x = if true {} | ; }", Keyword("else")),
             ("cell top() { match m { | } }", Pattern),
             ("cell top() { match m { Some(|) => 1, } }", Pattern),
+            ("cell top() { match m { Shape::Box { | } => 1, } }", Pattern),
+            (
+                "cell top() { match m { Shape::Box { w: | } => 1, } }",
+                Pattern,
+            ),
+            ("enum E { V { a: | } }", Type),
             ("fn f<|>() {}", NewIdentifier),
             ("fn f(o: Option<|>) {}", Type),
             ("cell top() { let n: | = 1; }", Type),
@@ -466,9 +472,9 @@ mod tests {
         assert_eq!(text(option.span), "enum Option<T> { Some(T), None, }");
         assert_eq!(text(option.params[0].span), "T");
         assert_eq!(text(option.variants[0].span), "Some(T)");
-        assert_eq!(option.variants[0].payload.len(), 1);
+        assert_eq!(option.variants[0].payload.tys().count(), 1);
         assert_eq!(text(option.variants[1].span), "None");
-        assert!(option.variants[1].payload.is_empty());
+        assert!(option.variants[1].payload.is_unit());
 
         let Decl::Cell(cell) = &ast.decls[1] else {
             panic!("expected a cell");
@@ -517,6 +523,107 @@ mod tests {
 
     /// A shorthand field desugars to `name: name` with the value at the name's
     /// own span, so later passes see an ordinary field.
+    #[test]
+    fn struct_variants_parse() {
+        for src in [
+            "enum Shape { Circle { r: Float }, Box { w: Float, h: Float, }, Empty, }",
+            "enum E<T> { V { item: T, rest: [T] }, }",
+            "enum E { V {}, }",
+        ] {
+            assert!(
+                parse(src).is_ok(),
+                "should parse: `{src}`: {:?}",
+                parse(src).err()
+            );
+        }
+        for src in [
+            "enum E { V { a }, }",
+            "enum E { V { a: }, }",
+            "enum E { V { a: Int b: Int }, }",
+            "enum E { V { a: Int, }",
+        ] {
+            assert!(parse(src).is_err(), "should be rejected: `{src}`");
+        }
+
+        let valid = [
+            "match s { Shape::Circle { r } => r, _ => 0., }",
+            "match s { Shape::Box { w, h: tall, } => w, _ => 0., }",
+            "match s { Shape::Box { w, .. } => w, _ => 0., }",
+            "match s { Shape::Box { .. } => 1., _ => 0., }",
+            "match s { Shape::Box { h: _ } => 1., _ => 0., }",
+            "match s { lib::shapes::Shape::Box { w } => w, _ => 0., }",
+            "match s { Shape::Empty {} => 1., _ => 0., }",
+            "let x = Shape::Circle { r: 1. };",
+        ];
+        for body in valid {
+            assert!(snippet_ok(body), "should parse: `{body}`");
+        }
+        let invalid = [
+            // `..` comes last and takes no trailing comma.
+            "match s { Shape::Box { .., w } => w, _ => 0., }",
+            "match s { Shape::Box { w, .., } => w, _ => 0., }",
+            // A field pattern is a name or `_`, never a nested pattern.
+            "match s { Shape::Box { w: Some(x) } => 1., _ => 0., }",
+            "match s { Shape::Box { : w } => 1., _ => 0., }",
+            "match s { Shape::Box { w => 1., _ => 0., }",
+        ];
+        for body in invalid {
+            assert!(!snippet_ok(body), "should be rejected: `{body}`");
+        }
+    }
+
+    /// A struct variant's fields keep their declared order and spans, and a
+    /// shorthand field pattern binds the field's own name.
+    #[test]
+    fn struct_variant_nodes_span_their_source_text() {
+        use crate::ast::{Decl, Expr, Pattern, Statement, VariantPayload};
+
+        let src = "enum Shape { Box { w: Float, h: Float }, }\n\
+                   cell c() {\n  let v = match s { Shape::Box { w, h: tall, } => w, _ => 0., };\n}\n";
+        let mut parser = super::grammar::Parser::new(src, 0);
+        let ast = parser.parse_root();
+        assert!(parser.errors.is_empty(), "{:?}", parser.errors);
+        let text = |span: cfgrammar::Span| &src[span.start()..span.end()];
+
+        let Decl::Enum(shape) = &ast.decls[0] else {
+            panic!("expected an enum");
+        };
+        assert_eq!(text(shape.variants[0].span), "Box { w: Float, h: Float }");
+        let VariantPayload::Struct(fields) = &shape.variants[0].payload else {
+            panic!("expected a named payload");
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name.name, "w");
+        assert_eq!(text(fields[1].span), "h: Float");
+
+        let Decl::Cell(cell) = &ast.decls[1] else {
+            panic!("expected a cell");
+        };
+        let Statement::LetBinding(v) = &cell.scope.stmts[0] else {
+            panic!("expected a let");
+        };
+        let Expr::Match(m) = &v.value else {
+            panic!("expected a match");
+        };
+        let Pattern::StructVariant {
+            path,
+            fields,
+            rest,
+            span,
+        } = &m.arms[0].pattern
+        else {
+            panic!("expected a struct variant pattern");
+        };
+        assert_eq!(text(*span), "Shape::Box { w, h: tall, }");
+        assert_eq!(path.path[1].name, "Box");
+        assert!(!rest);
+        assert!(fields[0].shorthand);
+        assert!(matches!(&fields[0].pattern, Pattern::Binding { name, .. } if name.name == "w"));
+        assert!(!fields[1].shorthand);
+        assert_eq!(fields[1].name.name, "h");
+        assert!(matches!(&fields[1].pattern, Pattern::Binding { name, .. } if name.name == "tall"));
+    }
+
     #[test]
     fn shorthand_struct_fields_desugar_to_a_path_at_the_name() {
         use crate::ast::{Decl, Expr, Statement};

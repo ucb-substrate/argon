@@ -597,6 +597,24 @@ mod tests {
     }
 
     #[test]
+    fn execution_evaluates_a_struct_variant_cell_argument() {
+        let source = temp_source(
+            "struct-variant-args",
+            "enum Mode { Sized { w: Float, h: Float }, Fast, }\n\
+             cell top(m: Mode) {\n\
+             let w = match m { Mode::Sized { w, .. } => w, Mode::Fast => 10., };\n\
+             let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=10.);\n\
+             }\n",
+        );
+        let rect = compiled_rect(
+            "struct-variant",
+            source,
+            "top(Mode::Sized { h: 1., w: 40. })",
+        );
+        assert_eq!(rect.x1.0, 40.);
+    }
+
+    #[test]
     fn execution_evaluates_an_option_cell_argument() {
         let source = temp_source(
             "option-args",

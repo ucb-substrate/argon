@@ -81,6 +81,20 @@ pub enum StaticErrorKind {
         expected: usize,
         found: usize,
     },
+    /// A variant with named fields was used as a value or called like a tuple
+    /// variant; it is built with `Enum::Variant { field: value }`.
+    #[error("variant `{0}` has named fields; construct it with braces")]
+    StructVariantConstruction(String),
+    /// A tuple or unit variant was written with braces, which only a variant
+    /// with named fields accepts.
+    #[error("variant `{0}` has no named fields")]
+    NotAStructVariant(String),
+    /// A variant pattern without `..` omits declared fields.
+    #[error("missing fields {fields} in pattern of {ty}; add `..` to ignore them")]
+    MissingPatternFields { ty: String, fields: String },
+    /// A variant literal used `..base`, which only a struct literal accepts.
+    #[error("`..` is not supported in a variant; every field must be given")]
+    VariantLiteralBase,
     /// A match arm after every variant is covered or after a catch-all.
     #[error("unreachable match arm")]
     UnreachableMatchArm,

@@ -24,11 +24,12 @@ use arcstr::ArcStr;
 use crate::{
     ast::{
         ArgDecl, CellDecl, Decl, EnumDecl, Expr, FnDecl, GenericArgs, Ident, IdentPath, ModPath,
-        Pattern, Scope, Statement, StructDecl, TyParam, TySpec, TySpecKind, UseDecl, WorkspaceAst,
+        Pattern, Scope, Statement, StructDecl, TyParam, TySpec, TySpecKind, UseDecl,
+        VariantPayload, WorkspaceAst,
     },
     compile::{
         AdtDef, BUILTINS, RESERVED_CELL_FIELDS, Ty, TyParamTy, TypeDefs, TypedWorkspace, VarId,
-        VarIdTyMetadata, module_prefix, param_map, subst,
+        VarIdTyMetadata, VariantTys, module_prefix, param_map, subst,
     },
 };
 
@@ -1424,21 +1425,30 @@ impl<'a> Builder<'a> {
         };
         let def = self.defs.get(&name_id).and_then(AdtDef::as_enum);
         let params = def.map(|def| def.params.clone()).unwrap_or_default();
-        // A variant's rendering, `Some(T)` or `None`, from its checked payload.
+        // A variant's rendering -- `Some(T)`, `Circle { r: Float }`, or
+        // `None` -- from its checked payload.
         let variant_label = |name: &str| {
             let payload = def
                 .and_then(|def| def.variants.get(name))
-                .map(|variant| &variant.payload[..])
-                .unwrap_or_default();
-            if payload.is_empty() {
-                name.to_owned()
-            } else {
-                let payload = payload
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{name}({payload})")
+                .map(|variant| &variant.payload);
+            match payload {
+                Some(VariantTys::Tuple(payload)) if !payload.is_empty() => {
+                    let payload = payload
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{name}({payload})")
+                }
+                Some(VariantTys::Struct(fields)) => {
+                    let fields = fields
+                        .iter()
+                        .map(|(field, ty)| format!("{field}: {ty}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{name} {{ {fields} }}")
+                }
+                Some(VariantTys::Tuple(_)) | None => name.to_owned(),
             }
         };
         let variants = decl
@@ -1468,17 +1478,22 @@ impl<'a> Builder<'a> {
             let payload = def
                 .and_then(|def| def.variants.get(name.as_str()))
                 .map(|variant| variant.payload.clone())
-                .unwrap_or_default();
+                .unwrap_or_else(|| VariantTys::Tuple(Vec::new()));
             let label = format!("{}::{}", decl.name.name, variant_label(&name));
             // A tuple variant is callable, so it has a signature: one
-            // positional parameter per payload element.
-            let signature = (!payload.is_empty()).then(|| SignatureInfo {
-                label: label.clone(),
-                parameters: payload
-                    .iter()
-                    .map(|ty| parameter(&ty.to_string(), false))
-                    .collect(),
-            });
+            // positional parameter per payload element. A variant with named
+            // fields is built by a literal, so it has none.
+            let signature = match &payload {
+                VariantTys::Tuple(payload) if !payload.is_empty() => Some(SignatureInfo {
+                    label: label.clone(),
+                    parameters: payload
+                        .iter()
+                        .map(|ty| parameter(&ty.to_string(), false))
+                        .collect(),
+                }),
+                VariantTys::Tuple(_) | VariantTys::Struct(_) => None,
+            };
+            let variant_id = def.and_then(|def| def.variants.get(name.as_str()).map(|v| v.id));
             self.define(
                 DefKey::Variant(name_id, name),
                 SymbolKind::Variant,
@@ -1490,8 +1505,36 @@ impl<'a> Builder<'a> {
                     full_span: Some(variant.span),
                 },
             );
-            for (spec, ty) in variant.payload.iter().zip(&payload) {
-                self.ty_spec(spec, ty);
+            match (&variant.payload, &payload) {
+                (VariantPayload::Tuple(specs), VariantTys::Tuple(tys)) => {
+                    for (spec, ty) in specs.iter().zip(tys) {
+                        self.ty_spec(spec, ty);
+                    }
+                }
+                (VariantPayload::Struct(fields), VariantTys::Struct(tys)) => {
+                    for field in fields {
+                        let ty = tys
+                            .get(field.name.name.as_str())
+                            .cloned()
+                            .unwrap_or_default();
+                        self.ty_spec(&field.ty, &ty);
+                        let Some(variant_id) = variant_id else {
+                            continue;
+                        };
+                        self.define(
+                            DefKey::Field(variant_id, field.name.name.to_string()),
+                            SymbolKind::Field,
+                            &field.name,
+                            DefinitionInfo {
+                                detail: format!("{}: {ty}", field.name.name),
+                                ty: Some(ty),
+                                signature: None,
+                                full_span: Some(field.span),
+                            },
+                        );
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1980,17 +2023,27 @@ impl<'a> Builder<'a> {
                     return;
                 };
                 self.module_path(prefix);
-                // The struct reaches us through the literal's checked type;
-                // like a call's callee, the path itself carries no `VarId`.
-                let struct_id = match &lit.metadata {
-                    Ty::Struct(struct_ty) => Some(struct_ty.def),
-                    _ => None,
+                // The struct or variant reaches us through the literal's
+                // checked type; like a call's callee, the path itself carries
+                // no `VarId`. A variant's fields are keyed by the variant, so
+                // it is looked up by name in its enum.
+                let (target, field_id) = match (&lit.metadata.ty, &lit.metadata.variant) {
+                    (Ty::Struct(struct_ty), _) => {
+                        (Target::Def(DefKey::Var(struct_ty.def)), Some(struct_ty.def))
+                    }
+                    (Ty::Enum(enum_ty), Some(variant)) => (
+                        Target::Def(DefKey::Variant(enum_ty.def, variant.clone())),
+                        self.defs
+                            .get(&enum_ty.def)
+                            .and_then(AdtDef::as_enum)
+                            .and_then(|def| def.variants.get(variant))
+                            .map(|variant| variant.id),
+                    ),
+                    _ => (Target::Unresolved, None),
                 };
-                let target =
-                    struct_id.map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(id)));
                 self.record(name.span, target);
                 if let Some(args) = &lit.path.generic_args {
-                    self.generic_args(args, &lit.metadata);
+                    self.generic_args(args, &lit.metadata.ty);
                 }
                 for field in &lit.fields {
                     // A shorthand field is one token naming both the field and
@@ -1998,7 +2051,7 @@ impl<'a> Builder<'a> {
                     // local -- recorded when the value is walked -- is the more
                     // useful place to jump.
                     if !field.shorthand {
-                        let target = struct_id.map_or(Target::Unresolved, |id| {
+                        let target = field_id.map_or(Target::Unresolved, |id| {
                             Target::Def(DefKey::Field(id, field.name.name.to_string()))
                         });
                         self.record(field.name.span, target);
@@ -2106,6 +2159,21 @@ impl<'a> Builder<'a> {
                 self.ident_path(path);
                 for field in fields {
                     self.pattern(field, body);
+                }
+            }
+            Pattern::StructVariant { path, fields, .. } => {
+                self.ident_path(path);
+                let variant_id = path.metadata.0;
+                for field in fields {
+                    // A shorthand field is one token naming both the field and
+                    // the local it binds; the local is the more useful target.
+                    if !field.shorthand {
+                        let target = variant_id.map_or(Target::Unresolved, |id| {
+                            Target::Def(DefKey::Field(id, field.name.name.to_string()))
+                        });
+                        self.record(field.name.span, target);
+                    }
+                    self.pattern(&field.pattern, body);
                 }
             }
         }
@@ -2479,6 +2547,51 @@ fn width(s: Shape) -> Float {
         assert_eq!(span.path, Path::new(STD_PATH));
         assert_eq!(&STD_SOURCE[span.span.start()..span.span.end()], "Some");
         assert_eq!(definition.detail, "Option::Some(T)");
+    }
+
+    /// A variant's named fields are definitions of their own, so the field
+    /// names in a literal and in a pattern jump to the declaration, and the
+    /// variant name jumps to the variant.
+    #[test]
+    fn struct_variant_fields_resolve_and_hover() {
+        check(
+            r#"
+enum Shape {
+    Circle { radius: Float },
+    Empty,
+}
+
+fn width(s: Shape) -> Float {
+    match s {
+        Shape::Cir$0cle { rad$0ius: r } => $0r,
+        Shape::Empty => 0.,
+    }
+}
+
+cell top() {
+    let c = Shape::Cir$0cle { rad$0ius: 1. };
+}
+"#,
+            // `r` is a one-letter name, so its occurrence index counts every
+            // `r` in the source.
+            &["Circle#0", "radius#0", "r#4", "Circle#0", "radius#0"],
+        );
+
+        let (source, index, _) = index(
+            "enum Shape { Circle { radius: Float }, Empty, }\n\
+             fn width(s: Shape) -> Float { match s { Shape::Circle { radius } => radius, Shape::Empty => 0., } }\n",
+        );
+        let hover = |needle: &str| {
+            index
+                .hover_at(Path::new(ROOT), source.find(needle).unwrap())
+                .unwrap_or_else(|| panic!("hover on {needle}"))
+                .contents
+        };
+        assert_eq!(
+            hover("Shape {"),
+            "enum Shape { Circle { radius: Float }, Empty }"
+        );
+        assert_eq!(hover("Circle {"), "Shape::Circle { radius: Float }");
     }
 
     #[test]

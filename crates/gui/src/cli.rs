@@ -1040,15 +1040,22 @@ mod tests {
             None,
             "/tmp/relay socket.sock",
         ));
-        let output = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&command)
-            .env("SHELL", "/bin/sh")
-            // An interactive shell sources `$ENV`, so clear it to keep the
-            // host's startup files from deciding this test's outcome.
-            .env("ENV", "")
-            .output()
-            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let output = loop {
+            let output = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&command)
+                .env("SHELL", "/bin/sh")
+                .env("ENV", "")
+                .output()
+                .unwrap();
+            let busy = !output.status.success()
+                && String::from_utf8_lossy(&output.stderr).contains("Text file busy");
+            if !busy || Instant::now() >= deadline {
+                break output;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
 
         assert!(
             output.status.success(),

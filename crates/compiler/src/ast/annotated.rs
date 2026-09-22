@@ -140,7 +140,7 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         &mut self,
         input: &super::EnumVariant<Self::InputS, Self::InputMetadata>,
         _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
-        _payload: &[super::TySpec<Self::OutputS, Self::OutputMetadata>],
+        _payload: &super::VariantPayload<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::EnumVariant {
         input.metadata.clone()
     }

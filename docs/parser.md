@@ -349,9 +349,10 @@ while !self.at(Eof) {
 Argument declarations (`argDecl : ident COLON tySpec (EQ expr)?`) and enum
 variants / struct fields are comma-separated lists parsed by the shared
 `separated_list` helper (§8). An enum variant is
-`enumVariant : ident (LPAREN tySpecList RPAREN)?`, so `Some(T)` carries a
-payload and `None` does not. A parameter with a default value is a keyword
-parameter; `parse_arg_decls` gives the parameter list its own scope-ordinal
+`enumVariant : ident (LPAREN tySpecList RPAREN | LBRACE structFields RBRACE)?`,
+so `Some(T)` carries a positional payload, `Circle { r: Float }` a named one
+reusing `parse_struct_field`, and `None` none at all. A parameter with a
+default value is a keyword parameter; `parse_arg_decls` gives the parameter list its own scope-ordinal
 counter (§10) so scopes opened inside default values are numbered from zero.
 
 `genericParams : LT ident (COMMA ident)* COMMA? GT` follows the name of a
@@ -436,10 +437,17 @@ non-consuming `parse_item` cannot spin.
 >   *comma-terminated*, not comma-separated: a comma after **every** arm is
 >   mandatory. The comma is part of each arm, and `matchArms : matchArm+`
 >   requires at least one arm, so `match k {}` is a syntax error. A `pattern` is
->   `_`, an `identPath`, or an `identPath` followed by a parenthesised list of
->   sub-patterns, each a name or `_`; `parse_pattern` records
->   `CompletionSite::Pattern`. A bare name parses as a `Pattern::Binding`, and
->   the type checker decides whether it names a unit variant instead.
+>   `_`, an `identPath`, an `identPath` followed by a parenthesised list of
+>   sub-patterns, or an `identPath` followed by a braced list of field
+>   patterns; a sub-pattern is a name or `_` either way. `parse_pattern`
+>   records `CompletionSite::Pattern`. A bare name parses as a
+>   `Pattern::Binding`, and the type checker decides whether it names a unit
+>   variant instead.
+> - **Struct variant patterns** (`E::V { f, g: name, .. }`) have two
+>   terminators — `}` and the `..` — so `parse_struct_variant_pattern` keeps
+>   its own loop, shaped like the struct literal's. A field pattern is
+>   `fieldPattern : ident (COLON subPattern)?`, where a bare `f` is shorthand
+>   for `f: f`, and the `..` comes last and takes no comma after it.
 > - **Struct literal bodies** ([§9.5](#95-struct-literals)) are comma-separated
 >   with an optional trailing comma, but have two terminators — `}` and the
 >   `..base` — so they keep their own loop as well.
@@ -618,6 +626,10 @@ path, the explicit fields, and the optional base:
   own loop rather than going through `separated_list`; it terminates for the
   same reason, since every iteration that does not `break` consumes the
   separator comma.
+- The same node also builds an **enum variant with named fields**, since
+  `E::V { r: 1. }` is `identPath LBRACE …` like any other literal. Which one a
+  literal builds is settled by the type checker, not the parser, and a variant
+  takes no `..base`.
 
 **The head restriction.** `if c {`, `match k {`, and `for v in seq {` already
 read `name {` as an identifier followed by the construct's own scope, so a

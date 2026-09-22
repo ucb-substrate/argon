@@ -611,15 +611,16 @@ fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> 
             candidate.kind,
             Kind::Cell | Kind::Enum | Kind::Struct | Kind::Type
         ),
+        // A field is offered because a variant pattern binds its payload by
+        // name, as in `Shape::Box { w, .. }`.
         CompletionSite::Pattern => match candidate.kind {
-            Kind::Enum | Kind::Variant | Kind::Module => true,
+            Kind::Enum | Kind::Variant | Kind::Module | Kind::Field => true,
             Kind::Keyword => candidate.label == "_",
             Kind::Function
             | Kind::Cell
             | Kind::Variable
             | Kind::Parameter
             | Kind::Struct
-            | Kind::Field
             | Kind::Type => false,
         },
         CompletionSite::ImportPath => candidate.kind == Kind::Module,

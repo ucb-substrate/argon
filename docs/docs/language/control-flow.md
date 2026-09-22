@@ -87,7 +87,60 @@ fn width(layer: Metal) -> Float {
 }
 ```
 
-Match arms use `=>` and end with commas.
+Match arms use `=>` and end with commas. The arms must cover every variant,
+unless a bare name or `_` arm matches the rest.
+
+### Variants with payloads
+
+A variant may carry values, written either as a tuple or as named fields. A
+tuple variant is constructed like a call and matched by position, where `_`
+skips an element:
+
+```argon
+enum Shape {
+    Circle(Float),
+    Box(Float, Float),
+}
+
+fn width(s: Shape) -> Float {
+    match s {
+        Shape::Circle(r) => 2. * r,
+        Shape::Box(w, _) => w,
+    }
+}
+```
+
+A variant with named fields is constructed with braces, like a
+[struct](/language/types-values), and matched by naming the fields to bind. The
+literal accepts the same `field` shorthand for `field: field`, but no `..base`:
+every field must be given. A pattern must name every field too, unless it ends
+in `..`; `field: name` renames a binding and `field: _` drops one.
+
+```argon
+enum Shape {
+    Circle { r: Float },
+    Box { w: Float, h: Float },
+}
+
+fn width(s: Shape) -> Float {
+    match s {
+        Shape::Circle { r } => 2. * r,
+        Shape::Box { w, .. } => w,
+    }
+}
+
+cell top() {
+    let w = 300.;
+    let h = 20.;
+    // Shorthand: `w` and `h` stand for `w: w` and `h: h`.
+    let r = rect("met1", x0=0., y0=0., w=width(Shape::Box { w, h }), h=h);
+}
+```
+
+A field pattern binds a name or `_`, never a nested pattern. As with a struct
+literal, a variant literal in an `if` condition, a `match` scrutinee, or a
+`for` sequence must be parenthesized, since `name {` there begins the
+construct's body.
 
 ## `for` loops
 

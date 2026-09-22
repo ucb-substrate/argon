@@ -181,6 +181,17 @@ fn hash_cell_arg_key(hasher: &mut fnv::FnvHasher, arg: &CellArgKey) {
                 hash_cell_arg_key(hasher, value);
             }
         }
+        CellArgKey::StructVariant(variant, fields) => {
+            hasher.write_u8(12);
+            hasher.write_usize(variant.len());
+            hasher.write(variant.as_bytes());
+            hasher.write_usize(fields.len());
+            for (field, value) in fields {
+                hasher.write_usize(field.len());
+                hasher.write(field.as_bytes());
+                hash_cell_arg_key(hasher, value);
+            }
+        }
         CellArgKey::Seq(values) => {
             hasher.write_u8(5);
             hasher.write_usize(values.len());
