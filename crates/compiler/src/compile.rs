@@ -7443,6 +7443,7 @@ impl<'a> ExecPass<'a> {
                 )
                 .is_none()
         );
+        let invocation_args = args.clone();
         for (arg, decl) in args.into_iter().zip(cell_decl.args.iter()) {
             let vid = self.value_id();
             // Built directly: `Self::span` resolves through a location, and
@@ -7685,7 +7686,7 @@ impl<'a> ExecPass<'a> {
                 .is_none()
         );
         self.compiled_cell_cache.insert(cache_key, cell_id);
-        self.retain_cell(cell_id, cell_errors_start, ids_start);
+        self.retain_cell(cell_id, cell_errors_start, ids_start, invocation_args);
         // A completed child is represented entirely by `compiled_cells` and
         // its persistent `Value::Cell` handle.  Keeping the much larger
         // execution state as well retained its solver, unsolved objects,
@@ -7748,7 +7749,13 @@ impl<'a> ExecPass<'a> {
     }
 
     /// Records a freshly compiled cell for reuse in a later revision.
-    fn retain_cell(&mut self, id: CellId, errors_start: usize, ids_start: u64) {
+    fn retain_cell(
+        &mut self,
+        id: CellId,
+        errors_start: usize,
+        ids_start: u64,
+        invocation_args: Vec<CellArg>,
+    ) {
         // A cell is named by content only when the session supplied
         // fingerprints, and the generated entry cell is never named at all.
         if self.items_arc.is_none() || !is_content_id(id) {
@@ -7768,6 +7775,7 @@ impl<'a> ExecPass<'a> {
         let Some(cell) = self.compiled_cells.get(&id).cloned() else {
             return;
         };
+        let span_paths = cell.span_paths();
         let children = cell
             .objects
             .values()
@@ -7791,10 +7799,12 @@ impl<'a> ExecPass<'a> {
                 id,
                 CachedCell {
                     cell,
+                    invocation_args,
                     children,
                     errors,
                     ids_consumed: self.next_id - ids_start,
                     items,
+                    span_paths,
                 },
             );
         }
@@ -12368,6 +12378,37 @@ fn hash_solved_value(
 }
 
 impl CompiledCell {
+    /// Files containing spans that a source rebase may need to translate.
+    /// Compute this once when caching the cell, not on every editor edit.
+    pub(crate) fn span_paths(&self) -> HashSet<PathBuf> {
+        let mut paths = HashSet::new();
+        for metadata in &self.scope_metadata {
+            paths.insert(&metadata.span.path);
+        }
+        for scope in self.scopes.values() {
+            for (_, emit) in &scope.emit {
+                paths.insert(&emit.span.path);
+            }
+        }
+        for object in self.objects.values() {
+            let span = match object {
+                SolvedValue::Rect(rect) => rect.span.as_ref(),
+                SolvedValue::Polygon(polygon) => polygon.span.as_ref(),
+                SolvedValue::Path(path) => path.span.as_ref(),
+                SolvedValue::Text(text) => text.span.as_ref(),
+                SolvedValue::Dimension(dimension) => dimension.span.as_ref(),
+                SolvedValue::Instance(instance) => Some(&instance.span),
+            };
+            if let Some(span) = span {
+                paths.insert(&span.path);
+            }
+        }
+        for fallback in &self.fallback_constraints_used {
+            paths.insert(&fallback.span.path);
+        }
+        paths.into_iter().cloned().collect()
+    }
+
     pub fn scope_name(&self, scope: ScopeId) -> &str {
         &self.scope_metadata[self.scopes[&scope].metadata.0 as usize].name
     }

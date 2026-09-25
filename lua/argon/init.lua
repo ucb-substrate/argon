@@ -284,9 +284,13 @@ M.start = function(bufnr)
             tostring(vim.g.argon_analyzer_relay),
         })
     end
-    local lsp_start_config = { 
+    local lsp_start_config = {
         name = 'argon',
         cmd = analyzer_cmd,
+        -- GUI drawing waits for the source acknowledgement, not for layout
+        -- compilation. Neovim otherwise rate-limits didChange to 150 ms,
+        -- making each queued drawing wait even when applyEdit was immediate.
+        flags = { debounce_text_changes = 0 },
         handlers = {
             ['custom/save'] = function(err, result, ctx)
                 if err then

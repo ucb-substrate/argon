@@ -14,11 +14,12 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::Arc,
 };
 
 use crate::{
-    compile::{CellId, CompiledCell, ExecError},
+    compile::{CellArg, CellId, CompiledCell, ExecError},
     fingerprint::{ItemIndex, SpanRebase},
 };
 
@@ -26,6 +27,9 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(crate) struct CachedCell {
     pub cell: Arc<CompiledCell>,
+    /// Exact arguments used by the parent. A focused preview must retain the
+    /// same parameterization even when the source invocation is generated.
+    pub invocation_args: Vec<CellArg>,
     /// Cells this one instantiates. Reinstating a cell means reinstating all
     /// of them, since a compiled cell names its children by [`CellId`].
     pub children: Vec<CellId>,
@@ -38,6 +42,8 @@ pub(crate) struct CachedCell {
     pub ids_consumed: u64,
     /// Declaration placements the cell's spans were recorded against.
     pub items: Arc<ItemIndex>,
+    /// Source files with spans in this cell, recorded when it is first built.
+    pub span_paths: HashSet<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -126,6 +132,11 @@ impl CellCache {
                 translated.push(index);
                 continue;
             };
+            if !rebase.affects_any_path(entry.span_paths.iter()) {
+                entry.items = items.clone();
+                translated.push(index);
+                continue;
+            }
             let cell = Arc::make_mut(&mut entry.cell);
             if cell.rebase_spans(rebase).is_err() {
                 self.stats.rebase_failures += 1;
@@ -195,5 +206,10 @@ impl CellCache {
 
     pub(crate) fn contains(&self, id: CellId) -> bool {
         self.entries.contains_key(&id)
+    }
+
+    pub(crate) fn invocation(&self, id: CellId) -> Option<(String, Vec<CellArg>)> {
+        let entry = self.entries.get(&id)?;
+        Some((entry.cell.name.clone(), entry.invocation_args.clone()))
     }
 }

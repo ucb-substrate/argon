@@ -5,7 +5,8 @@ use std::{net::Ipv4Addr, path::PathBuf, sync::Arc};
 use analyzer::{
     ArgonConfig,
     rpc::{
-        CompilationSnapshot, CompressedCompilationUpdate, Gui, InstancePreview, LangServerClient,
+        CompilationSnapshot, CompressedCompilationUpdate, FocusedCellPreview, Gui, GuiUpdateResult,
+        InstancePreview, LangServerClient,
     },
 };
 use argonc::{
@@ -67,14 +68,18 @@ impl Gui for HeadlessGui {
             .expect("full-stack test should still be receiving GUI events");
     }
 
-    async fn update_cell(self, _: context::Context, update: CompressedCompilationUpdate) -> bool {
+    async fn update_cell(
+        self,
+        _: context::Context,
+        update: CompressedCompilationUpdate,
+    ) -> GuiUpdateResult {
         let Ok(update) = update.decode() else {
-            return false;
+            return GuiUpdateResult::default();
         };
         let (kind, scope, rect_count, revision) = {
             let mut previous = self.snapshot.lock().unwrap();
             let Some(snapshot) = update.materialize(previous.as_ref()) else {
-                return false;
+                return GuiUpdateResult::default();
             };
             *previous = Some(snapshot.clone());
             let (kind, scope, rect_count) = snapshot_details(&snapshot.output);
@@ -93,7 +98,17 @@ impl Gui for HeadlessGui {
             })
             .expect("full-stack test should still be receiving GUI events");
         let _permit = self.update_gate.acquire().await.unwrap();
-        true
+        GuiUpdateResult {
+            accepted: true,
+            ..GuiUpdateResult::default()
+        }
+    }
+
+    async fn preview_cell(self, _: context::Context, _: FocusedCellPreview) -> GuiUpdateResult {
+        GuiUpdateResult {
+            accepted: true,
+            ..GuiUpdateResult::default()
+        }
     }
 
     async fn show_message(
@@ -127,6 +142,10 @@ impl Gui for HeadlessGui {
 
     async fn selected_scope(self, _: context::Context) -> Option<Span> {
         self.selected_scope.lock().expect("selected scope").clone()
+    }
+
+    async fn selected_cell(self, _: context::Context) -> Option<argonc::compile::CellId> {
+        None
     }
 
     async fn place_instance(self, _: context::Context, _: InstancePreview) {}
@@ -350,6 +369,33 @@ mod tests {
             .unwrap_or_else(|_| panic!("timed out {description}"));
     }
 
+    async fn draw_burst(analyzer: &LangServerClient, scope: &Span) {
+        time::timeout(std::time::Duration::from_secs(2), async {
+            for i in 0..20 {
+                let x = (i * 20) as f64;
+                let inserted = analyzer
+                    .draw_rect(
+                        context::current(),
+                        scope.clone(),
+                        "burst".to_owned(),
+                        BasicRect {
+                            layer: Some("met1".to_owned()),
+                            x0: x,
+                            y0: 0.,
+                            x1: x + 10.,
+                            y1: 10.,
+                            construction: false,
+                        },
+                    )
+                    .await
+                    .expect("GUI drawing request should reach analyzer");
+                assert!(inserted.is_some(), "drawing {i} should edit the buffer");
+            }
+        })
+        .await
+        .expect("20 GUI drawings were delayed by Neovim or GUI compilation");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn gui_edit_roundtrip() {
         assert_completes("waiting for GUI/editor round trip", async {
@@ -458,6 +504,117 @@ mod tests {
             assert!(source.contains("let gui_rect = rect("));
             assert!(source.contains("x0i = 1.2, y0i = 0., x1i = 10.3, y1i = 10."));
             assert!(source.contains("let editor_rect = rect("));
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rapid_gui_drawings_do_not_wait_for_gui_compilation() {
+        assert_completes("drawing while GUI compilation is blocked", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new("cell top() {\n}\n").await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("rapid_drawing");
+            let analyzer = session.connect_analyzer().await;
+            analyzer
+                .register(context::current(), session.gui_addr())
+                .await
+                .expect("register headless GUI");
+
+            let scope = loop {
+                if let GuiEvent::UpdateCell {
+                    kind: OutputKind::Data,
+                    scope: Some(scope),
+                    ..
+                } = session.next_event().await
+                {
+                    break scope;
+                }
+            };
+            // Block only subsequent GUI updates. Editor edits should still
+            // acknowledge promptly even when the GUI cannot accept a snapshot.
+            loop {
+                if matches!(session.next_event().await, GuiEvent::CompilationFinished(_)) {
+                    break;
+                }
+            }
+            let gate = session.update_gate.clone().acquire_owned().await.unwrap();
+            draw_burst(&analyzer, &scope).await;
+            drop(gate);
+            std::fs::write(&session.ack, "ok\n").expect("acknowledge GUI observations");
+            finish_nvim(child).await;
+            let source = std::fs::read_to_string(session.project.join("lib.ar"))
+                .expect("read edited source");
+            assert_eq!(source.matches("= rect(").count(), 20);
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bulk_delete_after_drawing_burst_skips_stale_compilations() {
+        assert_completes("bulk deleting after a drawing burst", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new("cell top() {\n}\n").await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("bulk_delete_after_burst");
+            let analyzer = session.connect_analyzer().await;
+            analyzer
+                .register(context::current(), session.gui_addr())
+                .await
+                .expect("register headless GUI");
+            let (opened_revision, scope) = loop {
+                if let GuiEvent::UpdateCell {
+                    revision,
+                    kind: OutputKind::Data,
+                    scope: Some(scope),
+                    ..
+                } = session.next_event().await
+                {
+                    break (revision, scope);
+                }
+            };
+            loop {
+                if matches!(session.next_event().await, GuiEvent::CompilationFinished(_)) {
+                    break;
+                }
+            }
+            let gate = session.update_gate.clone().acquire_owned().await.unwrap();
+            draw_burst(&analyzer, &scope).await;
+            time::timeout(TEST_TIMEOUT, async {
+                while !session.project.join("startup.ready").exists() {
+                    time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("Neovim did not bulk-delete the drawings");
+            let started = std::time::Instant::now();
+            drop(gate);
+            time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if matches!(
+                        session.next_event().await,
+                        GuiEvent::UpdateCell {
+                            revision,
+                            kind: OutputKind::Data,
+                            rect_count: 0,
+                            ..
+                        } if revision > opened_revision
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("newest bulk deletion waited for stale GUI/compiler work");
+            eprintln!(
+                "bulk_delete_after_burst_ms={}",
+                started.elapsed().as_millis()
+            );
+            std::fs::write(&session.ack, "ok\n").expect("acknowledge GUI observations");
+            finish_nvim(child).await;
+            let source = std::fs::read_to_string(session.project.join("lib.ar"))
+                .expect("read edited source");
+            assert_eq!(source.matches("= rect(").count(), 0);
         })
         .await;
     }

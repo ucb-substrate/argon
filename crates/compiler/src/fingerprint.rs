@@ -22,7 +22,7 @@
 //! has to make the fingerprint differ.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::Hasher,
     ops::Range,
     path::{Path, PathBuf},
@@ -1134,6 +1134,8 @@ pub struct SpanRebase {
     from: HashMap<PathBuf, Vec<(Range<usize>, Fingerprint)>>,
     /// Where each of those declarations lives now.
     to: HashMap<Fingerprint, (PathBuf, Range<usize>)>,
+    /// Files containing a declaration whose source extent moved or changed.
+    moved_paths: HashSet<PathBuf>,
 }
 
 /// A span that could not be translated.
@@ -1153,6 +1155,7 @@ impl SpanRebase {
     /// and every span is already correct.
     pub fn new(from: &ItemIndex, to: &ItemIndex) -> Option<Self> {
         let mut moved = false;
+        let mut moved_paths = HashSet::new();
         let mut by_fingerprint = HashMap::with_capacity(to.len());
         for (_, site) in to.iter() {
             by_fingerprint.insert(site.fingerprint, (site.path.clone(), site.span.clone()));
@@ -1161,7 +1164,10 @@ impl SpanRebase {
         for (_, site) in from.iter() {
             match by_fingerprint.get(&site.fingerprint) {
                 Some((path, span)) if path == &site.path && span == &site.span => {}
-                _ => moved = true,
+                _ => {
+                    moved = true;
+                    moved_paths.insert(site.path.clone());
+                }
             }
             by_path
                 .entry(site.path.clone())
@@ -1177,7 +1183,14 @@ impl SpanRebase {
         Some(Self {
             from: by_path,
             to: by_fingerprint,
+            moved_paths,
         })
+    }
+
+    pub fn affects_any_path<'a>(&self, paths: impl IntoIterator<Item = &'a PathBuf>) -> bool {
+        paths
+            .into_iter()
+            .any(|path| self.moved_paths.contains(path))
     }
 
     /// Translates one span in place.

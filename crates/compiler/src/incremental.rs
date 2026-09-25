@@ -101,6 +101,9 @@ pub struct IncrementalCompiler {
     parse_cache: parse::ParseCache,
     static_cache: Option<StaticCache>,
     execution_cache: HashMap<u64, CompileOutput>,
+    /// Keep the previous revision's live graph only while an explicit focused
+    /// preview is compiled before the opened top cell.
+    previous_revision_live: HashSet<compile::CellId>,
     execution_environment: Option<u64>,
     /// The most recent navigation index that had content. Retained so that
     /// editor navigation keeps answering while the workspace does not
@@ -326,6 +329,40 @@ impl IncrementalCompiler {
         cell: &[String],
         args: Vec<CellArg>,
     ) -> CompileOutput {
+        self.compile_cell_mode(config, cell, args, false)
+    }
+
+    /// Compile a focused subcell before propagating its change to the opened
+    /// top cell. Unlike a normal compile, this does not evict the top graph.
+    pub fn compile_cell_preview(
+        &mut self,
+        config: &WorkspaceConfig,
+        cell: &[String],
+        args: Vec<CellArg>,
+    ) -> CompileOutput {
+        self.compile_cell_mode(config, cell, args, true)
+    }
+
+    /// Preview the exact parameterized child selected in the previous full
+    /// layout. Returns `None` when it is not a retained source cell (for
+    /// example, a GDS import or a cell evicted after an environment change).
+    pub fn compile_cached_cell_preview(
+        &mut self,
+        config: &WorkspaceConfig,
+        previous_cell: compile::CellId,
+    ) -> Option<CompileOutput> {
+        let (name, args) = self.cell_cache.invocation(previous_cell)?;
+        let path = name.split("::").map(str::to_owned).collect::<Vec<_>>();
+        Some(self.compile_cell_preview(config, &path, args))
+    }
+
+    fn compile_cell_mode(
+        &mut self,
+        config: &WorkspaceConfig,
+        cell: &[String],
+        args: Vec<CellArg>,
+        preserve_previous_graph: bool,
+    ) -> CompileOutput {
         self.ensure_analysis(config);
         let analysis = &self
             .static_cache
@@ -356,6 +393,7 @@ impl IncrementalCompiler {
             self.gds_cache.clear();
             self.cell_cache.clear();
             self.check_cache.clear();
+            self.previous_revision_live.clear();
             self.tech = None;
             self.execution_environment = Some(environment);
         }
@@ -366,7 +404,12 @@ impl IncrementalCompiler {
         let key = hasher.finish();
         if let Some(output) = self.execution_cache.get(&key) {
             self.stats.execution_cache_hits += 1;
-            return output.clone();
+            let output = output.clone();
+            if !preserve_previous_graph {
+                self.previous_revision_live.clear();
+                self.prune_execution_caches();
+            }
+            return output;
         }
 
         self.stats.execution_cache_misses += 1;
@@ -414,6 +457,9 @@ impl IncrementalCompiler {
             )
         });
         self.execution_cache.insert(key, output.clone());
+        if !preserve_previous_graph {
+            self.previous_revision_live.clear();
+        }
         self.prune_execution_caches();
         output
     }
@@ -454,6 +500,7 @@ impl IncrementalCompiler {
             self.gds_cache.clear();
             self.cell_cache.clear();
             self.check_cache.clear();
+            self.previous_revision_live.clear();
             self.tech = None;
             self.execution_environment = Some(environment);
         }
@@ -463,7 +510,10 @@ impl IncrementalCompiler {
         let key = hasher.finish();
         if let Some(output) = self.execution_cache.get(&key) {
             self.stats.execution_cache_hits += 1;
-            return Ok(output.clone());
+            let output = output.clone();
+            self.previous_revision_live.clear();
+            self.prune_execution_caches();
+            return Ok(output);
         }
 
         self.stats.execution_cache_misses += 1;
@@ -499,6 +549,7 @@ impl IncrementalCompiler {
             compile::execute_cell_invocation_cached(&typed_ast, &invocation, config, None)
         });
         self.execution_cache.insert(key, output.clone());
+        self.previous_revision_live.clear();
         self.prune_execution_caches();
         Ok(output)
     }
@@ -516,6 +567,7 @@ impl IncrementalCompiler {
                 CompileOutput::FatalParseErrors | CompileOutput::StaticErrors(_) => None,
             })
             .flat_map(|data| data.cells.keys().copied())
+            .chain(self.previous_revision_live.iter().copied())
             .collect::<HashSet<_>>();
         if live.is_empty() {
             return;
@@ -559,6 +611,19 @@ impl IncrementalCompiler {
         self.revision = self.revision.saturating_add(1);
         self.stats.revision = self.revision;
         self.static_cache = None;
+        let current_live = self
+            .execution_cache
+            .values()
+            .filter_map(|output| match output {
+                CompileOutput::Valid(data) => Some(data),
+                CompileOutput::ExecErrors(errors) => errors.output.as_ref(),
+                CompileOutput::FatalParseErrors | CompileOutput::StaticErrors(_) => None,
+            })
+            .flat_map(|data| data.cells.keys().copied())
+            .collect::<HashSet<_>>();
+        if !current_live.is_empty() {
+            self.previous_revision_live = current_live;
+        }
         self.execution_cache.clear();
         // `gds_cache` and `execution_environment` deliberately survive. The
         // environment is recomputed and compared on the next execution
@@ -1979,6 +2044,194 @@ mod tests {
             compiler.stats().static_cache_misses,
             compiler.stats().execution_cache_hits,
             compiler.stats().execution_cache_misses,
+        );
+    }
+
+    #[test]
+    #[ignore = "SRAM parent-edit timing benchmark; run in release with --nocapture"]
+    fn bench_sram_parent_rectangle_edit() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/sram");
+        let root = workspace.join("lib.ar");
+        let source = std::fs::read_to_string(&root).unwrap();
+        let config = WorkspaceConfig::new(&root)
+            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")));
+        let cell = vec!["benchmark_parent".to_owned()];
+        let initial = format!(
+            "{source}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); }}\n"
+        );
+        let edited = format!(
+            "{source}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); let r = rect(\"met1.drawing\", x0=0., y0=0., x1=100., y1=100.)!; }}\n"
+        );
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(root.clone(), initial);
+        let start = std::time::Instant::now();
+        let cold = compiler.compile_cell(&config, &cell, Vec::new());
+        let cold_elapsed = start.elapsed();
+        assert!(matches!(cold, CompileOutput::Valid(_)));
+        let before = compiler.stats();
+        compiler.set_source_text(root, edited);
+        let start = std::time::Instant::now();
+        let warm = compiler.compile_cell(&config, &cell, Vec::new());
+        let edited_elapsed = start.elapsed();
+        if let CompileOutput::ExecErrors(ref errors) = warm {
+            panic!("SRAM parent edit errors: {:?}", errors.errors);
+        }
+        assert!(matches!(warm, CompileOutput::Valid(_)));
+        let after = compiler.stats();
+        eprintln!(
+            "sram_parent_edit,cold_ms={},edited_ms={},cell_hits={},cell_misses={},entries={}",
+            cold_elapsed.as_millis(),
+            edited_elapsed.as_millis(),
+            after.cell_cache.hits - before.cell_cache.hits,
+            after.cell_cache.misses - before.cell_cache.misses,
+            after.cell_cache.entries,
+        );
+    }
+
+    #[test]
+    fn editing_parent_preserves_subcell_allocations_in_other_files() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("lib.ar");
+        let leaf = workspace.path().join("leaf.ar");
+        std::fs::write(
+            &leaf,
+            "cell leaf() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }\n",
+        )
+        .unwrap();
+        let base = "mod leaf;\ncell top() { let child = inst(leaf::leaf(), x=0., y=0.); }\n";
+        std::fs::write(&root, base).unwrap();
+        let config = WorkspaceConfig::new(&root).with_tech(Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+        ));
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(root.clone(), base.to_owned());
+        let before = compiler
+            .compile_cell(&config, &["top".into()], vec![])
+            .unwrap_valid();
+        compiler.set_source_text(
+            root,
+            base.replace(
+                "cell top() {",
+                "cell top() { let added = rect(\"met2\", x0=0., y0=0., x1=5., y1=5.);",
+            ),
+        );
+        let after = compiler
+            .compile_cell(&config, &["top".into()], vec![])
+            .unwrap_valid();
+        let leaf_cells = before
+            .cells
+            .iter()
+            .filter(|(id, cell)| {
+                after.cells.contains_key(*id) && cell.span_paths().iter().all(|path| path == &leaf)
+            })
+            .collect::<Vec<_>>();
+        assert!(!leaf_cells.is_empty());
+        for (id, old_cell) in leaf_cells {
+            assert!(Arc::ptr_eq(old_cell, &after.cells[id]));
+        }
+    }
+
+    #[test]
+    fn compiling_focused_child_keeps_unrelated_parent_cache_alive() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("lib.ar");
+        let leaf = workspace.path().join("leaf.ar");
+        let stable = workspace.path().join("stable.ar");
+        std::fs::write(
+            &root,
+            "mod leaf; mod stable; cell top() { let a = inst(leaf::leaf(), x=0., y=0.); let b = inst(stable::stable(), x=20., y=0.); }",
+        )
+        .unwrap();
+        let original = "cell leaf() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }";
+        std::fs::write(&leaf, original).unwrap();
+        std::fs::write(
+            &stable,
+            "cell stable() { let r = rect(\"met2\", x0=0., y0=0., x1=5., y1=5.); }",
+        )
+        .unwrap();
+        let config = WorkspaceConfig::new(&root).with_tech(Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+        ));
+        let mut compiler = IncrementalCompiler::new();
+        let before = compiler
+            .compile_cell(&config, &["top".into()], vec![])
+            .unwrap_valid();
+        compiler.set_source_text(leaf.clone(), original.replace("x1=10.", "x1=12."));
+        // A second edit before any compilation must not forget the pinned top.
+        compiler.set_source_text(leaf, original.replace("x1=10.", "x1=14."));
+        compiler
+            .compile_cell_preview(&config, &["leaf".into(), "leaf".into()], vec![])
+            .unwrap_valid();
+        let after = compiler
+            .compile_cell(&config, &["top".into()], vec![])
+            .unwrap_valid();
+        let stable_id = before
+            .cells
+            .iter()
+            .find_map(|(id, cell)| cell.name.ends_with("stable::stable").then_some(*id))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &before.cells[&stable_id],
+            &after.cells[&stable_id]
+        ));
+    }
+
+    #[test]
+    #[ignore = "SRAM subcell timing benchmark; run in release with --nocapture"]
+    fn bench_sram_subcell_edit() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/sram");
+        let root = workspace.join("lib.ar");
+        let macro_source = workspace.join("bitcells/macros.ar");
+        let original = std::fs::read_to_string(&macro_source).unwrap();
+        let edited = original.replacen(
+            "cell sp_cell() {",
+            "cell sp_cell() { let debug_rect = rect(\"met1.drawing\", x0=-100., y0=-100., x1=-90., y1=-90.);",
+            1,
+        );
+        assert_ne!(original, edited);
+        let config = WorkspaceConfig::new(&root)
+            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")));
+        let mut compiler = IncrementalCompiler::new();
+        let top = vec!["example_no_control_logic".to_owned()];
+        let cold_started = std::time::Instant::now();
+        let before = compiler.compile_cell(&config, &top, vec![]).unwrap_valid();
+        let cold = cold_started.elapsed();
+        let mut direct = compiler.clone();
+        direct.set_source_text(macro_source.clone(), edited.clone());
+        let direct_started = std::time::Instant::now();
+        let direct_top = direct.compile_cell(&config, &top, vec![]).unwrap_valid();
+        let direct_elapsed = direct_started.elapsed();
+        compiler.set_source_text(macro_source, edited);
+        let local_started = std::time::Instant::now();
+        let local = compiler.compile_cell_preview(
+            &config,
+            &["bitcells".into(), "macros".into(), "sp_cell".into()],
+            vec![],
+        );
+        let local_elapsed = local_started.elapsed();
+        assert!(matches!(local, CompileOutput::Valid(_)));
+        let top_started = std::time::Instant::now();
+        let after = compiler.compile_cell(&config, &top, vec![]).unwrap_valid();
+        let top_elapsed = top_started.elapsed();
+        assert_eq!(after.cells.len(), direct_top.cells.len());
+        let reused = after
+            .cells
+            .iter()
+            .filter(|(id, cell)| {
+                before
+                    .cells
+                    .get(*id)
+                    .is_some_and(|previous| Arc::ptr_eq(previous, cell))
+            })
+            .count();
+        eprintln!(
+            "sram_subcell_edit,cold_ms={},direct_top_ms={},local_ms={},top_after_local_ms={},reused_cells={},total_cells={}",
+            cold.as_millis(),
+            direct_elapsed.as_millis(),
+            local_elapsed.as_millis(),
+            top_elapsed.as_millis(),
+            reused,
+            after.cells.len()
         );
     }
 }

@@ -5,13 +5,14 @@ use std::{
     sync::Arc,
 };
 
-use argonc::compile::{SolvedValue, bbox_dim_union, bbox_text_union, bbox_union, ifmatvec};
+use argonc::compile::{CellId, SolvedValue, bbox_dim_union, bbox_text_union, bbox_union, ifmatvec};
 use geometry::transform::TransformationMatrix;
 
 use super::{
-    CompileOutputState, CompiledData, ProcessScopeState, Rect, ScopeAddress, ScopePath, ScopeState,
-    mark_layer_used,
+    CompileOutputState, CompiledData, LayerState, ProcessScopeState, Rect, ScopeAddress, ScopePath,
+    ScopeState, mark_layer_used,
 };
+use gpui::SharedString;
 
 #[derive(Debug)]
 pub struct PreparedScope {
@@ -69,12 +70,25 @@ fn prepare_geometry(
     scopes: &mut HashMap<ScopeAddress, Arc<PreparedScope>>,
     layers: &mut indexmap::IndexSet<String>,
     previous: Option<&CompileOutputState>,
+    reusable: &HashSet<CellId>,
 ) {
     if scopes.contains_key(&address) {
         return;
     }
     let cell = &output.cells[&address.cell];
     let source_scope = &cell.scopes[&address.scope];
+    if reusable.contains(&address.cell)
+        && let Some(cached) = previous
+            .and_then(|old| old.state.get(&address))
+            .map(|scope| &scope.prepared)
+    {
+        // A content-derived cell and its whole instantiated closure are
+        // immutable. The old geometry is already prepared; walking its
+        // millions of execution scopes just to rediscover that costs more
+        // than recompiling a small parent edit.
+        scopes.insert(address, cached.clone());
+        return;
+    }
     if let Some(old) = previous
         && let Some(cached) = old
             .state
@@ -115,6 +129,7 @@ fn prepare_geometry(
                     scopes,
                     layers,
                     previous,
+                    reusable,
                 ),
                 SolvedValue::Dimension(_) => {}
             }
@@ -129,6 +144,7 @@ fn prepare_geometry(
                 scopes,
                 layers,
                 previous,
+                reusable,
             );
         }
         if cached.children.iter().all(|child| {
@@ -171,7 +187,7 @@ fn prepare_geometry(
                     cell: instance.cell,
                     scope: output.cells[&instance.cell].root,
                 };
-                prepare_geometry(output, child, scopes, layers, previous);
+                prepare_geometry(output, child, scopes, layers, previous, reusable);
                 children.push(child);
                 bbox = shared_bbox_union(
                     bbox,
@@ -203,7 +219,7 @@ fn prepare_geometry(
             cell: address.cell,
             scope: *child,
         };
-        prepare_geometry(output, child, scopes, layers, previous);
+        prepare_geometry(output, child, scopes, layers, previous, reusable);
         children.push(child);
         bbox = shared_bbox_union(bbox, scopes[&child].bbox.clone());
     }
@@ -369,16 +385,249 @@ fn reuse_paths(
     true
 }
 
+/// A reused cell is safe to keep as an opaque prepared subtree only when its
+/// own data and every referenced cell are the same immutable allocations.
+fn reusable_cells(output: &CompiledData, old: &CompileOutputState) -> HashSet<CellId> {
+    fn check(
+        id: CellId,
+        output: &CompiledData,
+        old: &CompileOutputState,
+        memo: &mut HashMap<CellId, bool>,
+    ) -> bool {
+        if let Some(reusable) = memo.get(&id) {
+            return *reusable;
+        }
+        let Some(cell) = output.cells.get(&id) else {
+            return false;
+        };
+        if !old
+            .output
+            .cells
+            .get(&id)
+            .is_some_and(|before| Arc::ptr_eq(before, cell))
+        {
+            memo.insert(id, false);
+            return false;
+        }
+        // Cached parents can retain their allocation while a referenced
+        // child is replaced (notably in generated and test hierarchies). The
+        // parent bbox and render index are reusable only if its closure is.
+        memo.insert(id, false);
+        let reusable = cell.objects.values().all(|value| match value {
+            SolvedValue::Instance(instance) => check(instance.cell, output, old, memo),
+            _ => true,
+        });
+        memo.insert(id, reusable);
+        reusable
+    }
+
+    let mut memo = HashMap::new();
+    for id in output.cells.keys() {
+        check(*id, output, old, &mut memo);
+    }
+    memo.into_iter()
+        .filter_map(|(id, reusable)| reusable.then_some(id))
+        .collect()
+}
+
+/// Update only changed cells in the persistent scope map. A common parent
+/// rectangle edit changes a handful of scopes, while the SRAM beneath it has
+/// millions of unchanged execution scopes; touching those again is unnecessary.
+fn reuse_unchanged_paths(
+    root: ScopeAddress,
+    scopes: &HashMap<ScopeAddress, Arc<PreparedScope>>,
+    state: &mut ProcessScopeState,
+    old: &CompileOutputState,
+    reusable: &HashSet<CellId>,
+) -> bool {
+    // Hidden scopes within a changed cell need name-path remapping. Let the
+    // structural fallback handle that uncommon case without losing visibility.
+    for (id, cell) in &old.output.cells {
+        if reusable.contains(id) {
+            continue;
+        }
+        for scope in cell.scopes.keys() {
+            let address = ScopeAddress {
+                cell: *id,
+                scope: *scope,
+            };
+            if old.state.get(&address).is_some_and(|scope| !scope.visible) {
+                return false;
+            }
+        }
+    }
+
+    state.state = old.state.as_ref().clone();
+    for (id, cell) in &old.output.cells {
+        if !reusable.contains(id) {
+            for scope in cell.scopes.keys() {
+                state.state.remove(&ScopeAddress {
+                    cell: *id,
+                    scope: *scope,
+                });
+            }
+        }
+    }
+    fn visit(
+        address: ScopeAddress,
+        parent: Option<ScopeAddress>,
+        scopes: &HashMap<ScopeAddress, Arc<PreparedScope>>,
+        state: &mut imbl::HashMap<ScopePath, ScopeState>,
+        reusable: &HashSet<CellId>,
+        seen: &mut HashSet<ScopeAddress>,
+    ) -> bool {
+        if !seen.insert(address) {
+            return true;
+        }
+        let Some(prepared) = scopes.get(&address) else {
+            return false;
+        };
+        if reusable.contains(&address.cell) {
+            let Some(existing) = state.get(&address) else {
+                return false;
+            };
+            if existing.parent != parent {
+                state.insert(
+                    address,
+                    ScopeState {
+                        parent,
+                        ..existing.clone()
+                    },
+                );
+            }
+            return true;
+        }
+        state.insert(
+            address,
+            ScopeState {
+                parent,
+                visible: true,
+                prepared: Arc::clone(prepared),
+            },
+        );
+        prepared
+            .children
+            .iter()
+            .rev()
+            .all(|child| visit(*child, Some(address), scopes, state, reusable, seen))
+    }
+    visit(
+        root,
+        None,
+        scopes,
+        &mut state.state,
+        reusable,
+        &mut HashSet::new(),
+    )
+}
+
+fn changed_cell_layers(output: &CompiledData, reusable: &HashSet<CellId>) -> HashSet<String> {
+    let mut layers = HashSet::new();
+    for (id, cell) in &output.cells {
+        if reusable.contains(id) {
+            continue;
+        }
+        for object in cell.objects.values() {
+            match object {
+                SolvedValue::Rect(rect) => {
+                    if let Some(layer) = &rect.layer {
+                        layers.insert(layer.clone());
+                    }
+                }
+                SolvedValue::Polygon(polygon) => {
+                    layers.insert(polygon.layer.clone());
+                }
+                SolvedValue::Path(path) => {
+                    layers.insert(path.layer.clone());
+                }
+                SolvedValue::Text(text) => {
+                    layers.insert(text.layer.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    layers
+}
+
 pub(super) fn prepare(
     output: &CompiledData,
     root: ScopeAddress,
     state: &mut ProcessScopeState,
     old: Option<&imbl::HashMap<ScopePath, ScopeState>>,
     previous: Option<&CompileOutputState>,
+    previous_layers: Option<&indexmap::IndexMap<SharedString, LayerState>>,
 ) -> PreparedHierarchy {
     let mut scopes = HashMap::new();
     let mut used_layers = indexmap::IndexSet::new();
-    prepare_geometry(output, root, &mut scopes, &mut used_layers, previous);
+    if let (Some(previous), Some(previous_layers)) = (previous, previous_layers) {
+        let profile_start = std::time::Instant::now();
+        let reusable = reusable_cells(output, previous);
+        let reusable_elapsed = profile_start.elapsed();
+        let old_changed_layers = changed_cell_layers(&previous.output, &reusable);
+        let new_changed_layers = changed_cell_layers(output, &reusable);
+        let layers_elapsed = profile_start.elapsed();
+        let same_layer_names = previous
+            .output
+            .tech
+            .layers
+            .iter()
+            .map(|layer| layer.name.as_str())
+            .eq(output.tech.layers.iter().map(|layer| layer.name.as_str()));
+        let no_new_unknown_layers = new_changed_layers.iter().all(|layer| {
+            state.layers.contains_key(layer.as_str())
+                || previous_layers.contains_key(layer.as_str())
+        });
+        if same_layer_names
+            && no_new_unknown_layers
+            && old_changed_layers.is_subset(&new_changed_layers)
+        {
+            prepare_geometry(
+                output,
+                root,
+                &mut scopes,
+                &mut used_layers,
+                Some(previous),
+                &reusable,
+            );
+            let geometry_elapsed = profile_start.elapsed();
+            if reuse_unchanged_paths(root, &scopes, state, previous, &reusable) {
+                let paths_elapsed = profile_start.elapsed();
+                for (name, layer) in previous_layers {
+                    if layer.used {
+                        mark_layer_used(state, name);
+                    }
+                }
+                for layer in new_changed_layers {
+                    mark_layer_used(state, &layer);
+                }
+                if std::env::var_os("ARGON_PROFILE_HIERARCHY").is_some() {
+                    eprintln!(
+                        "hierarchy_fast,reusable_ms={},layers_ms={},geometry_ms={},paths_ms={},total_ms={},reused_cells={},new_scopes={}",
+                        reusable_elapsed.as_millis(),
+                        layers_elapsed.as_millis(),
+                        geometry_elapsed.as_millis(),
+                        paths_elapsed.as_millis(),
+                        profile_start.elapsed().as_millis(),
+                        reusable.len(),
+                        scopes.len(),
+                    );
+                }
+                return PreparedHierarchy { scopes };
+            }
+            scopes.clear();
+            state.state.clear();
+            used_layers.clear();
+        }
+    }
+    prepare_geometry(
+        output,
+        root,
+        &mut scopes,
+        &mut used_layers,
+        previous,
+        &HashSet::new(),
+    );
     for layer in &used_layers {
         mark_layer_used(state, layer);
     }
@@ -470,7 +719,7 @@ cell top() {
         let mut expected = ProcessScopeState::default();
         Reference::process_scope_reference(&output, root, &mut expected, None, None);
         let mut actual = ProcessScopeState::default();
-        prepare(&output, root, &mut actual, None, None);
+        prepare(&output, root, &mut actual, None, None, None);
         assert_equivalent(&actual, &expected);
         let mut old = expected.state;
         for (index, (_, scope)) in old.iter_mut().enumerate() {
@@ -479,7 +728,7 @@ cell top() {
         let mut expected = ProcessScopeState::default();
         Reference::process_scope_reference(&output, root, &mut expected, None, Some(&old));
         let mut actual = ProcessScopeState::default();
-        prepare(&output, root, &mut actual, Some(&old), None);
+        prepare(&output, root, &mut actual, Some(&old), None, None);
         assert_equivalent(&actual, &expected);
     }
 
@@ -511,6 +760,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
         ];
         let mut compiler = argonc::incremental::IncrementalCompiler::new();
         let mut previous: Option<CompileOutputState> = None;
+        let mut previous_layers = None;
         for program in programs {
             compiler.set_source_text(source.clone(), program);
             let output = compiler
@@ -522,7 +772,14 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             };
             let mut actual = ProcessScopeState::default();
             let old_state = previous.as_ref().map(|old| old.state.as_ref());
-            prepare(&output, root, &mut actual, old_state, previous.as_ref());
+            prepare(
+                &output,
+                root,
+                &mut actual,
+                old_state,
+                previous.as_ref(),
+                previous_layers.as_ref(),
+            );
             let mut expected = ProcessScopeState::default();
             Reference::process_scope_reference(&output, root, &mut expected, None, old_state);
             if previous.is_some() {
@@ -533,12 +790,196 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             assert_equivalent(&actual, &expected);
             // A visibility override must survive every compatible path change.
             actual.state.get_mut(&root).unwrap().visible = false;
+            previous_layers = Some(actual.layers.clone());
             previous = Some(CompileOutputState {
                 selected_scope: root,
                 output: Arc::new(output),
                 state: Arc::new(actual.state),
             });
         }
+    }
+
+    #[test]
+    #[ignore = "SRAM hierarchy timing benchmark; run in release with --nocapture"]
+    fn bench_sram_parent_rectangle_preparation() {
+        let workspace =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/sram");
+        let source = workspace.join("lib.ar");
+        let original = std::fs::read_to_string(&source).unwrap();
+        let config = argonc::WorkspaceConfig::new(&source)
+            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")));
+        let cell = vec!["benchmark_parent".to_owned()];
+        let mut compiler = argonc::incremental::IncrementalCompiler::new();
+        compiler.set_source_text(
+            source.clone(),
+            format!(
+                "{original}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); }}\n"
+            ),
+        );
+        let before = compiler.compile_cell(&config, &cell, vec![]).unwrap_valid();
+        let old_root = ScopeAddress {
+            cell: before.top,
+            scope: before.cells[&before.top].root,
+        };
+        let mut old_state = ProcessScopeState::default();
+        let start = std::time::Instant::now();
+        prepare(&before, old_root, &mut old_state, None, None, None);
+        let cold = start.elapsed();
+        let old_layers = old_state.layers.clone();
+        let previous = CompileOutputState {
+            output: Arc::new(before),
+            selected_scope: old_root,
+            state: Arc::new(old_state.state),
+        };
+        compiler.set_source_text(
+            source,
+            format!(
+                "{original}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); let r = rect(\"met1.drawing\", x0=0., y0=0., x1=100., y1=100.)!; }}\n"
+            ),
+        );
+        let after = compiler.compile_cell(&config, &cell, vec![]).unwrap_valid();
+        let root = ScopeAddress {
+            cell: after.top,
+            scope: after.cells[&after.top].root,
+        };
+        let mut next_state = ProcessScopeState::default();
+        let start = std::time::Instant::now();
+        prepare(
+            &after,
+            root,
+            &mut next_state,
+            Some(previous.state.as_ref()),
+            Some(&previous),
+            Some(&old_layers),
+        );
+        let warm = start.elapsed();
+        assert_eq!(next_state.state.len(), previous.state.len());
+        eprintln!(
+            "sram_hierarchy_prepare,cold_ms={},edited_ms={},scopes={}",
+            cold.as_millis(),
+            warm.as_millis(),
+            next_state.state.len()
+        );
+
+        // Model a batch editor deletion after many rectangles were drawn in
+        // the parent. The SRAM below the parent must remain cached.
+        let rectangles = (0..100)
+            .map(|i| {
+                let x0 = i * 100;
+                format!(
+                    "let r{i} = rect(\"met1.drawing\", x0={x0}., y0=0., x1={}., y1=100.)!;",
+                    x0 + 100
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let with_rectangles = format!(
+            "{original}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); {rectangles} }}\n"
+        );
+        let without_rectangles = format!(
+            "{original}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); }}\n"
+        );
+        let mut previous = CompileOutputState {
+            output: Arc::new(after),
+            selected_scope: root,
+            state: Arc::new(next_state.state),
+        };
+        let mut previous_layers = next_state.layers;
+        for (label, text) in [
+            ("many_rectangles", with_rectangles),
+            ("bulk_delete", without_rectangles),
+        ] {
+            compiler.set_source_text(workspace.join("lib.ar"), text);
+            let started = std::time::Instant::now();
+            let output = compiler.compile_cell(&config, &cell, vec![]).unwrap_valid();
+            let compile_ms = started.elapsed().as_millis();
+            let next_root = ScopeAddress {
+                cell: output.top,
+                scope: output.cells[&output.top].root,
+            };
+            let mut next = ProcessScopeState::default();
+            let started = std::time::Instant::now();
+            prepare(
+                &output,
+                next_root,
+                &mut next,
+                Some(previous.state.as_ref()),
+                Some(&previous),
+                Some(&previous_layers),
+            );
+            eprintln!(
+                "sram_parent_{label},compile_ms={compile_ms},hierarchy_ms={},scopes={}",
+                started.elapsed().as_millis(),
+                next.state.len()
+            );
+            let started = std::time::Instant::now();
+            let all_visible = next.state.values().all(|scope| scope.visible);
+            eprintln!(
+                "sram_parent_{label},visibility_scan_ms={},all_visible={all_visible}",
+                started.elapsed().as_millis(),
+            );
+            previous_layers = next.layers;
+            previous = CompileOutputState {
+                output: Arc::new(output),
+                selected_scope: next_root,
+                state: Arc::new(next.state),
+            };
+        }
+    }
+
+    #[test]
+    #[ignore = "SRAM subcell hierarchy timing benchmark; run in release with --nocapture"]
+    fn bench_sram_subcell_preparation() {
+        let workspace =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/sram");
+        let source = workspace.join("lib.ar");
+        let macro_source = workspace.join("bitcells/macros.ar");
+        let original = std::fs::read_to_string(&macro_source).unwrap();
+        let edited = original.replacen(
+            "cell sp_cell() {",
+            "cell sp_cell() { let debug_rect = rect(\"met1.drawing\", x0=-100., y0=-100., x1=-90., y1=-90.);",
+            1,
+        );
+        let config = argonc::WorkspaceConfig::new(&source)
+            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")));
+        let cell = vec!["example_no_control_logic".to_owned()];
+        let mut compiler = argonc::incremental::IncrementalCompiler::new();
+        let before = compiler.compile_cell(&config, &cell, vec![]).unwrap_valid();
+        let old_root = ScopeAddress {
+            cell: before.top,
+            scope: before.cells[&before.top].root,
+        };
+        let mut old_state = ProcessScopeState::default();
+        prepare(&before, old_root, &mut old_state, None, None, None);
+        let old_layers = old_state.layers.clone();
+        let previous = CompileOutputState {
+            output: Arc::new(before),
+            selected_scope: old_root,
+            state: Arc::new(old_state.state),
+        };
+        compiler.set_source_text(macro_source, edited);
+        let after = compiler.compile_cell(&config, &cell, vec![]).unwrap_valid();
+        let root = ScopeAddress {
+            cell: after.top,
+            scope: after.cells[&after.top].root,
+        };
+        let mut next = ProcessScopeState::default();
+        let started = std::time::Instant::now();
+        prepare(
+            &after,
+            root,
+            &mut next,
+            Some(previous.state.as_ref()),
+            Some(&previous),
+            Some(&old_layers),
+        );
+        let warm = started.elapsed();
+        assert_eq!(next.state.len(), previous.state.len());
+        eprintln!(
+            "sram_subcell_hierarchy_prepare,edited_ms={},scopes={}",
+            warm.as_millis(),
+            next.state.len()
+        );
     }
 
     struct Reference;

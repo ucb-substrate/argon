@@ -5,7 +5,7 @@ use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 use argonc::{
     ast::Span,
     compile::{BasicRect, CellId, CompileOutput, CompiledData, PreviewGeometry},
-    parse::WorkspaceParseAst,
+    parse::{AnnotatedParseAst, WorkspaceParseAst},
 };
 
 use serde::{Deserialize, Serialize};
@@ -88,6 +88,9 @@ pub struct InstancePreview {
 pub struct RectangleEditResult {
     pub span: Span,
     pub revision: u64,
+    /// The source-authoritative binding name, which may differ when several
+    /// drawings outpace the last compiled geometry snapshot.
+    pub name: String,
 }
 
 /// A compiled GUI result tied to the exact analyzer source revision that
@@ -135,6 +138,12 @@ pub struct CompilationUpdate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressedCompilationUpdate {
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FocusedCellPreview {
+    pub previous_cell: CellId,
+    pub update: CompressedCompilationUpdate,
 }
 
 /// GUI-side costs for accepting a compilation snapshot. Returning these to the
@@ -264,11 +273,15 @@ pub trait Gui {
     async fn compilation_started(activity_id: u64);
     async fn compilation_finished(activity_id: u64);
     async fn update_cell(update: CompressedCompilationUpdate) -> GuiUpdateResult;
+    /// An independent, focused-cell geometry snapshot. It never advances the
+    /// full-snapshot delta base or replaces the opened top-level hierarchy.
+    async fn preview_cell(preview: FocusedCellPreview) -> GuiUpdateResult;
     async fn show_message(typ: MessageType, message: String);
     async fn fit();
     async fn set_workspace_path(path: Option<PathBuf>);
     async fn workspace_modified(modified: bool);
     async fn selected_scope() -> Option<Span>;
+    async fn selected_cell() -> Option<CellId>;
     async fn place_instance(preview: InstancePreview);
     async fn configure(config: ArgonConfig);
     async fn activate();
@@ -283,6 +296,47 @@ pub(crate) fn source_edit_error(ast: &WorkspaceParseAst, span: &Span) -> Option<
         return Some("The selected GUI object is no longer part of the current Argon workspace.");
     };
     (span.span.end() > ast.source_text.len()).then_some(READ_ONLY_GENERATED_SOURCE_MESSAGE)
+}
+
+/// Re-find a scope after queued edits. A scope is safe to match by the same
+/// opening offset when the prefix is unchanged, or by a shifted offset when
+/// the complete suffix beginning at that scope is unchanged. If neither side
+/// anchors it, an old byte offset could select a different scope.
+fn scope_after_insertion(
+    ast: &AnnotatedParseAst,
+    old_scope: &Span,
+    old_source: &str,
+) -> Option<Span> {
+    let old_start = old_scope.span.start();
+    let current = ast.source_text.as_str();
+    let prefix_unchanged = old_start < old_source.len()
+        && old_start < current.len()
+        && old_source.as_bytes()[..=old_start] == current.as_bytes()[..=old_start];
+    let start = if prefix_unchanged {
+        old_start
+    } else {
+        let suffix = old_source.get(old_start..)?;
+        current.strip_suffix(suffix).map(str::len)?
+    };
+    if prefix_unchanged && ast.span2scope.contains_key(old_scope) {
+        return Some(old_scope.clone());
+    }
+    let mut matching = ast
+        .span2scope
+        .keys()
+        .filter(|span| span.path == old_scope.path && span.span.start() == start);
+    let scope = matching.next()?.clone();
+    matching.next().is_none().then_some(scope)
+}
+
+fn available_rect_name(requested: String, used: &std::collections::HashSet<&str>) -> String {
+    if !used.contains(requested.as_str()) {
+        return requested;
+    }
+    (0..)
+        .map(|index| format!("rect{index}"))
+        .find(|name| !used.contains(name.as_str()))
+        .expect("a finite scope has a free rectangle name")
 }
 
 pub(crate) fn editor_buffers_are_current(source: &SourceState, compiled: &PublishedState) -> bool {
@@ -620,20 +674,71 @@ impl LangServer for State {
         var_name: String,
         rect: BasicRect<f64>,
     ) -> Option<RectangleEditResult> {
-        let Some(workspace_ast) = self.current_editor_ast().await else {
-            self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
-                .await;
-            return None;
+        let published_source = {
+            let published = self.published_state.lock().await;
+            if let Some(error) = source_edit_error(&published.ast, &scope_span) {
+                drop(published);
+                self.report_message(MessageType::ERROR, error).await;
+                return None;
+            }
+            published
+                .ast
+                .values()
+                .find(|ast| ast.path == scope_span.path)?
+                .source_text
+                .clone()
         };
-        if let Some(error) = source_edit_error(&workspace_ast, &scope_span) {
-            self.report_message(MessageType::ERROR, error).await;
-            return None;
-        }
         let url = Uri::from_file_path(&scope_span.path)?;
-        let ast = workspace_ast
-            .values()
-            .find(|ast| ast.path == scope_span.path)?;
-        let scope = ast.span2scope.get(&scope_span)?;
+        // The editor can acknowledge an insertion before its didChange event
+        // reaches the analyzer. Wait for that local source update, not for the
+        // entire layout to compile, before inserting the next queued shape.
+        let wait_started = std::time::Instant::now();
+        let source_text = loop {
+            let source = self.source_state.lock().await;
+            if !source.pending_workspace_edits.contains_key(&url) {
+                break source
+                    .editor_files
+                    .get(&url)
+                    .map(|document| document.contents().to_owned())
+                    .unwrap_or_else(|| published_source.to_string());
+            }
+            drop(source);
+            if wait_started.elapsed() >= std::time::Duration::from_secs(3) {
+                self.report_message(
+                    MessageType::ERROR,
+                    "Timed out waiting for the editor to apply the previous drawing.",
+                )
+                .await;
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        let ast = match argonc::parse::parse_source_text(source_text, scope_span.path.clone()) {
+            Ok(ast) => ast,
+            Err(error) => {
+                self.report_message(MessageType::ERROR, error.to_string())
+                    .await;
+                return None;
+            }
+        };
+        let current_scope = match scope_after_insertion(&ast, &scope_span, &published_source) {
+            Some(scope) => scope,
+            None => {
+                self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+                    .await;
+                return None;
+            }
+        };
+        let scope = &ast.span2scope[&current_scope];
+        let used_names = scope
+            .stmts
+            .iter()
+            .filter_map(|statement| match statement {
+                argonc::ast::Statement::LetBinding(binding) => Some(binding.name.name.as_str()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let var_name = available_rect_name(var_name, &used_names);
         let document = self.document(&ast.source_text);
         let grid = self.technology_grid().await;
         let expression = format!(
@@ -665,6 +770,7 @@ impl LangServer for State {
         Some(RectangleEditResult {
             span,
             revision: self.source_state.lock().await.revision,
+            name: var_name,
         })
     }
 
@@ -1115,6 +1221,48 @@ impl LangServer for State {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rapid_rectangles_get_unique_source_names_even_with_a_stale_layout() {
+        let mut names = std::collections::HashSet::<String>::new();
+        for _ in 0..100 {
+            // The GUI may keep requesting the same name while a large top
+            // cell is still evaluating. The source is authoritative.
+            let used = names.iter().map(String::as_str).collect();
+            let name = super::available_rect_name("rect61".to_owned(), &used);
+            assert!(names.insert(name));
+        }
+        assert!(names.contains("rect61"));
+        assert_eq!(names.len(), 100);
+    }
+
+    #[test]
+    fn queued_rectangle_relocates_scope_without_top_level_compilation() {
+        let path = std::path::PathBuf::from("lib.ar");
+        let original = "cell top() { let first = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.); }";
+        let parsed = argonc::parse::parse_source_text(original, path.clone()).unwrap();
+        let scope = parsed.span2scope.keys().next().unwrap().clone();
+        let edited = original.replace(
+            " }",
+            " let second = rect(\"met1\", x0=2., y0=2., x1=3., y1=3.); }",
+        );
+        let current = argonc::parse::parse_source_text(edited, path.clone()).unwrap();
+        let relocated = super::scope_after_insertion(&current, &scope, original).unwrap();
+        assert_eq!(relocated.span.start(), scope.span.start());
+        assert!(relocated.span.end() > scope.span.end());
+
+        let shifted = format!("// shifted\n{original}");
+        let shifted = argonc::parse::parse_source_text(shifted, path.clone()).unwrap();
+        let relocated = super::scope_after_insertion(&shifted, &scope, original).unwrap();
+        assert_eq!(
+            relocated.span.start(),
+            scope.span.start() + "// shifted\n".len()
+        );
+
+        let ambiguous = format!("// shifted\n{original}\n// changed tail");
+        let ambiguous = argonc::parse::parse_source_text(ambiguous, path).unwrap();
+        assert!(super::scope_after_insertion(&ambiguous, &scope, original).is_none());
+    }
+
     #[test]
     fn compilation_delta_preserves_identity_order_and_removes_old_cells() {
         use super::{CompilationSnapshot, CompilationUpdate, CompressedCompilationUpdate};

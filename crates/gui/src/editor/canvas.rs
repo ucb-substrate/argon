@@ -14,9 +14,11 @@ use analyzer::rpc::{
     DimensionParams, DrawSegmentConstraint, InitialConditionEdit, InstancePreview, PathParams,
     PolygonParams, RectangleEditResult, ValueEdit,
 };
+#[cfg(test)]
+use argonc::compile::RectInitialCondition;
 use argonc::{
     ast::Span,
-    compile::{self, CellId, CompiledData, ObjectId, RectInitialCondition, SolvedValue, ifmatvec},
+    compile::{self, CellId, CompiledData, ObjectId, SolvedValue, ifmatvec},
     solver::{LinearExpr, Var},
 };
 use enumify::enumify;
@@ -342,6 +344,45 @@ struct SseBody {
     targets: Vec<SseDragTarget>,
 }
 
+/// How a solved rectangle's width/height changes per layout unit of SSE
+/// pointer motion. Built once at drag start, so pointer moves need not walk
+/// the compiled cell or solve its basis for every rectangle.
+#[derive(Clone, Copy, Debug)]
+struct SseRectDragLimit {
+    width: f64,
+    height: f64,
+    width_dx: f64,
+    width_dy: f64,
+    height_dx: f64,
+    height_dy: f64,
+}
+
+fn limited_sse_pointer_delta(
+    proposed: Point<Pixels>,
+    scale: f32,
+    grid: f64,
+    limits: &[SseRectDragLimit],
+) -> Point<Pixels> {
+    if limits.is_empty() {
+        return proposed;
+    }
+    let dx = proposed.x.to_f64() / f64::from(scale);
+    let dy = -proposed.y.to_f64() / f64::from(scale);
+    let min_span = grid.max(1e-9);
+    let mut factor = 1_f64;
+    for limit in limits {
+        for (span, change) in [
+            (limit.width, limit.width_dx * dx + limit.width_dy * dy),
+            (limit.height, limit.height_dx * dx + limit.height_dy * dy),
+        ] {
+            if change < -crate::sse::EPSILON {
+                factor = factor.min(((span - min_span).max(0.) / -change).clamp(0., 1.));
+            }
+        }
+    }
+    Point::new(proposed.x * factor as f32, proposed.y * factor as f32)
+}
+
 #[derive(Clone)]
 struct LabeledBbox {
     rect: Rect,
@@ -645,13 +686,6 @@ fn ordered_dimension_rects<'a>(
         .collect::<Vec<_>>();
     candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
     candidates.into_iter().map(|(rect, _, _)| rect).collect()
-}
-
-struct InitialConditionUpdate {
-    span: Span,
-    value: f64,
-    changed: bool,
-    target: Option<RectInitialCondition>,
 }
 
 #[derive(Clone, Debug)]
@@ -1003,6 +1037,7 @@ struct PendingRectangle {
     source_path: std::path::PathBuf,
     name: String,
     rect: compile::BasicRect<f64>,
+    submitted: bool,
     submitted_revision: Option<u64>,
     receipt: Option<RectangleEditResult>,
     resolved_content_revision: Option<u64>,
@@ -1019,6 +1054,8 @@ impl PendingRectangle {
             id: None,
             cvars: None,
             border_widths: Edges::all(DEFAULT_BORDER_WIDTH),
+            // GUI-created rectangles use initial conditions, leaving all four
+            // coordinates SSE-draggable. Their compiled edges are dashed too.
             border_styles: Edges::all(BorderStyle::Dashed),
         }
     }
@@ -1027,6 +1064,19 @@ impl PendingRectangle {
         self.resolved_content_revision
             .is_some_and(|resolved| revision >= resolved)
     }
+}
+
+fn next_rectangle_submission(states: impl IntoIterator<Item = (bool, bool)>) -> Option<usize> {
+    let mut first_queued = None;
+    for (index, (submitted, source_accepted)) in states.into_iter().enumerate() {
+        if submitted && !source_accepted {
+            return None;
+        }
+        if !submitted && first_queued.is_none() {
+            first_queued = Some(index);
+        }
+    }
+    first_queued
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1175,11 +1225,14 @@ pub struct LayoutCanvas {
     // Keep displaying the final drag preview after mouse-up until the analyzer
     // sends back the result compiled from the rewritten initial conditions.
     is_sse_persisting: bool,
+    sse_source_edit_inflight: bool,
     pending_sse_values: Vec<PendingSseValue>,
     deferred_snapshot: Option<PreparedCompilationSnapshot>,
+    deferred_cell_preview: Option<(CellId, editor::ScopePath, PreparedCompilationSnapshot)>,
     sse_persist_after_revision: Option<u64>,
     sse_targets: Vec<SseDragTarget>,
     sse_delta: Point<Pixels>,
+    sse_rect_drag_limits: Vec<SseRectDragLimit>,
     // Drag handles and movable rectangle/instance bodies, recomputed each paint.
     sse_handles: Vec<SseHandle>,
     sse_bodies: Vec<SseBody>,
@@ -1232,6 +1285,9 @@ pub struct LayoutCanvas {
     last_presented_raster: Cell<Option<RasterDisplayTransform>>,
     retained_direct_frame: Option<Arc<DirectFrame>>,
     pending_rectangles: Vec<PendingRectangle>,
+    /// Source-edit queue paths follow full snapshots only. A focused geometry
+    /// preview has different cell IDs but must not retarget queued edits.
+    pending_scope_state: Option<Arc<imbl::HashMap<editor::ScopePath, editor::ScopeState>>>,
     next_rectangle_id: u64,
     #[cfg(test)]
     painted_complete_frame: bool,
@@ -1283,6 +1339,7 @@ pub struct LayoutCanvas {
     raster_layer_visibility: Vec<bool>,
     raster_hierarchy_depth: usize,
     raster_hide_external_geometry: bool,
+    raster_exclude_editable_geometry: bool,
     /// Conservative world-space bounds for everything the active presentation
     /// can draw. If retained tiles contain this box, zooming out may expose
     /// uncovered background but cannot expose missing geometry.
@@ -1407,6 +1464,7 @@ struct NavigationRasterInput {
     viewport: ViewportTransform,
     text_color: Rgba,
     include_text: bool,
+    exclude_editable_geometry: bool,
     content_revision: u64,
     content_revision_signal: Arc<AtomicU64>,
     scale_signal: Arc<AtomicU64>,
@@ -4043,7 +4101,9 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
             emits,
             occupancies: lod_occupancies,
             flattened_scope_tree,
-        } = if input.use_spatial_index {
+        } = if input.use_spatial_index
+            && !(input.exclude_editable_geometry && cell == selected.cell)
+        {
             input.spatial_index.query_lod(
                 &input.solved_cell,
                 address,
@@ -4088,6 +4148,12 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
             }
             let emitting_scope = &cell_info.scopes[&emit.scope];
             let (object, _) = &emitting_scope.emit[emit.emit_index];
+            if input.exclude_editable_geometry
+                && cell == selected.cell
+                && !matches!(cell_info.objects[object], SolvedValue::Instance(_))
+            {
+                continue;
+            }
             match &cell_info.objects[object] {
                 SolvedValue::Rect(rect) if !rect.construction => {
                     let Some(layer) = rect
@@ -5614,19 +5680,41 @@ fn same_scope_name_path(
     }
 }
 
-fn sort_initial_condition_pair(
-    updates: &mut [InitialConditionUpdate],
-    low_index: usize,
-    high_index: usize,
-) {
-    if let Some((low, high)) =
-        sorted_initial_condition_values(updates[low_index].value, updates[high_index].value)
-    {
-        updates[low_index].value = low;
-        updates[high_index].value = high;
-        updates[low_index].changed = true;
-        updates[high_index].changed = true;
+fn remap_scope_name_path(
+    old_state: &imbl::HashMap<editor::ScopePath, editor::ScopeState>,
+    old_scope: editor::ScopePath,
+    new_state: &imbl::HashMap<editor::ScopePath, editor::ScopeState>,
+    new_selected: editor::ScopePath,
+) -> Option<editor::ScopePath> {
+    if new_state.contains_key(&old_scope) {
+        return Some(old_scope);
     }
+    let mut names = Vec::new();
+    let mut current = Some(old_scope);
+    while let Some(address) = current {
+        let scope = old_state.get(&address)?;
+        names.push(scope.name.clone());
+        current = scope.parent;
+    }
+    let mut root = new_selected;
+    while let Some(parent) = new_state.get(&root)?.parent {
+        root = parent;
+    }
+    let mut names = names.into_iter().rev();
+    if new_state.get(&root)?.name != names.next()? {
+        return None;
+    }
+    let mut address = root;
+    for name in names {
+        address = new_state
+            .get(&address)?
+            .children
+            .iter()
+            .rev()
+            .copied()
+            .find(|child| new_state.get(child).is_some_and(|scope| scope.name == name))?;
+    }
+    Some(address)
 }
 
 fn fallback_value_edits(
@@ -5634,61 +5722,15 @@ fn fallback_value_edits(
     dv: &SparseVec,
     grid: f64,
 ) -> Vec<ValueEdit> {
-    let mut updates = fallbacks
+    fallbacks
         .iter()
-        .map(|fallback| {
+        .filter_map(|fallback| {
             let (value, changed) =
                 crate::sse::initial_condition_after_drag(&fallback.constraint, dv);
-            InitialConditionUpdate {
+            changed.then(|| ValueEdit {
                 span: fallback.span.clone(),
-                value,
-                changed,
-                target: fallback.initial_condition,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    // Rectangle edges exchange their initial values when dragged across one
-    // another. Polygon coordinates remain attached to their vertex index.
-    let mut pairs: HashMap<ObjectId, [Option<usize>; 4]> = HashMap::new();
-    for (index, update) in updates.iter().enumerate() {
-        let Some(target) = update.target else {
-            continue;
-        };
-        let (id, edge) = match target {
-            RectInitialCondition::X0(id) => (id, 0),
-            RectInitialCondition::X1(id) => (id, 1),
-            RectInitialCondition::Y0(id) => (id, 2),
-            RectInitialCondition::Y1(id) => (id, 3),
-            RectInitialCondition::PolygonX(_, _)
-            | RectInitialCondition::PolygonY(_, _)
-            | RectInitialCondition::PathX(_, _)
-            | RectInitialCondition::PathY(_, _)
-            | RectInitialCondition::PathWidth(_)
-            | RectInitialCondition::PathBeginExtension(_)
-            | RectInitialCondition::PathEndExtension(_)
-            | RectInitialCondition::InstanceX(_)
-            | RectInitialCondition::InstanceY(_) => {
-                continue;
-            }
-        };
-        pairs.entry(id).or_insert([None; 4])[edge] = Some(index);
-    }
-    for pair in pairs.values() {
-        if let (Some(x0), Some(x1)) = (pair[0], pair[1]) {
-            sort_initial_condition_pair(&mut updates, x0, x1);
-        }
-        if let (Some(y0), Some(y1)) = (pair[2], pair[3]) {
-            sort_initial_condition_pair(&mut updates, y0, y1);
-        }
-    }
-
-    updates
-        .into_iter()
-        .filter(|update| update.changed)
-        .map(|update| ValueEdit {
-            span: update.span,
-            value: crate::sse::format_value(update.value, grid),
+                value: crate::sse::format_value(value, grid),
+            })
         })
         .collect()
 }
@@ -5733,10 +5775,6 @@ fn drag_persistence_edits(
         values,
         initial_conditions,
     }
-}
-
-fn sorted_initial_condition_values(low: f64, high: f64) -> Option<(f64, f64)> {
-    (low > high).then_some((high, low))
 }
 
 /// Maps a selected object's source span through the value replacements used to
@@ -6016,7 +6054,7 @@ impl Element for CanvasElement {
                 inner.pending_init = false;
                 inner.fit_to_screen(cx);
             }
-            let has_solved_layout = inner.state.read(cx).solved_cell.read(cx).is_some();
+            let has_solved_layout = inner.state.read(cx).displayed_cell(cx).is_some();
             let raster_matches_viewport = inner
                 .raster_tiles
                 .as_ref()
@@ -6036,7 +6074,7 @@ impl Element for CanvasElement {
             }
         });
         let inner = self.inner.read(cx);
-        let solved_cell = &inner.state.read(cx).solved_cell.read(cx);
+        let solved_cell = inner.state.read(cx).displayed_cell(cx);
         let hide_external_geometry = &inner.state.read(cx).hide_external_geometry;
         let state = inner.state.read(cx);
         let pattern_tiles = inner.pattern_tiles.clone();
@@ -6142,7 +6180,7 @@ impl Element for CanvasElement {
                 scope_rects = frame.scope_rects.clone();
                 return Some(());
             }
-            if let Some(solved_cell) = solved_cell {
+            if let Some(solved_cell) = &solved_cell {
                 let scope_address = &solved_cell.selected_scope;
                 let editable_cell = &solved_cell.output.cells[&scope_address.cell];
                 if inner.is_sse_dragging || inner.is_sse_persisting {
@@ -7049,11 +7087,22 @@ impl Element for CanvasElement {
             .filter(|pending| {
                 !pending.included_in_frame(presented_content_revision)
                     && solved_cell.as_ref().is_some_and(|solved| {
-                        solved.selected_scope == pending.scope_path
-                            && solved
-                                .state
-                                .get(&pending.scope_path)
-                                .is_some_and(|scope| scope.visible)
+                        let displayed_path = if solved.state.contains_key(&pending.scope_path) {
+                            Some(pending.scope_path)
+                        } else {
+                            inner.pending_scope_state.as_deref().and_then(|old| {
+                                remap_scope_name_path(
+                                    old,
+                                    pending.scope_path,
+                                    &solved.state,
+                                    solved.selected_scope,
+                                )
+                            })
+                        };
+                        displayed_path.is_some_and(|path| {
+                            path == solved.selected_scope
+                                && solved.state.get(&path).is_some_and(|scope| scope.visible)
+                        })
                     })
             })
             .filter_map(|pending| {
@@ -7102,6 +7151,7 @@ impl Element for CanvasElement {
             Presentation::Raster { display, .. } => (display.scale, display.offset),
             Presentation::Direct => (scale, offset),
         };
+        let paint_editable_geometry = inner.raster_exclude_editable_geometry;
         inner
             .bg_style
             .clone()
@@ -7230,7 +7280,7 @@ impl Element for CanvasElement {
                 // editable cell's own objects. It is painted on top only while a
                 // drag previews their new positions; otherwise the tiles already
                 // show it at the same LOD.
-                let paint_geometry = !shallow || sse_dv.is_some();
+                let paint_geometry = !shallow || sse_dv.is_some() || paint_editable_geometry;
                 // GPUI batches quads, paths, and image sprites by primitive
                 // kind inside one paint layer, not by submission order. Give
                 // each technology layer its own fill and outline stacking
@@ -7411,6 +7461,18 @@ impl Element for CanvasElement {
                             window.paint_quad(get_paint_quad(
                                 preview_bounds,
                                 ShapeFill::Hollow,
+                                preview_color,
+                                layer.border_color,
+                                preview.border_widths,
+                                preview.border_styles,
+                            ));
+                        } else if paint_editable_geometry {
+                            // The committed rectangle is painted live above
+                            // the background raster, so keep its pending fill
+                            // on that same GPUI path across compilation.
+                            window.paint_quad(get_paint_quad(
+                                preview_bounds,
+                                preview_fill,
                                 preview_color,
                                 layer.border_color,
                                 preview.border_widths,
@@ -8643,11 +8705,14 @@ impl LayoutCanvas {
             is_dragging: false,
             is_sse_dragging: false,
             is_sse_persisting: false,
+            sse_source_edit_inflight: false,
             pending_sse_values: Vec::new(),
             deferred_snapshot: None,
+            deferred_cell_preview: None,
             sse_persist_after_revision: None,
             sse_targets: Vec::new(),
             sse_delta: Point::default(),
+            sse_rect_drag_limits: Vec::new(),
             sse_handles: Vec::new(),
             sse_bodies: Vec::new(),
             drag_start: Point::default(),
@@ -8667,10 +8732,12 @@ impl LayoutCanvas {
                     let change = canvas.update_raster_presentation(cx);
                     if change == RasterPresentationChange::None {
                         canvas.reconcile_pending_rectangles(cx);
+                        canvas.try_submit_next_rectangle(cx);
                         return;
                     }
                     canvas.raster_content_revision = canvas.raster_content_revision.wrapping_add(1);
                     canvas.reconcile_pending_rectangles(cx);
+                    canvas.try_submit_next_rectangle(cx);
                     canvas
                         .raster_content_revision_signal
                         .store(canvas.raster_content_revision, Ordering::Release);
@@ -8731,6 +8798,7 @@ impl LayoutCanvas {
             last_presented_raster: Cell::new(None),
             retained_direct_frame: None,
             pending_rectangles: Vec::new(),
+            pending_scope_state: None,
             next_rectangle_id: 0,
             #[cfg(test)]
             painted_complete_frame: false,
@@ -8758,6 +8826,7 @@ impl LayoutCanvas {
             raster_layer_visibility: Vec::new(),
             raster_hierarchy_depth: usize::MAX,
             raster_hide_external_geometry: false,
+            raster_exclude_editable_geometry: false,
             raster_layout_bbox: None,
             raster_dark_mode: true,
             cell_raster_tiles: Arc::new(Mutex::new(CellRasterTileCache::default())),
@@ -8836,6 +8905,26 @@ impl LayoutCanvas {
     /// changed. UI-only changes, such as selecting a layer in the sidebar, do
     /// not force a rebuild.
     fn update_raster_presentation(&mut self, cx: &gpui::App) -> RasterPresentationChange {
+        let canonical = self.state.read(cx).solved_cell.read(cx).clone();
+        let canonical_scope_state = canonical.as_ref().map(|cell| cell.state.clone());
+        let canonical_selected_scope = canonical.as_ref().map(|cell| cell.selected_scope);
+        if let (Some(old_state), Some(new_state), Some(new_selected)) = (
+            self.pending_scope_state.as_deref(),
+            canonical_scope_state.as_deref(),
+            canonical_selected_scope,
+        ) && !Arc::ptr_eq(
+            self.pending_scope_state.as_ref().unwrap(),
+            canonical_scope_state.as_ref().unwrap(),
+        ) {
+            for pending in &mut self.pending_rectangles {
+                if let Some(remapped) =
+                    remap_scope_name_path(old_state, pending.scope_path, new_state, new_selected)
+                {
+                    pending.scope_path = remapped;
+                }
+            }
+        }
+        self.pending_scope_state = canonical_scope_state;
         let (
             output,
             scope_state,
@@ -8845,11 +8934,19 @@ impl LayoutCanvas {
             layer_visibility,
             hierarchy_depth,
             hide_external_geometry,
+            exclude_editable_geometry,
             dark_mode,
         ) = {
             let state = self.state.read(cx);
             let hide_external_geometry = state.hide_external_geometry;
-            let solved_cell = state.solved_cell.read(cx);
+            let solved_cell = state.displayed_cell(cx);
+            // The editable cell is cheap to paint live if its own scope and
+            // object counts are bounded. Keeping those shapes out of retained
+            // tiles makes SSE drags move them without an old-position ghost.
+            let exclude_editable_geometry = solved_cell.as_ref().is_some_and(|solved| {
+                let editable = &solved.output.cells[&solved.selected_scope.cell];
+                editable.scopes.len() + editable.objects.len() <= UI_GEOMETRY_WORK_LIMIT / 2
+            });
             let (output, scope_state, selected_scope, displayed_cell, layout_bbox) = solved_cell
                 .as_ref()
                 .map(|solved| {
@@ -8891,6 +8988,7 @@ impl LayoutCanvas {
                 layer_visibility,
                 state.hierarchy_depth,
                 hide_external_geometry,
+                exclude_editable_geometry,
                 state.dark_mode,
             )
         };
@@ -8912,30 +9010,12 @@ impl LayoutCanvas {
             scope_state.as_deref(),
             selected_scope,
         );
-        if let (Some(old_state), Some(new_state), Some(new_selected)) = (
-            self.raster_scope_state.as_deref(),
-            scope_state.as_deref(),
-            selected_scope,
-        ) {
-            // Rectangle RPCs carry the scope selected when the edit was sent.
-            // Follow that same semantic scope across content-derived address
-            // changes so the preview remains until replacement pixels arrive.
-            for pending in &mut self.pending_rectangles {
-                if same_scope_name_path(
-                    Some(old_state),
-                    Some(pending.scope_path),
-                    Some(new_state),
-                    Some(new_selected),
-                ) {
-                    pending.scope_path = new_selected;
-                }
-            }
-        }
         let presentation_changed = !same_selected_scope
             || (same_output && self.raster_displayed_cell != displayed_cell)
             || self.raster_layer_visibility != layer_visibility
             || self.raster_hierarchy_depth != hierarchy_depth
             || self.raster_hide_external_geometry != hide_external_geometry
+            || self.raster_exclude_editable_geometry != exclude_editable_geometry
             || self.raster_dark_mode != dark_mode;
         let change = raster_presentation_change(
             presentation_changed,
@@ -8970,6 +9050,7 @@ impl LayoutCanvas {
         self.raster_layer_visibility = layer_visibility;
         self.raster_hierarchy_depth = hierarchy_depth;
         self.raster_hide_external_geometry = hide_external_geometry;
+        self.raster_exclude_editable_geometry = exclude_editable_geometry;
         self.raster_dark_mode = dark_mode;
         change
     }
@@ -8981,7 +9062,7 @@ impl LayoutCanvas {
         let (solved, hierarchy_depth, hide_external_geometry) = {
             let state = self.state.read(cx);
             (
-                state.solved_cell.read(cx).clone(),
+                state.displayed_cell(cx),
                 state.hierarchy_depth,
                 state.hide_external_geometry,
             )
@@ -9032,7 +9113,7 @@ impl LayoutCanvas {
         let (solved, layers, hierarchy_depth, hide_external_geometry) = {
             let state = self.state.read(cx);
             (
-                state.solved_cell.read(cx).clone(),
+                state.displayed_cell(cx),
                 state.layers.read(cx).layers.clone(),
                 state.hierarchy_depth,
                 state.hide_external_geometry,
@@ -9295,10 +9376,7 @@ impl LayoutCanvas {
         if bounds.size.width <= px(0.) || bounds.size.height <= px(0.) {
             return None;
         }
-        let cache = self
-            .raster_overview
-            .as_ref()
-            .filter(|cache| self.raster_revision_displayable(cache.content_revision))?;
+        let cache = self.raster_overview.as_ref()?;
         let bbox = self.raster_layout_bbox.as_ref()?;
         let current = ViewportTransform {
             size: self.screen_bounds.size,
@@ -9395,7 +9473,7 @@ impl LayoutCanvas {
         };
         let viewport = navigation_overview_viewport(bbox);
         let state = self.state.read(cx);
-        let Some(solved_cell) = state.solved_cell.read(cx).clone() else {
+        let Some(solved_cell) = state.displayed_cell(cx) else {
             return;
         };
         let overview_layers = navigation_overview_layers(&state.layers.read(cx).layers);
@@ -9408,6 +9486,7 @@ impl LayoutCanvas {
             viewport,
             text_color: state.theme().text,
             include_text: false,
+            exclude_editable_geometry: false,
             content_revision,
             content_revision_signal: self.raster_content_revision_signal.clone(),
             scale_signal: Arc::new(AtomicU64::new(viewport.scale.to_bits() as u64)),
@@ -9448,7 +9527,7 @@ impl LayoutCanvas {
         index: RasterTileIndex,
     ) -> Option<NavigationRasterInput> {
         let state = self.state.read(cx);
-        let solved_cell = state.solved_cell.read(cx).clone()?;
+        let solved_cell = state.displayed_cell(cx)?;
         Some(NavigationRasterInput {
             solved_cell,
             layers: Arc::new(state.layers.read(cx).layers.clone()),
@@ -9462,6 +9541,7 @@ impl LayoutCanvas {
             },
             text_color: state.theme().text,
             include_text: true,
+            exclude_editable_geometry: self.raster_exclude_editable_geometry,
             content_revision: target.content_revision,
             content_revision_signal: self.raster_content_revision_signal.clone(),
             scale_signal: self.raster_scale_signal.clone(),
@@ -9784,6 +9864,31 @@ impl LayoutCanvas {
         self.deferred_snapshot.take()
     }
 
+    pub(crate) fn defer_cell_preview(
+        &mut self,
+        previous_cell: CellId,
+        source_scope: editor::ScopePath,
+        preview: PreparedCompilationSnapshot,
+    ) {
+        if self
+            .deferred_cell_preview
+            .as_ref()
+            .is_none_or(|(_, _, pending)| pending.revision <= preview.revision)
+        {
+            self.deferred_cell_preview = Some((previous_cell, source_scope, preview));
+        }
+    }
+
+    pub(crate) fn take_deferred_cell_preview(
+        &mut self,
+    ) -> Option<(CellId, editor::ScopePath, PreparedCompilationSnapshot)> {
+        self.deferred_cell_preview.take()
+    }
+
+    pub(crate) fn is_sse_source_edit_inflight(&self) -> bool {
+        self.sse_source_edit_inflight
+    }
+
     fn sse_drag_delta_for_targets(
         targets: &[SseDragTarget],
         cell: &compile::CompiledCell,
@@ -9820,6 +9925,42 @@ impl LayoutCanvas {
                 crate::sse::drag_delta_multi(&edges, &vectors, &cell.unsolved_vars, &deltas)
             }
         }
+    }
+
+    fn sse_rect_drag_limits(
+        targets: &[SseDragTarget],
+        cell: &compile::CompiledCell,
+    ) -> Vec<SseRectDragLimit> {
+        let (Some(x_move), Some(y_move)) = (
+            Self::sse_drag_delta_for_targets(targets, cell, Point::new(1., 0.)),
+            Self::sse_drag_delta_for_targets(targets, cell, Point::new(0., 1.)),
+        ) else {
+            return Vec::new();
+        };
+        cell.objects
+            .values()
+            .filter_map(SolvedValue::get_rect)
+            .filter(|rect| !rect.construction)
+            .filter_map(|rect| {
+                let x0 = SparseVec::from(&rect.x0.1);
+                let x1 = SparseVec::from(&rect.x1.1);
+                let y0 = SparseVec::from(&rect.y0.1);
+                let y1 = SparseVec::from(&rect.y1.1);
+                let limit = SseRectDragLimit {
+                    width: rect.x1.0 - rect.x0.0,
+                    height: rect.y1.0 - rect.y0.0,
+                    width_dx: crate::sse::dot(&x1, &x_move) - crate::sse::dot(&x0, &x_move),
+                    width_dy: crate::sse::dot(&x1, &y_move) - crate::sse::dot(&x0, &y_move),
+                    height_dx: crate::sse::dot(&y1, &x_move) - crate::sse::dot(&y0, &x_move),
+                    height_dy: crate::sse::dot(&y1, &y_move) - crate::sse::dot(&y0, &y_move),
+                };
+                (limit.width_dx.abs() > crate::sse::EPSILON
+                    || limit.width_dy.abs() > crate::sse::EPSILON
+                    || limit.height_dx.abs() > crate::sse::EPSILON
+                    || limit.height_dy.abs() > crate::sse::EPSILON)
+                    .then_some(limit)
+            })
+            .collect()
     }
 
     fn sse_drag_delta(&self, cell: &compile::CompiledCell) -> Option<SparseVec> {
@@ -9985,10 +10126,10 @@ impl LayoutCanvas {
         self.raster_navigation_direction = RasterTileIndex { x: 0, y: 0 };
         // Fit is a camera change. Keep the previous complete image while the
         // same worker renders the new view, just as for a zoom gesture.
-        let has_solved_layout = self.state.read(cx).solved_cell.read(cx).is_some();
+        let has_solved_layout = self.state.read(cx).displayed_cell(cx).is_some();
         self.set_rendering(has_solved_layout, cx);
         self.hover_hit = None;
-        if let Some(cell) = self.state.read(cx).solved_cell.read(cx)
+        if let Some(cell) = self.state.read(cx).displayed_cell(cx)
             && let Some(bbox) = &cell.state[&cell.selected_scope].bbox.as_ref().or_else(|| {
                 let scope_address = &cell.selected_scope;
                 cell.state[&ScopeAddress {
@@ -10065,7 +10206,6 @@ impl LayoutCanvas {
             y1: draw_source_coordinate(p0.y.max(p1.y), grid),
             construction: false,
         };
-        let client = state.lang_server_client.clone();
         let scope_span = cell.scope_span(address.scope).clone();
         let id = self.next_rectangle_id;
         self.next_rectangle_id = self.next_rectangle_id.wrapping_add(1);
@@ -10074,12 +10214,46 @@ impl LayoutCanvas {
             scope_path: solved.selected_scope,
             source_path: scope_span.path.clone(),
             name: name.clone(),
-            rect: rect.clone(),
-            submitted_revision: state.compilation_revision,
+            rect,
+            submitted: false,
+            submitted_revision: None,
             receipt: None,
             resolved_content_revision: None,
         });
         cx.notify();
+        self.try_submit_next_rectangle(cx);
+    }
+
+    fn try_submit_next_rectangle(&mut self, cx: &mut Context<Self>) {
+        let Some(next) = next_rectangle_submission(self.pending_rectangles.iter().map(|rect| {
+            (
+                rect.submitted,
+                rect.receipt.is_some() || rect.resolved_content_revision.is_some(),
+            )
+        })) else {
+            return;
+        };
+        let state = self.state.read(cx);
+        let pending = &mut self.pending_rectangles[next];
+        let Some(solved) = state.solved_cell.read(cx).as_ref() else {
+            return;
+        };
+        let Some(cell) = solved.output.cells.get(&pending.scope_path.cell) else {
+            return;
+        };
+        if !cell.scopes.contains_key(&pending.scope_path.scope) {
+            return;
+        }
+        let scope_span = cell.scope_span(pending.scope_path.scope).clone();
+        if scope_span.path != pending.source_path {
+            return;
+        }
+        let client = state.lang_server_client.clone();
+        let id = pending.id;
+        let name = pending.name.clone();
+        let rect = pending.rect.clone();
+        pending.submitted = true;
+        pending.submitted_revision = state.compilation_revision;
         cx.spawn(async move |canvas, cx| {
             let result = client.draw_rect(scope_span, name, rect).await;
             let _ = canvas.update(cx, |canvas, cx| {
@@ -10102,22 +10276,31 @@ impl LayoutCanvas {
                     .iter_mut()
                     .find(|pending| pending.id == id)
                 {
+                    pending.name = receipt.name.clone();
                     pending.receipt = Some(receipt);
                 }
                 // The compiler may have delivered its snapshot before the RPC
                 // reply. Reconcile either arrival order without a blank frame.
                 self.reconcile_pending_rectangles(cx);
+                self.try_submit_next_rectangle(cx);
             }
             result => {
                 self.pending_rectangles.retain(|pending| pending.id != id);
-                if matches!(result, Ok(None)) {
-                    self.state.update(cx, |state, cx| {
-                        if state.message.is_none() {
-                            state.show_message(MessageType::ERROR, SOURCE_EDIT_REJECTED_MESSAGE);
-                        }
-                        cx.notify();
-                    });
-                }
+                // A rejected source edit is no longer in flight. Do not leave
+                // the drawing tool frozen until a new compilation happens:
+                // there may be no compilation to change that revision.
+                let message = match result {
+                    Ok(None) => SOURCE_EDIT_REJECTED_MESSAGE.to_owned(),
+                    Err(error) => format!("Could not apply the drawing: {error}"),
+                    Ok(Some(_)) => unreachable!(),
+                };
+                self.state.update(cx, |state, cx| {
+                    if state.message.is_none() {
+                        state.show_message(MessageType::ERROR, message);
+                    }
+                    cx.notify();
+                });
+                self.try_submit_next_rectangle(cx);
             }
         }
         cx.notify();
@@ -10131,6 +10314,9 @@ impl LayoutCanvas {
         let revision = state.compilation_revision;
         let solved = state.solved_cell.read(cx);
         self.pending_rectangles.retain_mut(|pending| {
+            if !pending.submitted {
+                return true;
+            }
             let contains_rectangle = solved.as_ref().is_some_and(|solved| {
                 solved.state.get(&pending.scope_path).is_some_and(|_| {
                     let address = pending.scope_path;
@@ -10822,6 +11008,19 @@ impl LayoutCanvas {
             }
             edit_dim
         });
+        if self.is_sse_dragging {
+            self.sse_rect_drag_limits = {
+                let state = self.state.read(cx);
+                let solved = state.solved_cell.read(cx);
+                solved
+                    .as_ref()
+                    .map(|solved| {
+                        let cell = &solved.output.cells[&solved.selected_scope.cell];
+                        Self::sse_rect_drag_limits(&self.sse_targets, cell)
+                    })
+                    .unwrap_or_default()
+            };
+        }
         if let Some((p0, p1)) = rectangle {
             self.place_rectangle(p0, p1, grid, cx);
         }
@@ -11352,7 +11551,17 @@ impl LayoutCanvas {
             self.request_navigation_raster(cx);
             cx.notify();
         } else if self.is_sse_dragging {
-            self.sse_delta = self.mouse_position - self.drag_start;
+            self.sse_delta = limited_sse_pointer_delta(
+                self.mouse_position - self.drag_start,
+                self.scale,
+                self.state
+                    .read(cx)
+                    .solved_cell
+                    .read(cx)
+                    .as_ref()
+                    .map_or(0.1, |solved| solved.output.tech.grid_step()),
+                &self.sse_rect_drag_limits,
+            );
             self.hover_hit = None;
             cx.notify();
         } else {
@@ -11394,6 +11603,7 @@ impl LayoutCanvas {
         self.is_sse_dragging = false;
         self.sse_delta = Point::default();
         self.sse_targets.clear();
+        self.sse_rect_drag_limits.clear();
         if was_dragging {
             self.request_navigation_overview(cx);
             self.request_navigation_raster(cx);
@@ -11440,56 +11650,87 @@ impl LayoutCanvas {
                 self.sse_delta = Point::default();
                 self.sse_targets.clear();
             } else {
-                let pending_initial_conditions = edits.initial_conditions.clone();
-                match self
-                    .state
-                    .read(cx)
-                    .lang_server_client
-                    .update_values(edits.values, edits.initial_conditions)
-                {
-                    Ok(Some(applied_edits)) => {
-                        self.is_sse_dragging = false;
-                        self.is_sse_persisting = true;
-                        self.pending_sse_values =
-                            pending_sse_values(&applied_edits, &pending_initial_conditions);
-                        self.sse_persist_after_revision = self.state.read(cx).compilation_revision;
-                        // Anything deferred before the workspace edit was
-                        // accepted belongs to the pre-drag source revision.
-                        self.deferred_snapshot = None;
-                        let selected_after_edits = {
-                            let tool = self.state.read(cx).tool.read(cx);
-                            match tool {
-                                ToolState::Select(SelectToolState {
-                                    selected_obj: Some(selected),
-                                }) => Some(remap_span_after_value_edits(selected, &applied_edits)),
-                                _ => None,
-                            }
-                        };
-                        if let Some(selected) = selected_after_edits {
-                            let tool = self.state.read(cx).tool.clone();
-                            tool.update(cx, |tool, cx| {
-                                if let ToolState::Select(select) = tool {
-                                    select.selected_obj = Some(selected);
-                                    cx.notify();
-                                }
-                            });
-                        }
-                    }
-                    Ok(None) => {
-                        self.is_sse_dragging = false;
-                        self.pending_sse_values.clear();
-                        self.sse_persist_after_revision = None;
-                        self.sse_delta = Point::default();
-                        self.sse_targets.clear();
-                    }
-                    Err(_) => {
-                        self.is_sse_dragging = false;
-                        self.pending_sse_values.clear();
-                        self.sse_persist_after_revision = None;
-                        self.sse_delta = Point::default();
-                        self.sse_targets.clear();
-                    }
+                self.is_sse_dragging = false;
+                self.is_sse_persisting = true;
+                self.sse_source_edit_inflight = true;
+                self.pending_sse_values =
+                    pending_sse_values(&edits.values, &edits.initial_conditions);
+                self.sse_persist_after_revision = self.state.read(cx).compilation_revision;
+                // Anything deferred during the gesture belongs to the old
+                // source. Keep the moved geometry visible while Neovim accepts
+                // the edit instead of blocking this mouse-up paint.
+                self.deferred_snapshot = None;
+                self.deferred_cell_preview = None;
+                let client = self.state.read(cx).lang_server_client.clone();
+                cx.spawn(async move |_, _| {
+                    let initial_conditions = edits.initial_conditions;
+                    let result = client
+                        .update_values_async(edits.values, initial_conditions.clone())
+                        .await;
+                    client.dispatch_sse_source_edit_result(result, initial_conditions);
+                })
+                .detach();
+            }
+        }
+        self.sse_rect_drag_limits.clear();
+        cx.notify();
+    }
+
+    pub(crate) fn complete_sse_source_edit(
+        &mut self,
+        result: anyhow::Result<Option<Vec<ValueEdit>>>,
+        initial_conditions: &[InitialConditionEdit],
+        cx: &mut Context<Self>,
+    ) {
+        if !self.sse_source_edit_inflight {
+            return;
+        }
+        self.sse_source_edit_inflight = false;
+        match result {
+            Ok(Some(applied_edits)) => {
+                if self.is_sse_persisting {
+                    self.pending_sse_values =
+                        pending_sse_values(&applied_edits, initial_conditions);
                 }
+                let selected_after_edits = {
+                    let tool = self.state.read(cx).tool.read(cx);
+                    match tool {
+                        ToolState::Select(SelectToolState {
+                            selected_obj: Some(selected),
+                        }) => Some(remap_span_after_value_edits(selected, &applied_edits)),
+                        _ => None,
+                    }
+                };
+                if let Some(selected) = selected_after_edits {
+                    let tool = self.state.read(cx).tool.clone();
+                    tool.update(cx, |tool, cx| {
+                        if let ToolState::Select(select) = tool {
+                            select.selected_obj = Some(selected);
+                            cx.notify();
+                        }
+                    });
+                }
+            }
+            Ok(None) => {
+                self.finish_sse_persist(cx);
+                self.state.update(cx, |state, cx| {
+                    if state.message.is_none() {
+                        state.show_message(MessageType::ERROR, SOURCE_EDIT_REJECTED_MESSAGE);
+                    }
+                    cx.notify();
+                });
+            }
+            Err(error) => {
+                self.finish_sse_persist(cx);
+                self.state.update(cx, |state, cx| {
+                    if state.message.is_none() {
+                        state.show_message(
+                            MessageType::ERROR,
+                            format!("Could not apply the SSE edit: {error}"),
+                        );
+                    }
+                    cx.notify();
+                });
             }
         }
         cx.notify();
@@ -11500,6 +11741,9 @@ impl LayoutCanvas {
     pub(crate) fn accepts_snapshot(&self, snapshot: &PreparedCompilationSnapshot) -> bool {
         if !self.is_sse_persisting {
             return true;
+        }
+        if self.sse_source_edit_inflight {
+            return false;
         }
         if !snapshot_follows_revision(snapshot.revision, self.sse_persist_after_revision) {
             return false;
@@ -11716,6 +11960,24 @@ mod tests {
             .sum::<f32>()
             .abs()
             / 2.
+    }
+
+    #[test]
+    fn rectangle_submissions_wait_for_acknowledged_predecessors() {
+        assert_eq!(next_rectangle_submission([]), None);
+        assert_eq!(next_rectangle_submission([(false, false)]), Some(0));
+        assert_eq!(
+            next_rectangle_submission([(true, false), (false, false)]),
+            None
+        );
+        assert_eq!(
+            next_rectangle_submission([(true, true), (false, false)]),
+            Some(1)
+        );
+        assert_eq!(
+            next_rectangle_submission([(true, true), (true, false), (false, false)]),
+            None
+        );
     }
 
     fn raster_from_style_planes(
@@ -13242,6 +13504,30 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                     dashed,
                     "{cell}: direct rendering lost constraint state"
                 );
+                if cell == "free" {
+                    let pending = PendingRectangle {
+                        id: 0,
+                        scope_path: ScopeAddress {
+                            cell: solved.output.top,
+                            scope: root.root,
+                        },
+                        source_path: source.clone(),
+                        name: "r".to_owned(),
+                        rect: compile::BasicRect {
+                            layer: Some("met1".to_owned()),
+                            x0: 10.,
+                            y0: 10.,
+                            x1: 90.,
+                            y1: 90.,
+                            construction: false,
+                        },
+                        submitted: false,
+                        submitted_revision: None,
+                        receipt: None,
+                        resolved_content_revision: None,
+                    };
+                    assert_eq!(pending.preview().border_styles, styles);
+                }
             }
             for fill in [ShapeFill::Hollow, ShapeFill::Solid, ShapeFill::Stippling] {
                 let layer = LayerState {
@@ -13716,6 +14002,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
             viewport,
             text_color: rgb(0xffffff),
             include_text: false,
+            exclude_editable_geometry: false,
             content_revision: 1,
             content_revision_signal: Arc::new(AtomicU64::new(1)),
             scale_signal: Arc::new(AtomicU64::new(viewport.scale.to_bits() as u64)),
@@ -13723,6 +14010,198 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
             spatial_index: Arc::new(RasterSpatialIndex::default()),
             use_spatial_index,
             cancel_if_generation_changes: None,
+        }
+    }
+
+    #[test]
+    fn editable_rect_is_absent_from_retained_raster_but_child_remains() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("lib.ar");
+        std::fs::write(
+            &source,
+            "cell child() { let r = rect(\"met2\", x0=0., y0=0., x1=10., y1=10.); } \
+             cell top() { let c = inst(child(), x=0., y=0.); \
+             let r = rect(\"met1\", x0=20., y0=0., x1=30., y1=10.); }",
+        )
+        .unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source).ast();
+        let output = compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+            },
+        );
+        let solved = raster_test_compile_output_state(output.unwrap_valid());
+        let layer = |name: &str, color, z| LayerState {
+            name: name.to_owned().into(),
+            color,
+            fill: ShapeFill::Solid,
+            used: true,
+            border_color: color,
+            visible: true,
+            z,
+        };
+        let layers = Arc::new(IndexMap::from([
+            (SharedString::from("met1"), layer("met1", rgb(0xff0000), 0)),
+            (SharedString::from("met2"), layer("met2", rgb(0x0000ff), 1)),
+        ]));
+        let viewport = ViewportTransform {
+            size: Size::new(px(100.), px(100.)),
+            screen_size: Size::new(px(100.), px(100.)),
+            scale: 2.,
+            offset: Point::new(px(0.), px(80.)),
+        };
+        let input = raster_test_navigation_input(solved, layers, viewport, false);
+        let normal = build_navigation_raster(input.clone()).unwrap();
+        let mut without_editable = input;
+        without_editable.exclude_editable_geometry = true;
+        let background = build_navigation_raster(without_editable).unwrap();
+        let opaque = |image: &LayoutRasterCache| {
+            image
+                .image
+                .as_bytes(0)
+                .unwrap()
+                .chunks_exact(4)
+                .filter(|pixel| pixel[3] != 0)
+                .count()
+        };
+        assert!(opaque(&background) > 0, "child geometry should remain");
+        assert!(opaque(&normal) > opaque(&background));
+    }
+
+    #[test]
+    #[ignore = "SRAM raster timing benchmark; run in release with --nocapture"]
+    fn bench_sram_parent_raster_after_bulk_delete() {
+        let workspace =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/sram");
+        let source = workspace.join("lib.ar");
+        let original = std::fs::read_to_string(&source).unwrap();
+        let config = argonc::WorkspaceConfig::new(&source)
+            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")));
+        let base = format!(
+            "{original}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); }}\n"
+        );
+        let rectangles = (0..100)
+            .map(|i| {
+                let x0 = (i % 10) * 10;
+                let y0 = (i / 10) * 10;
+                format!(
+                    "let r{i} = rect(\"met1.drawing\", x0={x0}., y0={y0}., x1={}., y1={}.)!;",
+                    x0 + 100,
+                    y0 + 100
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let many = format!(
+            "{original}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); {rectangles} }}\n"
+        );
+        let mut compiler = argonc::incremental::IncrementalCompiler::new();
+        let mut previous: Option<CompileOutputState> = None;
+        let mut previous_layers = None;
+        let mut previous_index: Option<Arc<RasterSpatialIndex>> = None;
+        for (label, text) in [("initial", &base), ("many", &many), ("deleted", &base)] {
+            compiler.set_source_text(source.clone(), text.clone());
+            let output = compiler
+                .compile_cell(&config, &["benchmark_parent".into()], vec![])
+                .unwrap_valid();
+            let root = ScopeAddress {
+                cell: output.top,
+                scope: output.cells[&output.top].root,
+            };
+            let mut state = editor::ProcessScopeState::default();
+            editor::hierarchy::prepare(
+                &output,
+                root,
+                &mut state,
+                previous.as_ref().map(|previous| previous.state.as_ref()),
+                previous.as_ref(),
+                previous_layers.as_ref(),
+            );
+            let bbox = state.state[&root].bbox.as_ref().unwrap().clone();
+            let viewport = navigation_overview_viewport(&bbox);
+            let solved = CompileOutputState {
+                output: Arc::new(output),
+                selected_scope: root,
+                state: Arc::new(state.state),
+            };
+            if let Some(previous) = &previous {
+                let started = std::time::Instant::now();
+                let prior = analyzer::rpc::CompilationSnapshot {
+                    revision: 1,
+                    output: compile::CompileOutput::Valid(previous.output.as_ref().clone()),
+                };
+                let current = analyzer::rpc::CompilationSnapshot {
+                    revision: 2,
+                    output: compile::CompileOutput::Valid(solved.output.as_ref().clone()),
+                };
+                let update = analyzer::rpc::CompilationUpdate::new(current, Some(&prior));
+                let changed_cells = update.snapshot.data().unwrap().cells.len();
+                let encoded = analyzer::rpc::CompressedCompilationUpdate::encode(&update)
+                    .expect("encode SRAM delta");
+                eprintln!(
+                    "sram_parent_delta_{label},encode_ms={},bytes={},changed_cells={changed_cells}",
+                    started.elapsed().as_millis(),
+                    encoded.encoded_len(),
+                );
+            }
+            let mut index =
+                RasterSpatialIndex::for_presentation(usize::MAX, Some(&solved.state), false);
+            if let (Some(previous), Some(previous_index)) = (&previous, &previous_index) {
+                index.reuse_ready_cells(previous_index, |cell| {
+                    previous
+                        .output
+                        .cells
+                        .get(&cell)
+                        .zip(solved.output.cells.get(&cell))
+                        .is_some_and(|(old, new)| Arc::ptr_eq(old, new))
+                });
+            }
+            let index = Arc::new(index);
+            let mut input = raster_test_navigation_input(
+                solved.clone(),
+                Arc::new(state.layers.clone()),
+                viewport,
+                true,
+            );
+            input.spatial_index = index.clone();
+            let started = std::time::Instant::now();
+            let raster = build_navigation_raster(input).expect("render SRAM overview");
+            eprintln!(
+                "sram_parent_raster_{label},render_ms={},bytes={}",
+                started.elapsed().as_millis(),
+                raster.image.as_bytes(0).map_or(0, |bytes| bytes.len()),
+            );
+            let viewport = navigation_overview_viewport_for_extents_in_size(
+                bbox.x0,
+                bbox.y0,
+                bbox.x1,
+                bbox.y1,
+                Size::new(px(1200.), px(800.)),
+            );
+            let mut input = raster_test_navigation_input(
+                solved.clone(),
+                Arc::new(state.layers.clone()),
+                viewport,
+                true,
+            );
+            input.spatial_index = index.clone();
+            input.include_text = true;
+            input.exclude_editable_geometry = {
+                let editable = &solved.output.cells[&solved.selected_scope.cell];
+                editable.scopes.len() + editable.objects.len() <= UI_GEOMETRY_WORK_LIMIT / 2
+            };
+            let started = std::time::Instant::now();
+            let raster = build_navigation_raster(input).expect("render SRAM canvas");
+            eprintln!(
+                "sram_parent_canvas_{label},render_ms={},bytes={}",
+                started.elapsed().as_millis(),
+                raster.image.as_bytes(0).map_or(0, |bytes| bytes.len()),
+            );
+            previous_layers = Some(state.layers);
+            previous_index = Some(index);
+            previous = Some(solved);
         }
     }
 
@@ -14162,13 +14641,70 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
     }
 
     #[test]
-    fn crossed_initial_condition_values_are_sorted() {
-        assert_eq!(
-            sorted_initial_condition_values(150., 100.),
-            Some((100., 150.))
+    fn sse_drag_stops_before_rectangle_edges_cross() {
+        let limits = [SseRectDragLimit {
+            width: 10.,
+            height: 20.,
+            width_dx: -1.,
+            width_dy: 0.,
+            height_dx: 0.,
+            height_dy: -1.,
+        }];
+        let right = limited_sse_pointer_delta(Point::new(px(40.), px(0.)), 2., 1., &limits);
+        assert!((f32::from(right.x) - 18.).abs() < 1e-4);
+        let up = limited_sse_pointer_delta(Point::new(px(0.), px(-80.)), 2., 1., &limits);
+        assert!((f32::from(up.y) + 38.).abs() < 1e-4);
+        let away = limited_sse_pointer_delta(Point::new(px(-40.), px(80.)), 2., 1., &limits);
+        assert_eq!(away, Point::new(px(-40.), px(80.)));
+    }
+
+    #[test]
+    fn solved_rectangle_edge_drag_is_clamped_before_persistence() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("lib.ar");
+        std::fs::write(
+            &source,
+            "cell top() { let r = rect(\"met1\", x0i=0., y0i=0., x1i=10., y1i=10.)!; }",
+        )
+        .unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source).ast();
+        let output = compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+            },
         );
-        assert_eq!(sorted_initial_condition_values(100., 150.), None);
-        assert_eq!(sorted_initial_condition_values(100., 100.), None);
+        let output = match output {
+            compile::CompileOutput::Valid(output) => output,
+            compile::CompileOutput::ExecErrors(output) => output
+                .output
+                .expect("underconstrained rectangle still has SSE geometry"),
+            output => panic!("rectangle SSE fixture failed: {output:?}"),
+        };
+        let cell = &output.cells[&output.top];
+        let rect = cell
+            .objects
+            .values()
+            .find_map(SolvedValue::get_rect)
+            .unwrap();
+        let targets = [SseDragTarget {
+            expr: rect.x0.1.clone(),
+            normal: Point::new(1., 0.),
+            source: None,
+        }];
+        let limits = LayoutCanvas::sse_rect_drag_limits(&targets, cell);
+        assert!(!limits.is_empty());
+        let limited = limited_sse_pointer_delta(Point::new(px(50.), px(0.)), 1., 0.1, &limits);
+        let dv = LayoutCanvas::sse_drag_delta_for_targets(
+            &targets,
+            cell,
+            Point::new(f32::from(limited.x), 0.),
+        )
+        .unwrap();
+        let new_x0 = rect.x0.0 + crate::sse::dot(&SparseVec::from(&rect.x0.1), &dv);
+        let new_x1 = rect.x1.0 + crate::sse::dot(&SparseVec::from(&rect.x1.1), &dv);
+        assert!(new_x0 <= new_x1 - 0.1 + 1e-6);
     }
 
     #[test]

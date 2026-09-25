@@ -118,6 +118,11 @@ pub struct EditorState {
     pub message: Option<EditorMessage>,
     pub connection_error: Option<SharedString>,
     pub solved_cell: Entity<Option<CompileOutputState>>,
+    /// Focused-cell geometry shown while the opened top is still compiling.
+    /// The full snapshot remains canonical for source edits and hierarchy UI.
+    pub preview_cell: Entity<Option<CompileOutputState>>,
+    preview_revision: Option<u64>,
+    preview_source_scope: Option<ScopePath>,
     pub hide_external_geometry: bool,
     pub layers: Entity<Layers>,
     pub lang_server_client: SyncLangServerClient,
@@ -246,6 +251,15 @@ fn mark_layer_used(state: &mut ProcessScopeState, layer: &str) {
 }
 
 impl EditorState {
+    pub(crate) fn displayed_cell(&self, cx: &App) -> Option<CompileOutputState> {
+        let full = self.solved_cell.read(cx).clone();
+        if full.as_ref().map(|cell| cell.selected_scope) == self.preview_source_scope {
+            self.preview_cell.read(cx).clone().or(full)
+        } else {
+            full
+        }
+    }
+
     fn theme(&self) -> &'static Theme {
         if self.dark_mode {
             &DARK_THEME
@@ -410,6 +424,7 @@ pub(crate) fn prepare_compilation_snapshot(
             &mut state,
             context.scope_state.as_deref(),
             context.previous.as_ref(),
+            context.previous.as_ref().map(|_| &context.layers),
         );
         let ProcessScopeState { layers, state } = state;
         let selected_scope = context
@@ -453,6 +468,7 @@ impl Editor {
         let (lang_server_client, mut rx) =
             SyncLangServerClient::new(cx.to_async(), lang_server_addr);
         let solved_cell = cx.new(|_cx| None);
+        let preview_cell = cx.new(|_cx| None);
         let tool = cx.new(|_cx| ToolState::default());
         let layers = cx.new(|_cx| Layers {
             layers: IndexMap::new(),
@@ -480,6 +496,9 @@ impl Editor {
                 message: None,
                 connection_error: None,
                 solved_cell,
+                preview_cell,
+                preview_revision: None,
+                preview_source_scope: None,
                 hide_external_geometry: false,
                 tool,
                 layers,
@@ -545,6 +564,17 @@ impl Editor {
             return false;
         }
         self.state.update(cx, |state, cx| {
+            if state
+                .preview_revision
+                .is_some_and(|revision| snapshot.revision >= revision)
+            {
+                state.preview_revision = None;
+                state.preview_source_scope = None;
+                state.preview_cell.update(cx, |preview, cx| {
+                    *preview = None;
+                    cx.notify();
+                });
+            }
             state.connection_error = None;
             state.compilation_revision = Some(snapshot.revision);
             if snapshot.prepared_output.is_some() {
@@ -553,6 +583,96 @@ impl Editor {
                 state.rendering = true;
             }
             state.apply_prepared_output(cx, snapshot);
+            cx.notify();
+        });
+        self.canvas
+            .update(cx, |canvas, cx| canvas.finish_sse_persist(cx));
+        true
+    }
+
+    pub(crate) fn selected_cell_id(&self, cx: &App) -> Option<CellId> {
+        let state = self.state.read(cx);
+        let solved = state.solved_cell.read(cx);
+        Some(solved.as_ref()?.selected_scope.cell)
+    }
+
+    pub(crate) fn preview_preparation_context(
+        &self,
+        cx: &App,
+        previous_cell: CellId,
+        revision: u64,
+    ) -> Option<(CompilationPreparationContext, ScopePath)> {
+        let state = self.state.read(cx);
+        if state
+            .compilation_revision
+            .is_some_and(|current| current >= revision)
+            || state
+                .preview_revision
+                .is_some_and(|current| current > revision)
+            || self.selected_cell_id(cx) != Some(previous_cell)
+        {
+            return None;
+        }
+        let selected = state.solved_cell.read(cx).as_ref()?.selected_scope;
+        Some((state.compilation_preparation_context(cx), selected))
+    }
+
+    pub(crate) fn finish_cell_preview(
+        &self,
+        cx: &mut App,
+        previous_cell: CellId,
+        source_scope: ScopePath,
+        preview: PreparedCompilationSnapshot,
+    ) -> bool {
+        if self
+            .preview_preparation_context(cx, previous_cell, preview.revision)
+            .is_none_or(|(_, selected)| selected != source_scope)
+        {
+            return false;
+        }
+        // A preview compiled before Neovim acknowledges the SSE edit cannot
+        // replace its live drag yet, but retaining it avoids waiting for a
+        // full parent compilation when that acknowledgement arrives.
+        if self.canvas.read(cx).is_sse_dragging()
+            || self.canvas.read(cx).is_sse_source_edit_inflight()
+        {
+            self.canvas.update(cx, |canvas, _| {
+                canvas.defer_cell_preview(previous_cell, source_scope, preview)
+            });
+            return false;
+        }
+        // The first matching focused preview can end the optimistic drag;
+        // otherwise applying the drag delta to its new geometry doubles it.
+        if !self.canvas.read(cx).accepts_snapshot(&preview) {
+            return false;
+        }
+        let Some(PreparedCompileOutput {
+            selected_scope,
+            state: scopes,
+            ..
+        }) = preview.prepared_output
+        else {
+            return false;
+        };
+        let output = match preview.output {
+            CompileOutput::Valid(output) => output,
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                output: Some(output),
+                errors,
+            }) if !errors.iter().any(|error| error.kind.is_invalid_cell()) => output,
+            _ => return false,
+        };
+        self.state.update(cx, |state, cx| {
+            state.preview_revision = Some(preview.revision);
+            state.preview_source_scope = Some(source_scope);
+            state.preview_cell.update(cx, |cell, cx| {
+                *cell = Some(CompileOutputState {
+                    output: Arc::new(output),
+                    selected_scope,
+                    state: Arc::new(scopes),
+                });
+                cx.notify();
+            });
             cx.notify();
         });
         self.canvas
@@ -624,7 +744,12 @@ impl Editor {
                 .update(cx, |canvas, _| canvas.defer_snapshot(snapshot));
             return;
         }
-        if !self.canvas.read(cx).accepts_snapshot(&snapshot) || !self.apply_snapshot(cx, snapshot) {
+        if !self.canvas.read(cx).accepts_snapshot(&snapshot) {
+            self.canvas
+                .update(cx, |canvas, _| canvas.defer_snapshot(snapshot));
+            return;
+        }
+        if !self.apply_snapshot(cx, snapshot) {
             return;
         }
         let state = self.state.clone();
@@ -645,6 +770,29 @@ impl Editor {
             });
             cx.notify();
         });
+    }
+
+    pub(crate) fn finish_sse_source_edit(
+        &self,
+        cx: &mut App,
+        result: anyhow::Result<Option<Vec<analyzer::rpc::ValueEdit>>>,
+        initial_conditions: Vec<analyzer::rpc::InitialConditionEdit>,
+    ) {
+        self.canvas.update(cx, |canvas, cx| {
+            canvas.complete_sse_source_edit(result, &initial_conditions, cx)
+        });
+        let deferred_preview = self
+            .canvas
+            .update(cx, |canvas, _| canvas.take_deferred_cell_preview());
+        if let Some((previous_cell, source_scope, preview)) = deferred_preview {
+            self.finish_cell_preview(cx, previous_cell, source_scope, preview);
+        }
+        let deferred = self
+            .canvas
+            .update(cx, |canvas, _| canvas.take_deferred_snapshot());
+        if let Some(snapshot) = deferred {
+            self.update_cell(cx, snapshot);
+        }
     }
 
     pub fn set_workspace_modified(&self, cx: &mut App, modified: bool) {
@@ -698,6 +846,12 @@ impl Editor {
     }
 
     fn on_left_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let deferred_preview = self
+            .canvas
+            .update(cx, |canvas, _| canvas.take_deferred_cell_preview());
+        if let Some((previous_cell, source_scope, preview)) = deferred_preview {
+            self.finish_cell_preview(cx, previous_cell, source_scope, preview);
+        }
         let deferred = self
             .canvas
             .update(cx, |canvas, _| canvas.take_deferred_snapshot());

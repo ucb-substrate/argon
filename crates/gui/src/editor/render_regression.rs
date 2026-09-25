@@ -1,9 +1,14 @@
 //! Self-contained rendering regressions using generated layouts and repository technology files.
 use super::*;
+use crate::editor::{PreparedCompileOutput, prepare_compilation_snapshot};
+use analyzer::rpc::CompilationSnapshot;
+use argonc::compile::CompileOutput;
+use std::path::PathBuf;
 
 fn test_canvas(cx: &mut gpui::TestAppContext) -> Entity<LayoutCanvas> {
     let state = cx.new(|cx| {
         let solved_cell = cx.new(|_| None);
+        let preview_cell = cx.new(|_| None);
         let layers = cx.new(|_| editor::Layers {
             layers: IndexMap::new(),
             selected_layer: None,
@@ -29,6 +34,9 @@ fn test_canvas(cx: &mut gpui::TestAppContext) -> Entity<LayoutCanvas> {
                 cx.observe(&layers, |_, _, cx| cx.notify()),
             ],
             solved_cell,
+            preview_cell,
+            preview_revision: None,
+            preview_source_scope: None,
             hide_external_geometry: false,
             layers,
             lang_server_client: crate::rpc::SyncLangServerClient::for_render_test(cx.to_async()),
@@ -43,6 +51,239 @@ fn test_canvas(cx: &mut gpui::TestAppContext) -> Entity<LayoutCanvas> {
         });
         LayoutCanvas::new(cx, &state, focus, input_focus, input)
     })
+}
+
+#[gpui::test]
+fn minimap_keeps_its_previous_image_until_replacement_is_ready(cx: &mut gpui::TestAppContext) {
+    let canvas = test_canvas(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    std::fs::write(
+        &source,
+        "cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }",
+    )
+    .unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+    ));
+    let CompileOutput::Valid(data) = argonc::incremental::IncrementalCompiler::new().compile_cell(
+        &config,
+        &["top".into()],
+        vec![],
+    ) else {
+        panic!("test cell did not compile");
+    };
+    let object_id = *data.cells[&data.top].objects.keys().next().unwrap();
+    canvas.update(cx, |canvas, _| {
+        let size = Size::new(px(100.), px(100.));
+        let image = image::RgbaImage::new(1, 1);
+        canvas.screen_bounds = Bounds::new(Point::default(), size);
+        canvas.raster_layout_bbox = Some(Arc::new(compile::Rect {
+            layer: None,
+            x0: 0.,
+            y0: 0.,
+            x1: 10.,
+            y1: 10.,
+            id: object_id,
+            construction: true,
+            span: None,
+        }));
+        canvas.raster_overview = Some(LayoutRasterCache {
+            image: Arc::new(RenderImage::new(vec![image::Frame::new(image)])),
+            scale_safe_lod: true,
+            texts: Arc::from([]),
+            scope_labels: Arc::from([]),
+            viewport: size,
+            screen_viewport: size,
+            scale: 1.,
+            offset: Point::default(),
+            content_revision: 1,
+        });
+        canvas.raster_content_revision = 2;
+        canvas.raster_stale_tiles_displayable = false;
+        assert!(
+            canvas
+                .navigation_overview_snapshot(Bounds::new(Point::default(), size))
+                .is_some()
+        );
+    });
+}
+
+#[gpui::test]
+fn sse_keeps_the_moved_preview_until_its_source_edit_is_acknowledged(
+    cx: &mut gpui::TestAppContext,
+) {
+    let canvas = test_canvas(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    std::fs::write(
+        &source,
+        "cell top() { let r = rect(\"met1\", x0i=1., y0i=0., x1i=10., y1i=10.)!; }",
+    )
+    .unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+    ));
+    let output = argonc::incremental::IncrementalCompiler::new().compile_cell(
+        &config,
+        &["top".into()],
+        vec![],
+    );
+    let data = match &output {
+        CompileOutput::Valid(data) => data,
+        CompileOutput::ExecErrors(errors) => errors.output.as_ref().unwrap(),
+        _ => panic!("SSE fixture did not compile"),
+    };
+    let fallback = data.cells[&data.top]
+        .fallback_constraints_used
+        .first()
+        .unwrap();
+    let pending = PendingSseValue {
+        span: Some(fallback.span.clone()),
+        value: -fallback.constraint.constant,
+    };
+    let snapshot = prepare_compilation_snapshot(
+        CompilationSnapshot {
+            revision: 2,
+            output,
+        },
+        canvas.read_with(cx, |canvas, cx| {
+            canvas.state.read(cx).compilation_preparation_context(cx)
+        }),
+    );
+    canvas.update(cx, |canvas, _| {
+        canvas.is_sse_persisting = true;
+        canvas.sse_source_edit_inflight = true;
+        canvas.sse_persist_after_revision = Some(1);
+        canvas.pending_sse_values = vec![pending];
+        assert!(!canvas.accepts_snapshot(&snapshot));
+        canvas.sse_source_edit_inflight = false;
+        assert!(canvas.accepts_snapshot(&snapshot));
+    });
+}
+
+#[gpui::test]
+fn focused_preview_changes_canvas_geometry_without_retargeting_source_edits(
+    cx: &mut gpui::TestAppContext,
+) {
+    let canvas = test_canvas(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    let original = "cell leaf(w: Int) { let r = rect(\"met1\", x0=0., y0=0., x1=w as Float, y1=10.); } cell top() { let child = inst(leaf(10), x=0., y=0.); }";
+    std::fs::write(&source, original).unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+    ));
+    let mut compiler = argonc::incremental::IncrementalCompiler::new();
+    let full = compiler.compile_cell(&config, &["top".to_owned()], vec![]);
+    let CompileOutput::Valid(ref full_data) = full else {
+        panic!("initial hierarchy did not compile");
+    };
+    let child = full_data
+        .cells
+        .iter()
+        .find_map(|(id, cell)| (cell.name == "leaf").then_some(*id))
+        .unwrap();
+    let scope = ScopeAddress {
+        cell: child,
+        scope: full_data.cells[&child].root,
+    };
+    let full_top = full_data.top;
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.update(cx, |state, cx| {
+            state.compilation_revision = Some(1);
+            state.update(cx, full);
+            state.solved_cell.update(cx, |cell, cx| {
+                cell.as_mut().unwrap().selected_scope = scope;
+                cx.notify();
+            });
+            cx.notify();
+        });
+        canvas.pending_rectangles.push(PendingRectangle {
+            id: 1,
+            scope_path: scope,
+            source_path: source.clone(),
+            name: "rect0".to_owned(),
+            rect: compile::BasicRect {
+                layer: Some("met1".to_owned()),
+                x0: 0.,
+                y0: 0.,
+                x1: 1.,
+                y1: 1.,
+                construction: false,
+            },
+            submitted: false,
+            submitted_revision: None,
+            receipt: None,
+            resolved_content_revision: None,
+        });
+        canvas.update_raster_presentation(cx);
+    });
+    compiler.set_source_text(
+        source,
+        original.replace("x1=w as Float", "x1=w as Float + 1."),
+    );
+    let preview = compiler.compile_cell_preview(
+        &config,
+        &["leaf".to_owned()],
+        vec![argonc::compile::CellArg::Int(10)],
+    );
+    let context = canvas.read_with(cx, |canvas, cx| {
+        canvas.state.read(cx).compilation_preparation_context(cx)
+    });
+    let prepared = prepare_compilation_snapshot(
+        CompilationSnapshot {
+            revision: 2,
+            output: preview,
+        },
+        context,
+    );
+    let PreparedCompileOutput {
+        selected_scope,
+        state: scopes,
+        ..
+    } = prepared.prepared_output.unwrap();
+    let CompileOutput::Valid(data) = prepared.output else {
+        panic!("focused preview did not compile");
+    };
+    let preview_top = data.top;
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.update(cx, |state, cx| {
+            state.preview_revision = Some(2);
+            state.preview_source_scope = Some(scope);
+            state.preview_cell.update(cx, |cell, cx| {
+                *cell = Some(CompileOutputState {
+                    output: Arc::new(data),
+                    selected_scope,
+                    state: Arc::new(scopes),
+                });
+                cx.notify();
+            });
+            cx.notify();
+        });
+        canvas.update_raster_presentation(cx);
+        assert!(canvas.raster_exclude_editable_geometry);
+        assert_eq!(canvas.raster_output.as_ref().unwrap().top, preview_top);
+        assert_eq!(canvas.pending_rectangles[0].scope_path, scope);
+        let canonical = canvas.state.read(cx).solved_cell.read(cx);
+        assert_eq!(canonical.as_ref().unwrap().output.top, full_top);
+    });
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.update(cx, |state, cx| {
+            state.solved_cell.update(cx, |cell, cx| {
+                let root = cell.as_ref().unwrap().output.cells[&full_top].root;
+                cell.as_mut().unwrap().selected_scope = ScopeAddress {
+                    cell: full_top,
+                    scope: root,
+                };
+                cx.notify();
+            });
+            cx.notify();
+        });
+        canvas.update_raster_presentation(cx);
+        assert_eq!(canvas.raster_output.as_ref().unwrap().top, full_top);
+        assert_eq!(canvas.pending_rectangles[0].scope_path, scope);
+    });
 }
 
 #[gpui::test]
@@ -221,6 +462,7 @@ fn input(
         viewport,
         text_color: rgb(0xffffff),
         include_text: true,
+        exclude_editable_geometry: false,
         content_revision: 1,
         content_revision_signal: Arc::new(AtomicU64::new(1)),
         scale_signal: Arc::new(AtomicU64::new(viewport.scale.to_bits() as u64)),
@@ -765,6 +1007,93 @@ fn test_editor(
         state,
         canvas: canvas.clone(),
     })
+}
+
+#[gpui::test]
+fn early_sse_cell_preview_is_applied_as_soon_as_neovim_acknowledges_the_edit(
+    cx: &mut gpui::TestAppContext,
+) {
+    let canvas = test_canvas(cx);
+    let editor = test_editor(&canvas, cx);
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    let original = "cell top() { let r = rect(\"met1\", x0i=0., y0i=0., x1i=10., y1i=10.)!; }";
+    std::fs::write(&source, original).unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+    ));
+    let mut compiler = argonc::incremental::IncrementalCompiler::new();
+    let full = compiler.compile_cell(&config, &["top".into()], vec![]);
+    let data = match &full {
+        CompileOutput::Valid(data) => data,
+        CompileOutput::ExecErrors(errors) => errors.output.as_ref().unwrap(),
+        _ => panic!("initial SSE cell did not compile"),
+    };
+    let previous_cell = data.top;
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.update(cx, |state, cx| {
+            state.compilation_revision = Some(1);
+            state.update(cx, full);
+            cx.notify();
+        });
+    });
+    let source_scope = canvas.read_with(cx, |canvas, cx| {
+        canvas
+            .state
+            .read(cx)
+            .solved_cell
+            .read(cx)
+            .as_ref()
+            .unwrap()
+            .selected_scope
+    });
+    compiler.set_source_text(source.clone(), original.replace("x1i=10.", "x1i=12."));
+    let preview = compiler.compile_cell(&config, &["top".into()], vec![]);
+    let prepared = prepare_compilation_snapshot(
+        CompilationSnapshot {
+            revision: 2,
+            output: preview,
+        },
+        canvas.read_with(cx, |canvas, cx| {
+            canvas.state.read(cx).compilation_preparation_context(cx)
+        }),
+    );
+    canvas.update(cx, |canvas, _| {
+        canvas.is_sse_persisting = true;
+        canvas.sse_source_edit_inflight = true;
+        canvas.sse_persist_after_revision = Some(1);
+    });
+    editor.update(cx, |editor, cx| {
+        assert!(!editor.finish_cell_preview(cx, previous_cell, source_scope, prepared));
+    });
+    assert!(canvas.read_with(cx, |canvas, _| canvas.deferred_cell_preview.is_some()));
+
+    editor.update(cx, |editor, cx| {
+        editor.finish_sse_source_edit(
+            cx,
+            Ok(Some(vec![])),
+            vec![analyzer::rpc::InitialConditionEdit {
+                call_span: Span {
+                    path: source,
+                    span: cfgrammar::Span::new(0, original.len()),
+                },
+                name: "x1i".to_owned(),
+                value: "12.".to_owned(),
+            }],
+        );
+    });
+    assert!(canvas.read_with(cx, |canvas, _| !canvas.is_sse_persisting));
+    let displayed_x1 = canvas.read_with(cx, |canvas, cx| {
+        let displayed = canvas.state.read(cx).displayed_cell(cx).unwrap();
+        displayed.output.cells[&displayed.selected_scope.cell]
+            .objects
+            .values()
+            .find_map(SolvedValue::get_rect)
+            .unwrap()
+            .x1
+            .0
+    });
+    assert_eq!(displayed_x1, 12.);
 }
 
 #[gpui::test]
@@ -1509,6 +1838,7 @@ cell top() { for row in std::range(96) { for col in std::range(96) {
         message: Ok(LangServerResponse::DrawRect(Some(RectangleEditResult {
             span: scope_span.clone(),
             revision: 1,
+            name: var_name.to_owned(),
         }))),
     });
     if !dense {
@@ -1664,6 +1994,9 @@ cell top() { for row in std::range(96) { for col in std::range(96) {
         canvas.read_with(cx, |canvas, _| canvas.painted_rectangle_previews.len()),
         1
     );
+    // A rejected edit must not permanently freeze the queued drawing. The
+    // next source RPC is sent without waiting for a new compiled frame.
+    assert!(canvas.read_with(cx, |canvas, _| canvas.pending_rectangles[0].submitted));
     let request = loop {
         if let Some(message) = server.next().now_or_never()
             && let tarpc::ClientMessage::Request(request) = message.unwrap().unwrap()
@@ -1672,12 +2005,20 @@ cell top() { for row in std::range(96) { for col in std::range(96) {
         }
         assert!(cx.dispatcher.tick(false));
     };
+    let LangServerRequest::DrawRect {
+        var_name: resumed_name,
+        ..
+    } = &request.message
+    else {
+        panic!("expected queued rectangle RPC");
+    };
     server
         .send(tarpc::Response {
             request_id: request.id,
             message: Ok(LangServerResponse::DrawRect(Some(RectangleEditResult {
                 span: scope_span,
                 revision: 2,
+                name: resumed_name.clone(),
             }))),
         })
         .now_or_never()

@@ -35,8 +35,8 @@ use argonc::{
 use futures::prelude::*;
 use indexmap::IndexMap;
 use rpc::{
-    CompilationSnapshot, CompressedCompilationUpdate, GuiClient, InstancePreview, LangServer,
-    insert_statement,
+    CompilationSnapshot, CompressedCompilationUpdate, FocusedCellPreview, GuiClient,
+    InstancePreview, LangServer, insert_statement,
 };
 use serde::{Deserialize, Serialize};
 use tarpc::{context, server::Channel, tokio_serde::formats::Bincode};
@@ -56,7 +56,9 @@ use tracing_subscriber::{
 };
 
 use crate::command_completion::{CommandCompletion, CommandCompletionParams};
-use crate::compiler_worker::{CompileIdentity, CompileRequest, CompileResult, CompilerWorker};
+use crate::compiler_worker::{
+    CompileIdentity, CompilePreview, CompileRequest, CompileResult, CompilerWorker,
+};
 use crate::document::{Document, DocumentChange, PositionEncoding};
 
 const DEFAULT_LOG_LEVEL: &str = "error";
@@ -404,6 +406,7 @@ pub(crate) struct PublishedState {
     pub(crate) nav: Option<Arc<NavIndex>>,
     pub(crate) prev_diagnostics: IndexMap<Uri, Vec<Diagnostic>>,
     pub(crate) compiled_revision: u64,
+    pub(crate) compiled_cell: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -894,19 +897,32 @@ impl Backend {
 
     /// Compile and publish diagnostics for an exact source/cell identity.
     /// GUI presentation is deliberately handled by the caller.
-    async fn compile_snapshot(&self, identity: CompileIdentity) -> Option<CompilationSnapshot> {
-        let request = {
+    async fn compile_snapshot(
+        &self,
+        identity: CompileIdentity,
+        preview_cell: Option<compile::CellId>,
+    ) -> Option<CompilationSnapshot> {
+        let (preview, result) = {
             let source = self.state.source_state.lock().await;
             if source.compile_identity() != identity {
                 return None;
             }
             let root_dir = self.state.root_dir.get().cloned()?;
-            CompileRequest {
+            self.state.compiler.compile_streamed(CompileRequest {
                 identity: identity.clone(),
                 root_dir,
-            }
+                preview_cell,
+            })
         };
-        let result = self.state.compiler.compile(request).await?;
+        if let Some(preview) = preview {
+            let backend = self.clone();
+            tokio::spawn(async move {
+                if let Ok(preview) = preview.await {
+                    backend.send_cell_preview(preview).await;
+                }
+            });
+        }
+        let result = result.await.ok()?;
         if !self.state.is_latest_compile_request(&result.identity).await {
             return None;
         }
@@ -954,6 +970,7 @@ impl Backend {
                 compiled.nav = Some(nav);
             }
             compiled.compiled_revision = identity.revision;
+            compiled.compiled_cell = identity.cell.clone();
         }
 
         for message in result.messages {
@@ -1018,6 +1035,12 @@ impl Backend {
         let update = rpc::CompilationUpdate::new(snapshot.clone(), previous.as_ref());
         let compression_started = Instant::now();
         let update = self.compress_gui_update(update).await?;
+        // A rapid source burst may supersede this snapshot while its large
+        // delta is being compressed. Do not occupy the serialized GUI RPC
+        // lane with a revision that can no longer be displayed.
+        if !self.state.is_latest_compile_request(identity).await {
+            return None;
+        }
         let compressed_mib = update.encoded_len() as f64 / (1024. * 1024.);
         progress
             .report(format!(
@@ -1162,13 +1185,34 @@ impl Backend {
     async fn update_cell(&self, identity: CompileIdentity) -> Option<GuiConnection> {
         let pipeline_started = Instant::now();
         let activity = self.state.begin_compilation(&identity).await;
+        let preview_cell = if identity.cell.is_some()
+            && self.state.published_state.lock().await.compiled_cell == identity.cell
+        {
+            if let Some(connection) = self.state.gui_connection().await {
+                // The query is only an optimization. A busy GUI must never
+                // delay the mandatory top-level compilation for an RPC's
+                // ordinary ten-second deadline.
+                tokio::time::timeout(
+                    Duration::from_millis(200),
+                    connection.client.selected_cell(context::current()),
+                )
+                .await
+                .ok()
+                .and_then(|result| result.ok())
+                .flatten()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let result = async {
             // The compiler runs on its dedicated worker thread, so the async
             // language-server task remains free to publish a heartbeat. Large
             // cells used to leave Neovim showing an undifferentiated spinner
             // for tens of seconds, making healthy evaluation indistinguishable
             // from a wedged worker.
-            let mut compilation = Box::pin(self.compile_snapshot(identity.clone()));
+            let mut compilation = Box::pin(self.compile_snapshot(identity.clone(), preview_cell));
             let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // `interval`'s first tick is immediate; the begin notification
@@ -1196,6 +1240,55 @@ impl Backend {
         .await;
         self.state.finish_compilation(activity).await;
         result
+    }
+
+    async fn send_cell_preview(&self, preview: CompilePreview) {
+        if !self
+            .state
+            .is_latest_compile_request(&preview.identity)
+            .await
+        {
+            return;
+        }
+        if !matches!(
+            preview.output,
+            CompileOutput::Valid(_) | CompileOutput::ExecErrors(_)
+        ) {
+            return;
+        }
+        let Some(connection) = self.state.gui_connection().await else {
+            return;
+        };
+        let update = rpc::CompilationUpdate::new(
+            CompilationSnapshot {
+                revision: preview.identity.revision,
+                output: preview.output,
+            },
+            None,
+        );
+        let Some(update) = self.compress_gui_update(update).await else {
+            return;
+        };
+        if !self
+            .state
+            .is_latest_compile_request(&preview.identity)
+            .await
+        {
+            return;
+        }
+        let request = FocusedCellPreview {
+            previous_cell: preview.previous_cell,
+            update,
+        };
+        if let Err(error) = connection
+            .client
+            .preview_cell(gui_snapshot_context(), request)
+            .await
+        {
+            if is_gui_disconnected(&error) {
+                self.state.clear_gui_connection(connection.id).await;
+            }
+        }
     }
 
     async fn open_cell_view(&self, identity: CompileIdentity) {
@@ -1407,7 +1500,16 @@ impl LanguageServer for Backend {
         let identity = source.compile_identity();
         drop(source);
         if analyzer_edit {
-            self.update_cell(identity).await;
+            // A didChange notification must release its LSP service slot as
+            // soon as the source is recorded. The GUI update can be much
+            // slower than the source edit, and waiting here exhausts the
+            // server's four concurrent request slots during rapid drawing.
+            let backend = self.clone();
+            tokio::spawn(async move {
+                if backend.state.is_latest_compile_request(&identity).await {
+                    backend.update_cell(identity).await;
+                }
+            });
         } else {
             self.compile_after_debounce(identity);
         }
