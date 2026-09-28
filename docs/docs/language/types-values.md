@@ -9,7 +9,7 @@ Argon's types fall into scalars, collections, tuples, and layout types. Write ty
 
 Structs, enums, functions, and cells may take type parameters, written in angle brackets after the name: `struct Pair<A, B>`, `fn last<T>(items: [T]) -> T`. A type parameter stands for one type per use, which is inferred from the arguments, and a value of type `T` can only be stored, passed, and returned.
 
-A struct groups values under named fields, written `Size { w: 100., h: 50. }` and read with `.`. An enum is a fixed set of variants, each of which may carry a tuple payload or named fields of its own; see [enums and `match`](/language/control-flow#enums-and-match).
+A struct groups values under named fields, written `Size { w: 100., h: 50. }` and read with `.` or taken apart with a pattern, as in `let Size { w, h } = s;` (see [bindings](/language/cells-functions#bindings-and-order)). An enum is a fixed set of variants, each of which may carry a tuple payload or named fields of its own; see [enums and `match`](/language/control-flow#enums-and-match).
 
 | Type | Example | Used for |
 | --- | --- | --- |

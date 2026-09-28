@@ -5,7 +5,7 @@ description: if, match, and for.
 
 # Control flow
 
-Argon has `if`, `match` on enums, and `for` over sequences. `if` and `match` are expressions, and an `if` with no `else` is a statement.
+Argon has `if`, `match` on enums and structs, and `for` over sequences. `if` and `match` are expressions, and an `if` with no `else` is a statement.
 
 ## `if` expressions
 
@@ -141,6 +141,27 @@ A field pattern binds a name or `_`, never a nested pattern. As with a struct
 literal, a variant literal in an `if` condition, a `match` scrutinee, or a
 `for` sequence must be parenthesized, since `name {` there begins the
 construct's body.
+
+### Matching structs
+
+A `match` on a [struct](/language/types-values) takes the same braced patterns,
+naming the struct instead of a variant. A field pattern may be a unit variant,
+which matches only that variant, so an arm like the second one below is needed
+to cover the rest:
+
+```argon
+struct Via {
+    layer: String,
+    n: Option<Int>,
+}
+
+fn count(v: Via) -> Int {
+    match v {
+        Via { n: None, .. } => 1,
+        Via { n, .. } => std::unwrap_or(n, 1),
+    }
+}
+```
 
 ## `for` loops
 
