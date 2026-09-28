@@ -222,7 +222,7 @@ dependencies = [
  "arc",
  "arcstr",
  "argonc",
- "bincode",
+ "bincode 3.0.0",
  "bytes",
  "cfgrammar",
  "clap",
@@ -263,7 +263,7 @@ dependencies = [
  "anyhow",
  "approx",
  "arcstr",
- "bincode",
+ "bincode 3.0.0",
  "cfgrammar",
  "clap",
  "const_format",
@@ -284,7 +284,7 @@ dependencies = [
  "sky130",
  "sparse-linear-solver",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
  "uniquify 0.4.1 (registry+https://github.com/substrate-labs/crates-index)",
@@ -688,7 +688,7 @@ dependencies = [
  "crc32fast",
  "futures-lite 2.6.1",
  "pin-project",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -747,7 +747,7 @@ dependencies = [
  "num-traits",
  "pastey",
  "rayon",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "v_frame",
  "y4m",
 ]
@@ -858,6 +858,12 @@ checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "bincode"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd6a120d2e16b3e1b4a24bd70f23b12d3e16b81f113364a26935f8db7245452d"
 
 [[package]]
 name = "bindgen"
@@ -1144,7 +1150,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "sha2 0.10.9",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-rusqlite",
  "tokio-stream",
@@ -1496,7 +1502,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b60b5124979fccd9addd89d8b97a1d6eebb4950694520c75ddd722535ea443f"
 dependencies = [
  "nix 0.31.3",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -3064,7 +3070,7 @@ dependencies = [
  "layir",
  "serde",
  "slotmap",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -3513,7 +3519,7 @@ dependencies = [
  "strum 0.27.2",
  "sum_tree",
  "taffy",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "usvg",
  "util",
  "util_macros",
@@ -4359,7 +4365,7 @@ dependencies = [
  "geometry 0.7.2 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
  "indexmap",
  "serde",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "uniquify 0.4.1 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
 ]
@@ -4884,7 +4890,7 @@ dependencies = [
  "rustc-hash 1.1.0",
  "spirv",
  "strum 0.26.3",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "unicode-ident",
 ]
 
@@ -5021,7 +5027,7 @@ dependencies = [
  "spice",
  "substrate",
  "tera",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "unicase",
 ]
@@ -5264,7 +5270,7 @@ dependencies = [
  "enumify 0.2.2 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
  "nom 8.0.0",
  "serde",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -5486,7 +5492,7 @@ dependencies = [
  "futures-sink",
  "js-sys",
  "pin-project-lite",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -6178,7 +6184,7 @@ dependencies = [
  "rustc-hash 2.1.3",
  "rustls",
  "socket2",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "web-time",
@@ -6200,7 +6206,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tinyvec",
  "tracing",
  "web-time",
@@ -6371,7 +6377,7 @@ dependencies = [
  "rand 0.9.5",
  "rand_chacha 0.9.0",
  "simd_helpers",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "v_frame",
  "wasm-bindgen",
 ]
@@ -6897,7 +6903,7 @@ dependencies = [
  "indexmap",
  "rust_decimal",
  "serde",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "uniquify 0.4.1 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
 ]
@@ -7261,7 +7267,7 @@ dependencies = [
  "spectre",
  "spice",
  "substrate",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "unicase",
 ]
 
@@ -7292,9 +7298,9 @@ dependencies = [
 
 [[package]]
 name = "smallvec"
-version = "1.16.1"
+version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
+checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 
 [[package]]
 name = "smawk"
@@ -7372,7 +7378,7 @@ dependencies = [
  "spice",
  "substrate",
  "tera",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "type_dispatch",
 ]
@@ -7394,7 +7400,7 @@ dependencies = [
  "rust_decimal_macros",
  "scir",
  "substrate",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "unicase",
 ]
@@ -7573,7 +7579,7 @@ dependencies = [
  "snippets",
  "splines",
  "test-log",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "type_dispatch",
  "uniquify 0.4.1 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
@@ -7864,7 +7870,7 @@ dependencies = [
  "serde",
  "static_assertions",
  "tarpc-plugins",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-serde",
  "tokio-util",
@@ -7992,11 +7998,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.20",
+ "thiserror-impl 2.0.21",
 ]
 
 [[package]]
@@ -8012,9 +8018,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8181,7 +8187,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caf600e7036b17782571dd44fa0a5cea3c82f60db5137f774a325a76a0d6852b"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "bytes",
  "educe",
  "futures-core",
@@ -8508,7 +8514,7 @@ checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
 dependencies = [
  "crossbeam-channel",
  "symlink",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "time",
  "tracing-subscriber",
 ]
@@ -9329,7 +9335,7 @@ checksum = "3a4df73e95feddb9ec1a7e9c2ca6323b8c97d5eeeff78d28f1eccdf19c882b24"
 dependencies = [
  "parking_lot",
  "rayon",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "windows 0.61.3",
  "windows-future",
 ]
