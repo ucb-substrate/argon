@@ -60,4 +60,13 @@ fn inset_bounds(rect_: Rect, amount: Float) -> Rect {
 let bounds = bbox(child);
 ```
 
+A `let` can also take a struct apart. The pattern names the struct and binds its fields: a bare `name` binds the field of that name, `field: other` binds it under another name, and `field: _` drops it. The pattern must name every field unless it ends in `..`, and field patterns do not nest.
+
+```argon
+let Size { w, h: height } = size;
+let ViaParams { layer, .. } = params;
+```
+
+At the top of a cell, each name a pattern binds is a field of the cell, like any other `let`.
+
 Top-level declarations are resolved across the whole module, so a cell can call a function declared further down the file.

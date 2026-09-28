@@ -29,7 +29,7 @@ use crate::{
     },
     compile::{
         AdtDef, BUILTINS, RESERVED_CELL_FIELDS, Ty, TyParamTy, TypeDefs, TypedWorkspace, VarId,
-        VarIdTyMetadata, VariantTys, module_prefix, param_map, subst,
+        VarIdTyMetadata, VariantTys, module_prefix, param_map, subst, typed_let_bindings,
     },
 };
 
@@ -1130,19 +1130,16 @@ impl<'a> Builder<'a> {
                             .scope
                             .stmts
                             .iter()
-                            .filter_map(|stmt| match stmt {
-                                Statement::LetBinding(binding) => Some(binding),
-                                _ => None,
-                            })
+                            .flat_map(typed_let_bindings)
                             .collect::<Vec<_>>();
                         let fields = bindings
                             .iter()
-                            .map(|binding| (binding.name.name.to_string(), binding.metadata))
+                            .map(|(name, id, _)| (name.name.to_string(), *id))
                             .collect();
                         self.cell_fields.insert(decl.metadata.1, fields);
                         let field_types = bindings
-                            .iter()
-                            .map(|binding| (binding.name.name.to_string(), binding.value.ty()))
+                            .into_iter()
+                            .map(|(name, _, ty)| (name.name.to_string(), ty))
                             .collect();
                         self.index
                             .cell_field_types
@@ -1597,6 +1594,9 @@ impl<'a> Builder<'a> {
                                 Statement::LetBinding(binding) => {
                                     find_param(&binding.value.ty(), name)
                                 }
+                                Statement::LetPattern(binding) => {
+                                    find_param(&binding.value.ty(), name)
+                                }
                                 _ => None,
                             })
                         }),
@@ -1890,6 +1890,11 @@ impl<'a> Builder<'a> {
                             available_after: binding.span.end(),
                         });
                 }
+                Statement::LetPattern(binding) => {
+                    // The value is evaluated before the names are bound.
+                    self.expr(&binding.value);
+                    self.pattern(&binding.pattern, scope.span, binding.span.end());
+                }
                 Statement::ForLoop(loop_) => {
                     self.expr(&loop_.seq);
                     let key = DefKey::Var(loop_.metadata);
@@ -1989,7 +1994,8 @@ impl<'a> Builder<'a> {
             Expr::Match(match_) => {
                 self.expr(&match_.scrutinee);
                 for arm in &match_.arms {
-                    self.pattern(&arm.pattern, arm.expr.span());
+                    let body = arm.expr.span();
+                    self.pattern(&arm.pattern, body, body.start());
                     self.expr(&arm.expr);
                 }
             }
@@ -2121,12 +2127,13 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Walks a `match` arm's pattern; a binding is a local scoped to the arm's
-    /// body.
+    /// Walks a pattern; a binding is a local visible in `scope` from
+    /// `available_after` on.
     fn pattern(
         &mut self,
         pattern: &'a Pattern<arcstr::Substr, VarIdTyMetadata>,
-        body: cfgrammar::Span,
+        scope: cfgrammar::Span,
+        available_after: usize,
     ) {
         match pattern {
             Pattern::Wildcard { .. } => {}
@@ -2151,29 +2158,30 @@ impl<'a> Builder<'a> {
                     .push(ScopeBinding {
                         name: name.name.to_string(),
                         key,
-                        scope: body,
-                        available_after: body.start(),
+                        scope,
+                        available_after,
                     });
             }
             Pattern::Variant { path, fields, .. } => {
                 self.ident_path(path);
                 for field in fields {
-                    self.pattern(field, body);
+                    self.pattern(field, scope, available_after);
                 }
             }
-            Pattern::StructVariant { path, fields, .. } => {
+            Pattern::Struct { path, fields, .. } => {
                 self.ident_path(path);
-                let variant_id = path.metadata.0;
+                // Keyed by the variant, or by the struct for a struct pattern.
+                let owner_id = path.metadata.0;
                 for field in fields {
                     // A shorthand field is one token naming both the field and
                     // the local it binds; the local is the more useful target.
                     if !field.shorthand {
-                        let target = variant_id.map_or(Target::Unresolved, |id| {
+                        let target = owner_id.map_or(Target::Unresolved, |id| {
                             Target::Def(DefKey::Field(id, field.name.name.to_string()))
                         });
                         self.record(field.name.span, target);
                     }
-                    self.pattern(&field.pattern, body);
+                    self.pattern(&field.pattern, scope, available_after);
                 }
             }
         }
@@ -2592,6 +2600,43 @@ cell top() {
             "enum Shape { Circle { radius: Float }, Empty }"
         );
         assert_eq!(hover("Circle {"), "Shape::Circle { radius: Float }");
+    }
+
+    /// A struct pattern's path jumps to the struct and its field names to the
+    /// fields; the names a `let` pattern binds are locals, and at the top of a
+    /// cell they are fields of its instances too.
+    #[test]
+    fn struct_patterns_resolve() {
+        check(
+            r#"
+struct Size { width: Float, height: Float, }
+
+fn area(s: Size) -> Float {
+    let Si$0ze { wid$0th, height: tal$0l } = s;
+    wid$0th * tal$0l
+}
+
+fn pick(s: Size) -> Float {
+    match s {
+        Size { heig$0ht: short, .. } => sho$0rt,
+    }
+}
+
+cell pad() {
+    let Size { width: wi$0de, .. } = Size { width: 1., height: 2. };
+    let r = rect("met1", x0=0., y0=0., w=wi$0de, h=1.);
+}
+
+cell top() {
+    let p = inst(pad(), x=0., y=0.);
+    let q = p.wi$0de;
+}
+"#,
+            &[
+                "Size#0", "width#1", "tall#0", "width#1", "tall#0", "height#0", "short#0",
+                "wide#0", "wide#0", "wide#0",
+            ],
+        );
     }
 
     #[test]

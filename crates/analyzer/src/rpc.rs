@@ -742,10 +742,8 @@ impl LangServer for State {
         let names = scope
             .stmts
             .iter()
-            .filter_map(|statement| match statement {
-                argonc::ast::Statement::LetBinding(binding) => Some(binding.name.name.as_str()),
-                _ => None,
-            })
+            .flat_map(|statement| statement.let_names())
+            .map(|name| name.name.as_str())
             .collect::<std::collections::HashSet<_>>();
         let var_name = (0..)
             .map(|index| format!("inst{index}"))

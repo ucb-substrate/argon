@@ -611,17 +611,12 @@ fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> 
             candidate.kind,
             Kind::Cell | Kind::Enum | Kind::Struct | Kind::Type
         ),
-        // A field is offered because a variant pattern binds its payload by
-        // name, as in `Shape::Box { w, .. }`.
+        // A field is offered because a struct or variant pattern binds fields
+        // by name, as in `Shape::Box { w, .. }`.
         CompletionSite::Pattern => match candidate.kind {
-            Kind::Enum | Kind::Variant | Kind::Module | Kind::Field => true,
+            Kind::Enum | Kind::Variant | Kind::Struct | Kind::Module | Kind::Field => true,
             Kind::Keyword => candidate.label == "_",
-            Kind::Function
-            | Kind::Cell
-            | Kind::Variable
-            | Kind::Parameter
-            | Kind::Struct
-            | Kind::Type => false,
+            Kind::Function | Kind::Cell | Kind::Variable | Kind::Parameter | Kind::Type => false,
         },
         CompletionSite::ImportPath => candidate.kind == Kind::Module,
         CompletionSite::Keyword(keyword) => {
@@ -1249,7 +1244,7 @@ mod tests {
         assert_eq!(labels(CompletionSite::ImportPath), ["lib"]);
         assert_eq!(
             labels(CompletionSite::Pattern),
-            ["Mode", "lib", "_", "Some"]
+            ["Mode", "Size", "lib", "_", "Some"]
         );
         // The statement candidates, plus `else`.
         assert_eq!(

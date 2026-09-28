@@ -1,0 +1,46 @@
+struct Size {
+    w: Float,
+    h: Float,
+}
+
+struct Pair<A, B> {
+    first: A,
+    second: B,
+}
+
+struct Via {
+    layer: String,
+    size: Size,
+    n: Option<Int>,
+}
+
+// A `let` pattern names the struct and binds its fields. `f: name` renames a
+// binding, `f: _` drops one, and a trailing `..` ignores the rest.
+fn area(s: Size) -> Float {
+    let Size { w, h: height } = s;
+    w * height
+}
+
+fn first<A, B>(p: Pair<A, B>) -> A {
+    let Pair { first, .. } = p;
+    first
+}
+
+// A `match` arm may name a field's unit variant; an arm that binds every
+// field covers the rest.
+fn count(v: Via) -> Int {
+    match v {
+        Via { n: None, .. } => 1,
+        Via { n, .. } => std::unwrap_or(n, 1),
+    }
+}
+
+cell top() {
+    let size = Size { w: 100., h: 50. };
+    // Each name a top-level pattern binds is a field of the cell.
+    let Size { w, h } = size;
+    let r = rect("met1", x0=0., y0=0., w=w, h=area(size) / w);
+    let p = Pair { first: 20., second: 3 };
+    let Via { layer, n, size: _ } = Via { layer: "met2", size, n: Some(3) };
+    let r2 = rect(layer, x0=0., y0=h, w=first(p) * (count(Via { layer, size, n }) as Float), h=h);
+}

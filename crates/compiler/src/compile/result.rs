@@ -47,7 +47,7 @@ pub enum StaticErrorKind {
     /// Attempted to use an enum variant that is not declared by the enum.
     #[error("not a variant of the enum: {0}")]
     InvalidVariant(String),
-    /// A struct literal names something that is not a struct type.
+    /// A struct literal or pattern names something that is not a struct type.
     #[error("expected a struct type")]
     NotAStruct,
     /// A struct literal gives the same field twice.
@@ -89,9 +89,18 @@ pub enum StaticErrorKind {
     /// with named fields accepts.
     #[error("variant `{0}` has no named fields")]
     NotAStructVariant(String),
-    /// A variant pattern without `..` omits declared fields.
+    /// A struct or variant pattern without `..` omits declared fields.
     #[error("missing fields {fields} in pattern of {ty}; add `..` to ignore them")]
     MissingPatternFields { ty: String, fields: String },
+    /// A struct was matched by position, as though it were a tuple variant.
+    #[error("`{0}` is a struct; destructure it with braces")]
+    StructPatternWithoutBraces(String),
+    /// A `let` pattern that some value of its type would not match.
+    #[error("`let` requires a pattern that always matches, such as `Struct {{ field, .. }}`")]
+    RefutableLetPattern,
+    /// A `match` whose scrutinee and arms name neither an enum nor a struct.
+    #[error("`match` requires an enum or struct value")]
+    NotMatchable,
     /// A variant literal used `..base`, which only a struct literal accepts.
     #[error("`..` is not supported in a variant; every field must be given")]
     VariantLiteralBase,

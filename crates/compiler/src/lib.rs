@@ -234,6 +234,7 @@ mod tests {
     const ARGON_OPTION: &str = concatcp!(EXAMPLES_DIR, "/option/lib.ar");
     const ARGON_ENUM_PAYLOAD: &str = concatcp!(EXAMPLES_DIR, "/enum_payload/lib.ar");
     const ARGON_ENUM_STRUCT_PAYLOAD: &str = concatcp!(EXAMPLES_DIR, "/enum_struct_payload/lib.ar");
+    const ARGON_STRUCT_DESTRUCTURE: &str = concatcp!(EXAMPLES_DIR, "/struct_destructure/lib.ar");
     const ARGON_RECURSIVE_STRUCT: &str = concatcp!(EXAMPLES_DIR, "/recursive_struct/lib.ar");
     const ARGON_GENERICS_CELL: &str = concatcp!(EXAMPLES_DIR, "/generics_cell/lib.ar");
 
@@ -4674,7 +4675,7 @@ cell top() {
         // expression produced a second `expected .., found Unknown`.
         //
         // Six predicates encode "this type satisfies every check". Teaching
-        // only `is_eq_ty`, `assert_ty_is_cell` and `assert_ty_is_enum` about
+        // only `is_eq_ty`, `assert_ty_is_cell` and `assert_ty_is_matchable` about
         // `Unknown` left the other three still reporting a second error, so
         // they all go through `Ty::is_wildcard` now and all are covered here.
         for source in [
@@ -4705,10 +4706,10 @@ cell top() {
     }
 
     #[test]
-    fn a_match_that_names_no_enum_is_reported() {
+    fn a_match_that_names_no_enum_or_struct_is_reported() {
         // `dispatch_match_expr` returned `lub_ty.unwrap_or_default()` --
         // `Ty::Unknown` -- with no diagnostic when neither the scrutinee nor
-        // any arm pattern resolved to an enum. That was survivable only while
+        // any arm pattern resolved to an enum or struct. That was survivable only while
         // `is_eq_ty` compared `Unknown` structurally; once `Unknown` satisfies
         // every check it silently suppressed the caller's checks too, and
         // `--check` accepted a program the evaluator refuses.
@@ -4723,7 +4724,7 @@ cell top() {
         assert!(
             errors
                 .iter()
-                .any(|error| matches!(error, StaticErrorKind::NotAnEnum)),
+                .any(|error| matches!(error, StaticErrorKind::NotMatchable)),
             "{errors:#?}"
         );
 
@@ -5986,6 +5987,153 @@ cell top() {
     }
 
     #[test]
+    fn let_struct_patterns_are_checked() {
+        let source = |stmt: &str| {
+            format!(
+                "struct S {{ a: Float, b: Int, o: Option<Int> }}\n\
+                 struct T {{ a: Float }}\n\
+                 enum E {{ V {{ a: Float }}, W, }}\n\
+                 fn f(s: S, t: T, e: E) -> Float {{ {stmt} 0. }}"
+            )
+        };
+        for stmt in [
+            "let S { a, b, o } = s;",
+            "let S { a: x, .. } = s;",
+            "let S { a: _, b: _, o: _ } = s;",
+            "let S { .. } = s;",
+            "let lib::S { a, .. } = s;",
+        ] {
+            assert!(generic_errors(&source(stmt)).is_empty(), "{stmt}");
+        }
+        assert!(matches!(
+            generic_errors(&source("let S { a } = s;")).as_slice(),
+            [StaticErrorKind::MissingPatternFields { ty, fields }]
+                if ty == "S" && fields == "`b`, `o`"
+        ));
+        assert!(matches!(
+            generic_errors(&source("let S { c, .. } = s;")).as_slice(),
+            [StaticErrorKind::NoFieldOnTy { .. }]
+        ));
+        assert!(matches!(
+            generic_errors(&source("let S { a, a, .. } = s;")).as_slice(),
+            [StaticErrorKind::DuplicateStructField { field }] if field == "a"
+        ));
+        assert!(matches!(
+            generic_errors(&source("let T { a } = s;")).as_slice(),
+            [StaticErrorKind::IncorrectTy { .. }]
+        ));
+        // A pattern that some value would not match is not a `let` pattern.
+        assert!(matches!(
+            generic_errors(&source("let E::V { a } = e;")).as_slice(),
+            [StaticErrorKind::RefutableLetPattern]
+        ));
+        assert!(matches!(
+            generic_errors(&source("let S { o: None, .. } = s;")).as_slice(),
+            [StaticErrorKind::RefutableLetPattern]
+        ));
+        // A variable of struct type does not name a struct.
+        assert!(matches!(
+            generic_errors(&source("let v = s; let v { a, .. } = s;")).as_slice(),
+            [StaticErrorKind::NotAStruct]
+        ));
+        // The bindings have the field types, substituted for a generic struct.
+        assert!(
+            generic_errors(
+                "struct P<A> { x: A }\n\
+                 fn f(p: P<Int>) -> Int { let P { x } = p; x }"
+            )
+            .is_empty()
+        );
+        assert!(matches!(
+            generic_errors(
+                "struct P<A> { x: A }\n\
+                 fn f(p: P<Int>) -> Float { let P { x } = p; x }"
+            )
+            .as_slice(),
+            [StaticErrorKind::IncorrectTy { .. }]
+        ));
+    }
+
+    #[test]
+    fn match_struct_patterns_are_checked() {
+        let source = |arms: &str| {
+            format!(
+                "struct S {{ a: Float, o: Option<Int> }}\n\
+                 fn f(s: S) -> Float {{ match s {{ {arms} }} }}"
+            )
+        };
+        for arms in [
+            "S { a, .. } => a,",
+            "S { o: None, .. } => 1., S { a, o } => a,",
+            "S { o: None, .. } => 1., _ => 2.,",
+        ] {
+            assert!(generic_errors(&source(arms)).is_empty(), "{arms}");
+        }
+        assert!(matches!(
+            generic_errors(&source("S { a, .. } => a, _ => 2.,")).as_slice(),
+            [StaticErrorKind::UnreachableMatchArm]
+        ));
+        assert!(matches!(
+            generic_errors(&source("S { o: None, .. } => 1.,")).as_slice(),
+            [StaticErrorKind::MatchArmsNotComprehensive]
+        ));
+        assert!(matches!(
+            generic_errors(&source("S(a, o) => a,")).as_slice(),
+            [StaticErrorKind::StructPatternWithoutBraces(ty)] if ty == "S"
+        ));
+        // A struct scrutinee is not matched by variants.
+        assert!(matches!(
+            generic_errors(&source("None => 1., _ => 2.,")).as_slice(),
+            [StaticErrorKind::IncorrectTy { .. }]
+        ));
+        assert!(matches!(
+            generic_errors("fn f(x: Float) -> Float { match x { _ => 1., } }").as_slice(),
+            [StaticErrorKind::IncorrectTyCategory { .. }, ..]
+        ));
+    }
+
+    #[test]
+    fn destructured_names_are_cell_fields() {
+        // `top` reads the fields of `pad` before `pad` is declared, so the
+        // pattern's statement is typed on demand.
+        let data = compile_source(
+            "struct Pad { r: Rect, via: Rect }
+             cell top() {
+                 let p = inst(pad(), x=0., y=0.);
+                 let r = rect(\"met2\", x0=0., y0=0., w=p.shape.w, h=p.via.h);
+             }
+             cell pad() {
+                 let Pad { r: shape, via } = Pad {
+                     r: rect(\"met1\", x0=0., y0=0., w=30., h=10.),
+                     via: rect(\"via1\", x0=0., y0=0., w=2., h=4.),
+                 };
+             }",
+            "top",
+            Vec::new(),
+        )
+        .unwrap_valid();
+        assert_eq!(top_rect_sizes(&data), [(30., 4.)]);
+        let pad = data.cells.values().find(|cell| cell.name == "pad").unwrap();
+        assert!(pad.fields.contains_key("shape") && pad.fields.contains_key("via"));
+    }
+
+    #[test]
+    fn a_struct_pattern_rejects_another_struct_at_runtime() {
+        // A value typed `Any` reaches the pattern unchecked.
+        for body in ["let S { a } = v; a", "match v { S { a } => a, }"] {
+            let errors = run_source(&format!(
+                "struct S {{ a: Float }}
+                 struct T {{ a: Float }}
+                 fn f(v: Any) -> Float {{ {body} }}
+                 cell top() {{
+                     let r = rect(\"met1\", x0=0., y0=0., w=f(T {{ a: 1. }}), h=1.);
+                 }}"
+            ));
+            assert_reports(&errors, |error| matches!(error, ExecErrorKind::InvalidType));
+        }
+    }
+
+    #[test]
     fn match_arms_after_a_catch_all_are_unreachable() {
         let source = |arms: &str| {
             format!("enum E {{ A, B, }}\nfn f(e: E) -> Int {{ match e {{ {arms} }} }}")
@@ -6379,6 +6527,14 @@ cell top() {
              }",
         );
         assert_eq!(rect_widths_of(&data, "shape"), [100., 300.]);
+    }
+
+    #[test]
+    fn argon_struct_destructure() {
+        let data = compile_example(ARGON_STRUCT_DESTRUCTURE);
+        // `area(size) / w` recovers the height; the second rect's width is
+        // `first(p)` times the count read out of the `Some(3)`.
+        assert_eq!(top_rect_sizes(&data), [(100., 50.), (60., 50.)]);
     }
 
     #[test]

@@ -564,12 +564,63 @@ mod tests {
             "match s { Shape::Box { w, .., } => w, _ => 0., }",
             // A field pattern is a name or `_`, never a nested pattern.
             "match s { Shape::Box { w: Some(x) } => 1., _ => 0., }",
+            "match s { Shape::Box { w: Size { x } } => 1., _ => 0., }",
             "match s { Shape::Box { : w } => 1., _ => 0., }",
             "match s { Shape::Box { w => 1., _ => 0., }",
         ];
         for body in invalid {
             assert!(!snippet_ok(body), "should be rejected: `{body}`");
         }
+    }
+
+    /// A name followed by `{` or `::` after `let` begins a pattern; any other
+    /// name is a plain binding.
+    #[test]
+    fn let_patterns_parse() {
+        use crate::ast::{Decl, Pattern, Statement};
+
+        for body in [
+            "let Size { w, h: tall } = s;",
+            "let Size { w, .. } = s;",
+            "let Size { .. } = s;",
+            "let geom::Size { w: _, h } = s;",
+            "let Pair::<Int, Float> { first, .. } = p;",
+            "let Size {} = s;",
+        ] {
+            assert!(snippet_ok(body), "should parse: `{body}`");
+        }
+        for body in [
+            "let Size { w: Size { x } } = s;",
+            "let Size { w } : Size = s;",
+            "let Size { w };",
+        ] {
+            assert!(!snippet_ok(body), "should be rejected: `{body}`");
+        }
+
+        let src = "cell c() { let Size { w, h: tall, .. } = s; let x = 1.; }";
+        let ast = parse(src).unwrap();
+        let Decl::Cell(cell) = &ast.ast.decls[0] else {
+            panic!("expected a cell");
+        };
+        let Statement::LetPattern(binding) = &cell.scope.stmts[0] else {
+            panic!("expected a let pattern");
+        };
+        assert_eq!(
+            &src[binding.span.start()..binding.span.end()],
+            "let Size { w, h: tall, .. } = s"
+        );
+        let Pattern::Struct { path, rest, .. } = &binding.pattern else {
+            panic!("expected a struct pattern");
+        };
+        assert_eq!(path.path[0].name, "Size");
+        assert!(rest);
+        let names = cell.scope.stmts[0]
+            .let_names()
+            .into_iter()
+            .map(|name| name.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["w", "tall"]);
+        assert!(matches!(&cell.scope.stmts[1], Statement::LetBinding(_)));
     }
 
     /// A struct variant's fields keep their declared order and spans, and a
@@ -605,7 +656,7 @@ mod tests {
         let Expr::Match(m) = &v.value else {
             panic!("expected a match");
         };
-        let Pattern::StructVariant {
+        let Pattern::Struct {
             path,
             fields,
             rest,

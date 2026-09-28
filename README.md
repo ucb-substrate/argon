@@ -154,6 +154,26 @@ including on the command line:
 arc run --cell 'via(ViaParams { layer: "met1", size: Size { w: 100., h: 50. }, n: 1 })'
 ```
 
+A `let` takes a struct apart with a pattern that names the struct and binds its
+fields. A bare `name` binds the field of that name, `field: other` binds it
+under another name, and `field: _` drops it. A pattern must name every field
+unless it ends in `..`, and field patterns do not nest. At the top of a cell,
+each name a pattern binds is a field of the cell, like any other `let`. A
+`match` on a struct takes the same patterns:
+
+```rust
+fn area(s: Size) -> Float {
+    let Size { w, h: height } = s;
+    w * height
+}
+
+cell via_pair(p: ViaParams) {
+    let ViaParams { layer, size, .. } = p;
+    let left = rect(layer, x0=0., y0=0., w=size.w, h=size.h);
+    let right = rect(layer, x0=2. * size.w, y0=0., w=size.w, h=size.h);
+}
+```
+
 Enum variants may carry values, either as a tuple or as named fields. A tuple
 variant is constructed like a call and taken apart by a `match` pattern that
 binds its payload; `_` skips an element, and a bare name or `_` arm matches

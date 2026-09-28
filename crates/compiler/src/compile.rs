@@ -39,7 +39,7 @@ use crate::workspace::WorkspaceConfig;
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOp, BinOpExpr, BoolOp, CallExpr, CellDecl,
-        Decl, Expr, Ident, IfExpr, LetBinding, Statement,
+        Decl, Expr, Ident, IfExpr, LetBinding, LetPattern, Statement,
     },
     cellcache::{CachedCell, CellCache},
     fingerprint::{ItemIndex, RebaseError, SpanRebase},
@@ -1253,21 +1253,23 @@ impl StatementView {
     fn extend(&mut self, typing: &CellTyping<'_>) {
         let stmt = self.limit;
         self.limit += 1;
-        let Statement::LetBinding(binding) = &typing.decl.scope.stmts[stmt] else {
-            return;
-        };
-        let name = &binding.name.name;
+        let names = typing.decl.scope.stmts[stmt].let_names();
         match &typing.stmts[stmt] {
-            Some(Statement::LetBinding(typed)) => {
-                self.frame
-                    .var_bindings
-                    .insert(name.clone(), (typed.metadata, typed.value.ty()));
-                self.untyped.swap_remove(name.as_str());
+            Some(typed) => {
+                // A bare name in a pattern may have typed as a unit variant,
+                // so the typed statement says which names it bound.
+                for name in names {
+                    self.untyped.swap_remove(name.name.as_str());
+                }
+                for (name, id, ty) in typed_let_bindings(typed) {
+                    self.frame.var_bindings.insert(name.name.clone(), (id, ty));
+                }
             }
-            Some(_) => unreachable!("a `let` statement is typed as a `let`"),
             None => {
-                self.frame.var_bindings.swap_remove(name.as_str());
-                self.untyped.insert(name.clone(), stmt);
+                for name in names {
+                    self.frame.var_bindings.swap_remove(name.name.as_str());
+                    self.untyped.insert(name.name.clone(), stmt);
+                }
             }
         }
     }
@@ -1301,6 +1303,8 @@ struct Demand {
     cell: VarId,
     /// Index of the `let` statement declaring the field.
     stmt: usize,
+    /// The field's name.
+    field: String,
     /// Where it was read, for the diagnostic if the demand cannot be met.
     span: cfgrammar::Span,
 }
@@ -1590,11 +1594,35 @@ impl VariantTys {
     }
 }
 
-/// A variant pattern's annotated path and the variant it resolved to, if any.
-type ResolvedPatternPath = (
-    IdentPath<Substr, VarIdTyMetadata>,
-    Option<(VarId, Arc<CtorTy>)>,
-);
+/// A pattern's annotated path and what it resolved to, if anything.
+type ResolvedPatternPath = (IdentPath<Substr, VarIdTyMetadata>, Option<PatternTarget>);
+
+/// The names a typed `let` statement binds, with their ids and types; empty
+/// for any other statement.
+pub(crate) fn typed_let_bindings<S>(
+    stmt: &Statement<S, VarIdTyMetadata>,
+) -> Vec<(&Ident<S, VarIdTyMetadata>, VarId, Ty)> {
+    match stmt {
+        Statement::LetBinding(binding) => {
+            vec![(&binding.name, binding.metadata, binding.value.ty())]
+        }
+        Statement::LetPattern(binding) => binding
+            .pattern
+            .bindings()
+            .into_iter()
+            .map(|(name, (id, ty))| (name, *id, ty.clone()))
+            .collect(),
+        Statement::Expr { .. } | Statement::ForLoop(_) => Vec::new(),
+    }
+}
+
+/// The declaration a pattern's path names.
+enum PatternTarget {
+    /// An enum variant, carrying any type arguments the path spelled out.
+    Variant(VarId, Arc<CtorTy>),
+    /// A struct declaration, with the type arguments the path spelled out.
+    Struct(VarId, Arc<StructTy>, Option<Vec<Ty>>),
+}
 
 /// The checked form of a struct literal: the type it builds and, when the
 /// literal names an enum variant, that variant.
@@ -2474,19 +2502,17 @@ impl<'a> VarIdTyPass<'a> {
 
         let mut lets: IndexMap<Substr, Vec<usize>> = IndexMap::new();
         for (stmt, statement) in input.scope.stmts.iter().enumerate() {
-            let Statement::LetBinding(binding) = statement else {
-                continue;
-            };
-            let name = &binding.name;
-            if RESERVED_CELL_FIELDS.contains(&name.name.as_str()) {
-                self.errors.push(StaticError {
-                    span: self.span(name.span),
-                    kind: StaticErrorKind::ReservedCellField {
-                        name: name.name.to_string(),
-                    },
-                });
+            for name in statement.let_names() {
+                if RESERVED_CELL_FIELDS.contains(&name.name.as_str()) {
+                    self.errors.push(StaticError {
+                        span: self.span(name.span),
+                        kind: StaticErrorKind::ReservedCellField {
+                            name: name.name.to_string(),
+                        },
+                    });
+                }
+                lets.entry(name.name.clone()).or_default().push(stmt);
             }
-            lets.entry(name.name.clone()).or_default().push(stmt);
         }
         self.cells.insert(
             cell_id,
@@ -2717,14 +2743,11 @@ impl<'a> VarIdTyPass<'a> {
                         || goal.attempting == Some(Unit::Stmt(demand.stmt)))
             });
             if cyclic {
-                let Statement::LetBinding(binding) = &typing.decl.scope.stmts[demand.stmt] else {
-                    unreachable!("demands name `let` statements")
-                };
                 self.errors.push(StaticError {
                     span: self.span(demand.span),
                     kind: StaticErrorKind::CyclicCellField {
                         cell: typing.decl.name.name.to_string(),
-                        field: binding.name.name.to_string(),
+                        field: demand.field.clone(),
                     },
                 });
                 self.poisoned.insert((demand.cell, demand.stmt));
@@ -2784,12 +2807,8 @@ impl<'a> VarIdTyPass<'a> {
         }
         let fields = stmts
             .iter()
-            .filter_map(|stmt| match stmt {
-                Statement::LetBinding(binding) => {
-                    Some((binding.name.name.to_string(), binding.value.ty()))
-                }
-                _ => None,
-            })
+            .flat_map(typed_let_bindings)
+            .map(|(name, _, ty)| (name.name.to_string(), ty))
             .collect();
         self.finished_cell_fields.insert(cell, fields);
         let scope = Scope {
@@ -2811,12 +2830,17 @@ impl<'a> VarIdTyPass<'a> {
 
     /// Records that the current attempt read the field declared by statement
     /// `stmt` of `cell` before it was typed.
-    fn demand(&mut self, cell: VarId, stmt: usize, span: cfgrammar::Span) {
+    fn demand(&mut self, cell: VarId, stmt: usize, field: &str, span: cfgrammar::Span) {
         if self.poisoned.contains(&(cell, stmt)) {
             return;
         }
         if let Some(attempt) = self.attempt.as_mut() {
-            attempt.demands.push(Demand { cell, stmt, span });
+            attempt.demands.push(Demand {
+                cell,
+                stmt,
+                field: field.to_string(),
+                span,
+            });
         }
     }
 
@@ -2830,7 +2854,7 @@ impl<'a> VarIdTyPass<'a> {
         let (Some(cell), Some(&stmt)) = (attempt.cell, attempt.visible_untyped.get(name)) else {
             return false;
         };
-        self.demand(cell, stmt, span);
+        self.demand(cell, stmt, name, span);
         true
     }
 
@@ -2894,10 +2918,16 @@ impl<'a> VarIdTyPass<'a> {
                 return self.no_field_on_ty(field, base_ty.clone());
             };
             return match &typing.stmts[stmt] {
-                Some(Statement::LetBinding(binding)) => subst(&binding.value.ty(), &map),
-                Some(_) => unreachable!("`lets` indexes `let` statements"),
+                Some(typed) => match typed_let_bindings(typed)
+                    .into_iter()
+                    .find(|(binding, _, _)| binding.name == *name)
+                {
+                    Some((_, _, ty)) => subst(&ty, &map),
+                    // The name typed as a unit variant, not a binding.
+                    None => self.no_field_on_ty(field, base_ty.clone()),
+                },
                 None => {
-                    self.demand(def, stmt, field.span);
+                    self.demand(def, stmt, name, field.span);
                     Ty::Unknown
                 }
             };
@@ -3895,14 +3925,14 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
-    fn assert_ty_is_enum(&mut self, span: cfgrammar::Span, ty: &Ty) {
+    fn assert_ty_is_matchable(&mut self, span: cfgrammar::Span, ty: &Ty) {
         let ty = self.shallow(ty);
-        if !(matches!(ty, Ty::Enum(_) | Ty::Infer(_)) || ty.is_wildcard()) {
+        if !(matches!(ty, Ty::Enum(_) | Ty::Struct(_) | Ty::Infer(_)) || ty.is_wildcard()) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTyCategory {
                     found: self.display(&ty),
-                    expected: "Enum".into(),
+                    expected: "Enum or Struct".into(),
                 },
             });
         }
@@ -4745,60 +4775,63 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         arms: &[crate::ast::MatchArm<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr {
         let scrutinee_ty = self.shallow(&scrutinee.ty());
-        self.assert_ty_is_enum(scrutinee.span(), &scrutinee_ty);
+        self.assert_ty_is_matchable(scrutinee.span(), &scrutinee_ty);
 
         // The scrutinee type is only known statically when it is a declared
-        // enum. `Any` is common in practice, because cell and instance types
-        // cannot be named, so arms are then checked against the enum the
-        // *patterns* name instead. The evaluator has no fallback for an arm set
-        // that does not cover the runtime variant, so the checks below are what
-        // keep it from reaching an unmatched value.
-        fn variant_ty(arm: &MatchArm<Substr, VarIdTyMetadata>) -> Option<&Ty> {
+        // enum or struct. `Any` is common in practice, because cell and
+        // instance types cannot be named, so arms are then checked against the
+        // type the *patterns* name instead. The evaluator has no fallback for
+        // an arm set that does not cover the runtime value, so the checks below
+        // are what keep it from reaching an unmatched value.
+        fn pattern_ty(arm: &MatchArm<Substr, VarIdTyMetadata>) -> Option<&Ty> {
             match &arm.pattern {
-                Pattern::Variant { path, .. } | Pattern::StructVariant { path, .. } => {
+                Pattern::Variant { path, .. } | Pattern::Struct { path, .. } => {
                     Some(&path.metadata.1)
                 }
                 _ => None,
             }
         }
-        let pattern_ty = arms
+        let named_ty = arms
             .iter()
-            .filter_map(variant_ty)
-            .find(|ty| matches!(ty, Ty::Enum(_)))
+            .filter_map(pattern_ty)
+            .find(|ty| matches!(ty, Ty::Enum(_) | Ty::Struct(_)))
             .cloned();
         let expected_ty = match scrutinee_ty {
-            Ty::Enum(_) => Some(scrutinee_ty.clone()),
-            _ => pattern_ty,
+            Ty::Enum(_) | Ty::Struct(_) => Some(scrutinee_ty.clone()),
+            _ => named_ty,
         };
 
-        // Neither the scrutinee nor any arm pattern names an enum, so there is
-        // nothing to check the arms against: an unsayable match type has to be
-        // reported here or `--check` accepts a program the evaluator refuses.
+        // Neither the scrutinee nor any arm pattern names an enum or struct, so
+        // there is nothing to check the arms against: an unsayable match type
+        // has to be reported here or `--check` accepts a program the evaluator
+        // refuses.
         let Some(expected_ty) = expected_ty else {
             let already_diagnosed = matches!(scrutinee_ty, Ty::Unknown)
                 || arms
                     .iter()
-                    .filter_map(variant_ty)
+                    .filter_map(pattern_ty)
                     .any(|ty| matches!(ty, Ty::Unknown));
             if !already_diagnosed {
                 self.errors.push(StaticError {
                     span: self.span(scrutinee.span()),
-                    kind: StaticErrorKind::NotAnEnum,
+                    kind: StaticErrorKind::NotMatchable,
                 });
             }
             return Ty::Unknown;
         };
         // An `Any` scrutinee leaves the patterns' type arguments unsolved; an
-        // inference variable scrutinee is solved to the patterns' enum.
+        // inference variable scrutinee is solved to the patterns' type.
         self.unify(&scrutinee_ty, &expected_ty);
-        let Ty::Enum(enum_ty) = &expected_ty else {
-            unreachable!("expected type is an enum")
+        // The enum variants no arm has covered yet. A struct has one shape,
+        // covered once an arm matches every value of it.
+        let mut remaining = match &expected_ty {
+            Ty::Enum(enum_ty) => self
+                .adt_def(enum_ty.def)
+                .and_then(AdtDef::as_enum)
+                .map(|def| def.variants.keys().cloned().collect::<IndexSet<_>>())
+                .unwrap_or_default(),
+            _ => IndexSet::from([String::new()]),
         };
-        let mut remaining = self
-            .adt_def(enum_ty.def)
-            .and_then(AdtDef::as_enum)
-            .map(|def| def.variants.keys().cloned().collect::<IndexSet<_>>())
-            .unwrap_or_default();
         let mut covered = IndexSet::new();
         let mut result: Option<Ty> = None;
         for arm in arms {
@@ -4809,11 +4842,27 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 });
             } else {
                 match &arm.pattern {
+                    // All arms must name the same type, whether or not the
+                    // scrutinee's own type pinned that type down.
+                    Pattern::Variant { path, .. } | Pattern::Struct { path, .. }
+                        if matches!(expected_ty, Ty::Struct(_)) =>
+                    {
+                        self.assert_eq_ty(arm.pattern.span(), &path.metadata.1, &expected_ty);
+                        let catch_all = match &arm.pattern {
+                            Pattern::Struct { fields, .. } => {
+                                fields.iter().all(|field| field.pattern.is_catch_all())
+                            }
+                            _ => false,
+                        };
+                        // An arm whose path was already diagnosed counts as
+                        // covering the struct, so that it is reported once.
+                        if catch_all || matches!(path.metadata.1, Ty::Unknown) {
+                            remaining.clear();
+                        }
+                    }
                     // A payload sub-pattern is a name or `_`, so an arm that
                     // names a variant covers all of it.
-                    Pattern::Variant { path, .. } | Pattern::StructVariant { path, .. } => {
-                        // All arms must belong to the same enum, whether or not
-                        // the scrutinee's own type pinned that enum down.
+                    Pattern::Variant { path, .. } | Pattern::Struct { path, .. } => {
                         self.assert_eq_ty(arm.pattern.span(), &path.metadata.1, &expected_ty);
                         let variant = path.path.last().expect("paths are non-empty").name.clone();
                         remaining.swap_remove(variant.as_str());
@@ -5302,6 +5351,21 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         self.alloc(&name.name, ty)
     }
 
+    fn transform_let_pattern(
+        &mut self,
+        input: &LetPattern<Substr, Self::InputMetadata>,
+    ) -> LetPattern<Substr, Self::OutputMetadata> {
+        let value = self.transform_expr(&input.value);
+        let value_ty = self.shallow(&value.ty());
+        let pattern = self.type_pattern(&input.pattern, &value_ty);
+        self.check_let_pattern(&pattern, &value);
+        LetPattern {
+            pattern,
+            value,
+            span: input.span,
+        }
+    }
+
     fn transform_for_loop(
         &mut self,
         input: &crate::ast::ForLoop<Self::InputS, Self::InputMetadata>,
@@ -5359,7 +5423,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 }
 
 impl<'a> VarIdTyPass<'a> {
-    /// Types a `match` arm's pattern against the scrutinee's type, binding
+    /// Types a pattern against the type of the value it takes apart, binding
     /// each name it introduces in the current frame. A bare name is a unit
     /// variant pattern when it resolves to a unit variant, and a binding
     /// otherwise.
@@ -5380,7 +5444,7 @@ impl<'a> VarIdTyPass<'a> {
                     };
                     return self.type_variant_pattern(
                         path,
-                        Some((id, ctor)),
+                        Some(PatternTarget::Variant(id, ctor)),
                         &[],
                         name.span,
                         scrutinee_ty,
@@ -5396,54 +5460,38 @@ impl<'a> VarIdTyPass<'a> {
                 let (output, resolved) = self.resolve_pattern_path(path);
                 self.type_variant_pattern(output, resolved, fields, *span, scrutinee_ty)
             }
-            Pattern::StructVariant {
+            Pattern::Struct {
                 path,
                 fields,
                 rest,
                 span,
             } => {
                 let (output, resolved) = self.resolve_pattern_path(path);
-                self.type_struct_variant_pattern(
-                    output,
-                    resolved,
-                    fields,
-                    *rest,
-                    *span,
-                    scrutinee_ty,
-                )
+                self.type_struct_pattern(output, resolved, fields, *rest, *span, scrutinee_ty)
             }
         }
     }
 
-    /// Resolves a variant pattern's path, reporting a name that is not a
-    /// variant, and returns the annotated path beside what it resolved to.
+    /// Resolves a pattern's path to an enum variant or a struct declaration,
+    /// reporting a name that is neither.
     fn resolve_pattern_path(
         &mut self,
         path: &IdentPath<Substr, ParseMetadata>,
     ) -> ResolvedPatternPath {
-        let resolved = if path.path.len() == 1 {
-            match self.lookup(&path.path[0].name) {
-                Some((id, Ty::Ctor(ctor))) => Some((id, ctor)),
-                Some(_) | None => {
-                    self.errors.push(StaticError {
-                        span: self.span(path.span),
-                        kind: StaticErrorKind::UndeclaredVar {
-                            name: path.path[0].name.to_string(),
-                        },
-                    });
-                    None
-                }
+        let binding = if path.path.len() == 1 {
+            let binding = self.lookup(&path.path[0].name);
+            if binding.is_none() {
+                self.errors.push(StaticError {
+                    span: self.span(path.span),
+                    kind: StaticErrorKind::UndeclaredVar {
+                        name: path.path[0].name.to_string(),
+                    },
+                });
             }
+            binding
         } else {
             match self.resolve_qualified(&path.path) {
-                Ok((id, Ty::Ctor(ctor))) => Some((id, ctor)),
-                Ok(_) => {
-                    self.errors.push(StaticError {
-                        span: self.span(path.span),
-                        kind: StaticErrorKind::NotAnEnum,
-                    });
-                    None
-                }
+                Ok(binding) => Some(binding),
                 Err(error) => {
                     self.report_qualified_error(error, path.span);
                     None
@@ -5451,6 +5499,44 @@ impl<'a> VarIdTyPass<'a> {
             }
         };
         let explicit = self.explicit_args(path);
+        let resolved = match binding {
+            Some((id, Ty::Ctor(ctor))) => Some(PatternTarget::Variant(
+                id,
+                match explicit {
+                    Some(args) => Arc::new(CtorTy {
+                        args,
+                        ..(*ctor).clone()
+                    }),
+                    None => ctor,
+                },
+            )),
+            // A struct's own name is bound to its declaration's id; a variable
+            // of struct type is not a pattern and is reported below.
+            Some((id, Ty::Struct(struct_ty))) if id == struct_ty.def => {
+                Some(PatternTarget::Struct(id, struct_ty, explicit))
+            }
+            None => None,
+            Some((_, Ty::Struct(_))) => {
+                self.errors.push(StaticError {
+                    span: self.span(path.span),
+                    kind: StaticErrorKind::NotAStruct,
+                });
+                None
+            }
+            Some(_) => {
+                self.errors.push(StaticError {
+                    span: self.span(path.span),
+                    kind: if path.path.len() == 1 {
+                        StaticErrorKind::UndeclaredVar {
+                            name: path.path[0].name.to_string(),
+                        }
+                    } else {
+                        StaticErrorKind::NotAnEnum
+                    },
+                });
+                None
+            }
+        };
         let output = IdentPath {
             path: path
                 .path
@@ -5464,18 +5550,6 @@ impl<'a> VarIdTyPass<'a> {
             metadata: (None, Ty::Unknown),
             span: path.span,
         };
-        let resolved = resolved.map(|(id, ctor)| {
-            (
-                id,
-                match explicit {
-                    Some(args) => Arc::new(CtorTy {
-                        args,
-                        ..(*ctor).clone()
-                    }),
-                    None => ctor,
-                },
-            )
-        });
         (output, resolved)
     }
 
@@ -5573,17 +5647,26 @@ impl<'a> VarIdTyPass<'a> {
     fn type_variant_pattern(
         &mut self,
         mut path: IdentPath<Substr, VarIdTyMetadata>,
-        resolved: Option<(VarId, Arc<CtorTy>)>,
+        resolved: Option<PatternTarget>,
         fields: &[Pattern<Substr, ParseMetadata>],
         span: cfgrammar::Span,
         scrutinee_ty: &Ty,
     ) -> Pattern<Substr, VarIdTyMetadata> {
-        let Some((id, ctor)) = resolved else {
-            let fields = fields
-                .iter()
-                .map(|field| self.type_pattern(field, &Ty::Unknown))
-                .collect();
-            return Pattern::Variant { path, fields, span };
+        let (id, ctor) = match resolved {
+            Some(PatternTarget::Variant(id, ctor)) => (id, ctor),
+            target => {
+                if let Some(PatternTarget::Struct(_, struct_ty, _)) = target {
+                    self.errors.push(StaticError {
+                        span: self.span(span),
+                        kind: StaticErrorKind::StructPatternWithoutBraces(struct_ty.name.clone()),
+                    });
+                }
+                let fields = fields
+                    .iter()
+                    .map(|field| self.type_pattern(field, &Ty::Unknown))
+                    .collect();
+                return Pattern::Variant { path, fields, span };
+            }
         };
         let def = self.adt_def(ctor.def).and_then(AdtDef::as_enum).cloned();
         let Some(def) = def else {
@@ -5678,12 +5761,12 @@ impl<'a> VarIdTyPass<'a> {
         (map, payload)
     }
 
-    /// Types a `E::V { f, g: name, .. }` pattern whose path resolved to
-    /// `resolved`, if it did.
-    fn type_struct_variant_pattern(
+    /// Types a `S { f, g: name, .. }` or `E::V { f, g: name, .. }` pattern
+    /// whose path resolved to `resolved`, if it did.
+    fn type_struct_pattern(
         &mut self,
         mut path: IdentPath<Substr, VarIdTyMetadata>,
-        resolved: Option<(VarId, Arc<CtorTy>)>,
+        resolved: Option<PatternTarget>,
         fields: &[FieldPattern<Substr, ParseMetadata>],
         rest: bool,
         span: cfgrammar::Span,
@@ -5699,38 +5782,73 @@ impl<'a> VarIdTyPass<'a> {
                     span: field.span,
                 })
                 .collect();
-            Pattern::StructVariant {
+            Pattern::Struct {
                 path,
                 fields,
                 rest,
                 span,
             }
         };
-        let Some((id, ctor)) = resolved else {
-            return unchecked(self, path);
-        };
-        let Some(def) = self.adt_def(ctor.def).and_then(AdtDef::as_enum).cloned() else {
-            return unchecked(self, path);
-        };
-        let (map, payload) =
-            self.variant_pattern_payload(&mut path, id, &ctor, &def, span, scrutinee_ty);
-        let ctor_ty = Ty::Ctor(Arc::new((*ctor).clone()));
-        let VariantTys::Struct(payload) = payload else {
-            self.errors.push(StaticError {
-                span: self.span(span),
-                kind: StaticErrorKind::NotAStructVariant(format!(
-                    "{}::{}",
-                    ctor.enum_name, ctor.variant
-                )),
-            });
-            return unchecked(self, path);
+        // The substitution for the declaration's type parameters, its named
+        // fields, and the type that names the pattern in diagnostics.
+        let (map, declared, pattern_ty) = match resolved {
+            None => return unchecked(self, path),
+            Some(PatternTarget::Variant(id, ctor)) => {
+                let Some(def) = self.adt_def(ctor.def).and_then(AdtDef::as_enum).cloned() else {
+                    return unchecked(self, path);
+                };
+                let (map, payload) =
+                    self.variant_pattern_payload(&mut path, id, &ctor, &def, span, scrutinee_ty);
+                let VariantTys::Struct(payload) = payload else {
+                    self.errors.push(StaticError {
+                        span: self.span(span),
+                        kind: StaticErrorKind::NotAStructVariant(format!(
+                            "{}::{}",
+                            ctor.enum_name, ctor.variant
+                        )),
+                    });
+                    return unchecked(self, path);
+                };
+                (map, payload, Ty::Ctor(Arc::new((*ctor).clone())))
+            }
+            Some(PatternTarget::Struct(id, struct_ty, explicit)) => {
+                let Some(def) = self
+                    .adt_def(struct_ty.def)
+                    .and_then(AdtDef::as_struct)
+                    .cloned()
+                else {
+                    return unchecked(self, path);
+                };
+                // Like a variant pattern, a struct pattern takes the
+                // scrutinee's type arguments when it is this struct.
+                let args = match scrutinee_ty {
+                    Ty::Struct(ty) if ty.def == struct_ty.def && explicit.is_none() => {
+                        ty.args.clone()
+                    }
+                    _ => {
+                        let map = self.instantiate(&def.params, explicit, span, &struct_ty.name);
+                        def.params
+                            .iter()
+                            .map(|param| map[&param.id].clone())
+                            .collect()
+                    }
+                };
+                let map = param_map(&def.params, &args);
+                let ty = Ty::Struct(Arc::new(StructTy {
+                    def: struct_ty.def,
+                    name: struct_ty.name.clone(),
+                    args,
+                }));
+                path.metadata = (Some(id), ty.clone());
+                (map, def.fields, ty)
+            }
         };
         let mut seen = IndexSet::new();
         let fields = fields
             .iter()
             .map(|field| {
                 let name = field.name.name.as_str();
-                let ty = match payload.get(name) {
+                let ty = match declared.get(name) {
                     Some(ty) if seen.insert(name.to_string()) => subst(ty, &map),
                     Some(_) => {
                         self.errors.push(StaticError {
@@ -5741,7 +5859,7 @@ impl<'a> VarIdTyPass<'a> {
                         });
                         Ty::Unknown
                     }
-                    None => self.no_field_on_ty(&field.name, ctor_ty.clone()),
+                    None => self.no_field_on_ty(&field.name, pattern_ty.clone()),
                 };
                 FieldPattern {
                     name: self.transform_ident(&field.name),
@@ -5752,7 +5870,7 @@ impl<'a> VarIdTyPass<'a> {
             })
             .collect();
         if !rest {
-            let missing = payload
+            let missing = declared
                 .keys()
                 .filter(|name| !seen.contains(name.as_str()))
                 .map(|name| format!("`{name}`"))
@@ -5761,17 +5879,46 @@ impl<'a> VarIdTyPass<'a> {
                 self.errors.push(StaticError {
                     span: self.span(span),
                     kind: StaticErrorKind::MissingPatternFields {
-                        ty: self.display(&ctor_ty),
+                        ty: self.display(&pattern_ty),
                         fields: missing.join(", "),
                     },
                 });
             }
         }
-        Pattern::StructVariant {
+        Pattern::Struct {
             path,
             fields,
             rest,
             span,
+        }
+    }
+
+    /// Checks that a typed `let` pattern matches every value of `value`'s
+    /// type: a struct pattern whose fields are names or `_`.
+    fn check_let_pattern(
+        &mut self,
+        pattern: &Pattern<Substr, VarIdTyMetadata>,
+        value: &Expr<Substr, VarIdTyMetadata>,
+    ) {
+        match pattern {
+            Pattern::Struct { path, fields, .. } if matches!(path.metadata.1, Ty::Struct(_)) => {
+                self.assert_eq_ty(value.span(), &value.ty(), &path.metadata.1);
+                for field in fields {
+                    if !field.pattern.is_catch_all() {
+                        self.errors.push(StaticError {
+                            span: self.span(field.pattern.span()),
+                            kind: StaticErrorKind::RefutableLetPattern,
+                        });
+                    }
+                }
+            }
+            // A path that resolved to nothing was reported by resolution.
+            Pattern::Struct { path, .. } | Pattern::Variant { path, .. }
+                if matches!(path.metadata.1, Ty::Unknown) => {}
+            _ => self.errors.push(StaticError {
+                span: self.span(pattern.span()),
+                kind: StaticErrorKind::RefutableLetPattern,
+            }),
         }
     }
 }
@@ -7589,34 +7736,7 @@ impl<'a> ExecPass<'a> {
                 scope: root_scope_id,
                 seq_num,
             };
-            match stmt {
-                Statement::LetBinding(binding) => {
-                    let value = self.visit_expr(loc, &binding.value);
-                    self.frames
-                        .get_mut(&fid)
-                        .unwrap()
-                        .bindings
-                        .insert(binding.metadata, value);
-                    self.cell_states
-                        .get_mut(&cell_id)
-                        .unwrap()
-                        .fields
-                        .insert(binding.name.name.to_string(), value);
-                    self.cell_state_mut(loc.cell)
-                        .scopes
-                        .get_mut(&loc.scope)
-                        .unwrap()
-                        .bindings
-                        .insert(loc.seq_num, (binding.name.name.to_string(), value));
-                    seq_num = seq_num.next();
-                }
-                Statement::Expr { value, .. } => {
-                    self.visit_expr(loc, value);
-                }
-                Statement::ForLoop(f) => {
-                    self.eval_for_loop(loc, f);
-                }
-            }
+            seq_num = self.eval_stmt(loc, stmt, true);
         }
 
         while {
@@ -8614,29 +8734,77 @@ impl<'a> ExecPass<'a> {
         });
     }
 
-    fn eval_stmt(&mut self, loc: DynLoc, stmt: &Statement<Substr, VarIdTyMetadata>) {
+    /// Evaluates `stmt` at `loc` and returns the sequence number that follows
+    /// the names it binds. A top-level statement of a cell also publishes
+    /// those names as fields of the cell.
+    fn eval_stmt(
+        &mut self,
+        loc: DynLoc,
+        stmt: &Statement<Substr, VarIdTyMetadata>,
+        top_level: bool,
+    ) -> SeqNum {
         match stmt {
             Statement::LetBinding(binding) => {
                 let value = self.visit_expr(loc, &binding.value);
-                self.frames
-                    .get_mut(&loc.frame)
-                    .unwrap()
-                    .bindings
-                    .insert(binding.metadata, value);
-                self.cell_state_mut(loc.cell)
-                    .scopes
-                    .get_mut(&loc.scope)
-                    .unwrap()
-                    .bindings
-                    .insert(loc.seq_num, (binding.name.name.to_string(), value));
+                self.bind_let(loc, binding.metadata, &binding.name.name, value, top_level);
+                loc.seq_num.next()
+            }
+            Statement::LetPattern(binding) => {
+                let value = self.visit_expr(loc, &binding.value);
+                let mut seq_num = loc.seq_num;
+                let Pattern::Struct { path, fields, .. } = &binding.pattern else {
+                    return seq_num;
+                };
+                let struct_name = match &path.metadata.1 {
+                    Ty::Struct(ty) => Some(ty.name.clone()),
+                    _ => None,
+                };
+                for field in fields {
+                    let Pattern::Binding { name, metadata } = &field.pattern else {
+                        continue;
+                    };
+                    let loc = DynLoc { seq_num, ..loc };
+                    let element = self.new_deferred_value(loc, |_| {
+                        PartialEvalState::Destructure(Box::new(PartialDestructure {
+                            base: value,
+                            struct_name: struct_name.clone(),
+                            field: field.name.name.to_string(),
+                            span: field.span,
+                        }))
+                    });
+                    self.bind_let(loc, metadata.0, &name.name, element, top_level);
+                    seq_num = seq_num.next();
+                }
+                seq_num
             }
             Statement::Expr { value, .. } => {
                 self.visit_expr(loc, value);
+                loc.seq_num
             }
             Statement::ForLoop(f) => {
                 self.eval_for_loop(loc, f);
+                loc.seq_num
             }
         }
+    }
+
+    /// Binds the `let` name `name`, with id `id`, to `value` at `loc`.
+    fn bind_let(&mut self, loc: DynLoc, id: VarId, name: &str, value: ValueId, field: bool) {
+        self.frames
+            .get_mut(&loc.frame)
+            .unwrap()
+            .bindings
+            .insert(id, value);
+        let state = self.cell_state_mut(loc.cell);
+        if field {
+            state.fields.insert(name.to_string(), value);
+        }
+        state
+            .scopes
+            .get_mut(&loc.scope)
+            .unwrap()
+            .bindings
+            .insert(loc.seq_num, (name.to_string(), value));
     }
 
     /// Create a new execution scope.
@@ -8697,10 +8865,7 @@ impl<'a> ExecPass<'a> {
                 scope,
                 seq_num,
             };
-            self.eval_stmt(loc, stmt);
-            if matches!(stmt, Statement::LetBinding(_)) {
-                seq_num = seq_num.next();
-            }
+            seq_num = self.eval_stmt(loc, stmt, false);
         }
 
         let loc = DynLoc {
@@ -10878,17 +11043,19 @@ impl<'a> ExecPass<'a> {
                 MatchExprState::Scrutinee(scrutinee) => {
                     if let Defer::Ready(val) = &self.values[&scrutinee] {
                         // A scrutinee typed `Any` was never proven to be an
-                        // enum value, and even a genuine enum value may belong
-                        // to a different enum than the arms name.
-                        let Some(value) = val.get_enum().cloned() else {
+                        // enum or struct value, and even a genuine one may be
+                        // of a different type than the arms name.
+                        if !matches!(val, Value::Enum(_) | Value::Struct(_)) {
                             let span = self.span(&vref.loc, match_.expr.scrutinee.span());
                             self.invalid_type(cell_id, &span);
                             return self.poison(cell_id, vid);
-                        };
-                        let arm =
-                            match_.expr.arms.iter().find(|arm| {
-                                pattern_matches(&arm.pattern, &Value::Enum(value.clone()))
-                            });
+                        }
+                        let value = val.clone();
+                        let arm = match_
+                            .expr
+                            .arms
+                            .iter()
+                            .find(|arm| pattern_matches(&arm.pattern, &value));
                         let Some(arm) = arm else {
                             let span = self.span(&vref.loc, match_.expr.scrutinee.span());
                             self.invalid_type(cell_id, &span);
@@ -10900,7 +11067,7 @@ impl<'a> ExecPass<'a> {
                             bindings: Default::default(),
                             parent: Some(vref.loc.frame),
                         };
-                        self.bind_pattern(&arm.pattern, scrutinee, &Value::Enum(value), &mut frame);
+                        self.bind_pattern(&arm.pattern, scrutinee, &value, &mut frame);
                         let fid = self.frame_id();
                         self.frames.insert(fid, frame);
                         let value = self.visit_expr(
@@ -11755,6 +11922,32 @@ impl<'a> ExecPass<'a> {
                     true
                 }
             }
+            PartialEvalState::Destructure(d) => {
+                if let Defer::Ready(base) = &self.values[&d.base] {
+                    // The base may have arrived as `Any`, so it was never
+                    // checked against the struct the pattern names.
+                    let element = match base.as_ref() {
+                        ValueRef::Struct(value)
+                            if d.struct_name
+                                .as_ref()
+                                .is_none_or(|name| *name == value.name) =>
+                        {
+                            value.fields.get(&d.field).cloned()
+                        }
+                        _ => None,
+                    };
+                    let Some(element) = element else {
+                        let span = self.span(&vref.loc, d.span);
+                        self.invalid_type(cell_id, &span);
+                        return self.poison(cell_id, vid);
+                    };
+                    self.values.insert(vid, DeferValue::Ready(element));
+                    true
+                } else {
+                    self.add_value_dependent(d.base, vid);
+                    false
+                }
+            }
             PartialEvalState::ForLoop(f) => {
                 if let Defer::Ready(val) = &self.values[&f.seq] {
                     let seq = match val.as_ref() {
@@ -11835,12 +12028,14 @@ impl<'a> ExecPass<'a> {
                     self.bind_payload_element(field, element, frame);
                 }
             }
-            Pattern::StructVariant { fields, .. } => {
-                let Value::Enum(value) = value else {
-                    return;
-                };
-                let VariantValues::Struct(values) = &value.payload else {
-                    return;
+            Pattern::Struct { fields, .. } => {
+                let values = match value {
+                    Value::Struct(value) => &value.fields,
+                    Value::Enum(value) => match &value.payload {
+                        VariantValues::Struct(values) => values,
+                        VariantValues::Tuple(_) => return,
+                    },
+                    _ => return,
                 };
                 for field in fields {
                     let Some(element) = values.get(field.name.name.as_str()) else {
@@ -11852,7 +12047,8 @@ impl<'a> ExecPass<'a> {
         }
     }
 
-    /// Binds one payload element of a variant pattern, which is a name or `_`.
+    /// Binds one element of a variant or struct pattern, which is a name or
+    /// `_`.
     fn bind_payload_element(
         &mut self,
         pattern: &Pattern<Substr, VarIdTyMetadata>,
@@ -12109,12 +12305,14 @@ fn pattern_matches(pattern: &Pattern<Substr, VarIdTyMetadata>, value: &Value) ->
                     .zip(value.payload.values())
                     .all(|(field, element)| pattern_matches(field, element))
         }
-        Pattern::StructVariant { path, fields, .. } => {
-            let Some(value) = enum_value(path, value) else {
-                return false;
-            };
-            let VariantValues::Struct(values) = &value.payload else {
-                return false;
+        Pattern::Struct { path, fields, .. } => {
+            let values = match (&path.metadata.1, value) {
+                (Ty::Struct(ty), Value::Struct(value)) if value.name == ty.name => &value.fields,
+                (Ty::Struct(_), _) => return false,
+                _ => match enum_value(path, value).map(|value| &value.payload) {
+                    Some(VariantValues::Struct(values)) => values,
+                    _ => return false,
+                },
             };
             fields.iter().all(|field| {
                 values
@@ -12683,6 +12881,7 @@ enum PartialEvalState<T: AstMetadata> {
     StructLit(Box<PartialStructLit<T>>),
     ForLoop(Box<PartialForLoop<T>>),
     Ctor(PartialCtor),
+    Destructure(Box<PartialDestructure>),
 }
 
 impl<T: AstMetadata> PartialEvalState<T> {
@@ -12723,8 +12922,21 @@ impl<T: AstMetadata> PartialEvalState<T> {
             Self::StructLit(e) => e.fields.iter().copied().chain(e.base).collect(),
             Self::ForLoop(f) => vec![f.seq],
             Self::Ctor(c) => c.args.clone(),
+            Self::Destructure(d) => vec![d.base],
         }
     }
+}
+
+/// One field read out of a struct by a `let` pattern.
+#[derive(Debug, Clone)]
+struct PartialDestructure {
+    base: ValueId,
+    /// The struct the pattern names, checked against a base that arrived as
+    /// `Any`.
+    struct_name: Option<String>,
+    field: String,
+    /// The field pattern, for diagnostics.
+    span: cfgrammar::Span,
 }
 
 /// A tuple variant being constructed from its payload arguments.

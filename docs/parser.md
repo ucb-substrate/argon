@@ -443,8 +443,8 @@ non-consuming `parse_item` cannot spin.
 >   records `CompletionSite::Pattern`. A bare name parses as a
 >   `Pattern::Binding`, and the type checker decides whether it names a unit
 >   variant instead.
-> - **Struct variant patterns** (`E::V { f, g: name, .. }`) have two
->   terminators — `}` and the `..` — so `parse_struct_variant_pattern` keeps
+> - **Struct patterns** (`S { f, g: name, .. }` or `E::V { f, g: name, .. }`)
+>   have two terminators — `}` and the `..` — so `parse_struct_pattern` keeps
 >   its own loop, shaped like the struct literal's. A field pattern is
 >   `fieldPattern : ident (COLON subPattern)?`, where a bare `f` is shorthand
 >   for `f: f`, and the `..` comes last and takes no comma after it.
@@ -657,6 +657,10 @@ produce stable GUI hierarchy IDs without adding annotations to source text.
 The statement loop dispatches on `cur`:
 
 - `let name (: tySpec)? = expr ;` → `Statement::LetBinding`
+- `let pattern = expr ;` → `Statement::LetPattern`, chosen when the name after
+  `let` is followed by `{` or `::`, as in `let Size { w, .. } = s;`. The
+  pattern is parsed by `parse_pattern`; the type checker rejects any pattern
+  but a struct pattern whose fields are names or `_`.
 - `for v in expr scope` → `Statement::ForLoop`
 - `if` → parsed by `parse_if` directly rather than through `parse_expr`, with
   the `else` **optional**. This is the only position where it may be omitted,

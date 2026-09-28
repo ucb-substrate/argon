@@ -416,7 +416,7 @@ impl Builder<'_> {
                     self.pattern(field, out);
                 }
             }
-            Pattern::StructVariant { path, fields, .. } => {
+            Pattern::Struct { path, fields, .. } => {
                 self.ident_path(path, out);
                 for field in fields {
                     self.pattern(&field.pattern, out);
@@ -431,6 +431,10 @@ impl Builder<'_> {
             match stmt {
                 Statement::Expr { value, .. } => self.expr(value, out),
                 Statement::LetBinding(binding) => self.expr(&binding.value, out),
+                Statement::LetPattern(binding) => {
+                    self.expr(&binding.value, out);
+                    self.pattern(&binding.pattern, out);
+                }
                 Statement::ForLoop(loop_) => {
                     self.expr(&loop_.seq, out);
                     self.scope(&loop_.body, out);

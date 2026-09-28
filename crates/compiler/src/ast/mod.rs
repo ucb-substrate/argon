@@ -244,9 +244,31 @@ pub struct Scope<S, T: AstMetadata> {
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub enum Statement<S, T: AstMetadata> {
-    Expr { value: Expr<S, T>, semicolon: bool },
+    Expr {
+        value: Expr<S, T>,
+        semicolon: bool,
+    },
     LetBinding(LetBinding<S, T>),
+    /// `let S { f, g: name, .. } = value;`
+    LetPattern(LetPattern<S, T>),
     ForLoop(ForLoop<S, T>),
+}
+
+impl<S, T: AstMetadata> Statement<S, T> {
+    /// The names a `let` statement binds, in source order; empty for any
+    /// other statement.
+    pub fn let_names(&self) -> Vec<&Ident<S, T>> {
+        match self {
+            Self::LetBinding(binding) => vec![&binding.name],
+            Self::LetPattern(binding) => binding
+                .pattern
+                .bindings()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect(),
+            Self::Expr { .. } | Self::ForLoop(_) => Vec::new(),
+        }
+    }
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -256,6 +278,15 @@ pub struct LetBinding<S, T: AstMetadata> {
     pub ty: Option<TySpec<S, T>>,
     pub value: Expr<S, T>,
     pub metadata: T::LetBinding,
+    pub span: cfgrammar::Span,
+}
+
+/// A `let` that destructures its value with a pattern. Each name the pattern
+/// binds carries its own metadata.
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct LetPattern<S, T: AstMetadata> {
+    pub pattern: Pattern<S, T>,
+    pub value: Expr<S, T>,
     pub span: cfgrammar::Span,
 }
 
@@ -380,8 +411,9 @@ pub enum Pattern<S, T: AstMetadata> {
         fields: Vec<Pattern<S, T>>,
         span: cfgrammar::Span,
     },
-    /// An enum variant with named fields, `E::V { f, g: name, .. }`.
-    StructVariant {
+    /// A struct, `S { f, g: name, .. }`, or an enum variant with named
+    /// fields, `E::V { f, g: name, .. }`.
+    Struct {
         path: IdentPath<S, T>,
         fields: Vec<FieldPattern<S, T>>,
         /// Whether the pattern ended in `..`, ignoring the fields not listed.
@@ -390,7 +422,7 @@ pub enum Pattern<S, T: AstMetadata> {
     },
 }
 
-/// One `field: pattern` entry of a [`Pattern::StructVariant`].
+/// One `field: pattern` entry of a [`Pattern::Struct`].
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct FieldPattern<S, T: AstMetadata> {
     pub name: Ident<S, T>,
@@ -405,8 +437,39 @@ impl<S, T: AstMetadata> Pattern<S, T> {
         match self {
             Self::Wildcard { span } => *span,
             Self::Binding { name, .. } => name.span,
-            Self::Variant { span, .. } | Self::StructVariant { span, .. } => *span,
+            Self::Variant { span, .. } | Self::Struct { span, .. } => *span,
         }
+    }
+
+    /// The bindings this pattern introduces, in source order.
+    ///
+    /// A bare name counts as a binding even where it may turn out to name a
+    /// unit variant, which only the type checker can decide.
+    pub fn bindings(&self) -> Vec<(&Ident<S, T>, &T::PatternBinding)> {
+        let mut out = Vec::new();
+        self.collect_bindings(&mut out);
+        out
+    }
+
+    fn collect_bindings<'p>(&'p self, out: &mut Vec<(&'p Ident<S, T>, &'p T::PatternBinding)>) {
+        match self {
+            Self::Wildcard { .. } => {}
+            Self::Binding { name, metadata } => out.push((name, metadata)),
+            Self::Variant { fields, .. } => {
+                fields.iter().for_each(|field| field.collect_bindings(out));
+            }
+            Self::Struct { fields, .. } => {
+                fields
+                    .iter()
+                    .for_each(|field| field.pattern.collect_bindings(out));
+            }
+        }
+    }
+
+    /// Whether the pattern is a name or `_`, which matches any value once type
+    /// checking has resolved bare names that are unit variants.
+    pub fn is_catch_all(&self) -> bool {
+        matches!(self, Self::Wildcard { .. } | Self::Binding { .. })
     }
 }
 
@@ -1065,6 +1128,7 @@ pub trait AstTransformer {
                 semicolon: *semicolon,
             },
             Statement::LetBinding(l) => Statement::LetBinding(self.transform_let_binding(l)),
+            Statement::LetPattern(l) => Statement::LetPattern(self.transform_let_pattern(l)),
             Statement::ForLoop(l) => Statement::ForLoop(self.transform_for_loop(l)),
         }
     }
@@ -1081,6 +1145,19 @@ pub trait AstTransformer {
             ty,
             value,
             metadata,
+            span: input.span,
+        }
+    }
+    fn transform_let_pattern(
+        &mut self,
+        input: &LetPattern<Self::InputS, Self::InputMetadata>,
+    ) -> LetPattern<Self::OutputS, Self::OutputMetadata> {
+        // The value is visited first, since the names are bound after it.
+        let value = self.transform_expr(&input.value);
+        let pattern = self.transform_pattern(&input.pattern);
+        LetPattern {
+            pattern,
+            value,
             span: input.span,
         }
     }
@@ -1162,12 +1239,12 @@ pub trait AstTransformer {
                     .collect(),
                 span: *span,
             },
-            Pattern::StructVariant {
+            Pattern::Struct {
                 path,
                 fields,
                 rest,
                 span,
-            } => Pattern::StructVariant {
+            } => Pattern::Struct {
                 path: self.transform_ident_path(path),
                 fields: fields
                     .iter()

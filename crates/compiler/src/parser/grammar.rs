@@ -19,8 +19,8 @@ use crate::ast::{
     ArgDecl, Args, ArithOp, Ast, BinOp, BinOpExpr, BoolLiteral, BoolOp, CallExpr, CastExpr,
     CellDecl, ComparisonOp, ConstantDecl, Decl, EmitExpr, EnumDecl, EnumVariant, Expr,
     FieldAccessExpr, FieldPattern, FloatLiteral, FnDecl, ForLoop, GenericArgs, Ident, IdentPath,
-    IfExpr, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, LetBinding, MatchArm,
-    MatchExpr, ModDecl, NilLiteral, Pattern, Scope, SeqLiteral, Statement, StringLiteral,
+    IfExpr, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, LetBinding, LetPattern,
+    MatchArm, MatchExpr, ModDecl, NilLiteral, Pattern, Scope, SeqLiteral, Statement, StringLiteral,
     StructDecl, StructField, StructLitExpr, StructLitField, TupleExpr, TyParam, TySpec, TySpecKind,
     UnaryOp, UnaryOpExpr, UseDecl, VariantPayload,
 };
@@ -908,9 +908,9 @@ impl<'a> Parser<'a> {
             self.record_completion_site(CompletionSite::Statement);
             match self.cur.kind {
                 TokenKind::KwLet => {
-                    let lb = self.parse_let_binding();
+                    let stmt = self.parse_let();
                     self.expect(TokenKind::Semi);
-                    stmts.push(Statement::LetBinding(lb));
+                    stmts.push(stmt);
                 }
                 TokenKind::KwFor => {
                     stmts.push(Statement::ForLoop(self.parse_for_loop()));
@@ -996,22 +996,37 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `letBinding : LET ident (COLON tySpec)? EQ expr` (span excludes the
-    /// trailing SEMI, which belongs to the enclosing `statement`).
-    fn parse_let_binding(&mut self) -> LetBinding<&'a str, Md> {
+    /// `letStmt : LET (ident (COLON tySpec)? | pattern) EQ expr` (span
+    /// excludes the trailing SEMI, which belongs to the enclosing `statement`).
+    ///
+    /// A name followed by `{` or `::` begins a pattern, as in
+    /// `let geom::Size { w, .. } = s`; any other name is a plain binding.
+    fn parse_let(&mut self) -> Statement<&'a str, Md> {
         let lo = self.cur.start;
         self.expect(TokenKind::KwLet);
+        if self.at(TokenKind::Ident)
+            && matches!(self.nxt.kind, TokenKind::LBrace | TokenKind::PathSep)
+        {
+            let pattern = self.parse_pattern();
+            self.expect(TokenKind::Eq);
+            let value = self.parse_expr(0);
+            return Statement::LetPattern(LetPattern {
+                pattern,
+                value,
+                span: self.finish_span(lo),
+            });
+        }
         let name = self.ident(CompletionSite::NewIdentifier);
         let ty = self.eat(TokenKind::Colon).then(|| self.parse_ty_spec());
         self.expect(TokenKind::Eq);
         let value = self.parse_expr(0);
-        LetBinding {
+        Statement::LetBinding(LetBinding {
             name,
             ty,
             value,
             metadata: (),
             span: self.finish_span(lo),
-        }
+        })
     }
 
     /// `forLoop : FOR ident IN expr scope`
@@ -1160,7 +1175,7 @@ impl<'a> Parser<'a> {
         let lo = self.cur.start;
         let path = self.parse_ident_path(CompletionSite::Pattern);
         if self.at(TokenKind::LBrace) {
-            return self.parse_struct_variant_pattern(lo, path);
+            return self.parse_struct_pattern(lo, path);
         }
         if self.eat(TokenKind::LParen) {
             let fields = self.separated_list(TokenKind::RParen, CompletionSite::Pattern, |p| {
@@ -1191,7 +1206,7 @@ impl<'a> Parser<'a> {
     /// two terminators (`}` and `..`) it does not go through
     /// [`Self::separated_list`]; termination holds for the same reason, since
     /// every iteration that does not `break` consumes the separator.
-    fn parse_struct_variant_pattern(
+    fn parse_struct_pattern(
         &mut self,
         lo: u32,
         path: IdentPath<&'a str, Md>,
@@ -1211,7 +1226,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(TokenKind::RBrace);
-        Pattern::StructVariant {
+        Pattern::Struct {
             path,
             fields,
             rest,
@@ -1244,8 +1259,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// A payload element pattern: `_` or a name. Nested variant patterns are
-    /// not supported.
+    /// A payload element pattern: `_` or a name. Nested variant and struct
+    /// patterns are not supported.
     fn parse_sub_pattern(&mut self) -> Pattern<&'a str, Md> {
         self.record_completion_site(CompletionSite::Pattern);
         if self.at_wildcard() {
@@ -1253,7 +1268,7 @@ impl<'a> Parser<'a> {
             return Pattern::Wildcard { span: self.span(t) };
         }
         let name = self.ident(CompletionSite::Pattern);
-        if self.at(TokenKind::LParen) || self.at(TokenKind::PathSep) {
+        if self.at(TokenKind::LParen) || self.at(TokenKind::PathSep) || self.at(TokenKind::LBrace) {
             self.error_at(
                 self.span(self.cur),
                 "nested patterns are not supported; a payload element pattern is a name or `_`"
@@ -1268,6 +1283,15 @@ impl<'a> Parser<'a> {
                     p.parse_sub_pattern()
                 });
                 self.expect(TokenKind::RParen);
+            } else if self.at(TokenKind::LBrace) {
+                let lo = self.cur.start;
+                let path = IdentPath {
+                    path: vec![name.clone()],
+                    generic_args: None,
+                    metadata: (),
+                    span: name.span,
+                };
+                self.parse_struct_pattern(lo, path);
             }
         }
         Pattern::Binding { name, metadata: () }
