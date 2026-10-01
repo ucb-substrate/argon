@@ -1609,6 +1609,39 @@ mod tests {
         assert_ne!(geometry(&first), geometry(&second), "the edit took effect");
     }
 
+    /// A reused cell brings along a cell it holds in a field but never
+    /// instantiates, so that its parent can still place it.
+    #[test]
+    fn reusing_a_cell_reinstates_the_cells_its_fields_hold() {
+        let source = "cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+                      cell holder() { let c = leaf(); }\n\
+                      cell parent() {\n    let h = inst(holder(), x = 0., y = 0.);\n    \
+                      let l = inst(h.c, x = 10., y = 0.);\n}\n";
+        let (_dir, config) = scratch_workspace(source);
+        let root = config.root_lib().to_path_buf();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = config.with_tech(Some(tech));
+        let cell = vec!["parent".to_owned()];
+
+        let mut session = IncrementalCompiler::new();
+        session.set_source_text(root.clone(), source);
+        session.compile_cell(&config, &cell, Vec::new());
+
+        let edited = source.replace("x = 10., y = 0.", "x = 20., y = 0.");
+        assert_ne!(edited, source);
+        session.set_source_text(root.clone(), edited.clone());
+        let second = session.compile_cell(&config, &cell, Vec::new());
+        assert!(session.stats().cell_cache.hits > 0, "`holder` is reused");
+
+        let mut fresh = IncrementalCompiler::new();
+        fresh.set_source_text(root, edited);
+        assert_eq!(
+            geometry(&second),
+            geometry(&fresh.compile_cell(&config, &cell, Vec::new()))
+        );
+    }
+
     /// A child that actually changed must be re-executed, and only it.
     #[test]
     fn changing_a_child_re_executes_only_that_child() {

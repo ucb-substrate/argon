@@ -4893,6 +4893,160 @@ cell top() {
     }
 
     #[test]
+    fn instances_read_scalar_fields() {
+        let data = compile_top(
+            "fn width_of(i: Any) -> Any { i.width }
+             cell pad() {
+                 let count = 3;
+                 let width = 2.5;
+                 let layer = \"met2\";
+                 let wide = true;
+                 let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
+             }
+             cell top() {
+                 let n = inst(pad(), x=0., y=0.).count;
+                 let p = inst(pad(), x=20., y=0.);
+                 let w = if p.wide { width_of(p) } else { 1. };
+                 let r = rect(p.layer, x0=0., y0=0., w=(n + p.count) as Float * w, h=10.);
+             }",
+        );
+        let widths = layout_objects(&data, data.top)
+            .into_iter()
+            .filter_map(SolvedValue::get_rect)
+            .filter(|rect| rect.layer.as_deref() == Some("met2"))
+            .map(|rect| rect.x1.0 - rect.x0.0)
+            .collect::<Vec<_>>();
+        assert_eq!(widths, [15.]);
+    }
+
+    #[test]
+    fn instance_fields_place_nested_geometry_and_points_in_the_parent() {
+        let data = compile_top(
+            "struct Pins { pad: Rect, tip: Point, count: Int }
+             cell pad() {
+                 let tri = polygon(\"met1\", 3, x0=0., y0=0., x1=10., y1=0., x2=10., y2=20.);
+                 let pins = Pins {
+                     pad: rect(\"met2\", x0=0., y0=0., x1=10., y1=5.),
+                     tip: tri.points[2],
+                     count: 2,
+                 };
+             }
+             cell top() {
+                 let pins = inst(pad(), x=100., y=0., angle=90).pins;
+                 let r = rect(
+                     \"met3\",
+                     x0=pins.tip.x,
+                     y0=pins.tip.y,
+                     x1=pins.pad.x1,
+                     y1=pins.pad.y1 + pins.count as Float,
+                 );
+             }",
+        );
+        let r = layout_objects(&data, data.top)
+            .into_iter()
+            .filter_map(SolvedValue::get_rect)
+            .find(|rect| rect.layer.as_deref() == Some("met3"))
+            .unwrap();
+        // Rotated a quarter turn about the origin, then moved to (100, 0).
+        assert_eq!((r.x0.0, r.y0.0, r.x1.0, r.y1.0), (80., 10., 100., 12.));
+    }
+
+    #[test]
+    fn a_cell_held_in_a_field_can_be_placed_by_the_parent() {
+        let data = compile_top(
+            "cell leaf() { let r = rect(\"met1\", x0=0., y0=0., x1=5., y1=5.); }
+             cell holder() { let c = leaf(); }
+             cell top() {
+                 let h = inst(holder(), x=0., y=0.);
+                 let l = inst(h.c, x=10., y=0.);
+             }",
+        );
+        assert_eq!(rect_widths_of(&data, "leaf"), [5.]);
+    }
+
+    #[test]
+    fn an_instance_reads_the_last_binding_of_a_shadowed_field() {
+        let data = compile_top(
+            "cell pad() {
+                 let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
+                 let a = 4.;
+             }
+             cell top() {
+                 let p = inst(pad(), x=0., y=0.);
+                 let r = rect(\"met2\", x0=0., y0=0., w=p.a, h=10.);
+             }",
+        );
+        let r = layout_objects(&data, data.top)
+            .into_iter()
+            .filter_map(SolvedValue::get_rect)
+            .find(|rect| rect.layer.as_deref() == Some("met2"))
+            .unwrap();
+        assert_eq!(r.x1.0 - r.x0.0, 4.);
+    }
+
+    #[test]
+    fn a_poisoned_instance_field_reports_only_its_own_error() {
+        let errors = run_source(
+            "cell pad() {
+                 let c = crect(x0=0., y0=0., x1=10., y1=10.);
+                 let layer = c.layer;
+             }
+             cell top() {
+                 let p = inst(pad(), x=0., y=0.);
+                 let r = rect(p.layer, x0=0., y0=0., x1=10., y1=10.);
+             }",
+        );
+        assert!(
+            matches!(errors.as_slice(), [ExecErrorKind::EmptyField { field }] if field == "layer"),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn reading_a_function_field_through_an_instance_is_a_static_error() {
+        let errors = check_source(
+            "fn double(x: Int) -> Int { x * 2 }
+             cell pad() { let f = double; let fs = [double]; }
+             cell top() {
+                 let p = inst(pad(), x=0., y=0.);
+                 let f = p.f;
+                 let fs = p.fs;
+             }",
+        );
+        let fields = errors
+            .iter()
+            .filter_map(|error| match error {
+                StaticErrorKind::UnreadableInstanceField { field, cell, kind }
+                    if cell == "pad" && kind == "function" =>
+                {
+                    Some(field.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(fields, ["f", "fs"], "{errors:#?}");
+    }
+
+    #[test]
+    fn reading_a_function_field_through_any_is_a_run_time_error() {
+        assert_reports(
+            &run_source(
+                "fn double(x: Int) -> Int { x * 2 }
+                 fn read_f(i: Any) -> Any { i.f }
+                 cell pad() { let f = double; }
+                 cell top() {
+                     let p = inst(pad(), x=0., y=0.);
+                     let f = read_f(p);
+                 }",
+            ),
+            |error| {
+                matches!(error, ExecErrorKind::UnreadableInstanceField { field, cell, kind }
+                if field == "f" && cell == "pad" && kind == "function")
+            },
+        );
+    }
+
+    #[test]
     fn reading_the_layer_of_a_construction_rect_reports_one_error() {
         // Used `InvalidRotation` -- a copy-paste, reported as "non-Manhattan
         // rotation" -- and then continued with a fabricated `Value::String("")`

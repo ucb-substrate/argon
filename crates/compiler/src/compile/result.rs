@@ -38,6 +38,15 @@ pub enum StaticErrorKind {
     /// Geometry of a cell was read before the cell was placed.
     #[error("`{cell}` is a cell; place it with `inst(...)` before reading field `{field}`")]
     CellFieldBeforePlacement { cell: String, field: String },
+    /// A field that holds a function was read through an instance.
+    #[error(
+        "field `{field}` of cell `{cell}` holds a {kind}, which cannot be read through an instance"
+    )]
+    UnreadableInstanceField {
+        field: String,
+        cell: String,
+        kind: String,
+    },
     /// A field was read from a cell function that was never called.
     #[error("`{cell}` is a cell function; call it as `{cell}(...)` before reading field `{field}`")]
     CellFnFieldAccess { cell: String, field: String },
@@ -346,6 +355,16 @@ pub enum ExecErrorKind {
     /// plain misspelling lands here.
     #[error("no field `{field}` on instance of cell `{cell}`")]
     NoFieldOnInstance { field: String, cell: String },
+    /// A field was read from an instance whose cell holds a value, such as a
+    /// function, that cannot leave the cell.
+    #[error(
+        "field `{field}` of cell `{cell}` holds a {kind}, which cannot be read through an instance"
+    )]
+    UnreadableInstanceField {
+        field: String,
+        cell: String,
+        kind: String,
+    },
     /// An optional field was read on a value that never received one.
     ///
     /// Today this is only a `crect` created without a `layer=` argument, whose

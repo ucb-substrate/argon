@@ -1597,6 +1597,21 @@ impl VariantTys {
 /// A pattern's annotated path and what it resolved to, if anything.
 type ResolvedPatternPath = (IdentPath<Substr, VarIdTyMetadata>, Option<PatternTarget>);
 
+/// The kind of function a value of type `ty` may hold, if any, named as
+/// [`Value::kind_name`] names it.
+fn function_kind(ty: &Ty) -> Option<&'static str> {
+    match ty {
+        Ty::Fn(_) => Some("function"),
+        Ty::CellFn(_) => Some("cell generator"),
+        Ty::Ctor(_) => Some("variant constructor"),
+        Ty::Seq(inner) => function_kind(inner),
+        Ty::Tuple(tys) => tys.iter().find_map(function_kind),
+        Ty::Struct(ty) => ty.args.iter().find_map(function_kind),
+        Ty::Enum(ty) => ty.args.iter().find_map(function_kind),
+        _ => None,
+    }
+}
+
 /// The names a typed `let` statement binds, with their ids and types; empty
 /// for any other statement.
 pub(crate) fn typed_let_bindings<S>(
@@ -4971,7 +4986,23 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "x" | "y" => Ty::Float,
                 _ => self.no_field_on_ty(field, Ty::Point),
             },
-            Ty::Inst(ref c) => self.inst_field_ty(c, field, &base_ty),
+            Ty::Inst(ref c) => {
+                let ty = self.inst_field_ty(c, field, &base_ty);
+                match function_kind(&ty) {
+                    Some(kind) => {
+                        self.errors.push(StaticError {
+                            span: self.span(field.span),
+                            kind: StaticErrorKind::UnreadableInstanceField {
+                                field: field.name.to_string(),
+                                cell: c.name.clone(),
+                                kind: kind.to_owned(),
+                            },
+                        });
+                        Ty::Unknown
+                    }
+                    None => ty,
+                }
+            }
             // A cell's coordinates are only determined relative to a
             // placement, so reading its geometry before `inst(...)` is
             // meaningless -- and the evaluator already refuses it. Saying so
@@ -7983,7 +8014,7 @@ impl<'a> ExecPass<'a> {
         let Some(cell) = self.compiled_cells.get(&id).cloned() else {
             return;
         };
-        let children = cell
+        let mut children = cell
             .objects
             .values()
             .filter_map(|object| match object {
@@ -7991,6 +8022,10 @@ impl<'a> ExecPass<'a> {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        // A field can name a cell that nothing here instantiates.
+        for field in cell.fields.values() {
+            field.for_each_cell(&mut |child| children.push(child));
+        }
         // Retaining a parent whose children are not retained would guarantee a
         // miss on every future lookup, since `reinstate` requires the whole
         // closure. GDS-imported children live in their own cache.
@@ -8264,7 +8299,10 @@ impl<'a> ExecPass<'a> {
                     name: structure_name,
                     scopes,
                     root,
-                    fields,
+                    fields: fields
+                        .iter()
+                        .map(|(name, ids)| (name.clone(), FieldValue::from_objects(ids)))
+                        .collect(),
                     sse_basis: SseBasis::Nullspace(Vec::new()),
                     objects,
                     fallback_constraints_used: Vec::new(),
@@ -8581,11 +8619,18 @@ impl<'a> ExecPass<'a> {
                     scope
                         .bindings
                         .insert(*seq_num, (name.clone(), obj_id.clone()));
-                    if *id == ccell.root {
-                        ccell.fields.insert(name.clone(), obj_id);
-                    }
                 }
             }
+        }
+
+        for (name, vid) in state.fields.iter() {
+            let value = self.values[vid]
+                .as_ref()
+                .into_ready()
+                .expect("cell fields must be ready");
+            ccell
+                .fields
+                .insert(name.clone(), FieldValue::solve(value, &state.solver));
         }
 
         ccell
@@ -11395,176 +11440,63 @@ impl<'a> ExecPass<'a> {
                                         // solved/compiled, and therefore it will be in the
                                         // compiled cell map.
                                         let cell = &self.compiled_cells[&inst_cell_id];
-                                        let field_value =
-                                            if let Some(field_value) = cell.field(field) {
-                                                field_value
-                                            } else {
+                                        let field_value = match cell.fields.get(field) {
+                                            // Reported when the cell was compiled.
+                                            Some(FieldValue::Poison) => {
+                                                return self.poison(cell_id, vid);
+                                            }
+                                            Some(FieldValue::Unreadable(kind)) => {
+                                                Err(ExecErrorKind::UnreadableInstanceField {
+                                                    field: field.to_string(),
+                                                    cell: cell.name.clone(),
+                                                    kind: kind.clone(),
+                                                })
+                                            }
+                                            Some(field_value) => Ok(field_value),
+                                            None => Err(ExecErrorKind::NoFieldOnInstance {
+                                                field: field.to_string(),
+                                                cell: cell.name.clone(),
+                                            }),
+                                        };
+                                        let field_value = match field_value {
+                                            Ok(field_value) => field_value,
+                                            Err(kind) => {
                                                 self.errors.push(ExecError {
                                                     span: Some(self.span(
                                                         &vref.loc,
                                                         field_access_expr.expr.span,
                                                     )),
                                                     cell: cell_id,
-                                                    kind: ExecErrorKind::NoFieldOnInstance {
-                                                        field: field.to_string(),
-                                                        cell: cell.name.clone(),
-                                                    },
+                                                    kind,
                                                 });
                                                 return self.poison(cell_id, vid);
-                                            };
+                                            }
+                                        };
                                         let cell_values = &self.cell_values;
                                         let obj_id = &mut self.next_id;
                                         let cell_state =
                                             self.cell_states.get_mut(&cell_id).unwrap();
                                         let proxies = &mut cell_state.proxy_objects;
                                         let objects = &mut cell_state.objects;
-                                        let transformed = Value::from_array(field_value.map(
-                                            &mut move |v| match v {
-                                                SolvedValue::Rect(rect) => {
-                                                    let id = object_id(obj_id);
-                                                    let rect = rect
-                                                        .to_float()
-                                                        .transform(inst.reflect, inst.angle);
-                                                    let xrect = Rect {
-                                                        id,
-                                                        layer: rect.layer.clone(),
-                                                        x0: LinearExpr::add(
-                                                            rect.x0,
-                                                            inst.x.clone(),
-                                                        ),
-                                                        y0: LinearExpr::add(
-                                                            rect.y0,
-                                                            inst.y.clone(),
-                                                        ),
-                                                        x1: LinearExpr::add(
-                                                            rect.x1,
-                                                            inst.x.clone(),
-                                                        ),
-                                                        y1: LinearExpr::add(
-                                                            rect.y1,
-                                                            inst.y.clone(),
-                                                        ),
-                                                        // A view of geometry the instance already draws, so it
-                                                        // is construction geometry -- drawing it again would put a
-                                                        // phantom shape on top of the SREF. `!` opts back in; see
-                                                        // `mark_emitted_proxies_as_layout`.
-                                                        construction: true,
-                                                        span: rect.span.clone(),
-                                                    };
-                                                    proxies.insert(xrect.id);
-                                                    objects.insert(xrect.id, xrect.clone().into());
-                                                    Value::Rect(xrect)
-                                                }
-                                                SolvedValue::Polygon(polygon) => {
-                                                    let id = object_id(obj_id);
-                                                    let mat = tmat(inst.angle, inst.reflect);
-                                                    let polygon = Polygon {
-                                                        id,
-                                                        layer: polygon.layer.clone(),
-                                                        points: polygon
-                                                            .points
-                                                            .iter()
-                                                            .map(|(x, y)| {
-                                                                let (x, y) =
-                                                                    ifmatvec(mat, (x.0, y.0));
-                                                                (
-                                                                    LinearExpr::add(
-                                                                        x,
-                                                                        inst.x.clone(),
-                                                                    ),
-                                                                    LinearExpr::add(
-                                                                        y,
-                                                                        inst.y.clone(),
-                                                                    ),
-                                                                )
-                                                            })
-                                                            .collect(),
-                                                        // A view of geometry the instance already draws, so it
-                                                        // is construction geometry -- drawing it again would put a
-                                                        // phantom shape on top of the SREF. `!` opts back in; see
-                                                        // `mark_emitted_proxies_as_layout`.
-                                                        construction: true,
-                                                        span: polygon.span.clone(),
-                                                    };
-                                                    proxies.insert(polygon.id);
-                                                    objects
-                                                        .insert(polygon.id, polygon.clone().into());
-                                                    Value::Polygon(polygon)
-                                                }
-                                                SolvedValue::Path(path) => {
-                                                    let id = object_id(obj_id);
-                                                    let mat = tmat(inst.angle, inst.reflect);
-                                                    let path = Path {
-                                                        id,
-                                                        layer: path.layer.clone(),
-                                                        width: LinearExpr::from(path.width.0),
-                                                        points: path
-                                                            .points
-                                                            .iter()
-                                                            .map(|(x, y)| {
-                                                                let (x, y) =
-                                                                    ifmatvec(mat, (x.0, y.0));
-                                                                (
-                                                                    LinearExpr::add(
-                                                                        x,
-                                                                        inst.x.clone(),
-                                                                    ),
-                                                                    LinearExpr::add(
-                                                                        y,
-                                                                        inst.y.clone(),
-                                                                    ),
-                                                                )
-                                                            })
-                                                            .collect(),
-                                                        begin_extension: LinearExpr::from(
-                                                            path.begin_extension.0,
-                                                        ),
-                                                        end_extension: LinearExpr::from(
-                                                            path.end_extension.0,
-                                                        ),
-                                                        // A view of geometry the instance already draws, so it
-                                                        // is construction geometry -- drawing it again would put a
-                                                        // phantom shape on top of the SREF. `!` opts back in; see
-                                                        // `mark_emitted_proxies_as_layout`.
-                                                        construction: true,
-                                                        span: path.span.clone(),
-                                                    };
-                                                    proxies.insert(path.id);
-                                                    objects.insert(path.id, path.clone().into());
-                                                    Value::Path(path)
-                                                }
-                                                SolvedValue::Instance(cinst) => {
-                                                    let (angle, reflect, cx, cy) = cascade(
-                                                        inst.angle,
-                                                        inst.reflect,
-                                                        cinst.angle,
-                                                        cinst.reflect,
-                                                        cinst.x,
-                                                        cinst.y,
-                                                    );
-                                                    let id = object_id(obj_id);
-                                                    let oinst = Instance {
-                                                        id,
-                                                        cell: cell_values[&cinst.cell],
-                                                        x: LinearExpr::add(inst.x.clone(), cx),
-                                                        y: LinearExpr::add(inst.y.clone(), cy),
-                                                        angle,
-                                                        reflect,
-                                                        // A view of geometry the instance already draws, so it
-                                                        // is construction geometry -- drawing it again would put a
-                                                        // phantom shape on top of the SREF. `!` opts back in; see
-                                                        // `mark_emitted_proxies_as_layout`.
-                                                        construction: true,
-                                                        span: cinst.span.clone(),
-                                                    };
-                                                    proxies.insert(oinst.id);
-                                                    objects.insert(oinst.id, oinst.clone().into());
-                                                    Value::Inst(oinst)
-                                                }
-                                                _ => unreachable!(),
-                                            },
-                                        ));
-                                        Some(transformed)
+                                        let mut place_object = |object| {
+                                            place_inst_object(
+                                                inst,
+                                                &cell.objects[&object],
+                                                cell_values,
+                                                obj_id,
+                                                proxies,
+                                                objects,
+                                            )
+                                        };
+                                        let mat = tmat(inst.angle, inst.reflect);
+                                        let mut place_point = |x, y| {
+                                            let (x, y) = ifmatvec(mat, (x, y));
+                                            Value::Point((
+                                                LinearExpr::add(x, inst.x.clone()),
+                                                LinearExpr::add(y, inst.y.clone()),
+                                            ))
+                                        };
+                                        Some(field_value.read(&mut place_object, &mut place_point))
                                     } else {
                                         None
                                     }
@@ -12232,13 +12164,6 @@ impl Value {
             _ => None,
         }
     }
-
-    fn from_array(arr: Arrayed<Value>) -> Self {
-        match arr {
-            Arrayed::Elem(v) => v,
-            Arrayed::Array(s) => Self::Seq(s.into_iter().map(Value::from_array).collect()),
-        }
-    }
 }
 
 /// An enum value: a variant and its payload. See [`Value::Enum`].
@@ -12522,7 +12447,8 @@ pub struct CompiledCell {
     pub name: String,
     pub scopes: IndexMap<ScopeId, CompiledScope>,
     pub root: ScopeId,
-    pub fields: IndexMap<String, Arrayed<ObjectId>>,
+    /// The cell's top-level `let` bindings, which an instance of it reads.
+    pub fields: IndexMap<String, FieldValue>,
     pub sse_basis: SseBasis,
     pub objects: IndexMap<ObjectId, SolvedValue>,
     pub fallback_constraints_used: Vec<UsedFallback>,
@@ -12555,6 +12481,181 @@ impl<T> Arrayed<T> {
         match self {
             Self::Elem(x) => f(x),
             Self::Array(x) => x.iter().for_each(|x| x.for_each(f)),
+        }
+    }
+}
+
+/// The solved value of a cell field, like [`Value`].
+///
+/// Geometry is named by object id and points are kept in the cell's frame, so
+/// that an instance can move both into its parent's frame when it reads them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FieldValue {
+    /// A rect, polygon, path, or instance of the cell.
+    Object(ObjectId),
+    Float(f64),
+    Int(i64),
+    Bool(bool),
+    String(String),
+    Point(f64, f64),
+    Cell(CellId),
+    Nil,
+    Seq(Vec<FieldValue>),
+    Tuple(Vec<FieldValue>),
+    /// A struct value: the qualified name of its type and its fields.
+    Struct {
+        name: String,
+        fields: Vec<(String, FieldValue)>,
+    },
+    /// A unit or tuple variant and its payload.
+    Enum {
+        variant: String,
+        payload: Vec<FieldValue>,
+    },
+    /// A variant with named fields.
+    StructVariant {
+        variant: String,
+        fields: Vec<(String, FieldValue)>,
+    },
+    /// A field whose value was poisoned, which already reported why. Only ever
+    /// a whole field.
+    Poison,
+    /// A field holding a value of the named kind, such as a function, which
+    /// cannot leave its cell. Only ever a whole field.
+    Unreadable(String),
+}
+
+impl FieldValue {
+    /// The field for `value`, whose solver variables belong to `solver`.
+    fn solve(value: &Value, solver: &Solver) -> Self {
+        Self::try_solve(value, solver).unwrap_or_else(|field| field)
+    }
+
+    /// Like [`Self::solve`], but a part that makes the whole field
+    /// [`Self::Poison`] or [`Self::Unreadable`] returns it as `Err`.
+    fn try_solve(value: &Value, solver: &Solver) -> Result<Self, Self> {
+        let solve = |value: &Value| Self::try_solve(value, solver);
+        let solve_fields = |fields: &IndexMap<String, Value>| {
+            fields
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), solve(value)?)))
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let exact =
+            |expr: &LinearExpr| solver.eval_expr_exact(expr).expect("cell field not solved");
+        Ok(match value {
+            Value::Rect(rect) => Self::Object(rect.id),
+            Value::Polygon(polygon) => Self::Object(polygon.id),
+            Value::Path(path) => Self::Object(path.id),
+            Value::Inst(inst) => Self::Object(inst.id),
+            Value::Linear(expr) => Self::Float(exact(expr)),
+            Value::Int(i) => Self::Int(*i),
+            Value::Bool(b) => Self::Bool(*b),
+            Value::String(s) => Self::String(s.clone()),
+            Value::Point((x, y)) => Self::Point(exact(x), exact(y)),
+            Value::Cell(cell) => Self::Cell(*cell),
+            Value::Nil => Self::Nil,
+            Value::Seq(items) => Self::Seq(items.iter().map(solve).collect::<Result<_, _>>()?),
+            Value::Tuple(items) => Self::Tuple(items.iter().map(solve).collect::<Result<_, _>>()?),
+            Value::Struct(value) => Self::Struct {
+                name: value.name.clone(),
+                fields: solve_fields(&value.fields)?,
+            },
+            Value::Enum(value) => match &value.payload {
+                VariantValues::Tuple(items) => Self::Enum {
+                    variant: value.variant.clone(),
+                    payload: items.iter().map(solve).collect::<Result<_, _>>()?,
+                },
+                VariantValues::Struct(fields) => Self::StructVariant {
+                    variant: value.variant.clone(),
+                    fields: solve_fields(fields)?,
+                },
+            },
+            Value::Poison => return Err(Self::Poison),
+            Value::Fn(_) | Value::CellFn(_) | Value::Ctor(_) => {
+                return Err(Self::Unreadable(value.kind_name().to_owned()));
+            }
+        })
+    }
+
+    /// The field for objects named the way a GDS cell names them.
+    fn from_objects(objects: &Arrayed<ObjectId>) -> Self {
+        match objects {
+            Arrayed::Elem(id) => Self::Object(*id),
+            Arrayed::Array(items) => Self::Seq(items.iter().map(Self::from_objects).collect()),
+        }
+    }
+
+    /// Rebuilds the field as a value, with `object` and `point` placing each
+    /// object and point.
+    fn read<F, G>(&self, object: &mut F, point: &mut G) -> Value
+    where
+        F: FnMut(ObjectId) -> Value,
+        G: FnMut(f64, f64) -> Value,
+    {
+        match self {
+            Self::Object(id) => object(*id),
+            Self::Float(f) => Value::Linear(LinearExpr::from(*f)),
+            Self::Int(i) => Value::Int(*i),
+            Self::Bool(b) => Value::Bool(*b),
+            Self::String(s) => Value::String(s.clone()),
+            Self::Point(x, y) => point(*x, *y),
+            Self::Cell(cell) => Value::Cell(*cell),
+            Self::Nil => Value::Nil,
+            Self::Seq(items) => {
+                Value::Seq(items.iter().map(|item| item.read(object, point)).collect())
+            }
+            Self::Tuple(items) => {
+                Value::Tuple(items.iter().map(|item| item.read(object, point)).collect())
+            }
+            Self::Struct { name, fields } => Value::Struct(Box::new(StructValue {
+                name: name.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(name, field)| (name.clone(), field.read(object, point)))
+                    .collect(),
+            })),
+            Self::Enum { variant, payload } => Value::Enum(Arc::new(EnumValue {
+                variant: variant.clone(),
+                payload: VariantValues::Tuple(
+                    payload
+                        .iter()
+                        .map(|item| item.read(object, point))
+                        .collect(),
+                ),
+            })),
+            Self::StructVariant { variant, fields } => Value::Enum(Arc::new(EnumValue {
+                variant: variant.clone(),
+                payload: VariantValues::Struct(
+                    fields
+                        .iter()
+                        .map(|(name, field)| (name.clone(), field.read(object, point)))
+                        .collect(),
+                ),
+            })),
+            Self::Poison | Self::Unreadable(_) => Value::Poison,
+        }
+    }
+
+    /// Calls `f` on every cell this field names.
+    fn for_each_cell(&self, f: &mut impl FnMut(CellId)) {
+        match self {
+            Self::Cell(cell) => f(*cell),
+            Self::Seq(items) | Self::Tuple(items) | Self::Enum { payload: items, .. } => {
+                items.iter().for_each(|item| item.for_each_cell(f))
+            }
+            Self::Struct { fields, .. } | Self::StructVariant { fields, .. } => {
+                fields.iter().for_each(|(_, field)| field.for_each_cell(f))
+            }
+            Self::Object(_)
+            | Self::Float(_)
+            | Self::Int(_)
+            | Self::Bool(_)
+            | Self::String(_)
+            | Self::Point(..)
+            | Self::Nil
+            | Self::Poison
+            | Self::Unreadable(_) => {}
         }
     }
 }
@@ -12717,12 +12818,6 @@ impl CompiledCell {
             rebase.rebase(span)?;
         }
         Ok(())
-    }
-
-    pub fn field(&self, name: &str) -> Option<Arrayed<&SolvedValue>> {
-        self.fields
-            .get(name)
-            .map(|o| o.map(&mut |id| &self.objects[id]))
     }
 }
 
@@ -13124,6 +13219,131 @@ pub fn ifmatvec(mat: TransformationMatrix, pt: (f64, f64)) -> (f64, f64) {
         mat[0][0] as f64 * pt.0 + mat[0][1] as f64 * pt.1,
         mat[1][0] as f64 * pt.0 + mat[1][1] as f64 * pt.1,
     )
+}
+
+/// Places `object`, an object of the cell `inst` instantiates, in the cell
+/// holding `inst`, registering the placed copy in `objects` as a proxy.
+fn place_inst_object(
+    inst: &Instance,
+    object: &SolvedValue,
+    cell_values: &HashMap<CellId, ValueId>,
+    obj_id: &mut u64,
+    proxies: &mut IndexSet<ObjectId>,
+    objects: &mut IndexMap<ObjectId, Object>,
+) -> Value {
+    match object {
+        SolvedValue::Rect(rect) => {
+            let id = object_id(obj_id);
+            let rect = rect.to_float().transform(inst.reflect, inst.angle);
+            let xrect = Rect {
+                id,
+                layer: rect.layer.clone(),
+                x0: LinearExpr::add(rect.x0, inst.x.clone()),
+                y0: LinearExpr::add(rect.y0, inst.y.clone()),
+                x1: LinearExpr::add(rect.x1, inst.x.clone()),
+                y1: LinearExpr::add(rect.y1, inst.y.clone()),
+                // A view of geometry the instance already draws, so it
+                // is construction geometry -- drawing it again would put a
+                // phantom shape on top of the SREF. `!` opts back in; see
+                // `mark_emitted_proxies_as_layout`.
+                construction: true,
+                span: rect.span.clone(),
+            };
+            proxies.insert(xrect.id);
+            objects.insert(xrect.id, xrect.clone().into());
+            Value::Rect(xrect)
+        }
+        SolvedValue::Polygon(polygon) => {
+            let id = object_id(obj_id);
+            let mat = tmat(inst.angle, inst.reflect);
+            let polygon = Polygon {
+                id,
+                layer: polygon.layer.clone(),
+                points: polygon
+                    .points
+                    .iter()
+                    .map(|(x, y)| {
+                        let (x, y) = ifmatvec(mat, (x.0, y.0));
+                        (
+                            LinearExpr::add(x, inst.x.clone()),
+                            LinearExpr::add(y, inst.y.clone()),
+                        )
+                    })
+                    .collect(),
+                // A view of geometry the instance already draws, so it
+                // is construction geometry -- drawing it again would put a
+                // phantom shape on top of the SREF. `!` opts back in; see
+                // `mark_emitted_proxies_as_layout`.
+                construction: true,
+                span: polygon.span.clone(),
+            };
+            proxies.insert(polygon.id);
+            objects.insert(polygon.id, polygon.clone().into());
+            Value::Polygon(polygon)
+        }
+        SolvedValue::Path(path) => {
+            let id = object_id(obj_id);
+            let mat = tmat(inst.angle, inst.reflect);
+            let path = Path {
+                id,
+                layer: path.layer.clone(),
+                width: LinearExpr::from(path.width.0),
+                points: path
+                    .points
+                    .iter()
+                    .map(|(x, y)| {
+                        let (x, y) = ifmatvec(mat, (x.0, y.0));
+                        (
+                            LinearExpr::add(x, inst.x.clone()),
+                            LinearExpr::add(y, inst.y.clone()),
+                        )
+                    })
+                    .collect(),
+                begin_extension: LinearExpr::from(path.begin_extension.0),
+                end_extension: LinearExpr::from(path.end_extension.0),
+                // A view of geometry the instance already draws, so it
+                // is construction geometry -- drawing it again would put a
+                // phantom shape on top of the SREF. `!` opts back in; see
+                // `mark_emitted_proxies_as_layout`.
+                construction: true,
+                span: path.span.clone(),
+            };
+            proxies.insert(path.id);
+            objects.insert(path.id, path.clone().into());
+            Value::Path(path)
+        }
+        SolvedValue::Instance(cinst) => {
+            let (angle, reflect, cx, cy) = cascade(
+                inst.angle,
+                inst.reflect,
+                cinst.angle,
+                cinst.reflect,
+                cinst.x,
+                cinst.y,
+            );
+            let id = object_id(obj_id);
+            let oinst = Instance {
+                id,
+                cell: cell_values[&cinst.cell],
+                x: LinearExpr::add(inst.x.clone(), cx),
+                y: LinearExpr::add(inst.y.clone(), cy),
+                angle,
+                reflect,
+                // A view of geometry the instance already draws, so it
+                // is construction geometry -- drawing it again would put a
+                // phantom shape on top of the SREF. `!` opts back in; see
+                // `mark_emitted_proxies_as_layout`.
+                construction: true,
+                span: cinst.span.clone(),
+            };
+            proxies.insert(oinst.id);
+            objects.insert(oinst.id, oinst.clone().into());
+            Value::Inst(oinst)
+        }
+        SolvedValue::Text(_) | SolvedValue::Dimension(_) => {
+            unreachable!("cell fields never hold text or dimensions")
+        }
+    }
 }
 
 fn tmat(rot: Rotation, refv: bool) -> TransformationMatrix {
