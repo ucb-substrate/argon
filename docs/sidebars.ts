@@ -74,6 +74,7 @@ const sidebars: SidebarsConfig = {
     'tools/argone',
     'tools/argonc',
     'tools/neovim',
+    'tools/agents',
   ],
 };
 

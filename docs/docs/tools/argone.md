@@ -38,8 +38,6 @@ argone ssh <HOST> [PATH] [OPTIONS]
 | `-o, --ssh-option <OPTION>` | None | An OpenSSH option. Repeat for more than one. |
 | `--local-analyzer-port <PORT>` | Allocated | Local port forwarded to the remote analyzer. |
 | `--remote-analyzer-port <PORT>` | Allocated | Analyzer port on the remote machine. |
-| `--local-gui-port <PORT>` | Allocated | Local port the GUI listens on for callbacks. |
-| `--remote-gui-port <PORT>` | Allocated | Port the callback is exposed on remotely. |
 
 ```bash
 argone ssh layout-host ~/work/chip
@@ -49,3 +47,9 @@ argone ssh layout-host . -o ProxyJump=bastion
 ## `argone gui`
 
 Starts only the GUI and connects it to a running analyzer. `argone` and `argone ssh` use this internally; you rarely need to run it yourself.
+
+```text
+argone gui <ADDRESS>
+```
+
+The GUI authenticates with the analyzer's session token. It reads the token from `ARGON_SESSION_TOKEN`, or, for an analyzer on the same machine, from the analyzer's session record.

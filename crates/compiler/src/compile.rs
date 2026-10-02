@@ -13702,6 +13702,44 @@ fn object_id(id: &mut u64) -> ObjectId {
 }
 
 impl CompiledData {
+    /// The bounding box of `cell`'s layout geometry, instances included, in
+    /// `cell`'s own coordinate frame.
+    pub fn layout_bbox(&self, cell: CellId) -> Option<Rect<f64>> {
+        self.layout_bbox_memoized(cell, &mut HashMap::new())
+    }
+
+    fn layout_bbox_memoized(
+        &self,
+        cell: CellId,
+        memo: &mut HashMap<CellId, Option<Rect<f64>>>,
+    ) -> Option<Rect<f64>> {
+        if let Some(bbox) = memo.get(&cell) {
+            return bbox.clone();
+        }
+        let mut bbox = None;
+        for object in self.cells.get(&cell)?.objects.values() {
+            if !object.is_layout() {
+                continue;
+            }
+            match object {
+                SolvedValue::Rect(r) => bbox = bbox_union(bbox, Some(r.to_float())),
+                SolvedValue::Polygon(p) => bbox = bbox_union(bbox, p.bbox()),
+                SolvedValue::Path(p) => bbox = bbox_union(bbox, p.bbox()),
+                SolvedValue::Instance(i) => {
+                    let child = self
+                        .layout_bbox_memoized(i.cell, memo)
+                        .map(|r| r.transform(i.reflect, i.angle).translate(i.x, i.y));
+                    bbox = bbox_union(bbox, child);
+                }
+                _ => {}
+            }
+        }
+        memo.insert(cell, bbox.clone());
+        bbox
+    }
+}
+
+impl CompiledData {
     /// Resolve one object's source name without allocating names for every
     /// reachable object. Later bindings and array entries win, as they do in
     /// [`Self::reachable_objs`]. This keeps hover hit testing cheap in large
