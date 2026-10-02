@@ -4,7 +4,9 @@ use std::{net::Ipv4Addr, path::PathBuf, sync::Arc};
 
 use analyzer::{
     ArgonConfig,
+    agent::AgentClient,
     rpc::{CompilationSnapshot, CompilationUpdate, Gui, InstancePreview, LangServerClient},
+    transport::{self, Role, SessionToken},
 };
 use argonc::{
     ast::Span,
@@ -41,6 +43,11 @@ pub enum GuiEvent {
     Fit,
     WorkspacePath(Option<PathBuf>),
     WorkspaceModified(bool),
+    Highlight {
+        revision: u64,
+        spans: Vec<Span>,
+    },
+    AgentActivity(Option<String>),
 }
 
 #[derive(Clone)]
@@ -129,6 +136,18 @@ impl Gui for HeadlessGui {
     async fn configure(self, _: context::Context, _: ArgonConfig) {}
 
     async fn activate(self, _: context::Context) {}
+
+    async fn highlight_spans(self, _: context::Context, revision: u64, spans: Vec<Span>) {
+        self.events
+            .send(GuiEvent::Highlight { revision, spans })
+            .expect("full-stack test should still be receiving GUI events");
+    }
+
+    async fn agent_activity(self, _: context::Context, label: Option<String>) {
+        self.events
+            .send(GuiEvent::AgentActivity(label))
+            .expect("full-stack test should still be receiving GUI events");
+    }
 }
 
 fn snapshot_details(output: &CompileOutput) -> (OutputKind, Option<Span>, usize) {
@@ -161,11 +180,13 @@ pub struct Session {
     ack: PathBuf,
     gui_edit_ack: PathBuf,
     diagnostic_ack: PathBuf,
+    steps: PathBuf,
     analyzer_addr: std::net::SocketAddr,
     analyzer_listener: Option<tokio::net::TcpListener>,
+    token: SessionToken,
     lsp_port: u16,
     lsp_listener: Option<tokio::net::TcpListener>,
-    gui_addr: std::net::SocketAddr,
+    gui: HeadlessGui,
     events: mpsc::UnboundedReceiver<GuiEvent>,
     #[cfg(test)]
     update_gate: std::sync::Arc<tokio::sync::Semaphore>,
@@ -173,10 +194,20 @@ pub struct Session {
 
 impl Session {
     pub async fn new(source: &str) -> Self {
+        Self::with_files(source, &[]).await
+    }
+
+    /// A project whose `lib.ar` is `source`, alongside the other `files`.
+    pub async fn with_files(source: &str, files: &[(&str, &str)]) -> Self {
         let directory = tempfile::tempdir().expect("create full-stack test directory");
         let project = directory.path().join("project");
         std::fs::create_dir(&project).expect("create test project");
         std::fs::write(project.join("lib.ar"), source).expect("write test source");
+        for (name, contents) in files {
+            std::fs::write(project.join(name), contents).expect("write test module");
+        }
+        let steps = directory.path().join("steps");
+        std::fs::create_dir(&steps).expect("create test step directory");
         std::fs::write(
             project.join("Argon.toml"),
             "name = \"full-stack-test\"\ntech = \"tech.toml\"\n",
@@ -202,36 +233,13 @@ impl Session {
             .expect("read analyzer LSP address")
             .port();
         let (events_tx, events) = mpsc::unbounded_channel();
-        let selected_scope = Arc::new(std::sync::Mutex::new(None));
-        let mut listener =
-            tarpc::serde_transport::tcp::listen((Ipv4Addr::LOCALHOST, 0), Bincode::default)
-                .await
-                .expect("bind headless GUI RPC listener");
-        listener.config_mut().max_frame_length(usize::MAX);
-        let gui_addr = listener.local_addr();
         let update_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        let server_update_gate = update_gate.clone();
-        tokio::spawn(async move {
-            listener
-                .filter_map(|connection| futures::future::ready(connection.ok()))
-                .map(tarpc::server::BaseChannel::with_defaults)
-                .map(move |channel| {
-                    let server = HeadlessGui {
-                        events: events_tx.clone(),
-                        snapshot: Default::default(),
-                        update_gate: server_update_gate.clone(),
-                        selected_scope: selected_scope.clone(),
-                    };
-                    channel
-                        .execute(server.serve())
-                        .for_each(|response| async move {
-                            tokio::spawn(response);
-                        })
-                })
-                .buffer_unordered(10)
-                .for_each(|_| async {})
-                .await;
-        });
+        let gui = HeadlessGui {
+            events: events_tx,
+            snapshot: Default::default(),
+            update_gate: update_gate.clone(),
+            selected_scope: Arc::new(std::sync::Mutex::new(None)),
+        };
 
         let ack = directory.path().join("gui.ack");
         let gui_edit_ack = directory.path().join("gui-edit.ack");
@@ -242,11 +250,13 @@ impl Session {
             ack,
             gui_edit_ack,
             diagnostic_ack,
+            steps,
             analyzer_addr,
             analyzer_listener: Some(analyzer_listener),
+            token: SessionToken::generate().expect("generate a session token"),
             lsp_port,
             lsp_listener: Some(lsp_listener),
-            gui_addr,
+            gui,
             events,
             #[cfg(test)]
             update_gate,
@@ -262,15 +272,52 @@ impl Session {
             .analyzer_listener
             .take()
             .expect("analyzer should only be started once");
+        let token = self.token.clone();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept Neovim LSP stream");
             let (reader, writer) = tokio::io::split(stream);
-            analyzer::main_with_io_on_listener(rpc_listener, None, reader, writer).await;
+            analyzer::main_with_io_on_listener(rpc_listener, token, None, reader, writer).await;
         });
     }
 
-    pub fn gui_addr(&self) -> std::net::SocketAddr {
-        self.gui_addr
+    pub fn project(&self) -> &std::path::Path {
+        &self.project
+    }
+
+    async fn connect(&self, role: Role) -> transport::AuthenticatedStream {
+        time::timeout(TEST_TIMEOUT, async {
+            loop {
+                if let Ok(stream) = transport::connect(self.analyzer_addr, &self.token, role).await
+                {
+                    return stream;
+                }
+                time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("analyzer RPC server did not start")
+    }
+
+    /// Connects the headless GUI back to the analyzer for callbacks, as the
+    /// real GUI does once its window is up.
+    pub async fn connect_gui(&self) {
+        let stream = self.connect(Role::GuiCallback).await;
+        let gui = self.gui.clone();
+        tokio::spawn(async move {
+            let transport = tarpc::serde_transport::new(stream, Bincode::default());
+            tarpc::server::BaseChannel::with_defaults(transport)
+                .execute(gui.serve())
+                .for_each(|response| async move {
+                    tokio::spawn(response);
+                })
+                .await;
+        });
+    }
+
+    pub async fn connect_agent(&self) -> AgentClient {
+        let stream = self.connect(Role::Agent).await;
+        let transport = tarpc::serde_transport::new(stream, Bincode::default());
+        AgentClient::new(tarpc::client::Config::default(), transport).spawn()
     }
 
     pub fn spawn_nvim(&self, mode: &str) -> tokio::process::Child {
@@ -281,6 +328,7 @@ impl Session {
             .env("ARGON_TEST_ACK", &self.ack)
             .env("ARGON_TEST_GUI_EDIT_ACK", &self.gui_edit_ack)
             .env("ARGON_TEST_DIAGNOSTIC_ACK", &self.diagnostic_ack)
+            .env("ARGON_TEST_STEPS", &self.steps)
             .env("ARGON_TEST_MODE", mode)
             .env("ARGON_TEST_READY", self.project.join("startup.ready"))
             .arg("--cmd")
@@ -299,20 +347,39 @@ impl Session {
     }
 
     pub async fn connect_analyzer(&self) -> LangServerClient {
+        let stream = self.connect(Role::Gui).await;
+        let transport = tarpc::serde_transport::new(stream, Bincode::default());
+        LangServerClient::new(tarpc::client::Config::default(), transport).spawn()
+    }
+
+    /// Tells the Neovim fixture that step `name` happened.
+    pub fn signal(&self, name: &str) {
+        std::fs::write(self.steps.join(name), "ok\n").expect("signal a test step");
+    }
+
+    /// Waits for the Neovim fixture to signal step `name`.
+    pub async fn await_signal(&self, name: &str) {
+        let path = self.steps.join(name);
         time::timeout(TEST_TIMEOUT, async {
-            loop {
-                let mut transport =
-                    tarpc::serde_transport::tcp::connect(self.analyzer_addr, Bincode::default);
-                transport.config_mut().max_frame_length(usize::MAX);
-                if let Ok(transport) = transport.await {
-                    return LangServerClient::new(tarpc::client::Config::default(), transport)
-                        .spawn();
-                }
-                time::sleep(std::time::Duration::from_millis(25)).await;
+            while !path.exists() {
+                time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("analyzer RPC server did not start")
+        .unwrap_or_else(|_| panic!("Neovim never signalled {name}"));
+    }
+
+    /// Waits for a GUI event matching `predicate`, dropping the others.
+    pub async fn wait_for_event(
+        &mut self,
+        mut predicate: impl FnMut(&GuiEvent) -> bool,
+    ) -> GuiEvent {
+        loop {
+            let event = self.next_event().await;
+            if predicate(&event) {
+                return event;
+            }
+        }
     }
 
     pub async fn next_event(&mut self) -> GuiEvent {
@@ -331,6 +398,72 @@ mod tests {
 
     use super::*;
     use crate::finish_nvim;
+    use analyzer::{
+        ApprovalMode,
+        agent::{CALL_DEADLINE, CompileStatus, CreateRequest, EditRequest, Replacement},
+    };
+    use serde_json::{Value, json};
+    use tower_lsp_server::ls_types::MessageType;
+
+    const FIRST_RECT: &str = "let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);";
+    const SECOND_RECT: &str = "let b = rect(\"met1\", x0=20., y0=0., x1=30., y1=10.);";
+    const UNIT: &str =
+        "cell unit() {\n    let body = rect(\"met1\", x0=0., y0=0., x1=5., y1=5.);\n}\n";
+
+    fn one_rect() -> String {
+        format!("cell top() {{\n    {FIRST_RECT}\n}}\n")
+    }
+
+    fn with_unit() -> String {
+        format!(
+            "mod utils;\n\ncell top() {{\n    let unit = inst(utils::unit());\n    eq(unit.x, 0.);\n    eq(unit.y, 0.);\n    {FIRST_RECT}\n}}\n"
+        )
+    }
+
+    fn agent_context() -> context::Context {
+        let mut context = context::current();
+        context.deadline = std::time::Instant::now() + CALL_DEADLINE;
+        context
+    }
+
+    fn replace(path: &str, old: &str, new: &str, label: &str) -> EditRequest {
+        EditRequest {
+            path: PathBuf::from(path),
+            edits: vec![Replacement {
+                old: old.to_owned(),
+                new: new.to_owned(),
+                replace_all: false,
+            }],
+            label: label.to_owned(),
+        }
+    }
+
+    fn add_rect(statement: &str, label: &str) -> EditRequest {
+        replace(
+            "lib.ar",
+            FIRST_RECT,
+            &format!("{FIRST_RECT}\n    {statement}"),
+            label,
+        )
+    }
+
+    impl Session {
+        async fn wait_for_rects(&mut self, count: usize) -> u64 {
+            let GuiEvent::UpdateCell { revision, .. } = self
+                .wait_for_event(|event| {
+                    matches!(
+                        event,
+                        GuiEvent::UpdateCell { kind: OutputKind::Data, rect_count, .. }
+                            if *rect_count == count
+                    )
+                })
+                .await
+            else {
+                unreachable!()
+            };
+            revision
+        }
+    }
 
     // Process-heavy scenarios share ports and startup deadlines, so keep them
     // serial even though Cargo runs Rust tests in parallel by default.
@@ -350,10 +483,7 @@ mod tests {
             session.start_analyzer();
             let child = session.spawn_nvim("roundtrip");
             let analyzer = session.connect_analyzer().await;
-            analyzer
-                .register(context::current(), session.gui_addr())
-                .await
-                .expect("register headless GUI");
+            session.connect_gui().await;
 
             let mut drew_rect = false;
             let mut saw_editor_update = false;
@@ -455,7 +585,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn gui_registration_does_not_wait_for_initial_error_presentation() {
+    async fn gui_connection_does_not_wait_for_initial_error_presentation() {
         assert_completes("registering GUI with initial source errors", async {
             let _guard = FULL_STACK_LOCK.lock().await;
             let mut session = Session::new("cell top() { missing; }\n").await;
@@ -465,17 +595,11 @@ mod tests {
             while !session.project.join("startup.ready").exists() {
                 time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            let analyzer = session.connect_analyzer().await;
-            // A real GUI cannot service initial snapshot callbacks until its
-            // constructor returns. Registration must acknowledge independently
-            // of that first presentation, including when no cell is selected.
-            time::timeout(
-                std::time::Duration::from_secs(1),
-                analyzer.register(context::current(), session.gui_addr()),
-            )
-            .await
-            .expect("GUI registration waited for presentation")
-            .expect("register headless GUI");
+            // Connecting must not wait on the first presentation, including
+            // when no cell is selected.
+            time::timeout(std::time::Duration::from_secs(1), session.connect_gui())
+                .await
+                .expect("GUI connection waited for presentation");
             loop {
                 if matches!(
                     session.next_event().await,
@@ -501,11 +625,7 @@ mod tests {
             let mut session = Session::new("cell top() {\n    missing;\n}\n").await;
             session.start_analyzer();
             let child = session.spawn_nvim("diagnostics");
-            let analyzer = session.connect_analyzer().await;
-            analyzer
-                .register(context::current(), session.gui_addr())
-                .await
-                .expect("register headless GUI");
+            session.connect_gui().await;
 
             let mut saw_errors = false;
             let mut saw_recovery = false;
@@ -543,11 +663,7 @@ mod tests {
             .await;
             session.start_analyzer();
             let child = session.spawn_nvim("navigation");
-            let analyzer = session.connect_analyzer().await;
-            analyzer
-                .register(context::current(), session.gui_addr())
-                .await
-                .expect("register headless GUI");
+            session.connect_gui().await;
 
             std::fs::write(&session.ack, "ok\n").expect("acknowledge navigation");
             finish_nvim(child).await;
@@ -563,10 +679,7 @@ mod tests {
             session.start_analyzer();
             let child = session.spawn_nvim("rpc_errors");
             let analyzer = session.connect_analyzer().await;
-            analyzer
-                .register(context::current(), session.gui_addr())
-                .await
-                .expect("register headless GUI");
+            session.connect_gui().await;
             analyzer
                 .open_cell(context::current(), "top(".to_owned())
                 .await
@@ -582,6 +695,473 @@ mod tests {
             }
 
             std::fs::write(&session.ack, "ok\n").expect("acknowledge mirrored GUI error");
+            finish_nvim(child).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_edits_land_in_neovim_and_the_gui() {
+        assert_completes("waiting for an agent edit round trip", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new(&one_rect()).await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("agent_edit");
+            session.connect_gui().await;
+            session.wait_for_rects(1).await;
+            let agent = session.connect_agent().await;
+
+            let status = agent.status(agent_context()).await.unwrap();
+            assert!(status.gui_connected);
+            assert!(!status.follow_mode);
+            assert_eq!(status.approval, ApprovalMode::Never);
+            assert_eq!(status.open_cell.as_deref(), Some("top()"));
+            assert_eq!(status.open_files, vec![PathBuf::from("lib.ar")]);
+
+            let report = agent
+                .edit_file(agent_context(), add_rect(SECOND_RECT, "add a second rect"))
+                .await
+                .unwrap()
+                .expect("the agent edit should apply");
+            assert!(report.compiled_revision >= report.revision);
+            let summary = report.summary.clone().expect("the edit should compile");
+            assert_eq!(summary.status, CompileStatus::Valid);
+            assert_eq!(summary.rects, 2);
+            assert_eq!(summary.bbox, Some([0., 0., 30., 10.]));
+            assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+
+            let file = agent
+                .read_file(agent_context(), PathBuf::from("lib.ar"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(file.from_editor);
+            assert!(file.contents.contains(SECOND_RECT));
+            let disk = std::fs::read_to_string(session.project().join("lib.ar")).unwrap();
+            assert!(!disk.contains(SECOND_RECT), "agent edits must stay unsaved");
+
+            let (mut activity, mut geometry, mut highlight, mut idle) =
+                (false, false, false, false);
+            while !(activity && geometry && highlight && idle) {
+                match session.next_event().await {
+                    GuiEvent::AgentActivity(Some(label)) => {
+                        assert_eq!(label, "add a second rect");
+                        activity = true;
+                    }
+                    GuiEvent::AgentActivity(None) => idle = activity,
+                    GuiEvent::UpdateCell {
+                        kind: OutputKind::Data,
+                        rect_count: 2,
+                        ..
+                    } => geometry = true,
+                    GuiEvent::Highlight { revision, spans } => {
+                        assert_eq!(revision, report.revision);
+                        let [span] = spans.as_slice() else {
+                            panic!("expected one highlighted span, got {spans:?}");
+                        };
+                        assert!(span.path.ends_with("lib.ar"));
+                        assert_eq!(
+                            &file.contents[span.span.start()..span.span.end()],
+                            format!("{FIRST_RECT}\n    {SECOND_RECT}")
+                        );
+                        highlight = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            session.signal("undo");
+            session.await_signal("undone").await;
+            session.wait_for_rects(1).await;
+            std::fs::write(&session.ack, "ok\n").unwrap();
+            finish_nvim(child).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_edits_closed_files_and_reports_problems() {
+        assert_completes("waiting for agent edits to closed files", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::with_files(&with_unit(), &[("utils.ar", UNIT)]).await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("agent_hidden");
+            session.connect_gui().await;
+            session.wait_for_rects(1).await;
+            let agent = session.connect_agent().await;
+
+            let report = agent
+                .edit_file(
+                    agent_context(),
+                    replace("utils.ar", "x1=5.", "x1=17.", "widen the unit"),
+                )
+                .await
+                .unwrap()
+                .expect("editing a closed file should load it");
+            assert_eq!(report.summary.unwrap().bbox, Some([0., 0., 17., 10.]));
+            session.signal("edited_hidden");
+
+            agent
+                .create_file(
+                    agent_context(),
+                    CreateRequest {
+                        path: PathBuf::from("extra.ar"),
+                        contents: "cell extra() {\n}\n".to_owned(),
+                        label: "add a module".to_owned(),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("creating a file should open an unsaved buffer");
+            session.signal("created");
+            session.await_signal("hidden_checked").await;
+
+            let probe = agent
+                .compile_cell(agent_context(), "utils::unit()".to_owned())
+                .await
+                .unwrap()
+                .unwrap();
+            let summary = probe.summary.unwrap();
+            assert_eq!(summary.status, CompileStatus::Valid);
+            assert_eq!(summary.bbox, Some([0., 0., 17., 5.]));
+            let status = agent.status(agent_context()).await.unwrap();
+            assert_eq!(
+                status.open_cell.as_deref(),
+                Some("top()"),
+                "probing a cell must not change what the GUI shows"
+            );
+
+            let broken = agent
+                .edit_file(
+                    agent_context(),
+                    replace("utils.ar", "x1=17.", "x1=missing", "break it"),
+                )
+                .await
+                .unwrap()
+                .expect("an edit that does not compile should still apply");
+            assert!(
+                broken.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.path == std::path::Path::new("utils.ar")
+                        && diagnostic.line == 2
+                        && diagnostic.message.contains("missing")
+                }),
+                "{:?}",
+                broken.diagnostics
+            );
+
+            let error = |result: Result<analyzer::agent::Report, String>| {
+                result.expect_err("the edit should be refused")
+            };
+            let refused = |request| {
+                let agent = agent.clone();
+                async move { error(agent.edit_file(agent_context(), request).await.unwrap()) }
+            };
+            assert!(
+                refused(replace("lib.ar", "0.", "1.", "ambiguous"))
+                    .await
+                    .contains("occurs")
+            );
+            assert!(
+                refused(replace("lib.ar", "nowhere", "x", "missing"))
+                    .await
+                    .contains("not found")
+            );
+            assert!(
+                refused(replace("Argon.toml", "name", "x", "manifest"))
+                    .await
+                    .contains("not an Argon source file")
+            );
+            assert!(
+                refused(replace("/elsewhere/lib.ar", "a", "b", "outside"))
+                    .await
+                    .contains("outside")
+            );
+            let follow = agent
+                .open_cell(agent_context(), "top()".to_owned())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(follow, analyzer::agent::FOLLOW_REQUIRED);
+
+            std::fs::write(&session.ack, "ok\n").unwrap();
+            finish_nvim(child).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn approval_mode_asks_before_each_agent_edit() {
+        assert_completes("waiting for approved agent edits", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new(&one_rect()).await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("agent_approval");
+            session.connect_gui().await;
+            session.wait_for_rects(1).await;
+            let agent = session.connect_agent().await;
+            let rect = |name: &str| {
+                add_rect(
+                    &format!("let {name} = rect(\"met1\", x0=20., y0=0., x1=30., y1=10.);"),
+                    name,
+                )
+            };
+
+            session.await_signal("approval_on").await;
+            assert_eq!(
+                agent.status(agent_context()).await.unwrap().approval,
+                ApprovalMode::Always
+            );
+            let rejected = agent
+                .edit_file(agent_context(), rect("rejected_rect"))
+                .await
+                .unwrap();
+            assert_eq!(
+                rejected.unwrap_err(),
+                "The user rejected this edit in Neovim."
+            );
+            agent
+                .edit_file(agent_context(), rect("approved_rect"))
+                .await
+                .unwrap()
+                .expect("an approved edit should apply");
+            session.signal("approved");
+
+            session.await_signal("approval_off").await;
+            agent
+                .edit_file(agent_context(), rect("unprompted_rect"))
+                .await
+                .unwrap()
+                .expect("an edit should apply without approval");
+            session.signal("unprompted");
+
+            std::fs::write(&session.ack, "ok\n").unwrap();
+            finish_nvim(child).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_edits_survive_concurrent_typing() {
+        assert_completes("waiting for an interrupted agent edit", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new(&one_rect()).await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("agent_stale");
+            session.connect_gui().await;
+            session.wait_for_rects(1).await;
+            let agent = session.connect_agent().await;
+            session.await_signal("typing_armed").await;
+
+            agent
+                .edit_file(agent_context(), add_rect(SECOND_RECT, "add a second rect"))
+                .await
+                .unwrap()
+                .expect("the edit should be replanned after the buffer changed");
+            let file = agent
+                .read_file(agent_context(), PathBuf::from("lib.ar"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(file.contents.contains(SECOND_RECT));
+            assert!(file.contents.contains("// typed during the agent edit"));
+
+            std::fs::write(&session.ack, "ok\n").unwrap();
+            finish_nvim(child).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn follow_mode_gates_cell_switching_and_tracks_edits() {
+        assert_completes("waiting for follow mode", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::with_files(&with_unit(), &[("utils.ar", UNIT)]).await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("agent_follow");
+            session.connect_gui().await;
+            session.wait_for_rects(1).await;
+            let agent = session.connect_agent().await;
+
+            let refused = agent
+                .open_cell(agent_context(), "utils::unit()".to_owned())
+                .await
+                .unwrap();
+            assert!(refused.unwrap_err().contains("follow mode"));
+
+            session.signal("follow");
+            session.await_signal("following").await;
+            while !agent.status(agent_context()).await.unwrap().follow_mode {
+                time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let opened = agent
+                .open_cell(agent_context(), "utils::unit()".to_owned())
+                .await
+                .unwrap()
+                .expect("follow mode should allow switching the GUI's cell");
+            assert_eq!(
+                opened.summary.unwrap().cell.as_deref(),
+                Some("utils::unit()")
+            );
+            session
+                .wait_for_event(|event| matches!(event, GuiEvent::Fit))
+                .await;
+
+            agent
+                .edit_file(
+                    agent_context(),
+                    replace("utils.ar", "x1=5.", "x1=6.", "widen the unit"),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            session.signal("edited_followed");
+            session.await_signal("followed").await;
+
+            std::fs::write(&session.ack, "ok\n").unwrap();
+            finish_nvim(child).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disk_changes_reach_neovim_and_the_gui() {
+        assert_completes("waiting for disk changes", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::with_files(&with_unit(), &[("utils.ar", UNIT)]).await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("watcher");
+            session.connect_gui().await;
+            session.wait_for_rects(1).await;
+            let agent = session.connect_agent().await;
+            while !agent.status(agent_context()).await.unwrap().watching_files {
+                time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            // A closed file is reread from disk.
+            std::fs::write(
+                session.project().join("utils.ar"),
+                UNIT.replace("x1=5.", "x1=25."),
+            )
+            .unwrap();
+            loop {
+                let report = agent.diagnostics(agent_context()).await.unwrap();
+                if report.summary.and_then(|summary| summary.bbox) == Some([0., 0., 25., 10.]) {
+                    break;
+                }
+                time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+
+            // An open buffer without unsaved changes reloads.
+            let lib = session.project().join("lib.ar");
+            let third = "let c = rect(\"met1\", x0=40., y0=0., x1=50., y1=10.);";
+            std::fs::write(
+                &lib,
+                with_unit().replace(FIRST_RECT, &format!("{FIRST_RECT}\n    {third}")),
+            )
+            .unwrap();
+            session.wait_for_rects(2).await;
+
+            // An open buffer with unsaved changes keeps them.
+            session.await_signal("buffer_modified").await;
+            let fourth = "let d = rect(\"met1\", x0=60., y0=0., x1=70., y1=10.);";
+            std::fs::write(
+                &lib,
+                with_unit().replace(FIRST_RECT, &format!("{FIRST_RECT}\n    {fourth}")),
+            )
+            .unwrap();
+            session
+                .wait_for_event(|event| {
+                    matches!(
+                        event,
+                        GuiEvent::Message { typ, message }
+                            if *typ == MessageType::WARNING && message.contains("unsaved changes")
+                    )
+                })
+                .await;
+            session.signal("rewritten");
+
+            std::fs::write(&session.ack, "ok\n").unwrap();
+            finish_nvim(child).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_bridge_and_hook_use_the_running_session() {
+        assert_completes("waiting for the MCP bridge", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new(&one_rect()).await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("mcp");
+            session.connect_gui().await;
+            session.wait_for_rects(1).await;
+
+            let bridge = analyzer::mcp::Bridge::new(session.project().to_path_buf());
+            let call = |name: &str, arguments: Value| {
+                let request = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": { "name": name, "arguments": arguments },
+                });
+                let bridge = &bridge;
+                async move {
+                    let response = bridge.handle(request).await.unwrap();
+                    let result = &response["result"];
+                    (
+                        result["content"][0]["text"].as_str().unwrap().to_owned(),
+                        result["isError"].as_bool().unwrap(),
+                    )
+                }
+            };
+
+            let (status, failed) = call("status", json!({})).await;
+            assert!(!failed && status.contains("Open cell: top()"), "{status}");
+            let (edited, failed) = call(
+                "edit_file",
+                json!({
+                    "path": "lib.ar",
+                    "label": "add a second rect",
+                    "edits": [{
+                        "old_string": FIRST_RECT,
+                        "new_string": format!("{FIRST_RECT}\n    {SECOND_RECT}"),
+                    }],
+                }),
+            )
+            .await;
+            assert!(!failed && edited.contains("2 rects"), "{edited}");
+            let (read, failed) = call("read_file", json!({ "path": "lib.ar" })).await;
+            assert!(!failed && read.contains("from the Neovim buffer"), "{read}");
+            assert!(read.contains("let b = rect("), "{read}");
+
+            let lib = session.project().join("lib.ar");
+            let hook_input = |tool: &str, path: &std::path::Path| {
+                json!({
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": tool,
+                    "tool_input": { "file_path": path },
+                    "cwd": session.project(),
+                })
+            };
+            let edit = analyzer::hook::decision(&hook_input("Edit", &lib)).await;
+            assert!(edit.is_some_and(|reason| reason.contains("edit_file")));
+            let read = analyzer::hook::decision(&hook_input("Read", &lib)).await;
+            assert!(read.is_some_and(|reason| reason.contains("unsaved")));
+            let notes = session.project().join("notes.md");
+            assert_eq!(
+                analyzer::hook::decision(&hook_input("Edit", &notes)).await,
+                None
+            );
+
+            session.signal("save");
+            session.await_signal("saved").await;
+            assert_eq!(
+                analyzer::hook::decision(&hook_input("Read", &lib)).await,
+                None,
+                "a saved file can be read from disk"
+            );
+
+            std::fs::write(&session.ack, "ok\n").unwrap();
             finish_nvim(child).await;
         })
         .await;

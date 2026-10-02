@@ -12,6 +12,36 @@ local function wait_for(description, predicate)
 end
 
 local bufnr = vim.api.nvim_get_current_buf()
+
+local function buffer_text(buf)
+  return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), '\n')
+end
+
+local function signal(name)
+  vim.fn.writefile({ 'ok' }, vim.env.ARGON_TEST_STEPS .. '/' .. name)
+end
+
+local function await(name)
+  wait_for('test step ' .. name, function()
+    return vim.uv.fs_stat(vim.env.ARGON_TEST_STEPS .. '/' .. name) ~= nil
+  end)
+end
+
+local function find_buffer(suffix)
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_get_name(buf):sub(-#suffix) == suffix then
+      return buf
+    end
+  end
+end
+
+local function argon_client()
+  return vim.lsp.get_clients({ name = 'argon', bufnr = bufnr })[1]
+end
+
+local function contains(buf, text)
+  return buffer_text(buf):find(text, 1, true) ~= nil
+end
 local expected_completeopt
 if vim.env.ARGON_TEST_MODE == 'navigation' then
   expected_completeopt = 'menu,preview'
@@ -340,6 +370,117 @@ elseif vim.env.ARGON_TEST_MODE == 'navigation' then
       .. ' got '
       .. tostring(shifted.range.start.line)
   )
+elseif vim.env.ARGON_TEST_MODE == 'agent_edit' then
+  wait_for('the agent edit to reach the buffer', function()
+    return contains(bufnr, 'let b = rect(')
+  end)
+  assert(vim.bo[bufnr].modified, 'an agent edit should leave the buffer modified')
+  await('undo')
+  vim.cmd('undo')
+  assert(not contains(bufnr, 'let b'), 'one undo should revert the whole agent edit')
+  assert(contains(bufnr, 'let a = rect('), 'undo should keep the original text')
+  signal('undone')
+elseif vim.env.ARGON_TEST_MODE == 'agent_hidden' then
+  await('edited_hidden')
+  local utils = find_buffer('/utils.ar')
+  assert(utils, 'editing a closed file should load it into a buffer')
+  assert(vim.bo[utils].buflisted, 'the loaded buffer should be listed')
+  assert(vim.bo[utils].modified, 'the loaded buffer should hold the unsaved edit')
+  assert(contains(utils, 'x1=17.'), 'the edit should be in the buffer')
+  assert(vim.lsp.buf_is_attached(utils, argon_client().id), 'the buffer should be attached')
+  assert(
+    vim.api.nvim_get_current_buf() == bufnr,
+    'loading a file for the agent should not change the current window'
+  )
+  await('created')
+  local extra = find_buffer('/extra.ar')
+  assert(extra and contains(extra, 'cell extra'), 'a created file should be a buffer')
+  assert(vim.bo[extra].modified, 'a created file should be unsaved')
+  assert(
+    vim.uv.fs_stat(vim.api.nvim_buf_get_name(extra)) == nil,
+    'a created file should not be written to disk'
+  )
+  signal('hidden_checked')
+elseif vim.env.ARGON_TEST_MODE == 'agent_approval' then
+  local agent = require('argon.agent')
+  local prompts = {}
+  agent.confirm = function(_, params)
+    table.insert(prompts, params)
+    return #prompts > 1
+  end
+  local function set_approval(value)
+    local response = argon_client():request_sync('custom/setConfig', {
+      key = 'agent.approval',
+      value = value,
+    }, 10000, bufnr)
+    assert(response and not response.err, 'could not set the approval mode')
+  end
+  set_approval('always')
+  signal('approval_on')
+  await('approved')
+  assert(#prompts == 2, 'each edit should be confirmed, got ' .. #prompts)
+  assert(
+    prompts[1].newText:find('rejected_rect', 1, true),
+    'the prompt should preview the edited file'
+  )
+  assert(not contains(bufnr, 'rejected_rect'), 'a rejected edit should not be applied')
+  assert(contains(bufnr, 'approved_rect'), 'an accepted edit should be applied')
+  set_approval('never')
+  signal('approval_off')
+  await('unprompted')
+  assert(#prompts == 2, 'edits must not be confirmed when approval is off')
+  assert(contains(bufnr, 'unprompted_rect'), 'the unconfirmed edit should be applied')
+elseif vim.env.ARGON_TEST_MODE == 'agent_stale' then
+  local agent = require('argon.agent')
+  local original = agent.apply_edit
+  local interrupted = false
+  agent.apply_edit = function(params, ctx)
+    if not interrupted then
+      interrupted = true
+      vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { '// typed during the agent edit' })
+    end
+    return original(params, ctx)
+  end
+  signal('typing_armed')
+  wait_for('the agent edit after the interruption', function()
+    return contains(bufnr, 'let b = rect(')
+  end)
+  assert(interrupted, 'the first attempt should have been interrupted')
+  assert(contains(bufnr, '// typed during'), 'the concurrent change should survive')
+elseif vim.env.ARGON_TEST_MODE == 'agent_follow' then
+  await('follow')
+  local win = vim.api.nvim_get_current_win()
+  vim.cmd('Argon follow')
+  signal('following')
+  await('edited_followed')
+  local shown = vim.api.nvim_win_get_buf(win)
+  assert(
+    vim.api.nvim_buf_get_name(shown):sub(-#'/utils.ar') == '/utils.ar',
+    'the follow window should show the edited file'
+  )
+  assert(
+    vim.api.nvim_win_get_cursor(win)[1] == 2,
+    'the follow window should move to the edit, got line '
+      .. vim.api.nvim_win_get_cursor(win)[1]
+  )
+  signal('followed')
+elseif vim.env.ARGON_TEST_MODE == 'watcher' then
+  wait_for('the changed file to reload', function()
+    return contains(bufnr, 'let c = rect(')
+  end)
+  assert(not vim.bo[bufnr].modified, 'reloading should leave the buffer unmodified')
+  vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { '// unsaved' })
+  signal('buffer_modified')
+  await('rewritten')
+  assert(contains(bufnr, '// unsaved'), 'a disk change must not discard unsaved edits')
+  assert(not contains(bufnr, 'let d = rect('), 'a modified buffer should not reload')
+elseif vim.env.ARGON_TEST_MODE == 'mcp' then
+  wait_for('the MCP edit to reach the buffer', function()
+    return contains(bufnr, 'let b = rect(')
+  end)
+  await('save')
+  vim.cmd('write')
+  signal('saved')
 elseif vim.env.ARGON_TEST_MODE == 'rpc_errors' then
   -- The Rust test drives the analyzer RPC directly and acknowledges the
   -- mirrored GUI error after observing it.

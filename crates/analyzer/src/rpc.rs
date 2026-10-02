@@ -1,6 +1,6 @@
 //! RPC types shared by the analyzer and Argone.
 
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf};
 
 use argonc::{
     ast::Span,
@@ -9,7 +9,7 @@ use argonc::{
 };
 
 use serde::{Deserialize, Serialize};
-use tarpc::{context, tokio_serde::formats::Bincode};
+use tarpc::context;
 use tower_lsp_server::ls_types::{
     Diagnostic, DiagnosticSeverity, MessageType, Position, Range, ShowDocumentParams, TextEdit,
     Uri, WorkspaceEdit,
@@ -192,7 +192,6 @@ pub struct FocusEditorParams {
 
 #[tarpc::service]
 pub trait LangServer {
-    async fn register(addr: SocketAddr);
     async fn select_rect(span: Span);
     async fn draw_rect(
         scope_span: Span,
@@ -232,6 +231,11 @@ pub trait Gui {
     async fn place_instance(preview: InstancePreview);
     async fn configure(config: ArgonConfig);
     async fn activate();
+    /// Briefly outlines objects whose source overlaps `spans`, once the GUI
+    /// shows `revision` or later.
+    async fn highlight_spans(revision: u64, spans: Vec<Span>);
+    /// Shows what an agent is doing, or clears it with `None`.
+    async fn agent_activity(label: Option<String>);
 }
 
 pub(crate) const OUT_OF_SYNC_MESSAGE: &str = "Editor buffer state is inconsistent with GUI state.";
@@ -432,20 +436,37 @@ impl State {
         }
     }
 
+    /// Marks an analyzer edit to `uri` as in flight, so the `didChange` it
+    /// produces compiles immediately.
+    pub(crate) async fn begin_pending_edit(&self, uri: &Uri) {
+        *self
+            .source_state
+            .lock()
+            .await
+            .pending_workspace_edits
+            .entry(uri.clone())
+            .or_default() += 1;
+    }
+
+    /// Withdraws an in-flight edit that will not produce a `didChange`.
+    pub(crate) async fn end_pending_edit(&self, uri: &Uri) {
+        let mut state = self.source_state.lock().await;
+        if let Some(count) = state.pending_workspace_edits.get_mut(uri) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                state.pending_workspace_edits.shift_remove(uri);
+            }
+        }
+    }
+
     pub(crate) async fn apply_source_changes(
         &self,
         changes: HashMap<Uri, Vec<TextEdit>>,
         focus: Option<Uri>,
     ) -> bool {
         let pending_uris = changes.keys().cloned().collect::<Vec<_>>();
-        {
-            let mut state = self.source_state.lock().await;
-            for uri in &pending_uris {
-                *state
-                    .pending_workspace_edits
-                    .entry(uri.clone())
-                    .or_default() += 1;
-            }
+        for uri in &pending_uris {
+            self.begin_pending_edit(uri).await;
         }
         let result: Result<(), String> = async {
             if let Some(uri) = focus {
@@ -480,16 +501,9 @@ impl State {
         .await;
 
         if let Err(error) = result {
-            let mut state = self.source_state.lock().await;
-            for uri in pending_uris {
-                if let Some(count) = state.pending_workspace_edits.get_mut(&uri) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        state.pending_workspace_edits.shift_remove(&uri);
-                    }
-                }
+            for uri in &pending_uris {
+                self.end_pending_edit(uri).await;
             }
-            drop(state);
             self.report_message(MessageType::ERROR, error).await;
             false
         } else {
@@ -503,22 +517,10 @@ impl State {
     }
 }
 
-impl LangServer for State {
-    async fn register(self, _: tarpc::context::Context, addr: SocketAddr) -> () {
-        let mut transport = tarpc::serde_transport::tcp::connect(addr, Bincode::default);
-        transport.config_mut().max_frame_length(usize::MAX);
-        let gui_client = match transport.await {
-            Ok(transport) => GuiClient::new(tarpc::client::Config::default(), transport).spawn(),
-            Err(error) => {
-                self.editor_client
-                    .show_message(
-                        MessageType::ERROR,
-                        format!("Could not connect to the GUI: {error}"),
-                    )
-                    .await;
-                return;
-            }
-        };
+impl State {
+    /// Adopts a GUI that connected back for callbacks, replacing any earlier
+    /// one, and sends it the session's configuration and current cell.
+    pub(crate) async fn connect_gui(self, gui_client: GuiClient) {
         let connection = self.install_gui_connection(gui_client.clone()).await;
         let modified = self.source_state.lock().await.workspace_modified;
         if let Err(error) = gui_client
@@ -541,14 +543,11 @@ impl LangServer for State {
         }
         self.publish_workspace_modified(modified, Some(connection))
             .await;
-        // Acknowledge the connection before compiling/preparing its first
-        // snapshot. That work may need GUI callbacks or exceed the handshake
-        // deadline; neither should prevent the window from opening.
-        tokio::spawn(async move {
-            Backend { state: self }.open_current().await;
-        });
+        Backend { state: self }.open_current().await;
     }
+}
 
+impl LangServer for State {
     async fn select_rect(self, _: tarpc::context::Context, span: Span) {
         // TODO: check that vim file is in sync with GUI file.
         let compiled = self.published_state.lock().await;
