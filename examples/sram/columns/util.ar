@@ -590,7 +590,6 @@ fn simple_jog_clip(
     dst_pos
 }
 
-
 fn met1_port(x0: Float, y0: Float, x1: Float, y1: Float) -> Rect {
     let draw = rect("met1.drawing", x0=x0, y0=y0, x1=x1, y1=y1);
     rect("met1.pin", x0=x0, y0=y0, x1=x1, y1=y1);
@@ -698,4 +697,12 @@ fn wmask_ports(bit: Int, bits: Int, unit_w: Float, y0: Float) -> [Rect] {
             wmask_ports(bit + 1, bits, unit_w, y0)
         )
     }
+}
+
+fn concat_rects(a: [Rect], b: [Rect]) -> [Rect] {
+    if a == [] { b } else { cons(head(a), concat_rects(tail(a), b)) }
+}
+
+fn shift_rects(l: [Rect], dx: Float, dy: Float) -> [Rect] {
+    if l == [] { [] } else { cons(rect_translate(head(l), dx, dy), shift_rects(tail(l), dx, dy)) }
 }

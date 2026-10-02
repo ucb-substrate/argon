@@ -2,4 +2,8 @@ mod fixed_macros;
 mod dff;
 mod replica;
 mod guard_ring;
+mod control;
+mod floorplan;
+mod routing;
+mod power;
 mod sram;

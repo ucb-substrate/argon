@@ -645,6 +645,8 @@ pub struct State {
     pub(crate) source_state: Arc<Mutex<SourceState>>,
     pub(crate) published_state: Arc<Mutex<PublishedState>>,
     compiler: CompilerWorker,
+    /// Serializes GUI drags and remembers the edits they applied.
+    pub(crate) drag_edits: Arc<Mutex<rpc::DragEditHistory>>,
     gui: Arc<Mutex<GuiState>>,
     next_compilation_activity_id: Arc<AtomicU64>,
     app_config: Arc<RwLock<ArgonConfig>>,
@@ -665,6 +667,7 @@ impl State {
             source_state: Default::default(),
             published_state: Default::default(),
             compiler: CompilerWorker::new(),
+            drag_edits: Default::default(),
             gui: Default::default(),
             next_compilation_activity_id: Default::default(),
             app_config: Arc::new(RwLock::new(config)),
@@ -1259,12 +1262,15 @@ impl Backend {
         let Some(connection) = self.state.gui_connection().await else {
             return;
         };
+        // Cells the GUI already holds are sent by reference. The lock keeps an
+        // in-flight update from replacing that base while the delta is built;
+        // if one lands before the preview arrives, the GUI rejects the preview.
         let update = rpc::CompilationUpdate::new(
             CompilationSnapshot {
                 revision: preview.identity.revision,
                 output: preview.output,
             },
-            None,
+            connection.snapshot.lock().await.as_ref(),
         );
         let Some(update) = self.compress_gui_update(update).await else {
             return;

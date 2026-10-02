@@ -204,12 +204,33 @@ cell replica_column_mos(p: ReplicaColumnParams) {
     if p.units % 8 != 0 {
         let final_tap = inst(column_mos_tap(p.gate_width, p.drain_n_width, p.drain_p_width), x=1300. + p.units as Float * 1200. + (p.units / 8) as Float * 1300., y=offset_y);
     } else { crect(x0=0., y0=0., x1=0., y1=0.); };
+    let width = 1300. + p.units as Float * 1200. + ((p.units + 7) / 8) as Float * 1300.;
+    let unit0 = inst(column_mos(p.gate_width, p.drain_n_width, p.drain_p_width, 0 < p.gate_target, 0 < p.drain_n_target, 0 < p.drain_p_target), x=1300., y=offset_y, construction=true);
+    let bl = unit_bitlines(unit0.bl, 0, p.units);
+    let vdd = lib::columns::util::rect_with_hspan(first_tap.vdd, (0., width,));
+    let vss = list(lib::columns::util::rect_with_hspan(first_tap.vss0, (0., width,)), lib::columns::util::rect_with_hspan(first_tap.vss1, (0., width,)));
+}
+
+// Each unit's bitline port, from the first unit's.
+fn unit_bitlines(bl: Rect, unit: Int, units: Int) -> [Rect] {
+    if unit == units { [] } else { cons(lib::columns::util::rect_translate(bl, unit as Float * 1200. + (unit / 8) as Float * 1300., 0.), unit_bitlines(bl, unit + 1, units)) }
 }
 
 // Metal-only load used to make the replica bitline see the same first-order
 // interconnect capacitance as a main bitline. The sparse 680 nm track pitch is
 // intentional: it is the same routing pitch used by SRAM22's column tracks.
+fn routing_track(p: ReplicaRoutingParams, track: Int) -> Rect {
+    let width = if track == p.tracks - 1 { 320 + p.m1_width % 320 } else { 320 };
+    let x0 = 680. * track as Float;
+    lib::columns::util::cbox(x0, 0., x0 + width as Float, p.m1_height as Float)
+}
+
+fn routing_tracks(p: ReplicaRoutingParams, track: Int) -> [Rect] {
+    if track == p.tracks { [] } else { cons(routing_track(p, track), routing_tracks(p, track + 1)) }
+}
+
 cell replica_metal_routing(p: ReplicaRoutingParams) {
+    let bl = routing_tracks(p, 0);
     let m0 = lib::columns::util::cbox(0., 0., p.m0_width as Float, p.m0_height as Float);
     lib::columns::util::draw_box("li1.drawing", m0);
     for track in std::range(p.tracks) {

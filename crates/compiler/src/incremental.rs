@@ -1720,6 +1720,53 @@ mod tests {
         assert_ne!(geometry(&first), geometry(&second), "the edit took effect");
     }
 
+    /// Reusing a cell whose spans did not move must keep its allocation, which
+    /// is how the GUI recognizes it as unchanged.
+    #[test]
+    fn reuse_keeps_the_allocation_of_cells_whose_spans_did_not_move() {
+        let source = "cell before() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+                      cell parent() {\n    let a = inst(before(), x = 0., y = 0.);\n    \
+                      let b = inst(after(), x = 10., y = 0.);\n}\n\
+                      cell after() { let r = rect(\"met1\", x0 = 2., y0 = 0., x1 = 3., y1 = 1.); }\n";
+        let (_dir, config) = scratch_workspace(source);
+        let root = config.root_lib().to_path_buf();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = config.with_tech(Some(tech));
+        let cell = vec!["parent".to_owned()];
+
+        let mut session = IncrementalCompiler::new();
+        session.set_source_text(root.clone(), source);
+        let first = session.compile_cell(&config, &cell, Vec::new());
+        // Lengthen the parent, which shifts `after` but not `before`.
+        let edited = source.replace("x = 10., y = 0.", "x = 100., y = 0.");
+        session.set_source_text(root.clone(), edited.clone());
+        let second = session.compile_cell(&config, &cell, Vec::new());
+        assert_eq!(session.stats().cell_cache.hits, 2);
+        assert_eq!(session.stats().cell_cache.rebased, 1, "only `after` moved");
+
+        let named = |output: &CompileOutput, name: &str| {
+            compiled_data(output)
+                .cells
+                .values()
+                .find(|cell| cell.name.ends_with(name))
+                .cloned()
+                .unwrap()
+        };
+        assert!(Arc::ptr_eq(
+            &named(&first, "before"),
+            &named(&second, "before")
+        ));
+        assert!(!Arc::ptr_eq(
+            &named(&first, "after"),
+            &named(&second, "after")
+        ));
+        let mut fresh = IncrementalCompiler::new();
+        fresh.set_source_text(root, edited);
+        let uncached = fresh.compile_cell(&config, &cell, Vec::new());
+        assert_eq!(spans_of(&second), spans_of(&uncached));
+    }
+
     /// A child that actually changed must be re-executed, and only it.
     #[test]
     fn changing_a_child_re_executes_only_that_child() {
@@ -2086,6 +2133,70 @@ mod tests {
             after.cell_cache.misses - before.cell_cache.misses,
             after.cell_cache.entries,
         );
+    }
+
+    /// Deletes unconstrained rectangles one at a time from the SRAM top cell,
+    /// compiling through the same entry point the language server uses.
+    #[test]
+    #[ignore = "SRAM unconstrained-rectangle timing benchmark; run in release with --nocapture"]
+    fn bench_sram_unconstrained_rect_delete() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/sram");
+        let root = workspace.join("lib.ar");
+        let source = std::fs::read_to_string(&root).unwrap();
+        let config = WorkspaceConfig::new(&root)
+            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")));
+        let rects = |count: usize| {
+            (0..count)
+                .map(|i| {
+                    let x = 1000. * i as f64;
+                    format!(
+                        "let bench_rect{i} = rect(\"met1.drawing\", x0i = {x}., y0i = 0., x1i = {}., y1i = 500.)!;\n",
+                        x + 500.
+                    )
+                })
+                .collect::<String>()
+        };
+        let opening = "cell example_no_control_logic() {\n";
+        assert!(source.contains(opening));
+        let with_rects =
+            |count: usize| source.replacen(opening, &format!("{opening}{}", rects(count)), 1);
+        let invocation = "example_no_control_logic()";
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(root.clone(), with_rects(73));
+        let start = std::time::Instant::now();
+        let mut previous = compiler.compile_invocation(&config, invocation).unwrap();
+        let cold = start.elapsed();
+        eprintln!(
+            "sram_unconstrained_rect_delete,cold_ms={}",
+            cold.as_millis()
+        );
+        for count in (70..73).rev() {
+            compiler.set_source_text(root.clone(), with_rects(count));
+            let start = std::time::Instant::now();
+            let output = compiler.compile_invocation(&config, invocation).unwrap();
+            let elapsed = start.elapsed();
+            let data = |output: &CompileOutput| match output {
+                CompileOutput::ExecErrors(errors) => errors.output.clone().unwrap(),
+                _ => panic!("expected an underconstrained output"),
+            };
+            let (before, after) = (data(&previous), data(&output));
+            let changed = after
+                .cells
+                .iter()
+                .filter(|(id, cell)| {
+                    !before
+                        .cells
+                        .get(*id)
+                        .is_some_and(|old| Arc::ptr_eq(old, cell))
+                })
+                .count();
+            eprintln!(
+                "sram_unconstrained_rect_delete,rects={count},edited_ms={},changed_cells={changed},total_cells={}",
+                elapsed.as_millis(),
+                after.cells.len(),
+            );
+            previous = output;
+        }
     }
 
     #[test]

@@ -1,0 +1,134 @@
+// Routing grid for the control logic. Met1 runs horizontally on rows
+// y = 205 + 460k and met2 runs vertically on columns x = 350 + 460j. Wires
+// are 320 nm wide, so wires on distinct grid lines are at least 140 nm apart.
+
+fn track_y(k: Int) -> Float { 205. + 460. * k as Float }
+fn track_x(j: Int) -> Float { 350. + 460. * j as Float }
+
+// The wire-width square centered on grid point (j, k).
+fn grid_box(j: Int, k: Int) -> Rect {
+    crect(x0=track_x(j) - 160., y0=track_y(k) - 160., x1=track_x(j) + 160., y1=track_y(k) + 160.)
+}
+
+// Met1 on row k spanning columns j0 through j1.
+fn m1_h(k: Int, j0: Int, j1: Int) -> Rect {
+    let a = lib::columns::util::imin(j0, j1);
+    let b = lib::columns::util::imax(j0, j1);
+    rect("met1.drawing", x0=track_x(a) - 160., y0=track_y(k) - 160., x1=track_x(b) + 160., y1=track_y(k) + 160.)
+}
+
+// A via1 at grid point (j, k) with met1 and met2 landing squares.
+fn via12(j: Int, k: Int) {
+    let b = grid_box(j, k);
+    rect("met1.drawing", x0=b.x0, y0=b.y0, x1=b.x1, y1=b.y1);
+    rect("met2.drawing", x0=b.x0, y0=b.y0, x1=b.x1, y1=b.y1);
+    rect("via.drawing", x0=track_x(j) - 75., y0=track_y(k) - 75., x1=track_x(j) + 75., y1=track_y(k) + 75.);
+}
+
+fn m2_rect(j: Int, k0: Int, k1: Int) -> Rect {
+    let a = lib::columns::util::imin(k0, k1);
+    let b = lib::columns::util::imax(k0, k1);
+    rect("met2.drawing", x0=track_x(j) - 160., y0=track_y(a) - 160., x1=track_x(j) + 160., y1=track_y(b) + 160.)
+}
+
+// Met2 on column j spanning rows k0 through k1, with vias at both ends.
+fn m2_v(j: Int, k0: Int, k1: Int) -> Rect {
+    via12(j, k0);
+    via12(j, k1);
+    m2_rect(j, k0, k1)
+}
+
+// Met2 from row k0 to a boundary pin at row k1, with a via only at k0.
+fn m2_v_to_pin(j: Int, k0: Int, k1: Int) -> Rect {
+    via12(j, k0);
+    m2_rect(j, k0, k1)
+}
+
+// Connects an li1 pin to grid point (j, k) through one mcon placed as close
+// to the point as the pin allows. The met1 pad spans the mcon and the point.
+fn li1_access(pin: Rect, j: Int, k: Int) -> Rect {
+    let cx = lib::columns::util::clamp(track_x(j), pin.x0 + 85., pin.x1 - 85.);
+    let cy = lib::columns::util::clamp(track_y(k), pin.y0 + 85., pin.y1 - 85.);
+    rect("mcon.drawing", x0=cx - 85., y0=cy - 85., x1=cx + 85., y1=cy + 85.);
+    rect(
+        "met1.drawing",
+        x0=lib::columns::util::fmin(cx - 145., track_x(j) - 160.),
+        y0=lib::columns::util::fmin(cy - 115., track_y(k) - 160.),
+        x1=lib::columns::util::fmax(cx + 145., track_x(j) + 160.),
+        y1=lib::columns::util::fmax(cy + 115., track_y(k) + 160.),
+    )
+}
+
+// Connects a met1 pin to grid point (j, k) with a strap on column j, which
+// must lie within the pin.
+fn m1_access(pin: Rect, j: Int, k: Int) -> Rect {
+    rect(
+        "met1.drawing",
+        x0=track_x(j) - 160.,
+        y0=lib::columns::util::fmin(pin.y0, track_y(k) - 160.),
+        x1=track_x(j) + 160.,
+        y1=lib::columns::util::fmax(pin.y1, track_y(k) + 160.),
+    )
+}
+
+fn pin_label(name: String, layer: String, b: Rect) {
+    text(name, layer, (b.x0 + b.x1) / 2., (b.y0 + b.y1) / 2.);
+}
+
+// A labeled 320 nm met1 boundary pin at grid point (j, k).
+fn m1_pin(name: String, j: Int, k: Int) -> Rect {
+    let b = grid_box(j, k);
+    rect("met1.pin", x0=b.x0, y0=b.y0, x1=b.x1, y1=b.y1);
+    pin_label(name, "met1.label", b);
+    rect("met1.drawing", x0=b.x0, y0=b.y0, x1=b.x1, y1=b.y1)
+}
+
+// A labeled 320 nm met2 boundary pin at grid point (j, k).
+fn m2_pin(name: String, j: Int, k: Int) -> Rect {
+    let b = grid_box(j, k);
+    rect("met2.pin", x0=b.x0, y0=b.y0, x1=b.x1, y1=b.y1);
+    pin_label(name, "met2.label", b);
+    rect("met2.drawing", x0=b.x0, y0=b.y0, x1=b.x1, y1=b.y1)
+}
+
+// Met1 on column j spanning rows k0 through k1, for short jogs between tracks.
+fn m1_v(j: Int, k0: Int, k1: Int) -> Rect {
+    let a = lib::columns::util::imin(k0, k1);
+    let b = lib::columns::util::imax(k0, k1);
+    rect("met1.drawing", x0=track_x(j) - 160., y0=track_y(a) - 160., x1=track_x(j) + 160., y1=track_y(b) + 160.)
+}
+
+// The column whose track is nearest to x.
+fn col_near(x: Float) -> Int {
+    let t = (x - 350.) / 460.;
+    if t < 0. { -((0.5 - t) as Int) } else { (t + 0.5) as Int }
+}
+
+// The column nearest the center of r.
+fn pin_col(r: Rect) -> Int {
+    col_near((r.x0 + r.x1) / 2.)
+}
+
+// The last column at or left of the center of r.
+fn pin_col_left(r: Rect) -> Int {
+    (((r.x0 + r.x1) / 2. - 350.) / 460.) as Int
+}
+
+// The first column right of the center of r.
+fn pin_col_right(r: Rect) -> Int {
+    pin_col_left(r) + 1
+}
+
+// The first column whose wire starts at or after x.
+fn col_starting_after(x: Float) -> Int {
+    ((x - 191.) / 460.) as Int + 1
+}
+
+fn contains(cols: [Int], j: Int) -> Bool {
+    if cols == [] { false } else if head(cols) == j { true } else { contains(tail(cols), j) }
+}
+
+// The first of j, j + step, j + 2 step, ... that is not in `avoid`.
+fn free_col(j: Int, step: Int, avoid: [Int]) -> Int {
+    if contains(avoid, j) { free_col(j + step, step, avoid) } else { j }
+}

@@ -28,6 +28,8 @@ pub struct PreparedScope {
 #[derive(Debug, Default)]
 pub(super) struct PreparedHierarchy {
     scopes: HashMap<ScopeAddress, Arc<PreparedScope>>,
+    /// See [`CompileOutputState::all_scopes_visible`].
+    pub(super) all_scopes_visible: bool,
 }
 
 impl PreparedHierarchy {
@@ -613,7 +615,12 @@ pub(super) fn prepare(
                         scopes.len(),
                     );
                 }
-                return PreparedHierarchy { scopes };
+                // Reused scopes keep their visibility and new ones are
+                // visible, and no changed cell had a hidden scope.
+                return PreparedHierarchy {
+                    scopes,
+                    all_scopes_visible: previous.all_scopes_visible,
+                };
             }
             scopes.clear();
             state.state.clear();
@@ -631,15 +638,25 @@ pub(super) fn prepare(
     for layer in &used_layers {
         mark_layer_used(state, layer);
     }
-    if !previous.is_some_and(|previous| reuse_paths(root, &scopes, state, previous)) {
+    // Remapped scopes keep their previous visibility.
+    let all_scopes_visible = if let Some(previous) =
+        previous.filter(|previous| reuse_paths(root, &scopes, state, previous))
+    {
+        previous.all_scopes_visible
+    } else {
         let hidden_paths = hidden_paths(old);
         if hidden_paths.is_empty() {
             prepare_visible_paths(root, None, &scopes, state);
+            true
         } else {
             prepare_paths(root, None, &mut Vec::new(), &hidden_paths, &scopes, state);
+            state.state.values().all(|scope| scope.visible)
         }
+    };
+    PreparedHierarchy {
+        scopes,
+        all_scopes_visible,
     }
-    PreparedHierarchy { scopes }
 }
 
 #[cfg(test)]
@@ -772,13 +789,17 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             };
             let mut actual = ProcessScopeState::default();
             let old_state = previous.as_ref().map(|old| old.state.as_ref());
-            prepare(
+            let prepared = prepare(
                 &output,
                 root,
                 &mut actual,
                 old_state,
                 previous.as_ref(),
                 previous_layers.as_ref(),
+            );
+            assert_eq!(
+                prepared.all_scopes_visible,
+                actual.state.values().all(|scope| scope.visible)
             );
             let mut expected = ProcessScopeState::default();
             Reference::process_scope_reference(&output, root, &mut expected, None, old_state);
@@ -795,6 +816,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
                 selected_scope: root,
                 output: Arc::new(output),
                 state: Arc::new(actual.state),
+                all_scopes_visible: false,
             });
         }
     }
@@ -830,6 +852,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             output: Arc::new(before),
             selected_scope: old_root,
             state: Arc::new(old_state.state),
+            all_scopes_visible: true,
         };
         compiler.set_source_text(
             source,
@@ -883,6 +906,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             output: Arc::new(after),
             selected_scope: root,
             state: Arc::new(next_state.state),
+            all_scopes_visible: true,
         };
         let mut previous_layers = next_state.layers;
         for (label, text) in [
@@ -923,6 +947,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
                 output: Arc::new(output),
                 selected_scope: next_root,
                 state: Arc::new(next.state),
+                all_scopes_visible: true,
             };
         }
     }
@@ -956,6 +981,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             output: Arc::new(before),
             selected_scope: old_root,
             state: Arc::new(old_state.state),
+            all_scopes_visible: true,
         };
         compiler.set_source_text(macro_source, edited);
         let after = compiler.compile_cell(&config, &cell, vec![]).unwrap_valid();

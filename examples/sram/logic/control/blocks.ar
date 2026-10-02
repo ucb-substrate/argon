@@ -1,0 +1,133 @@
+// Control-logic building blocks: inverter chains, the clock edge detector,
+// and the NAND SR latch. Each block is one 3330 nm standard-cell row with
+// VGND at y = 0 and exports its outline and signal pins.
+
+fn row_h() -> Float { 3330. }
+fn tap_w() -> Float { 960. }
+
+// Draws an li1-to-met1 contact centered at (cx, cy) and returns its met1.
+// Horizontal contacts extend met1 along x; vertical ones extend it along y.
+fn li_m1_contact(cx: Float, cy: Float, horizontal: Bool) -> Rect {
+    rect("li1.drawing", x0=cx - 85., y0=cy - 85., x1=cx + 85., y1=cy + 85.);
+    rect("mcon.drawing", x0=cx - 85., y0=cy - 85., x1=cx + 85., y1=cy + 85.);
+    let hw = if horizontal { 145. } else { 115. };
+    let hh = if horizontal { 115. } else { 145. };
+    rect("met1.drawing", x0=cx - hw, y0=cy - hh, x1=cx + hw, y1=cy + hh)
+}
+
+// Draws a met1 elbow from the vertical edge of `src` at x = `edge_x` to the
+// point (x, y): a horizontal run at the source height, then a vertical run.
+fn m1_elbow(src: Rect, edge_x: Float, x: Float, y: Float) {
+    let hw = (src.y1 - src.y0) / 2.;
+    let x0 = lib::columns::util::fmin(edge_x, x - hw);
+    let x1 = lib::columns::util::fmax(edge_x, x + hw);
+    rect("met1.drawing", x0=x0, y0=src.y0, x1=x1, y1=src.y1);
+    rect("met1.drawing", x0=x - hw, y0=lib::columns::util::fmin(src.y0, y), x1=x + hw, y1=lib::columns::util::fmax(src.y1, y));
+}
+
+// Left edge of stage `index` in an inverter chain; a tap follows every seventh stage.
+fn inv_chain_x(index: Int) -> Float {
+    1440. * index as Float + tap_w() * (index / 7) as Float
+}
+
+fn inv_chain_w(n: Int) -> Float {
+    inv_chain_x(n - 1) + 2400.
+}
+
+// Chain of `n` >= 2 inverters: 2x stages followed by one 4x stage, joined by li1.
+// SVT chains use SVT inverters, whose pins match the LVT cells.
+cell inv_chain(n: Int, svt: Bool) {
+    let inv2 = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_2(), x=0., y=0., construction=true);
+    let inv4 = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_4(), x=0., y=0., construction=true);
+    for i in std::range(n) {
+        let x = inv_chain_x(i);
+        if i == n - 1 {
+            if svt {
+                inst(lib::logic::control::cells::sramgen_svt_inv_4(), x=x, y=0.);
+            } else {
+                inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_4(), x=x, y=0.);
+            }
+        } else {
+            if svt {
+                inst(lib::logic::control::cells::sramgen_svt_inv_2(), x=x, y=0.);
+            } else {
+                inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_2(), x=x, y=0.);
+            }
+        }
+        if i % 7 == 6 && i < n - 1 {
+            inst(lib::logic::control::cells::sky130_fd_sc_hs__tap_2(), x=x + 1440., y=0.);
+        }
+    }
+    // Each jumper spans the driver output and the next input on a 170 nm band
+    // centered on that input, snapped down to a 10 nm grid.
+    for i in std::range(n - 1) {
+        let last = i == n - 2;
+        let a_x1 = if last { inv4.a.x1 } else { inv2.a.x1 };
+        let a_cy = if last { (inv4.a.y0 + inv4.a.y1) / 2. } else { (inv2.a.y0 + inv2.a.y1) / 2. };
+        let y0 = ((a_cy - 85.) / 10.) as Int as Float * 10.;
+        rect("li1.drawing", x0=inv_chain_x(i) + inv2.out.x0, y0=y0, x1=inv_chain_x(i + 1) + a_x1, y1=y0 + 170.);
+    }
+    let x_last = inv_chain_x(n - 1);
+    let din = crect(layer="li1.drawing", x0=inv2.a.x0, y0=inv2.a.y0, x1=inv2.a.x1, y1=inv2.a.y1);
+    let dout = crect(layer="li1.drawing", x0=x_last + inv4.out.x0, y0=inv4.out.y0, x1=x_last + inv4.out.x1, y1=inv4.out.y1);
+    let outline = crect(x0=0., y0=0., x1=inv_chain_w(n), y1=row_h());
+}
+
+fn edge_detector_invs() -> Int { 9 }
+
+fn edge_detector_w() -> Float {
+    inv_chain_w(edge_detector_invs()) + 4320.
+}
+
+// Rising-edge pulse generator: AND of the input and its delayed complement.
+cell edge_detector() {
+    let chain = inst(inv_chain(edge_detector_invs(), false), x=0., y=0.);
+    let and2 = inst(lib::logic::control::cells::sky130_fd_sc_hs__and2_4(), x=edge_detector_w(), y=0., reflect=true, angle=180);
+
+    let din_cx = (chain.din.x0 + chain.din.x1) / 2.;
+    let din_cy = (chain.din.y0 + chain.din.y1) / 2.;
+    li_m1_contact(din_cx, din_cy, false);
+    let a = li_m1_contact((and2.a.x0 + and2.a.x1) / 2., and2.a.y1 - 115., true);
+    let b_cy = and2.b.y0 + 115.;
+    li_m1_contact(and2.b.x0 + 145., b_cy, true);
+    let dout = li_m1_contact((chain.dout.x0 + chain.dout.x1) / 2., b_cy - 340., true);
+    m1_elbow(a, a.x0, din_cx, din_cy);
+    m1_elbow(dout, dout.x1, and2.b.x0 + 115., b_cy);
+
+    let din = chain.din;
+    let out = and2.out;
+    let outline = crect(x0=0., y0=0., x1=edge_detector_w(), y1=row_h());
+}
+
+fn sr_latch_w() -> Float { 21120. }
+fn sr_latch_inverters_x() -> Float { 18240. }
+
+// Cross-coupled NAND2 SR latch with active-low set and reset and buffered outputs.
+cell sr_latch() {
+    let nand_set = inst(lib::logic::control::cells::sky130_fd_sc_hs__nand2_8(), x=0., y=0.);
+    inst(lib::logic::control::cells::sky130_fd_sc_hs__tap_2(), x=8160., y=0.);
+    let nand_reset = inst(lib::logic::control::cells::sky130_fd_sc_hs__nand2_8(), x=17280., y=0., reflect=true, angle=180);
+    inst(lib::logic::control::cells::sky130_fd_sc_hs__tap_2(), x=17280., y=0.);
+    let q_inv = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_2(), x=sr_latch_inverters_x(), y=0.);
+    let qb_inv = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_2(), x=sr_latch_inverters_x() + 1440., y=0.);
+
+    // q0 drives the reset NAND and the qb inverter.
+    let q0 = li_m1_contact((nand_set.out.x0 + nand_set.out.x1) / 2., nand_set.out.y0 - 245., true);
+    let q0_reset = li_m1_contact(nand_reset.a.x0 + 145., nand_reset.a.y0 + 115., true);
+    let q0_inv = li_m1_contact((qb_inv.a.x0 + qb_inv.a.x1) / 2., qb_inv.a.y0 + 115., true);
+    m1_elbow(q0, q0.x1, (q0_reset.x0 + q0_reset.x1) / 2., (q0_reset.y0 + q0_reset.y1) / 2.);
+    m1_elbow(q0, q0.x1, (q0_inv.x0 + q0_inv.x1) / 2., (q0_inv.y0 + q0_inv.y1) / 2.);
+
+    // q0b drives the set NAND and the q inverter.
+    let q0b = li_m1_contact((nand_reset.out.x0 + nand_reset.out.x1) / 2., nand_reset.out.y1 - 15., true);
+    let q0b_set = li_m1_contact(nand_set.a.x0 + 145., nand_set.a.y1 - 115., true);
+    let q0b_inv = li_m1_contact(q_inv.a.x0 + 145., q_inv.a.y1 - 155., true);
+    m1_elbow(q0b, q0b.x0, (q0b_set.x0 + q0b_set.x1) / 2., (q0b_set.y0 + q0b_set.y1) / 2.);
+    m1_elbow(q0b, q0b.x0, (q0b_inv.x0 + q0b_inv.x1) / 2., (q0b_inv.y0 + q0b_inv.y1) / 2.);
+
+    let sb = nand_set.b;
+    let rb = nand_reset.b;
+    let q = q_inv.out;
+    let qb = qb_inv.out;
+    let outline = crect(x0=0., y0=0., x1=sr_latch_w(), y1=row_h());
+}

@@ -1,0 +1,422 @@
+// Replica-timed control logic. Standard cells sit in fixed rows, and all
+// interconnect between them is hand-routed on a fixed track grid.
+
+mod cells;
+mod blocks;
+mod tracks;
+mod rails;
+
+use lib::logic::control::tracks::m1_h;
+use lib::logic::control::tracks::m2_v;
+use lib::logic::control::tracks::m2_v_to_pin;
+use lib::logic::control::tracks::li1_access;
+use lib::logic::control::tracks::m1_access;
+use lib::logic::control::tracks::m1_pin;
+use lib::logic::control::tracks::m2_pin;
+use lib::logic::control::tracks::m1_v;
+use lib::logic::control::tracks::pin_col;
+use lib::logic::control::tracks::pin_col_left;
+use lib::logic::control::tracks::pin_col_right;
+use lib::logic::control::tracks::col_starting_after;
+use lib::logic::control::tracks::free_col;
+use lib::logic::control::rails::concat;
+use lib::logic::control::rails::inv_chain_gaps;
+use lib::logic::control::rails::sr_latch_gaps;
+use lib::logic::control::rails::row_spans;
+use lib::logic::control::rails::shared_spans;
+use lib::logic::control::rails::rail_pins;
+use lib::params::ControlLogicParams;
+
+// Fixed clock-path delay-chain lengths.
+fn clk_delay_invs() -> Int { 12 }
+fn clkp_delay_invs() -> Int { 3 }
+
+fn tap(x: Float, y: Float, flip: Bool) {
+    inst(lib::logic::control::cells::sky130_fd_sc_hs__tap_2(), x=x, y=y, reflect=flip);
+}
+
+// Instance y for the cells of row r (0 = top), which occupies y in
+// [-3330 (r + 1), -3330 r]. Odd rows are mirrored so adjacent rows share rails.
+// A supply rail at height y, spanning the block.
+fn rail_rect(y: Float, right: Float) -> Rect {
+    lib::columns::util::cbox(0., y - 245., right, y + 245.)
+}
+
+fn row_y(r: Int) -> Float {
+    if r % 2 == 0 { -lib::logic::control::blocks::row_h() * (r + 1) as Float } else { -lib::logic::control::blocks::row_h() * r as Float }
+}
+
+// Joins abutting li1 pins across the tap between them with a 180 nm band
+// centered on the destination pin and snapped to a 10 nm grid.
+fn li1_jumper(src: Rect, dst: Rect) {
+    let cy = (dst.y0 + dst.y1) / 2.;
+    let y0 = lib::columns::util::snap5((cy - 90.) / 2.) * 2.;
+    rect("li1.drawing", x0=src.x1, y0=y0, x1=dst.x0, y1=y0 + 180.);
+}
+
+// Fails unless v >= lo.
+fn at_least(v: Int, lo: Int) {
+    eq(lib::columns::util::imax(v, lo) as Float, v as Float);
+}
+
+// The replica-timed control logic, with pins on its left and right edges.
+cell control_logic_replica_v2(p: ControlLogicParams) {
+    // Each chain needs two inverters. Longer decoder replica and wordline
+    // pulse chains keep the precharge latch and the mux clear of fixed met2
+    // columns in rows 4 and 1.
+    at_least(p.decoder_delay_invs, 6);
+    at_least(p.wlen_pulse_invs, 9);
+    at_least(p.pc_set_delay_invs, 2);
+    at_least(p.wrdrven_set_delay_invs, 2);
+    let t = lib::logic::control::blocks::tap_w();
+
+    // Row 0: reset buffer, clock gate, and clock pulse generation.
+    let y0 = row_y(0);
+    tap(0., y0, false);
+    let reset_inv = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_16(), x=t, y=y0);
+    let clk_delay_x = t + 8160. + t;
+    tap(clk_delay_x - t, y0, false);
+    let clk_delay = inst(lib::logic::control::blocks::inv_chain(clk_delay_invs(), false), x=clk_delay_x, y=y0);
+    let clk_gate_x = clk_delay_x + lib::logic::control::blocks::inv_chain_w(clk_delay_invs()) + t;
+    tap(clk_gate_x - t, y0, false);
+    let clk_gate = inst(lib::logic::control::cells::sky130_fd_sc_hs__and2_2(), x=clk_gate_x, y=y0);
+    let clk_pulse_x = clk_gate_x + 2400. + t;
+    tap(clk_pulse_x - t, y0, false);
+    let clk_pulse = inst(lib::logic::control::blocks::edge_detector(), x=clk_pulse_x, y=y0);
+    let clk_pulse_buf_x = clk_pulse_x + lib::logic::control::blocks::edge_detector_w() + t;
+    tap(clk_pulse_buf_x - t, y0, false);
+    let clk_pulse_buf = inst(lib::logic::control::cells::sky130_fd_sc_hs__buf_16(), x=clk_pulse_buf_x + 10560., y=y0, reflect=true, angle=180);
+    let clk_pulse_inv_x = clk_pulse_buf_x + 10560. + t;
+    tap(clk_pulse_inv_x - t, y0, false);
+    let clk_pulse_inv = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_16(), x=clk_pulse_inv_x, y=y0);
+    let inv_rbl_x = clk_pulse_inv_x + 8160. + t;
+    tap(inv_rbl_x - t, y0, false);
+    let inv_rbl = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_2(), x=inv_rbl_x + 1440., y=y0, reflect=true, angle=180);
+    tap(inv_rbl_x + 1440., y0, false);
+
+    // Row 1: pulse delays, write/read reset select, and the wordline latch.
+    let y1 = row_y(1);
+    tap(0., y1, true);
+    let clkp_delay = inst(lib::logic::control::blocks::inv_chain(clkp_delay_invs(), false), x=t, y=y1, reflect=true);
+    let clkpd_inv_x = t + lib::logic::control::blocks::inv_chain_w(clkp_delay_invs()) + t;
+    tap(clkpd_inv_x - t, y1, true);
+    let clkpd_inv = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_2(), x=clkpd_inv_x, y=y1, reflect=true);
+    let clkpd_delay_x = clkpd_inv_x + 1440. + t;
+    tap(clkpd_delay_x - t, y1, true);
+    let clkpd_delay = inst(lib::logic::control::blocks::inv_chain(p.wlen_pulse_invs, false), x=clkpd_delay_x, y=y1, reflect=true);
+    let mux_x = clkpd_delay_x + lib::logic::control::blocks::inv_chain_w(p.wlen_pulse_invs) + t;
+    tap(mux_x - t, y1, true);
+    let mux_wlen_rst = inst(lib::logic::control::cells::sky130_fd_sc_hs__mux2_4(), x=mux_x + 8640., y=y1, angle=180);
+    let rep_delay_x = mux_x + 8640. + t;
+    tap(rep_delay_x - t, y1, true);
+    let decoder_replica_delay = inst(lib::logic::control::blocks::inv_chain(p.pc_set_delay_invs, false), x=rep_delay_x, y=y1, reflect=true);
+    let wl_ctl_x = rep_delay_x + lib::logic::control::blocks::inv_chain_w(p.pc_set_delay_invs) + t;
+    tap(wl_ctl_x - t, y1, true);
+    let wl_ctl = inst(lib::logic::control::blocks::sr_latch(), x=wl_ctl_x, y=y1, reflect=true);
+    tap(wl_ctl_x + lib::logic::control::blocks::sr_latch_w(), y1, true);
+
+    // Row 2: reset gating and wordline/sense enable logic.
+    let y2 = row_y(2);
+    tap(0., y2, false);
+    let inv_we = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_2(), x=t, y=y2);
+    let wlen_grst_x = t + 1440. + t;
+    tap(wlen_grst_x - t, y2, false);
+    let wlen_grst = inst(lib::logic::control::cells::sky130_fd_sc_hs__nor2_4(), x=wlen_grst_x, y=y2);
+    let pc_set_x = wlen_grst_x + 4320. + t;
+    tap(pc_set_x - t, y2, false);
+    let pc_set = inst(lib::logic::control::cells::sky130_fd_sc_hs__nor2_4(), x=pc_set_x, y=y2);
+    let wrdrven_grst_x = pc_set_x + 4320. + t;
+    tap(wrdrven_grst_x - t, y2, false);
+    let wrdrven_grst = inst(lib::logic::control::cells::sky130_fd_sc_hs__nor2_4(), x=wrdrven_grst_x, y=y2);
+    let clkp_grst_x = wrdrven_grst_x + 4320. + t;
+    tap(clkp_grst_x - t, y2, false);
+    let clkp_grst = inst(lib::logic::control::cells::sky130_fd_sc_hs__nor2_4(), x=clkp_grst_x, y=y2);
+    let nand_sense_en_x = clkp_grst_x + 4320. + t;
+    tap(nand_sense_en_x - t, y2, false);
+    let nand_sense_en = inst(lib::logic::control::cells::sky130_fd_sc_hs__nand2_4(), x=nand_sense_en_x, y=y2);
+    let nand_wlendb_web_x = nand_sense_en_x + 4320. + t;
+    tap(nand_wlendb_web_x - t, y2, false);
+    let nand_wlendb_web = inst(lib::logic::control::cells::sky130_fd_sc_hs__nand2_4(), x=nand_wlendb_web_x, y=y2);
+    let and_wlen_x = nand_wlendb_web_x + 4320. + t;
+    tap(and_wlen_x - t, y2, false);
+    let and_wlen = inst(lib::logic::control::cells::sky130_fd_sc_hs__and2_4(), x=and_wlen_x + 4320., y=y2, reflect=true, angle=180);
+    let rwl_buf_x = and_wlen_x + 4320. + t;
+    tap(rwl_buf_x - t, y2, false);
+    let rwl_buf = inst(lib::logic::control::cells::sky130_fd_sc_hs__buf_16(), x=rwl_buf_x + 10560., y=y2, reflect=true, angle=180);
+    tap(rwl_buf_x + 10560., y2, false);
+
+    // Row 3: sense-enable and write-driver-enable latches.
+    let y3 = row_y(3);
+    tap(0., y3, true);
+    let saen_ctl = inst(lib::logic::control::blocks::sr_latch(), x=t, y=y3, reflect=true);
+    let wrdrven_set_x = t + lib::logic::control::blocks::sr_latch_w() + t;
+    tap(wrdrven_set_x - t, y3, true);
+    let wrdrven_set = inst(lib::logic::control::cells::sky130_fd_sc_hs__nand2_4(), x=wrdrven_set_x, y=y3, reflect=true);
+    let wrdrven_set_delay_x = wrdrven_set_x + 4320. + t;
+    tap(wrdrven_set_delay_x - t, y3, true);
+    let wrdrven_set_delay = inst(lib::logic::control::blocks::inv_chain(p.wrdrven_set_delay_invs, false), x=wrdrven_set_delay_x, y=y3, reflect=true);
+    let wrdrven_ctl_x = wrdrven_set_delay_x + lib::logic::control::blocks::inv_chain_w(p.wrdrven_set_delay_invs) + t;
+    tap(wrdrven_ctl_x - t, y3, true);
+    let wrdrven_ctl = inst(lib::logic::control::blocks::sr_latch(), x=wrdrven_ctl_x, y=y3, reflect=true);
+    tap(wrdrven_ctl_x + lib::logic::control::blocks::sr_latch_w(), y3, true);
+
+    // Row 4: decoder replica and the precharge latch.
+    let y4 = row_y(4);
+    tap(0., y4, false);
+    let decoder_replica = inst(lib::logic::control::blocks::inv_chain(p.decoder_delay_invs, true), x=t, y=y4);
+    let pc_ctl_x = t + lib::logic::control::blocks::inv_chain_w(p.decoder_delay_invs) + t;
+    tap(pc_ctl_x - t, y4, false);
+    let pc_ctl = inst(lib::logic::control::blocks::sr_latch(), x=pc_ctl_x, y=y4);
+    let pc_b_buf_x = pc_ctl_x + lib::logic::control::blocks::sr_latch_w() + t;
+    tap(pc_b_buf_x - t, y4, false);
+    let pc_b_buf = inst(lib::logic::control::cells::sky130_fd_sc_hs__buf_16(), x=pc_b_buf_x + 10560., y=y4, reflect=true, angle=180);
+    tap(pc_b_buf_x + 10560., y4, false);
+
+    // Abutting li1 connections.
+    li1_jumper(clk_delay.dout, clk_gate.a);
+    li1_jumper(clk_gate.out, clk_pulse.din);
+    li1_jumper(clk_pulse.out, clk_pulse_buf.a);
+    li1_jumper(clkp_delay.dout, clkpd_inv.a);
+    li1_jumper(clkpd_inv.out, clkpd_delay.din);
+    li1_jumper(wrdrven_set.out, wrdrven_set_delay.din);
+
+    // Supply pins on the six row rails. Rails of the same supply are joined
+    // outside the block.
+    let spans0 = row_spans(concat(inv_chain_gaps(clk_delay_x, clk_delay_invs(), 1), inv_chain_gaps(clk_pulse_x, lib::logic::control::blocks::edge_detector_invs(), 1)), 0., inv_rbl_x + 1440. + t);
+    let spans1 = row_spans(concat(inv_chain_gaps(t, clkp_delay_invs(), 1), concat(inv_chain_gaps(clkpd_delay_x, p.wlen_pulse_invs, 1), concat(inv_chain_gaps(rep_delay_x, p.pc_set_delay_invs, 1), sr_latch_gaps(wl_ctl_x)))), 0., wl_ctl_x + lib::logic::control::blocks::sr_latch_w() + t);
+    let spans2 = row_spans([], 0., rwl_buf_x + 10560. + t);
+    let spans3 = row_spans(concat(sr_latch_gaps(t), concat(inv_chain_gaps(wrdrven_set_delay_x, p.wrdrven_set_delay_invs, 1), sr_latch_gaps(wrdrven_ctl_x))), 0., wrdrven_ctl_x + lib::logic::control::blocks::sr_latch_w() + t);
+    let spans4 = row_spans(concat(inv_chain_gaps(t, p.decoder_delay_invs, 1), sr_latch_gaps(pc_ctl_x)), 0., pc_b_buf_x + 10560. + t);
+    rail_pins("vdd", 0., spans0);
+    rail_pins("vss", y0, shared_spans(spans0, spans1));
+    rail_pins("vdd", y2 + lib::logic::control::blocks::row_h(), shared_spans(spans1, spans2));
+    rail_pins("vss", y2, shared_spans(spans2, spans3));
+    rail_pins("vdd", y4 + lib::logic::control::blocks::row_h(), shared_spans(spans3, spans4));
+    rail_pins("vss", y4, spans4);
+
+    // Signal routes. Rows 0 and 2 are fixed; the delay chains move the
+    // cells after them in rows 1, 3, and 4. Moving pins pick their columns
+    // from their own positions and step past columns that other nets cross
+    // there. Met2 columns 0, 1, and 13 through 15 stay empty; the SRAM runs
+    // supply feeders across the block there.
+    let right = lib::columns::util::fmax(
+        lib::columns::util::fmax(inv_rbl_x + 1440. + t, wl_ctl_x + lib::logic::control::blocks::sr_latch_w() + t),
+        lib::columns::util::fmax(wrdrven_ctl_x + lib::logic::control::blocks::sr_latch_w() + t, pc_b_buf_x + 10560. + t),
+    );
+    let rh = lib::logic::control::blocks::row_h();
+    let vdd_rails = list(rail_rect(0., right), rail_rect(y2 + rh, right), rail_rect(y4 + rh, right));
+    let vss_rails = list(rail_rect(y0, right), rail_rect(y2, right), rail_rect(y4, right));
+    // The right pins go on the first column that starts 3.2 um past the cell
+    // bbox, whose nwell extends 190 nm past the last row.
+    let pin_j = col_starting_after(right + 190. + 3200.);
+    // Right-pin feeders run on the column before the pins, clear of the
+    // SRAM's met2 routes from the pins.
+    let feed_j = pin_j - 1;
+    // Fixed met2 columns crossing row 1 (rbl_b, wlen, rwl), and those crossing
+    // row 0, which also include clkp_b's and rbl_b's risers there.
+    let row1_cross = list(71, 83, 101);
+    let row0_cross = list(71, 83, 101, 146, 162);
+
+    // rstb
+    let rstb = m1_pin("rstb", -9, -9);
+    m1_h(-9, -9, -1);
+    m2_v(-1, -9, -5);
+    m1_h(-5, -1, 5);
+    m1_access(reset_inv.a, 5, -5);
+    // clk
+    let clk = m1_pin("clk", -9, -3);
+    m1_h(-3, -9, -2);
+    m2_v(-2, -3, -2);
+    m1_h(-2, -2, 22);
+    li1_access(clk_delay.din, 22, -2);
+    // ce
+    let ce = m1_pin("ce", -9, -5);
+    m1_h(-5, -9, -3);
+    m2_v(-3, -5, -6);
+    m1_h(-6, -3, 67);
+    li1_access(clk_gate.b, 67, -6);
+    // reset
+    m1_access(reset_inv.out, 16, -3);
+    m2_v(16, -3, -11);
+    m1_h(-11, 16, 49);
+    m2_v(16, -11, -19);
+    li1_access(wlen_grst.b, 16, -19);
+    m2_v(26, -11, -19);
+    li1_access(pc_set.b, 26, -19);
+    m2_v(37, -11, -19);
+    li1_access(wrdrven_grst.b, 37, -19);
+    m2_v(49, -11, -19);
+    li1_access(clkp_grst.b, 49, -19);
+    // clkp
+    m1_access(clk_pulse_buf.out, 136, -2);
+    m1_h(-2, 43, 140);
+    m1_v(140, -2, -5);
+    m1_h(-5, 140, 150);
+    m1_access(clk_pulse_inv.a, 150, -5);
+    m2_v(43, -2, -19);
+    li1_access(clkp_grst.a, 43, -19);
+    // rbl
+    li1_access(inv_rbl.a, 164, -5);
+    m1_h(-5, 164, pin_j);
+    let rbl = m1_pin("rbl", pin_j, -5);
+    // we
+    let we = m1_pin("we", -9, -7);
+    m1_h(-7, -9, -4);
+    m2_v(-4, -19, -7);
+    m1_h(-19, -4, 2);
+    li1_access(inv_we.a, 2, -19);
+    let we_j = free_col(pin_col(mux_wlen_rst.s), 1, row0_cross);
+    m2_v(-4, -7, 2);
+    m1_h(2, -4, we_j);
+    m2_v(we_j, 2, -11);
+    li1_access(mux_wlen_rst.s, we_j, -11);
+    m2_v(54, 2, -26);
+    li1_access(wrdrven_set.b, 54, -26);
+    // clkp_b
+    m1_access(clk_pulse_inv.out, 146, -2);
+    m2_v(146, -2, 1);
+    m1_h(1, -6, 146);
+    m2_v(-6, 1, -11);
+    m1_h(-11, -6, 2);
+    li1_access(clkp_delay.din, 2, -11);
+    let clkp_b_j = free_col(pin_col(pc_ctl.rb), 1, list(31, 35, 43, 48, 50, pin_col(wrdrven_ctl.rb), pin_col_right(wrdrven_ctl.q)));
+    m2_v(-6, -11, -41);
+    m1_h(-41, -6, clkp_b_j);
+    m2_v(clkp_b_j, -41, -33);
+    li1_access(pc_ctl.rb, clkp_b_j, -33);
+    // rbl_b
+    li1_access(inv_rbl.out, 162, -2);
+    m2_v(162, -2, 6);
+    let rbl_b_j = free_col(pin_col_right(mux_wlen_rst.a0), 1, list(83, 101, 146, 162));
+    m1_h(6, lib::columns::util::imin(71, rbl_b_j), lib::columns::util::imax(162, rbl_b_j));
+    m2_v(71, 6, -18);
+    li1_access(nand_wlendb_web.a, 71, -18);
+    m2_v(rbl_b_j, 6, -11);
+    li1_access(mux_wlen_rst.a0, rbl_b_j, -11);
+    // clkpd_b
+    li1_access(clkpd_inv.out, 16, -10);
+    m1_h(-10, 16, pin_col(wl_ctl.sb));
+    li1_access(wl_ctl.sb, pin_col(wl_ctl.sb), -10);
+    // clkpdd
+    li1_access(clkpd_delay.dout, pin_col(clkpd_delay.dout), -12);
+    m1_h(-12, pin_col(clkpd_delay.dout), pin_col_left(mux_wlen_rst.a1));
+    li1_access(mux_wlen_rst.a1, pin_col_left(mux_wlen_rst.a1), -12);
+    // decrepstart
+    let decrepstart_j = free_col(pin_col(mux_wlen_rst.out) - 1, -1, row1_cross);
+    li1_access(mux_wlen_rst.out, decrepstart_j, -11);
+    m2_v(decrepstart_j, -11, -9);
+    m1_h(-9, 7, decrepstart_j);
+    m2_v(7, -9, -19);
+    li1_access(wlen_grst.a, 7, -19);
+    m2_v(7, -19, -33);
+    m1_h(-33, 2, 7);
+    li1_access(decoder_replica.din, 2, -33);
+    // decrepend
+    let decrepend_j = free_col(pin_col(decoder_replica_delay.din), 1, row0_cross);
+    li1_access(decoder_replica_delay.din, decrepend_j, -11);
+    m2_v(decrepend_j, -11, 4);
+    m1_h(4, 31, decrepend_j);
+    m2_v(31, 4, -19);
+    li1_access(wrdrven_grst.a, 31, -19);
+    m2_v(57, 4, -19);
+    li1_access(nand_sense_en.b, 57, -19);
+    m2_v(31, -19, -35);
+    m1_h(-35, 31, pin_col(decoder_replica.dout));
+    li1_access(decoder_replica.dout, pin_col(decoder_replica.dout), -35);
+    // wlen_rst_decoderd
+    li1_access(decoder_replica_delay.dout, pin_col(decoder_replica_delay.dout), -13);
+    m1_h(-13, 20, pin_col(decoder_replica_delay.dout));
+    m2_v(20, -13, -19);
+    li1_access(pc_set.a, 20, -19);
+    // wlen_grst_b
+    let wlen_grst_b_j = free_col(pin_col(wl_ctl.rb), 1, row0_cross);
+    li1_access(wl_ctl.rb, wlen_grst_b_j, -11);
+    m2_v(wlen_grst_b_j, -11, 3);
+    m1_h(3, 12, wlen_grst_b_j);
+    m2_v(12, 3, -20);
+    li1_access(wlen_grst.out, 12, -20);
+    // clkpd
+    li1_access(clkp_delay.dout, 11, -11);
+    m2_v(11, -11, 5);
+    m1_h(5, 11, 56);
+    m2_v(56, 5, -27);
+    li1_access(wrdrven_set.a, 56, -27);
+    // we_b
+    li1_access(inv_we.out, 4, -17);
+    m1_h(-17, 4, 69);
+    m2_v(60, -17, -19);
+    li1_access(nand_sense_en.a, 60, -19);
+    m2_v(69, -17, -19);
+    li1_access(nand_wlendb_web.b, 69, -19);
+    // saen_set_b
+    li1_access(nand_sense_en.out, 62, -19);
+    m2_v(62, -19, -28);
+    m1_h(-28, 8, 62);
+    m2_v(8, -28, -26);
+    li1_access(saen_ctl.sb, 8, -26);
+    // pc_set_b
+    li1_access(pc_set.out, 24, -20);
+    m2_v(24, -20, -31);
+    m1_h(-31, 24, pin_col(pc_ctl.sb));
+    li1_access(pc_ctl.sb, pin_col(pc_ctl.sb), -31);
+    // clkp_grst_b
+    li1_access(clkp_grst.out, 47, -18);
+    m1_h(-18, 32, 47);
+    m2_v(32, -18, -25);
+    li1_access(saen_ctl.rb, 32, -25);
+    // wrdrven_grst_b
+    li1_access(wrdrven_grst.out, 35, -19);
+    m2_v(35, -19, -39);
+    m1_h(-39, 35, pin_col(wrdrven_ctl.rb));
+    m2_v(pin_col(wrdrven_ctl.rb), -39, -25);
+    li1_access(wrdrven_ctl.rb, pin_col(wrdrven_ctl.rb), -25);
+    // wlend
+    li1_access(nand_wlendb_web.out, 73, -20);
+    m2_v(73, -20, -24);
+    m1_h(-24, 73, 80);
+    m2_v(80, -24, -18);
+    li1_access(and_wlen.b, 80, -18);
+    // wlen_q
+    li1_access(wl_ctl.q, pin_col_right(wl_ctl.q), -13);
+    m2_v(pin_col_right(wl_ctl.q), -13, -20);
+    m1_h(-20, 77, pin_col_right(wl_ctl.q));
+    li1_access(and_wlen.a, 77, -20);
+    li1_access(rwl_buf.a, 90, -20);
+    // wlen
+    li1_access(and_wlen.out, 83, -18);
+    m2_v(83, -18, 5);
+    m1_h(5, 83, feed_j);
+    m2_v(feed_j, 5, -3);
+    m1_h(-3, feed_j, pin_j);
+    let wlen = m1_pin("wlen", pin_j, -3);
+    // rwl
+    m1_access(rwl_buf.out, 101, -17);
+    m2_v_to_pin(101, -17, 9);
+    let rwl = m2_pin("rwl", 101, 9);
+    // saen
+    li1_access(saen_ctl.q, 43, -27);
+    m2_v(43, -27, -38);
+    m1_h(-38, 43, 50);
+    m2_v_to_pin(50, -38, -46);
+    let saen = m2_pin("saen", 50, -46);
+    // wrdrven
+    li1_access(wrdrven_ctl.q, pin_col_right(wrdrven_ctl.q), -28);
+    m2_v(pin_col_right(wrdrven_ctl.q), -28, -40);
+    m1_h(-40, 48, pin_col_right(wrdrven_ctl.q));
+    m2_v_to_pin(48, -40, -46);
+    let wrdrven = m2_pin("wrdrven", 48, -46);
+    // wrdrven_set_b
+    li1_access(wrdrven_set_delay.dout, pin_col(wrdrven_set_delay.dout), -25);
+    m1_h(-25, pin_col(wrdrven_set_delay.dout), pin_col(wrdrven_ctl.sb));
+    li1_access(wrdrven_ctl.sb, pin_col(wrdrven_ctl.sb), -25);
+    // pc_b0
+    li1_access(pc_ctl.qb, pin_col_right(pc_ctl.qb), -33);
+    m1_h(-33, pin_col_right(pc_ctl.qb), pin_col(pc_b_buf.a));
+    li1_access(pc_b_buf.a, pin_col(pc_b_buf.a), -33);
+    // pc_b
+    m1_access(pc_b_buf.out, pin_col(pc_b_buf.out), -31);
+    m1_h(-31, pin_col(pc_b_buf.out), feed_j);
+    m2_v(feed_j, -31, -7);
+    m1_h(-7, feed_j, pin_j);
+    let pc_b = m1_pin("pc_b", pin_j, -7);
+}

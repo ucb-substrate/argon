@@ -62,3 +62,7 @@ zstd = "0.13"
 geometry = { version = "0.7", registry = "substrate" }
 enumify = { version = "0.2", registry = "substrate" }
 uniquify = { version = "0.4", registry = "substrate" }
+
+[profile.dev.package.argon-sram-sizing]
+# Sizing runs tens of millions of gradient-descent steps.
+opt-level = 3

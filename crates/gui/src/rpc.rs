@@ -513,12 +513,13 @@ impl SyncLangServerClient {
         &self,
         edits: Vec<ValueEdit>,
         initial_conditions: Vec<InitialConditionEdit>,
+        base_revision: Option<u64>,
     ) -> Result<Option<Vec<ValueEdit>>> {
         self.call_async(move |rpc| {
             let edits = edits.clone();
             let initial_conditions = initial_conditions.clone();
             async move {
-                rpc.update_values(context::current(), edits, initial_conditions)
+                rpc.update_values(context::current(), edits, initial_conditions, base_revision)
                     .await
             }
         })
@@ -527,11 +528,14 @@ impl SyncLangServerClient {
 
     pub fn dispatch_sse_source_edit_result(
         &self,
+        generation: u64,
         result: Result<Option<Vec<ValueEdit>>>,
         initial_conditions: Vec<InitialConditionEdit>,
     ) {
         let _ = self.to_exec.unbounded_send(Box::new(move |editor, cx| {
-            let _ = cx.update(|cx| editor.finish_sse_source_edit(cx, result, initial_conditions));
+            let _ = cx.update(|cx| {
+                editor.finish_sse_source_edit(cx, generation, result, initial_conditions)
+            });
         }));
     }
 
@@ -680,12 +684,10 @@ impl Gui for GuiServer {
         let Ok(update) = preview.update.decode() else {
             return GuiUpdateResult::default();
         };
-        // A preview is self-contained and never changes the full-snapshot
-        // delta base. Reject a partial or stale preview before preparing it.
-        if update.base_revision.is_some() {
-            return GuiUpdateResult::default();
-        }
-        let Some(snapshot) = update.materialize(None) else {
+        // A preview may be a delta against the current full snapshot, but it
+        // never becomes the base for later updates. A preview built against
+        // any other base is rejected before it is prepared.
+        let Some(snapshot) = update.materialize(lock_unpoisoned(&self.snapshot).as_ref()) else {
             return GuiUpdateResult::default();
         };
         let decode_seconds = decode_started.elapsed().as_secs_f64();
@@ -923,7 +925,10 @@ mod tests {
         let done = completed.clone();
         cx.to_async()
             .spawn(async move |_| {
-                client.update_values_async(vec![], vec![]).await.unwrap();
+                client
+                    .update_values_async(vec![], vec![], None)
+                    .await
+                    .unwrap();
                 done.store(true, Ordering::Release);
             })
             .detach();

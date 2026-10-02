@@ -61,7 +61,6 @@ cell dff_column(mux: Int) {
     let q_b = placed.q_b;
 }
 
-
 cell tapped_dff() {
     let base = inst(dff_column(4), x=0., y=0.);
     let outline = rect("layout_boundary.boundary", x0=0., y0=1270., x1=4800. + 1300., y1=15570.);

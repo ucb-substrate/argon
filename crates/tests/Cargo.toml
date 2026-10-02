@@ -16,3 +16,6 @@ tarpc = { workspace = true }
 tempfile = { workspace = true }
 tokio = { version = "1", features = ["full"] }
 tower-lsp-server = { workspace = true }
+
+[dev-dependencies]
+cfgrammar = { workspace = true }

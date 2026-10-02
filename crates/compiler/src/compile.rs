@@ -17,7 +17,7 @@ use indexmap::{IndexMap, IndexSet};
 use itertools::{Either, Itertools};
 use serde::{Deserialize, Serialize};
 
-use fnv::{FnvHashMap, FnvHasher};
+use fnv::{FnvHashMap, FnvHashSet, FnvHasher};
 
 type FnvIndexMap<K, V> = IndexMap<K, V, BuildHasherDefault<FnvHasher>>;
 type FnvIndexSet<T> = IndexSet<T, BuildHasherDefault<FnvHasher>>;
@@ -6285,6 +6285,105 @@ pub(crate) struct DynLoc {
     pub(crate) seq_num: SeqNum,
 }
 
+/// Values waiting on one value, in the order they started waiting.
+///
+/// Almost every value has one or two waiters, which a short list holds
+/// without the hash table a set would allocate.
+#[derive(Clone, Debug, Default)]
+struct Waiters {
+    list: Vec<ValueId>,
+    /// Membership index, built once the list is long enough to need one.
+    index: Option<FnvHashSet<ValueId>>,
+}
+
+impl Waiters {
+    const INDEX_AFTER: usize = 16;
+
+    fn insert(&mut self, value: ValueId) {
+        let new = match &mut self.index {
+            Some(index) => index.insert(value),
+            None => !self.list.contains(&value),
+        };
+        if new {
+            self.list.push(value);
+            if self.index.is_none() && self.list.len() > Self::INDEX_AFTER {
+                self.index = Some(self.list.iter().copied().collect());
+            }
+        }
+    }
+}
+
+/// Deferred values to evaluate, most recently queued first. Queuing a value
+/// that is already waiting leaves it where it is.
+///
+/// A cell's own values have IDs from `base` on, so their membership is a bit
+/// per ID; anything older is tracked in a set.
+#[derive(Clone, Debug, Default)]
+struct Worklist {
+    stack: Vec<ValueId>,
+    base: ValueId,
+    queued: Vec<u64>,
+    queued_older: FnvHashSet<ValueId>,
+}
+
+impl Worklist {
+    fn new(base: ValueId) -> Self {
+        Self {
+            base,
+            ..Self::default()
+        }
+    }
+
+    /// Marks `value` queued or not, returning whether it was queued before.
+    fn set_queued(&mut self, value: ValueId, queued: bool) -> bool {
+        let Some(offset) = value.checked_sub(self.base) else {
+            return if queued {
+                !self.queued_older.insert(value)
+            } else {
+                self.queued_older.remove(&value)
+            };
+        };
+        let (word, bit) = ((offset / 64) as usize, 1u64 << (offset % 64));
+        if word >= self.queued.len() {
+            if !queued {
+                return false;
+            }
+            self.queued.resize(word + 1, 0);
+        }
+        let was = self.queued[word] & bit != 0;
+        if queued {
+            self.queued[word] |= bit;
+        } else {
+            self.queued[word] &= !bit;
+        }
+        was
+    }
+
+    fn insert(&mut self, value: ValueId) {
+        if !self.set_queued(value, true) {
+            self.stack.push(value);
+        }
+    }
+
+    fn pop(&mut self) -> Option<ValueId> {
+        let value = self.stack.pop()?;
+        self.set_queued(value, false);
+        Some(value)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.stack.is_empty()
+    }
+}
+
+impl Extend<ValueId> for Worklist {
+    fn extend<I: IntoIterator<Item = ValueId>>(&mut self, values: I) {
+        for value in values {
+            self.insert(value);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Frame {
     bindings: FnvHashMap<VarId, ValueId>,
@@ -6300,14 +6399,14 @@ struct Frame {
 /// rebuilding a multi-million-entry hash table only adds work. Chunks avoid a
 /// giant `Vec` reallocation while retaining constant-time direct indexing.
 const VALUE_CHUNK_LEN: usize = 4096;
-type ValueChunk = Box<[Option<DeferValue<VarIdTyMetadata>>]>;
+type ValueChunk<'a> = Box<[Option<DeferValue<'a>>]>;
 
-struct ValueStore {
-    chunks: Vec<Option<ValueChunk>>,
+struct ValueStore<'a> {
+    chunks: Vec<Option<ValueChunk<'a>>>,
 }
 
-impl ValueStore {
-    fn new(initial: impl IntoIterator<Item = (ValueId, DeferValue<VarIdTyMetadata>)>) -> Self {
+impl<'a> ValueStore<'a> {
+    fn new(initial: impl IntoIterator<Item = (ValueId, DeferValue<'a>)>) -> Self {
         let mut store = Self { chunks: Vec::new() };
         for (id, value) in initial {
             store.insert(id, value);
@@ -6315,7 +6414,7 @@ impl ValueStore {
         store
     }
 
-    fn slot(&self, id: ValueId) -> Option<&Option<DeferValue<VarIdTyMetadata>>> {
+    fn slot(&self, id: ValueId) -> Option<&Option<DeferValue<'a>>> {
         let id = usize::try_from(id).ok()?;
         self.chunks
             .get(id / VALUE_CHUNK_LEN)
@@ -6323,7 +6422,7 @@ impl ValueStore {
             .map(|chunk| &chunk[id % VALUE_CHUNK_LEN])
     }
 
-    fn slot_mut(&mut self, id: ValueId) -> &mut Option<DeferValue<VarIdTyMetadata>> {
+    fn slot_mut(&mut self, id: ValueId) -> &mut Option<DeferValue<'a>> {
         let id = usize::try_from(id).expect("value ID does not fit usize");
         let chunk = id / VALUE_CHUNK_LEN;
         while self.chunks.len() <= chunk {
@@ -6338,19 +6437,15 @@ impl ValueStore {
         &mut values[id % VALUE_CHUNK_LEN]
     }
 
-    fn get(&self, id: &ValueId) -> Option<&DeferValue<VarIdTyMetadata>> {
+    fn get(&self, id: &ValueId) -> Option<&DeferValue<'a>> {
         self.slot(*id)?.as_ref()
     }
 
-    fn insert(
-        &mut self,
-        id: ValueId,
-        value: DeferValue<VarIdTyMetadata>,
-    ) -> Option<DeferValue<VarIdTyMetadata>> {
+    fn insert(&mut self, id: ValueId, value: DeferValue<'a>) -> Option<DeferValue<'a>> {
         self.slot_mut(id).replace(value)
     }
 
-    fn remove(&mut self, id: &ValueId) -> Option<DeferValue<VarIdTyMetadata>> {
+    fn remove(&mut self, id: &ValueId) -> Option<DeferValue<'a>> {
         let id = usize::try_from(*id).ok()?;
         self.chunks.get_mut(id / VALUE_CHUNK_LEN)?.as_mut()?[id % VALUE_CHUNK_LEN].take()
     }
@@ -6403,16 +6498,16 @@ impl ValueStore {
     }
 }
 
-impl std::ops::Index<ValueId> for ValueStore {
-    type Output = DeferValue<VarIdTyMetadata>;
+impl<'a> std::ops::Index<ValueId> for ValueStore<'a> {
+    type Output = DeferValue<'a>;
 
     fn index(&self, id: ValueId) -> &Self::Output {
         self.get(&id).expect("value ID not found")
     }
 }
 
-impl std::ops::Index<&ValueId> for ValueStore {
-    type Output = DeferValue<VarIdTyMetadata>;
+impl<'a> std::ops::Index<&ValueId> for ValueStore<'a> {
+    type Output = DeferValue<'a>;
 
     fn index(&self, id: &ValueId) -> &Self::Output {
         self.get(id).expect("value ID not found")
@@ -6441,6 +6536,39 @@ struct ScopeMetadata {
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 struct ScopeMetadataId(u32);
+
+/// A place in the AST that creates execution scopes, plus the dynamic part of
+/// their label. Every scope created at one site has the same name and span.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+struct ScopeSite {
+    kind: ScopeSiteKind,
+    /// Address of the AST node that creates the scope.
+    node: usize,
+    index: u64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum ScopeSiteKind {
+    /// A parameter default; `index` is the call's scope order.
+    Default,
+    /// A function call; `index` is the callee declaration's address.
+    Call,
+    Block,
+    Then,
+    Else,
+    /// A loop body; `index` is the iteration.
+    Iteration,
+}
+
+impl ScopeSite {
+    fn new<T>(kind: ScopeSiteKind, node: &T, index: u64) -> Self {
+        Self {
+            kind,
+            node: std::ptr::from_ref(node) as usize,
+            index,
+        }
+    }
+}
 
 /// A vector whose empty representation is one pointer wide.
 ///
@@ -6555,7 +6683,7 @@ struct ExecScope {
     /// Bindings are appended in source order and sequence numbers are unique
     /// within a scope. A hash table per dynamic invocation wastes substantial
     /// memory for the overwhelmingly common empty or one-binding case.
-    bindings: SparseVec<(SeqNum, (String, ValueId))>,
+    bindings: SparseVec<(SeqNum, (Substr, ValueId))>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -6595,10 +6723,12 @@ struct CellState {
     emit: Vec<Emit>,
     object_emit: Vec<ObjectEmit>,
     objects: FnvIndexMap<ObjectId, Object>,
-    deferred: FnvIndexSet<ValueId>,
+    deferred: Worklist,
     root_scope: ScopeId,
     scopes: FnvIndexMap<ScopeId, ExecScope>,
     scope_metadata: FnvIndexSet<ScopeMetadata>,
+    /// The label interned for each scope site seen in this cell.
+    scope_site_metadata: FnvHashMap<ScopeSite, ScopeMetadataId>,
     fallback_constraints: BinaryHeap<FallbackConstraint>,
     fallback_constraints_used: Vec<UsedFallback>,
     /// Values the *compiler* defaults when nothing else determines them, as
@@ -6643,18 +6773,21 @@ impl CellState {
 
 struct ExecPass<'a> {
     ast: &'a WorkspaceAst<VarIdTyMetadata>,
+    /// Declarations named by [`Value::Fn`] and [`Value::CellFn`].
+    fn_decls: Vec<&'a FnDecl<Substr, VarIdTyMetadata>>,
+    cell_decls: Vec<&'a CellDecl<Substr, VarIdTyMetadata>>,
     /// Struct and enum definitions, read for cell-argument checks and struct
     /// literal field order.
     defs: &'a TypeDefs,
     tech: Technology,
     gds_imports: HashMap<VarId, (String, PathBuf)>,
-    cell_states: IndexMap<CellId, CellState>,
+    cell_states: FnvIndexMap<CellId, CellState>,
     // These execution tables have integer keys and no observable iteration
     // order. FNV avoids SipHash's cryptographic overhead in the evaluator's
     // hottest lookups, while ordered maps remain in the compiled output where
     // source order is part of the result.
-    values: ValueStore,
-    value_dependents: FnvHashMap<ValueId, FnvIndexSet<ValueId>>,
+    values: ValueStore<'a>,
+    value_dependents: FnvHashMap<ValueId, Waiters>,
     frames: FnvHashMap<FrameId, Frame>,
     nil_value: ValueId,
     seq_nil_value: ValueId,
@@ -6746,11 +6879,17 @@ fn add_scope(cell: &mut CompiledCell, state: &CellState, id: ScopeId, scope: &Ex
     if cell.scopes.contains_key(&id) {
         return;
     }
+    // Scopes are created after their parents, so in creation order the
+    // parent is almost always present already.
     if let Some(p) = scope.parent {
-        add_scope(cell, state, p, &state.scopes[&p]);
+        if !cell.scopes.contains_key(&p) {
+            add_scope(cell, state, p, &state.scopes[&p]);
+        }
         cell.scopes.get_mut(&p).unwrap().children.push(id);
     }
-    if let Some((p, _)) = scope.static_parent {
+    if let Some((p, _)) = scope.static_parent
+        && !cell.scopes.contains_key(&p)
+    {
         add_scope(cell, state, p, &state.scopes[&p]);
     }
     cell.scopes.insert(
@@ -6795,10 +6934,12 @@ impl<'a> ExecPass<'a> {
             .collect();
         Self {
             ast,
+            fn_decls: Vec::new(),
+            cell_decls: Vec::new(),
             defs: &workspace.defs,
             tech,
             gds_imports,
-            cell_states: IndexMap::new(),
+            cell_states: FnvIndexMap::default(),
             values: ValueStore::new([
                 (1, DeferValue::Ready(Value::Nil)),
                 (2, DeferValue::Ready(Value::Bool(true))),
@@ -7112,8 +7253,8 @@ impl<'a> ExecPass<'a> {
                 self.values.len(),
                 self.frames.len(),
                 self.value_dependents.len(),
-                std::mem::size_of::<DeferValue<VarIdTyMetadata>>(),
-                std::mem::size_of::<PartialEval<VarIdTyMetadata>>(),
+                std::mem::size_of::<DeferValue<'_>>(),
+                std::mem::size_of::<PartialEval<'_>>(),
                 std::mem::size_of::<ExecScope>(),
                 std::mem::size_of::<CompiledScope>(),
             );
@@ -7340,12 +7481,12 @@ impl<'a> ExecPass<'a> {
             parent: Some(self.global_frame),
             users: 1,
         };
-        let cell_decl = self.values[&self.lookup(self.global_frame, cell).unwrap()]
+        let cell_decl = self.cell_decls[self.values[&self.lookup(self.global_frame, cell).unwrap()]
             .as_ref()
             .unwrap_ready()
             .as_ref()
             .unwrap_cell_fn()
-            .clone();
+            .0 as usize];
         if args.len() != cell_decl.args.len() {
             self.errors.push(ExecError {
                 span: None,
@@ -7425,9 +7566,10 @@ impl<'a> ExecPass<'a> {
                         fields: Default::default(),
                         emit: Vec::new(),
                         object_emit: Vec::new(),
-                        deferred: Default::default(),
+                        deferred: Worklist::new(values_start),
                         scopes: FnvIndexMap::from_iter([(root_scope_id, root_scope)]),
                         scope_metadata: FnvIndexSet::from_iter([root_scope_metadata]),
+                        scope_site_metadata: FnvHashMap::default(),
                         fallback_constraints: Default::default(),
                         fallback_constraints_used: Vec::new(),
                         compiler_defaults: VecDeque::new(),
@@ -7485,7 +7627,7 @@ impl<'a> ExecPass<'a> {
                         .get_mut(&loc.scope)
                         .unwrap()
                         .bindings
-                        .push((loc.seq_num, (binding.name.name.to_string(), value)));
+                        .push((loc.seq_num, (binding.name.name.clone(), value)));
                     seq_num = seq_num.next();
                 }
                 Statement::Expr { value, .. } => {
@@ -8309,7 +8451,7 @@ impl<'a> ExecPass<'a> {
 
         let mut ccell = CompiledCell {
             name: state.name.clone(),
-            scopes: FnvIndexMap::default(),
+            scopes: FnvIndexMap::with_capacity_and_hasher(state.scopes.len(), Default::default()),
             scope_metadata: state.scope_metadata.iter().cloned().collect(),
             root: state.root_scope,
             fields: IndexMap::new(),
@@ -8384,9 +8526,9 @@ impl<'a> ExecPass<'a> {
                     let scope = ccell.scopes.get_mut(id).expect("scope not found");
                     scope
                         .bindings
-                        .push((*seq_num, (name.clone(), obj_id.clone())));
+                        .push((*seq_num, (name.to_string(), obj_id.clone())));
                     if *id == ccell.root {
-                        ccell.fields.insert(name.clone(), obj_id);
+                        ccell.fields.insert(name.to_string(), obj_id);
                     }
                 }
             }
@@ -8412,8 +8554,15 @@ impl<'a> ExecPass<'a> {
             .filter(|value| *value >= start && *value < end)
             .collect::<HashSet<_>>();
         self.values.remove_range(start, end, &preserve);
-        for id in start..end {
-            self.value_dependents.remove(&id);
+        // Nested cells reclaim nested ranges, so an outer range is mostly
+        // already empty. Walk whichever of the range and the table is smaller.
+        if (self.value_dependents.len() as u64) < end.saturating_sub(start) {
+            self.value_dependents
+                .retain(|id, _| !(start..end).contains(id));
+        } else {
+            for id in start..end {
+                self.value_dependents.remove(&id);
+            }
         }
     }
 
@@ -8491,14 +8640,17 @@ impl<'a> ExecPass<'a> {
     }
 
     fn declare_globals(&mut self) {
-        for (mod_path, ast) in self.ast.iter() {
+        let workspace: &'a WorkspaceAst<VarIdTyMetadata> = self.ast;
+        for (mod_path, ast) in workspace.iter() {
             for decl in &ast.ast.decls {
                 match decl {
                     Decl::Fn(f) => {
                         let vid = self.value_id();
+                        let index = DeclIndex(self.fn_decls.len() as u32);
+                        self.fn_decls.push(f);
                         assert!(
                             self.values
-                                .insert(vid, DeferValue::Ready(Value::Fn(Arc::new(f.clone()))))
+                                .insert(vid, DeferValue::Ready(Value::Fn(index)))
                                 .is_none()
                         );
                         assert!(
@@ -8521,9 +8673,11 @@ impl<'a> ExecPass<'a> {
                             .chain([c.name.name.as_str()])
                             .join("::");
                         self.cell_names.insert(c.metadata.1, qualified);
+                        let index = DeclIndex(self.cell_decls.len() as u32);
+                        self.cell_decls.push(c);
                         assert!(
                             self.values
-                                .insert(vid, DeferValue::Ready(Value::CellFn(Arc::new(c.clone()))),)
+                                .insert(vid, DeferValue::Ready(Value::CellFn(index)))
                                 .is_none()
                         );
                         assert!(
@@ -8571,17 +8725,14 @@ impl<'a> ExecPass<'a> {
         }
     }
 
-    fn eval_for_loop(&mut self, loc: DynLoc, f: &ForLoop<Substr, VarIdTyMetadata>) {
+    fn eval_for_loop(&mut self, loc: DynLoc, f: &'a ForLoop<Substr, VarIdTyMetadata>) {
         let seq = self.visit_expr(loc, &f.seq);
         self.new_deferred_value(loc, |_| {
-            PartialEvalState::ForLoop(Box::new(PartialForLoop {
-                for_loop: f.clone(),
-                seq,
-            }))
+            PartialEvalState::ForLoop(Box::new(PartialForLoop { for_loop: f, seq }))
         });
     }
 
-    fn eval_stmt(&mut self, loc: DynLoc, stmt: &Statement<Substr, VarIdTyMetadata>) {
+    fn eval_stmt(&mut self, loc: DynLoc, stmt: &'a Statement<Substr, VarIdTyMetadata>) {
         match stmt {
             Statement::LetBinding(binding) => {
                 let value = self.visit_expr(loc, &binding.value);
@@ -8595,7 +8746,7 @@ impl<'a> ExecPass<'a> {
                     .get_mut(&loc.scope)
                     .unwrap()
                     .bindings
-                    .push((loc.seq_num, (binding.name.name.to_string(), value)));
+                    .push((loc.seq_num, (binding.name.name.clone(), value)));
             }
             Statement::Expr { value, .. } => {
                 self.visit_expr(loc, value);
@@ -8608,26 +8759,42 @@ impl<'a> ExecPass<'a> {
 
     /// Create a new execution scope.
     ///
-    /// parent is the dynamic parent scope.
+    /// parent is the dynamic parent scope. `label` supplies the name and span
+    /// the first time `site` creates a scope in this cell.
     fn create_exec_scope(
         &mut self,
         cell_id: CellId,
         parent: ScopeId,
         static_parent: Option<(ScopeId, SeqNum)>,
-        name: String,
-        span: Span,
+        site: ScopeSite,
+        label: impl FnOnce(&Self) -> (String, Span),
     ) -> ScopeId {
-        let id = ScopeId::semantic(Some(parent), &name);
+        let cached = self
+            .cell_state(cell_id)
+            .scope_site_metadata
+            .get(&site)
+            .copied();
+        let metadata = match cached {
+            Some(metadata) => metadata,
+            None => {
+                let (name, span) = label(self);
+                let state = self.cell_state_mut(cell_id);
+                let (index, _) = state.scope_metadata.insert_full(ScopeMetadata {
+                    name: name.into(),
+                    span,
+                });
+                let metadata = ScopeMetadataId(index.try_into().expect("too many scope labels"));
+                state.scope_site_metadata.insert(site, metadata);
+                metadata
+            }
+        };
+        let state = self.cell_state_mut(cell_id);
+        let name = &state.scope_metadata[metadata.0 as usize].name;
+        let id = ScopeId::semantic(Some(parent), name);
         assert!(
-            !self.cell_state(cell_id).scopes.contains_key(&id),
+            !state.scopes.contains_key(&id),
             "duplicate semantic scope ID for {name}"
         );
-        let state = self.cell_state_mut(cell_id);
-        let (metadata, _) = state.scope_metadata.insert_full(ScopeMetadata {
-            name: name.into(),
-            span,
-        });
-        let metadata = ScopeMetadataId(metadata.try_into().expect("too many scope labels"));
         state.scopes.insert(
             id,
             ExecScope {
@@ -8644,13 +8811,18 @@ impl<'a> ExecPass<'a> {
     ///
     /// The scope is inserted in the execution trace at the location specified by `loc`.
     /// The static and dynamic parents of the new scope both point to `loc`.
-    fn create_exec_scope_at_loc(&mut self, loc: DynLoc, name: String, span: Span) -> ScopeId {
+    fn create_exec_scope_at_loc(
+        &mut self,
+        loc: DynLoc,
+        site: ScopeSite,
+        label: impl FnOnce(&Self) -> (String, Span),
+    ) -> ScopeId {
         self.create_exec_scope(
             loc.cell,
             loc.scope,
             Some((loc.scope, loc.seq_num)),
-            name,
-            span,
+            site,
+            label,
         )
     }
 
@@ -8659,7 +8831,7 @@ impl<'a> ExecPass<'a> {
         cell_id: CellId,
         frame: FrameId,
         scope: ScopeId,
-        s: &Scope<Substr, VarIdTyMetadata>,
+        s: &'a Scope<Substr, VarIdTyMetadata>,
     ) -> ValueId {
         let mut seq_num = SeqNum::new();
         for stmt in &s.stmts {
@@ -8706,8 +8878,8 @@ impl<'a> ExecPass<'a> {
     fn explicit_args(
         &mut self,
         loc: DynLoc,
-        call: &CallExpr<Substr, VarIdTyMetadata>,
-        params: &[ArgDecl<Substr, VarIdTyMetadata>],
+        call: &'a CallExpr<Substr, VarIdTyMetadata>,
+        params: &'a [ArgDecl<Substr, VarIdTyMetadata>],
     ) -> Vec<Option<ValueId>> {
         params
             .iter()
@@ -8738,7 +8910,7 @@ impl<'a> ExecPass<'a> {
         loc: DynLoc,
         call_order: u64,
         path: &FsPath,
-        params: &[ArgDecl<Substr, VarIdTyMetadata>],
+        params: &'a [ArgDecl<Substr, VarIdTyMetadata>],
         explicit: Vec<Option<ValueId>>,
     ) -> Vec<ValueId> {
         params
@@ -8750,10 +8922,15 @@ impl<'a> ExecPass<'a> {
                     (None, Some(default)) => {
                         let scope = self.create_exec_scope_at_loc(
                             loc,
-                            format!("{call_order} default {}", param.name.name),
-                            Span {
-                                path: path.to_path_buf(),
-                                span: default.span(),
+                            ScopeSite::new(ScopeSiteKind::Default, param, call_order),
+                            |_| {
+                                (
+                                    format!("{call_order} default {}", param.name.name),
+                                    Span {
+                                        path: path.to_path_buf(),
+                                        span: default.span(),
+                                    },
+                                )
                             },
                         );
                         self.visit_expr(DynLoc { scope, ..loc }, default)
@@ -8780,7 +8957,7 @@ impl<'a> ExecPass<'a> {
     fn new_deferred_value(
         &mut self,
         loc: DynLoc,
-        state: impl FnOnce(&mut Self) -> PartialEvalState<VarIdTyMetadata>,
+        state: impl FnOnce(&mut Self) -> PartialEvalState<'a>,
     ) -> ValueId {
         let vid = self.value_id();
         self.retain_frame(loc.frame);
@@ -8791,7 +8968,7 @@ impl<'a> ExecPass<'a> {
         vid
     }
 
-    fn visit_expr(&mut self, loc: DynLoc, expr: &Expr<Substr, VarIdTyMetadata>) -> ValueId {
+    fn visit_expr(&mut self, loc: DynLoc, expr: &'a Expr<Substr, VarIdTyMetadata>) -> ValueId {
         match expr {
             Expr::Nil(_) => self.nil_value,
             Expr::SeqNil(_) => self.seq_nil_value,
@@ -8828,7 +9005,7 @@ impl<'a> ExecPass<'a> {
                 if BUILTINS.contains(&c.func.path.last().unwrap().name.as_str()) {
                     self.new_deferred_value(loc, |this| {
                         PartialEvalState::Call(Box::new(PartialCallExpr {
-                            expr: c.clone(),
+                            expr: c,
                             state: CallExprState {
                                 posargs: c
                                     .args
@@ -8856,23 +9033,29 @@ impl<'a> ExecPass<'a> {
                         .unwrap();
                     match self.values[&callee].as_ref().unwrap_ready().as_ref() {
                         ValueRef::Fn(val) => {
-                            // Keep the declaration alive independently of the
-                            // value table so evaluating a call never deep-clones
-                            // its parameter list and complete function body.
-                            let val = Arc::clone(val);
+                            let val = self.fn_decls[val.0 as usize];
                             let explicit = self.explicit_args(loc, c, &val.args);
                             let scope = self.create_exec_scope(
                                 loc.cell,
                                 loc.scope,
                                 None,
-                                format!(
-                                    "{} fn {}",
-                                    c.scope_order,
-                                    c.func.path.iter().map(|ident| &ident.name).join("::")
+                                ScopeSite::new(
+                                    ScopeSiteKind::Call,
+                                    c,
+                                    std::ptr::from_ref(val) as u64,
                                 ),
-                                Span {
-                                    path: val.metadata.0.clone(),
-                                    span: val.scope.span,
+                                |_| {
+                                    (
+                                        format!(
+                                            "{} fn {}",
+                                            c.scope_order,
+                                            c.func.path.iter().map(|ident| &ident.name).join("::")
+                                        ),
+                                        Span {
+                                            path: val.metadata.0.clone(),
+                                            span: val.scope.span,
+                                        },
+                                    )
                                 },
                             );
                             let fid = self.new_call_frame();
@@ -8912,7 +9095,7 @@ impl<'a> ExecPass<'a> {
                             value
                         }
                         ValueRef::CellFn(val) => {
-                            let val = Arc::clone(val);
+                            let val = self.cell_decls[val.0 as usize];
                             let explicit = self.explicit_args(loc, c, &val.args);
                             let fid = self.new_call_frame();
                             let callee_loc = DynLoc { frame: fid, ..loc };
@@ -8925,7 +9108,7 @@ impl<'a> ExecPass<'a> {
                             );
                             let value = self.new_deferred_value(loc, |_| {
                                 PartialEvalState::Call(Box::new(PartialCallExpr {
-                                    expr: c.clone(),
+                                    expr: c,
                                     state: CallExprState {
                                         posargs,
                                         kwargs: Vec::new(),
@@ -8964,7 +9147,7 @@ impl<'a> ExecPass<'a> {
                 let cond = self.visit_expr(loc, &if_expr.cond);
                 self.new_deferred_value(loc, |_| {
                     PartialEvalState::If(Box::new(PartialIfExpr {
-                        expr: (**if_expr).clone(),
+                        expr: if_expr,
                         state: IfExprState::Cond(cond),
                     }))
                 })
@@ -8972,29 +9155,29 @@ impl<'a> ExecPass<'a> {
             Expr::Match(match_expr) => self.new_deferred_value(loc, |this| {
                 let scrutinee = this.visit_expr(loc, &match_expr.scrutinee);
                 PartialEvalState::Match(Box::new(PartialMatchExpr {
-                    expr: (**match_expr).clone(),
+                    expr: match_expr,
                     state: MatchExprState::Scrutinee(scrutinee),
                 }))
             }),
             Expr::Scope(s) => {
                 let scope = self.create_exec_scope_at_loc(
                     loc,
-                    format!("{} block", s.scope_order),
-                    self.span(&loc, s.span),
+                    ScopeSite::new(ScopeSiteKind::Block, &**s, 0),
+                    |this| (format!("{} block", s.scope_order), this.span(&loc, s.span)),
                 );
                 self.visit_scope_expr_inner(loc.cell, loc.frame, scope, s)
             }
             Expr::FieldAccess(f) => self.new_deferred_value(loc, |this| {
                 let base = this.visit_expr(loc, &f.base);
                 PartialEvalState::FieldAccess(Box::new(PartialFieldAccessExpr {
-                    expr: (**f).clone(),
+                    expr: f,
                     state: FieldAccessExprState { base },
                 }))
             }),
             Expr::IndexFieldAccess(f) => self.new_deferred_value(loc, |this| {
                 let base = this.visit_expr(loc, &f.base);
                 PartialEvalState::IndexFieldAccess(Box::new(PartialIndexFieldAccessExpr {
-                    expr: (**f).clone(),
+                    expr: f,
                     state: IndexFieldAccessExprState { base },
                 }))
             }),
@@ -9002,7 +9185,7 @@ impl<'a> ExecPass<'a> {
                 let base = this.visit_expr(loc, &i.base);
                 let index = this.visit_expr(loc, &i.index);
                 PartialEvalState::Index(Box::new(PartialIndexExpr {
-                    expr: (**i).clone(),
+                    expr: i,
                     state: IndexExprState { base, index },
                 }))
             }),
@@ -9014,7 +9197,7 @@ impl<'a> ExecPass<'a> {
                         left,
                         right,
                         op,
-                        expr: b.clone(),
+                        expr: b,
                     })
                 }),
                 BinOp::Cmp(op) => self.new_deferred_value(loc, |this| {
@@ -9022,7 +9205,7 @@ impl<'a> ExecPass<'a> {
                     let right = this.visit_expr(loc, &b.right);
                     PartialEvalState::Comparison(Box::new(PartialComparison {
                         op,
-                        expr: (**b).clone(),
+                        expr: b,
                         left,
                         right,
                     }))
@@ -9032,7 +9215,7 @@ impl<'a> ExecPass<'a> {
                     self.new_deferred_value(loc, |_| {
                         PartialEvalState::BoolOp(Box::new(PartialBoolOp {
                             op,
-                            expr: (**b).clone(),
+                            expr: b,
                             state: BoolOpState::Left(left),
                         }))
                     })
@@ -9043,13 +9226,13 @@ impl<'a> ExecPass<'a> {
                 PartialEvalState::UnaryOp(PartialUnaryOp {
                     operand,
                     op: u.op,
-                    expr: u.clone(),
+                    expr: u,
                 })
             }),
             Expr::Cast(cast) => self.new_deferred_value(loc, |this| {
                 let value = this.visit_expr(loc, &cast.value);
                 PartialEvalState::Cast(Box::new(PartialCastExpr {
-                    expr: (**cast).clone(),
+                    expr: cast,
                     state: PartialCastState {
                         value,
                         ty: cast.metadata.clone(),
@@ -9080,7 +9263,7 @@ impl<'a> ExecPass<'a> {
                         .collect();
                     let base = lit.base.as_ref().map(|base| this.visit_expr(loc, base));
                     PartialEvalState::StructLit(Box::new(PartialStructLit {
-                        expr: (**lit).clone(),
+                        expr: lit,
                         ty,
                         fields,
                         base,
@@ -9097,13 +9280,19 @@ impl<'a> ExecPass<'a> {
             .insert(dependent);
     }
 
-    /// Clone a value's waiters in their stable insertion order.
+    /// Schedules a value's waiters in `cell_id`, in their insertion order.
     ///
     /// Solver updates can deliberately revisit a ready value. Its existing
     /// dependents must be scheduled again on that revisit, so these sets are
     /// retained until the enclosing cell has completely settled.
-    fn value_dependents(&self, vid: ValueId) -> FnvIndexSet<ValueId> {
-        self.value_dependents.get(&vid).cloned().unwrap_or_default()
+    fn schedule_dependents(&mut self, cell_id: CellId, vid: ValueId) {
+        if let Some(dependents) = self.value_dependents.get(&vid) {
+            self.cell_states
+                .get_mut(&cell_id)
+                .expect("no cell state found for cell ID")
+                .deferred
+                .extend(dependents.list.iter().copied());
+        }
     }
 
     fn add_var_dependent(&mut self, cell_id: CellId, var: Var, dependent: ValueId) {
@@ -9431,28 +9620,21 @@ impl<'a> ExecPass<'a> {
     /// as failing to open over a single bad field read.
     fn poison(&mut self, cell_id: CellId, vid: ValueId, frame: FrameId) -> Result<bool, ()> {
         self.values.insert(vid, Defer::Ready(Value::Poison));
-        for dep_vid in self.value_dependents(vid) {
-            self.cell_state_mut(cell_id).deferred.insert(dep_vid);
-        }
+        self.schedule_dependents(cell_id, vid);
         self.release_frame(frame);
         Ok(true)
     }
 
     fn eval_partial(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
-        // Evaluate the owned state in place.  The old implementation cloned
-        // `PartialEval` before every retry; because deferred states retain AST
-        // nodes, a single worklist pass could deep-clone millions of complete
-        // expressions.  Removing it temporarily also releases the table
-        // borrow while builtins mutate the evaluator.
+        // Evaluate the owned state in place. Removing it temporarily releases
+        // the table borrow while builtins mutate the evaluator.
         let Some(value) = self.values.remove(&vid) else {
             return Ok(false);
         };
         let mut vref = match value {
             ready @ Defer::Ready(_) => {
                 self.values.insert(vid, ready);
-                for dep_vid in self.value_dependents(vid) {
-                    self.cell_state_mut(cell_id).deferred.insert(dep_vid);
-                }
+                self.schedule_dependents(cell_id, vid);
                 return Ok(true);
             }
             Defer::Deferred(v) => v,
@@ -9465,9 +9647,7 @@ impl<'a> ExecPass<'a> {
         // appears in.
         if vref
             .state
-            .inputs()
-            .iter()
-            .any(|input| matches!(self.values.get(input), Some(Defer::Ready(Value::Poison))))
+            .any_input(|input| matches!(self.values.get(&input), Some(Defer::Ready(Value::Poison))))
         {
             return self.poison(cell_id, vid, vref.loc.frame);
         }
@@ -10837,10 +11017,17 @@ impl<'a> ExecPass<'a> {
                         // The branch that runs, or `None` when the condition
                         // is false and there is no `else`.
                         let taken = if *val.as_ref().unwrap_bool() {
+                            let if_expr = if_.expr;
+                            let loc = vref.loc;
                             let scope = self.create_exec_scope_at_loc(
-                                vref.loc,
-                                format!("{} if", if_.expr.scope_order),
-                                self.span(&vref.loc, if_.expr.then.span),
+                                loc,
+                                ScopeSite::new(ScopeSiteKind::Then, &if_expr.then, 0),
+                                |this| {
+                                    (
+                                        format!("{} if", if_expr.scope_order),
+                                        this.span(&loc, if_expr.then.span),
+                                    )
+                                },
                             );
                             let then = self.visit_scope_expr_inner(
                                 cell_id,
@@ -10850,10 +11037,17 @@ impl<'a> ExecPass<'a> {
                             );
                             Some(IfExprState::Then(then))
                         } else if let Some(else_scope) = &if_.expr.else_ {
+                            let if_expr = if_.expr;
+                            let loc = vref.loc;
                             let scope = self.create_exec_scope_at_loc(
-                                vref.loc,
-                                format!("{} else", if_.expr.scope_order),
-                                self.span(&vref.loc, else_scope.span),
+                                loc,
+                                ScopeSite::new(ScopeSiteKind::Else, else_scope, 0),
+                                |this| {
+                                    (
+                                        format!("{} else", if_expr.scope_order),
+                                        this.span(&loc, else_scope.span),
+                                    )
+                                },
                             );
                             let else_ = self.visit_scope_expr_inner(
                                 cell_id,
@@ -11765,13 +11959,20 @@ impl<'a> ExecPass<'a> {
                         self.values
                             .insert(elem_vid, DeferValue::Ready(elem.clone()));
                         frame.bindings.insert(f.for_loop.metadata, elem_vid);
+                        let for_loop = f.for_loop;
+                        let loc = vref.loc;
                         let scope = self.create_exec_scope_at_loc(
-                            vref.loc,
-                            format!(
-                                "{} for {}[{i}]",
-                                f.for_loop.scope_order, f.for_loop.var.name
-                            ),
-                            self.span(&vref.loc, f.for_loop.body.span),
+                            loc,
+                            ScopeSite::new(ScopeSiteKind::Iteration, for_loop, i as u64),
+                            |this| {
+                                (
+                                    format!(
+                                        "{} for {}[{i}]",
+                                        for_loop.scope_order, for_loop.var.name
+                                    ),
+                                    this.span(&loc, for_loop.body.span),
+                                )
+                            },
                         );
                         let fid = self.frame_id();
                         self.insert_frame(fid, frame);
@@ -11791,9 +11992,7 @@ impl<'a> ExecPass<'a> {
             self.values.insert(vid, Defer::Deferred(vref));
         }
         if self.values[&vid].is_ready() {
-            for dep_vid in self.value_dependents(vid) {
-                self.cell_state_mut(cell_id).deferred.insert(dep_vid);
-            }
+            self.schedule_dependents(cell_id, vid);
             self.release_frame(value_frame);
         }
         Ok(progress)
@@ -11879,6 +12078,10 @@ impl<'a> ExecPass<'a> {
 /// exactly when `Value` is — no regression for the (tokio) language server.
 type Seq = im::Vector<Value>;
 
+/// Index of a function or cell declaration the evaluator borrows from the AST.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeclIndex(u32);
+
 #[enumify]
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -11894,9 +12097,8 @@ pub enum Value {
     Path(Box<Path<LinearExpr>>),
     Point(Box<(LinearExpr, LinearExpr)>),
     Bool(bool),
-    /// Shared so each invocation can release the value-table borrow without
-    /// deep-cloning the function's complete AST.
-    Fn(Arc<FnDecl<Substr, VarIdTyMetadata>>),
+    /// A function, by its declaration's index in the evaluator.
+    Fn(DeclIndex),
     /// A cell generator.
     ///
     /// Example:
@@ -11907,7 +12109,7 @@ pub enum Value {
     /// ```
     ///
     /// `mycell` is a value of type `CellFn`.
-    CellFn(Arc<CellDecl<Substr, VarIdTyMetadata>>),
+    CellFn(DeclIndex),
     /// A particular parameterization of a cell.
     ///
     /// Example:
@@ -12483,6 +12685,70 @@ impl CompiledCell {
         Ok(())
     }
 
+    /// Whether [`Self::rebase_spans`] would change any span, with the same
+    /// errors. It visits the same fields.
+    pub fn spans_moved_by(&self, rebase: &SpanRebase) -> Result<bool, RebaseError> {
+        let Self {
+            name: _,
+            scopes,
+            scope_metadata,
+            root: _,
+            fields: _,
+            sse_basis: _,
+            objects,
+            fallback_constraints_used,
+            unsolved_vars: _,
+            inconsistent_constraints: _,
+        } = self;
+        let mut moved = false;
+        let mut check = |span: &Span| -> Result<(), RebaseError> {
+            moved |= rebase.moves(span)?;
+            Ok(())
+        };
+
+        for metadata in scope_metadata {
+            check(&metadata.span)?;
+        }
+
+        for scope in scopes.values() {
+            let CompiledScope {
+                static_parent: _,
+                bindings: _,
+                children: _,
+                metadata: _,
+                emit,
+            } = scope;
+            for (_, CompiledEmit { span }) in emit.iter() {
+                check(span)?;
+            }
+        }
+
+        for object in objects.values() {
+            match object {
+                SolvedValue::Rect(Rect { span, .. })
+                | SolvedValue::Polygon(Polygon { span, .. })
+                | SolvedValue::Path(Path { span, .. })
+                | SolvedValue::Text(Text { span, .. })
+                | SolvedValue::Dimension(Dimension { span, .. }) => {
+                    if let Some(span) = span {
+                        check(span)?;
+                    }
+                }
+                SolvedValue::Instance(SolvedInstance { span, .. }) => check(span)?,
+            }
+        }
+
+        for fallback in fallback_constraints_used {
+            let UsedFallback {
+                constraint: _,
+                span,
+                initial_condition: _,
+            } = fallback;
+            check(span)?;
+        }
+        Ok(moved)
+    }
+
     pub fn field(&self, name: &str) -> Option<Arrayed<&SolvedValue>> {
         self.fields
             .get(name)
@@ -12713,71 +12979,70 @@ enum Typed<T> {
 // is much larger than the common scalar ready values, so keep it out of line.
 // On the SRAM this reduces every one of roughly nine million slots rather than
 // merely the subset that happens to be deferred at the peak.
-type DeferValue<T> = Defer<Value, Box<PartialEval<T>>>;
+type DeferValue<'a> = Defer<Value, Box<PartialEval<'a>>>;
 
 #[derive(Debug, Clone)]
-struct PartialEval<T: AstMetadata> {
-    state: PartialEvalState<T>,
+struct PartialEval<'a> {
+    state: PartialEvalState<'a>,
     loc: DynLoc,
 }
 
 #[derive(Debug, Clone)]
-enum PartialEvalState<T: AstMetadata> {
-    If(Box<PartialIfExpr<T>>),
-    Match(Box<PartialMatchExpr<T>>),
-    Arith(PartialArith<T>),
-    Comparison(Box<PartialComparison<T>>),
-    BoolOp(Box<PartialBoolOp<T>>),
-    UnaryOp(PartialUnaryOp<T>),
-    Call(Box<PartialCallExpr<T>>),
-    FieldAccess(Box<PartialFieldAccessExpr<T>>),
-    IndexFieldAccess(Box<PartialIndexFieldAccessExpr<T>>),
-    Index(Box<PartialIndexExpr<T>>),
+enum PartialEvalState<'a> {
+    If(Box<PartialIfExpr<'a>>),
+    Match(Box<PartialMatchExpr<'a>>),
+    Arith(PartialArith<'a>),
+    Comparison(Box<PartialComparison<'a>>),
+    BoolOp(Box<PartialBoolOp<'a>>),
+    UnaryOp(PartialUnaryOp<'a>),
+    Call(Box<PartialCallExpr<'a>>),
+    FieldAccess(Box<PartialFieldAccessExpr<'a>>),
+    IndexFieldAccess(Box<PartialIndexFieldAccessExpr<'a>>),
+    Index(Box<PartialIndexExpr<'a>>),
     Constraint(PartialConstraint),
-    Cast(Box<PartialCastExpr<T>>),
+    Cast(Box<PartialCastExpr<'a>>),
     Tuple(PartialTupleExpr),
-    StructLit(Box<PartialStructLit<T>>),
-    ForLoop(Box<PartialForLoop<T>>),
+    StructLit(Box<PartialStructLit<'a>>),
+    ForLoop(Box<PartialForLoop<'a>>),
     Ctor(PartialCtor),
 }
 
-impl<T: AstMetadata> PartialEvalState<T> {
-    /// The values this state reads to make its next step.
+impl PartialEvalState<'_> {
+    /// Whether `f` holds for any value this state reads to make its next step.
     ///
     /// `If` and `Match` hold only the branch evaluation has reached, so an
     /// arm that was never taken is not an input and cannot poison the result.
-    fn inputs(&self) -> Vec<ValueId> {
+    fn any_input(&self, mut f: impl FnMut(ValueId) -> bool) -> bool {
         match self {
             Self::If(e) => match e.state {
-                IfExprState::Cond(v) | IfExprState::Then(v) | IfExprState::Else(v) => vec![v],
+                IfExprState::Cond(v) | IfExprState::Then(v) | IfExprState::Else(v) => f(v),
             },
             Self::Match(e) => match e.state {
-                MatchExprState::Scrutinee(v) | MatchExprState::Value(v) => vec![v],
+                MatchExprState::Scrutinee(v) | MatchExprState::Value(v) => f(v),
             },
-            Self::Arith(e) => vec![e.left, e.right],
-            Self::Comparison(e) => vec![e.left, e.right],
+            Self::Arith(e) => f(e.left) || f(e.right),
+            Self::Comparison(e) => f(e.left) || f(e.right),
             // One operand at a time, so a short-circuited `&&`/`||` never
             // reads -- and so is never poisoned by -- the operand it skipped.
             Self::BoolOp(e) => match e.state {
-                BoolOpState::Left(v) | BoolOpState::Right(v) => vec![v],
+                BoolOpState::Left(v) | BoolOpState::Right(v) => f(v),
             },
-            Self::UnaryOp(e) => vec![e.operand],
+            Self::UnaryOp(e) => f(e.operand),
             Self::Call(e) => e
                 .state
                 .posargs
                 .iter()
                 .chain(e.state.kwargs.iter())
-                .copied()
-                .collect(),
-            Self::FieldAccess(e) => vec![e.state.base],
-            Self::IndexFieldAccess(e) => vec![e.state.base],
-            Self::Index(e) => vec![e.state.base, e.state.index],
-            Self::Constraint(c) => vec![c.lhs, c.rhs],
-            Self::Cast(e) => vec![e.state.value],
-            Self::Tuple(e) => e.items.clone(),
-            Self::StructLit(e) => e.fields.iter().copied().chain(e.base).collect(),
-            Self::ForLoop(f) => vec![f.seq],
-            Self::Ctor(c) => c.args.clone(),
+                .any(|input| f(*input)),
+            Self::FieldAccess(e) => f(e.state.base),
+            Self::IndexFieldAccess(e) => f(e.state.base),
+            Self::Index(e) => f(e.state.base) || f(e.state.index),
+            Self::Constraint(c) => f(c.lhs) || f(c.rhs),
+            Self::Cast(e) => f(e.state.value),
+            Self::Tuple(e) => e.items.iter().any(|input| f(*input)),
+            Self::StructLit(e) => e.fields.iter().copied().chain(e.base).any(f),
+            Self::ForLoop(for_loop) => f(for_loop.seq),
+            Self::Ctor(c) => c.args.iter().any(|input| f(*input)),
         }
     }
 }
@@ -12806,29 +13071,29 @@ struct PartialConstraint {
 }
 
 #[derive(Debug, Clone)]
-struct PartialArith<T: AstMetadata> {
+struct PartialArith<'a> {
     left: ValueId,
     right: ValueId,
     op: ArithOp,
-    expr: Box<BinOpExpr<Substr, T>>,
+    expr: &'a BinOpExpr<Substr, VarIdTyMetadata>,
 }
 
 #[derive(Debug, Clone)]
-struct PartialUnaryOp<T: AstMetadata> {
+struct PartialUnaryOp<'a> {
     operand: ValueId,
     op: UnaryOp,
-    expr: Box<UnaryOpExpr<Substr, T>>,
+    expr: &'a UnaryOpExpr<Substr, VarIdTyMetadata>,
 }
 
 #[derive(Debug, Clone)]
-struct PartialIfExpr<T: AstMetadata> {
-    expr: IfExpr<Substr, T>,
+struct PartialIfExpr<'a> {
+    expr: &'a IfExpr<Substr, VarIdTyMetadata>,
     state: IfExprState,
 }
 
 #[derive(Debug, Clone)]
-struct PartialMatchExpr<T: AstMetadata> {
-    expr: MatchExpr<Substr, T>,
+struct PartialMatchExpr<'a> {
+    expr: &'a MatchExpr<Substr, VarIdTyMetadata>,
     state: MatchExprState,
 }
 
@@ -12846,8 +13111,8 @@ pub enum MatchExprState {
 }
 
 #[derive(Debug, Clone)]
-struct PartialCallExpr<T: AstMetadata> {
-    expr: CallExpr<Substr, T>,
+struct PartialCallExpr<'a> {
+    expr: &'a CallExpr<Substr, VarIdTyMetadata>,
     state: CallExprState,
 }
 
@@ -12858,9 +13123,9 @@ pub struct CallExprState {
 }
 
 #[derive(Debug, Clone)]
-struct PartialBoolOp<T: AstMetadata> {
+struct PartialBoolOp<'a> {
     op: BoolOp,
-    expr: BinOpExpr<Substr, T>,
+    expr: &'a BinOpExpr<Substr, VarIdTyMetadata>,
     state: BoolOpState,
 }
 
@@ -12876,34 +13141,34 @@ pub enum BoolOpState {
 }
 
 #[derive(Debug, Clone)]
-struct PartialComparison<T: AstMetadata> {
+struct PartialComparison<'a> {
     op: ComparisonOp,
-    expr: BinOpExpr<Substr, T>,
+    expr: &'a BinOpExpr<Substr, VarIdTyMetadata>,
     left: ValueId,
     right: ValueId,
 }
 
 #[derive(Debug, Clone)]
-struct PartialFieldAccessExpr<T: AstMetadata> {
-    expr: FieldAccessExpr<Substr, T>,
+struct PartialFieldAccessExpr<'a> {
+    expr: &'a FieldAccessExpr<Substr, VarIdTyMetadata>,
     state: FieldAccessExprState,
 }
 
 #[derive(Debug, Clone)]
-struct PartialIndexFieldAccessExpr<T: AstMetadata> {
-    expr: IndexFieldAccessExpr<Substr, T>,
+struct PartialIndexFieldAccessExpr<'a> {
+    expr: &'a IndexFieldAccessExpr<Substr, VarIdTyMetadata>,
     state: IndexFieldAccessExprState,
 }
 
 #[derive(Debug, Clone)]
-struct PartialIndexExpr<T: AstMetadata> {
-    expr: IndexExpr<Substr, T>,
+struct PartialIndexExpr<'a> {
+    expr: &'a IndexExpr<Substr, VarIdTyMetadata>,
     state: IndexExprState,
 }
 
 #[derive(Debug, Clone)]
-struct PartialCastExpr<T: AstMetadata> {
-    expr: CastExpr<Substr, T>,
+struct PartialCastExpr<'a> {
+    expr: &'a CastExpr<Substr, VarIdTyMetadata>,
     state: PartialCastState,
 }
 
@@ -12913,8 +13178,8 @@ struct PartialTupleExpr {
 }
 
 #[derive(Debug, Clone)]
-struct PartialStructLit<T: AstMetadata> {
-    expr: StructLitExpr<Substr, T>,
+struct PartialStructLit<'a> {
+    expr: &'a StructLitExpr<Substr, VarIdTyMetadata>,
     /// The struct being built, from the literal's checked type; its
     /// definition's field order is the order the value's fields take.
     ty: Arc<StructTy>,
@@ -12924,8 +13189,8 @@ struct PartialStructLit<T: AstMetadata> {
 }
 
 #[derive(Debug, Clone)]
-struct PartialForLoop<T: AstMetadata> {
-    for_loop: ForLoop<Substr, T>,
+struct PartialForLoop<'a> {
+    for_loop: &'a ForLoop<Substr, VarIdTyMetadata>,
     seq: ValueId,
 }
 

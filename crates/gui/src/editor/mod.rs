@@ -75,6 +75,9 @@ pub struct CompileOutputState {
     pub output: Arc<CompiledData>,
     pub selected_scope: ScopePath,
     pub state: Arc<imbl::HashMap<ScopePath, ScopeState>>,
+    /// Whether every scope in `state` is visible. It may be false when they
+    /// all are, but is never true when one is hidden.
+    pub all_scopes_visible: bool,
 }
 
 impl CompileOutputState {
@@ -217,6 +220,7 @@ struct PreparedCompileOutput {
     layers: IndexMap<SharedString, LayerState>,
     selected_scope: ScopePath,
     state: imbl::HashMap<ScopePath, ScopeState>,
+    all_scopes_visible: bool,
 }
 
 pub(crate) struct PreparedCompilationSnapshot {
@@ -252,12 +256,21 @@ fn mark_layer_used(state: &mut ProcessScopeState, layer: &str) {
 
 impl EditorState {
     pub(crate) fn displayed_cell(&self, cx: &App) -> Option<CompileOutputState> {
+        self.displayed_cell_and_revision(cx).0
+    }
+
+    /// The displayed cell and the compile revision it came from.
+    pub(crate) fn displayed_cell_and_revision(
+        &self,
+        cx: &App,
+    ) -> (Option<CompileOutputState>, Option<u64>) {
         let full = self.solved_cell.read(cx).clone();
-        if full.as_ref().map(|cell| cell.selected_scope) == self.preview_source_scope {
-            self.preview_cell.read(cx).clone().or(full)
-        } else {
-            full
+        if full.as_ref().map(|cell| cell.selected_scope) == self.preview_source_scope
+            && let Some(preview) = self.preview_cell.read(cx).clone()
+        {
+            return (Some(preview), self.preview_revision);
         }
+        (full, self.compilation_revision)
     }
 
     fn theme(&self) -> &'static Theme {
@@ -348,6 +361,7 @@ impl EditorState {
             layers,
             selected_scope,
             state,
+            all_scopes_visible,
         }) = prepared_output
         else {
             return;
@@ -369,6 +383,7 @@ impl EditorState {
                 output: Arc::new(solved_cell),
                 selected_scope,
                 state: Arc::new(state),
+                all_scopes_visible,
             });
             cx.notify();
         });
@@ -446,6 +461,7 @@ pub(crate) fn prepare_compilation_snapshot(
             layers,
             selected_scope,
             state,
+            all_scopes_visible: hierarchy.all_scopes_visible,
         }
     });
     PreparedCompilationSnapshot {
@@ -585,8 +601,10 @@ impl Editor {
             state.apply_prepared_output(cx, snapshot);
             cx.notify();
         });
-        self.canvas
-            .update(cx, |canvas, cx| canvas.finish_sse_persist(cx));
+        self.canvas.update(cx, |canvas, cx| {
+            canvas.follow_sse_source_edits(cx);
+            canvas.finish_sse_persist(cx);
+        });
         true
     }
 
@@ -649,6 +667,7 @@ impl Editor {
         let Some(PreparedCompileOutput {
             selected_scope,
             state: scopes,
+            all_scopes_visible,
             ..
         }) = preview.prepared_output
         else {
@@ -670,13 +689,16 @@ impl Editor {
                     output: Arc::new(output),
                     selected_scope,
                     state: Arc::new(scopes),
+                    all_scopes_visible,
                 });
                 cx.notify();
             });
             cx.notify();
         });
-        self.canvas
-            .update(cx, |canvas, cx| canvas.finish_sse_persist(cx));
+        self.canvas.update(cx, |canvas, cx| {
+            canvas.follow_sse_source_edits(cx);
+            canvas.finish_sse_persist(cx);
+        });
         true
     }
 
@@ -775,11 +797,12 @@ impl Editor {
     pub(crate) fn finish_sse_source_edit(
         &self,
         cx: &mut App,
+        generation: u64,
         result: anyhow::Result<Option<Vec<analyzer::rpc::ValueEdit>>>,
         initial_conditions: Vec<analyzer::rpc::InitialConditionEdit>,
     ) {
         self.canvas.update(cx, |canvas, cx| {
-            canvas.complete_sse_source_edit(result, &initial_conditions, cx)
+            canvas.complete_sse_source_edit(generation, result, &initial_conditions, cx)
         });
         let deferred_preview = self
             .canvas

@@ -1,0 +1,307 @@
+// Block placement for the SRAM: each block is aligned to blocks placed before it.
+// Each position is the translation applied to a block after its orientation.
+
+use lib::params::SramLayoutParams;
+use lib::params::AndStageSizing;
+use lib::params::PrimitiveGateParams;
+use lib::columns::decoder::BufferLayout;
+use lib::columns::decoder::ColDecoderLayout;
+
+fn row_bits(p: SramLayoutParams) -> Int { log2(p.sram.num_words / p.sram.mux_ratio) }
+fn col_select_bits(p: SramLayoutParams) -> Int { log2(p.sram.mux_ratio) }
+fn addr_width(p: SramLayoutParams) -> Int { log2(p.sram.num_words) }
+
+fn log2(n: Int) -> Int {
+    if n <= 1 { 0 } else { 1 + log2(n / 2) }
+}
+
+// Layouts of the sized blocks, shared by the floorplan and the assembly.
+fn wlen_buffer_layout(p: SramLayoutParams) -> BufferLayout {
+    let gate = bbox(lib::columns::decoder::address_gate_stage(2 * row_bits(p)));
+    lib::columns::decoder::buffer_layout(p.periphery.wlen_buffer, rect_h_i(gate) - 2000, true)
+}
+
+fn pc_b_buffer_layout(p: SramLayoutParams) -> BufferLayout {
+    lib::columns::decoder::buffer_layout(p.periphery.pc_b_buffer, periphery_widths(p).pc_b_buffer, false)
+}
+
+fn sense_en_buffer_layout(p: SramLayoutParams) -> BufferLayout {
+    lib::columns::decoder::buffer_layout(p.periphery.sense_en_buffer, periphery_widths(p).sense_en_buffer, false)
+}
+
+fn write_driver_en_buffer_layout(p: SramLayoutParams) -> BufferLayout {
+    lib::columns::decoder::buffer_layout(p.periphery.write_driver_en_buffer, periphery_widths(p).write_driver_en_buffer, false)
+}
+
+fn col_decoder_layout(p: SramLayoutParams) -> ColDecoderLayout {
+    lib::columns::decoder::col_decoder_layout(p.periphery.col_decoder, periphery_widths(p).col_decoder)
+}
+
+// Bounding boxes after orientation: 0 = none, 1 = rotated 90 degrees
+// counterclockwise, 2 = rotated 90 degrees clockwise, 3 = mirrored about the
+// x axis, 4 = x and y swapped.
+fn oriented(b: Rect, orientation: Int) -> Rect {
+    if orientation == 0 {
+        b
+    } else if orientation == 1 {
+        lib::columns::util::cbox(0. - b.y1, b.x0, 0. - b.y0, b.x1)
+    } else if orientation == 2 {
+        lib::columns::util::cbox(b.y0, 0. - b.x1, b.y1, 0. - b.x0)
+    } else if orientation == 3 {
+        lib::columns::util::cbox(b.x0, 0. - b.y1, b.x1, 0. - b.y0)
+    } else {
+        lib::columns::util::cbox(b.y0, b.x0, b.y1, b.x1)
+    }
+}
+
+fn moved(b: Rect, at: (Float, Float)) -> Rect { lib::columns::util::rect_translate(b, at.0, at.1) }
+fn union(a: Rect, b: Rect) -> Rect { lib::columns::util::rect_union(a, b) }
+
+// Half of `v`, truncated toward zero.
+fn half(v: Float) -> Float { ((v as Int) / 2) as Float }
+
+// The nearest multiple of `grid`, with ties rounded down.
+fn snap(v: Float, grid: Int) -> Float {
+    let i = v as Int;
+    let rem = ((i % grid) + grid) % grid;
+    if rem <= grid / 2 { (i - rem) as Float } else { (i - rem + grid) as Float }
+}
+
+// Offset that centers `[lo, hi]` on `[olo, ohi]` and puts `lo` on the 5 nm grid.
+fn center_offset(lo: Float, hi: Float, olo: Float, ohi: Float) -> Float {
+    let d = half((olo + ohi) - (lo + hi));
+    snap(lo + d, 5) - lo
+}
+
+struct SramFloorplan {
+    cols: (Float, Float),
+    row_decoder: (Float, Float),
+    addr_gate: (Float, Float),
+    wlen_buffer: (Float, Float),
+    pc_b_buffer: (Float, Float),
+    sense_en_buffer: (Float, Float),
+    col_decoder: (Float, Float),
+    write_driver_en_buffer: (Float, Float),
+    control: (Float, Float),
+    rbl: (Float, Float),
+    replica_pc: (Float, Float),
+    replica_nmos: (Float, Float),
+    replica_routing: (Float, Float),
+    dffs: (Float, Float),
+    boxes: SramBoxes,
+}
+
+// Placed bounding boxes of the blocks.
+struct SramBoxes {
+    bitcells: Rect,
+    cols: Rect,
+    row_decoder: Rect,
+    addr_gate: Rect,
+    wlen_buffer: Rect,
+    pc_b_buffer: Rect,
+    sense_en_buffer: Rect,
+    col_decoder: Rect,
+    write_driver_en_buffer: Rect,
+    control: Rect,
+    rbl: Rect,
+    replica_pc: Rect,
+    replica_nmos: Rect,
+    replica_routing: Rect,
+    dffs: Rect,
+    all: Rect,
+}
+
+// Places every block, with the bitcell array at the origin.
+fn sram_floorplan(p: SramLayoutParams) -> SramFloorplan {
+    let bitcells = bbox(lib::bitcells::array::sp_cell_array(p.sram.num_words / p.sram.mux_ratio, p.sram.data_width * p.sram.mux_ratio, p.sram.mux_ratio));
+
+    let dec = oriented(bbox(lib::columns::decoder::row_decoder(p.periphery.row_decoder)), 2);
+    let dec_at = (bitcells.x0 - dec.x1 - 7000., center_offset(dec.y0, dec.y1, bitcells.y0, bitcells.y1),);
+    let dec_box = moved(dec, dec_at);
+
+    let gate = oriented(bbox(lib::columns::decoder::address_gate_stage(2 * row_bits(p))), 4);
+    let gate_x = dec_box.x0 - gate.x1 - (1400 + 1400 * row_bits(p)) as Float;
+    let wlen = bbox(lib::columns::decoder::fanout_buffer(wlen_buffer_layout(p)));
+    let wlen_at = (gate_x + gate.x1 - wlen.x1 - 2000., dec_box.y0 - wlen.y0,);
+    let wlen_box = moved(wlen, wlen_at);
+    let gate_at = (gate_x, wlen_box.y1 - gate.y0 + 2000.,);
+
+    let cols = bbox(lib::columns::top::column_peripherals_exact(p.col));
+    let cols_at = (center_offset(cols.x0, cols.x1, bitcells.x0, bitcells.x1), bitcells.y0 - cols.y1 - 4000.,);
+    let cols_box = moved(cols, cols_at);
+
+    let t = p.routing_tracks;
+    let pc_b = oriented(bbox(lib::columns::decoder::fanout_buffer(pc_b_buffer_layout(p))), 2);
+    let pc_b_space = 7100 + 700 * (2 * p.sram.mux_ratio * t.col_dec + t.sense_en + t.pc_b + t.write_driver_en);
+    let pc_b_at = (cols_box.x0 - pc_b.x1 - pc_b_space as Float, cols_box.y1 - pc_b.y1 + 1000.,);
+    let pc_b_box = moved(pc_b, pc_b_at);
+
+    let sense = oriented(bbox(lib::columns::decoder::fanout_buffer(sense_en_buffer_layout(p))), 2);
+    let sense_at = (pc_b_box.x1 - sense.x1, pc_b_box.y0 - sense.y1 - 6000.,);
+    let sense_box = moved(sense, sense_at);
+
+    let sense_top = lib::columns::top::column_sense_top(p.col);
+    let sense_m2 = lib::columns::util::cbox(0., sense_top - 305., lib::columns::util::row_w(p.col.cols, p.col.mux.mux_ratio), sense_top - 15.);
+    let col_dec_above = union(moved(sense_m2, cols_at), lib::columns::util::rect_expand_vert(sense_box, 3000.));
+    let col_dec = oriented(bbox(lib::columns::decoder::column_decoder(col_decoder_layout(p))), 4);
+    let col_dec_at = (pc_b_box.x1 - col_dec.x1, col_dec_above.y0 - col_dec.y1 - 3000.,);
+    let col_dec_box = moved(col_dec, col_dec_at);
+
+    let write = oriented(bbox(lib::columns::decoder::fanout_buffer(write_driver_en_buffer_layout(p))), 2);
+    let write_at = (pc_b_box.x1 - write.x1, col_dec_box.y0 - write.y1 - 6000.,);
+    let write_box = moved(write, write_at);
+
+    let buffers = union(union(col_dec_box, sense_box), union(pc_b_box, write_box));
+    let control = oriented(bbox(lib::logic::control::control_logic_replica_v2(p.control)), 1);
+    let control_space = (2100 + 1400 * col_select_bits(p)) as Float;
+    let control_at = (buffers.x0 - control.x1 - control_space, dec_box.y0 - control.y1 - 6000.,);
+    let control_box = moved(control, control_at);
+
+    let rbl = bbox(lib::bitcells::array::replica_cell_array(p.replica_rows, 2));
+    let rbl_x = control_box.x0 - rbl.x1 - 4480.;
+    let replica_pc = oriented(bbox(lib::columns::precharge::replica_precharge(p.replica_precharge)), 3);
+    let replica_pc_at = (center_offset(replica_pc.x0, replica_pc.x1, rbl.x0 + rbl_x, rbl.x1 + rbl_x), dec_box.y0 - replica_pc.y1 - 6000.,);
+    let replica_pc_box = moved(replica_pc, replica_pc_at);
+    let rbl_m2 = moved(oriented(inst(lib::columns::precharge::replica_precharge(p.replica_precharge), x=0., y=0., construction=true).rbl, 3), replica_pc_at);
+    let nmos = bbox(lib::logic::replica::replica_column_mos(p.replica_column));
+    let nmos_at = (replica_pc_box.x0 - nmos.x1 - 13000., rbl_m2.y0 - nmos.y1 - 140.,);
+    let nmos_box = moved(nmos, nmos_at);
+    let routing = oriented(bbox(lib::logic::replica::replica_metal_routing(p.replica_routing)), 3);
+    let routing_at = (nmos_box.x0 - routing.x1 - 1000., replica_pc_box.y1 - routing.y1,);
+    let routing_box = moved(routing, routing_at);
+    let replica_top = union(replica_pc_box, union(nmos_box, routing_box));
+    let rbl_at = (rbl_x, replica_top.y0 - rbl.y1 - 4000.,);
+    let rbl_box = moved(rbl, rbl_at);
+
+    let dffs = bbox(lib::logic::dff::dff_array(p.address_dff_count));
+    let dffs_above = union(control_box, union(rbl_box, write_box));
+    let dffs_space = (5500 + 1400 * addr_width(p)) as Float;
+    let dffs_at = (pc_b_box.x1 - dffs.x1, dffs_above.y0 - dffs.y1 - dffs_space,);
+    let dffs_box = moved(dffs, dffs_at);
+    let gate_box = moved(gate, gate_at);
+    let all = union(
+        union(union(union(bitcells, cols_box), union(dec_box, gate_box)), union(union(wlen_box, pc_b_box), union(sense_box, col_dec_box))),
+        union(union(union(write_box, control_box), union(rbl_box, replica_pc_box)), union(union(nmos_box, routing_box), dffs_box)),
+    );
+
+    SramFloorplan {
+        cols: cols_at,
+        row_decoder: dec_at,
+        addr_gate: gate_at,
+        wlen_buffer: wlen_at,
+        pc_b_buffer: pc_b_at,
+        sense_en_buffer: sense_at,
+        col_decoder: col_dec_at,
+        write_driver_en_buffer: write_at,
+        control: control_at,
+        rbl: rbl_at,
+        replica_pc: replica_pc_at,
+        replica_nmos: nmos_at,
+        replica_routing: routing_at,
+        dffs: dffs_at,
+        boxes: SramBoxes {
+            bitcells: bitcells,
+            cols: cols_box,
+            row_decoder: dec_box,
+            addr_gate: gate_box,
+            wlen_buffer: wlen_box,
+            pc_b_buffer: pc_b_box,
+            sense_en_buffer: sense_box,
+            col_decoder: col_dec_box,
+            write_driver_en_buffer: write_box,
+            control: control_box,
+            rbl: rbl_box,
+            replica_pc: replica_pc_box,
+            replica_nmos: nmos_box,
+            replica_routing: routing_box,
+            dffs: dffs_box,
+            all: all,
+        },
+    }
+}
+
+// Routing grid: M1 tracks run vertically and M2 tracks horizontally at a
+// 680 nm pitch, with track 0 centered on the lower-left corner.
+struct Grid {
+    x0: Float,
+    y0: Float,
+    nx: Int,
+    ny: Int,
+}
+
+// The router area: the block bbox grown by eight tracks, four more on
+// the right and room for the row address routes on the left, snapped to
+// the track pitch.
+fn sram_grid(p: SramLayoutParams, f: SramFloorplan) -> Grid {
+    let b = f.boxes.all;
+    let x0 = snap(b.x0 - 5440. - 1400. * row_bits(p) as Float, 680);
+    let y0 = snap(b.y0 - 5440., 680);
+    let x1 = snap(b.x1 + 5440. + 2720., 680);
+    let y1 = snap(b.y1 + 5440., 680);
+    // One track past the last that starts inside the area.
+    Grid { x0: x0, y0: y0, nx: (x1 - x0 + 160.) as Int / 680 + 2, ny: (y1 - y0 + 160.) as Int / 680 + 2 }
+}
+
+struct PeripheryWidths {
+    col_decoder: Int,
+    pc_b_buffer: Int,
+    sense_en_buffer: Int,
+    write_driver_en_buffer: Int,
+}
+
+fn rect_w_i(r: Rect) -> Int { (r.x1 - r.x0) as Int }
+fn rect_h_i(r: Rect) -> Int { (r.y1 - r.y0) as Int }
+fn rect_area_i(r: Rect) -> Int { rect_w_i(r) * rect_h_i(r) }
+
+// Top of the unfolded column decoder stage: an AND2 or AND3 gate, whose
+// inverter sits as it does in an AND2, and its inverters stacked 300 nm apart.
+fn unfolded_col_decoder_top(s: AndStageSizing) -> Float {
+    let and_top = 840. + lib::columns::decoder::and2_gate_top(s.nand, s.inv);
+    unfolded_inv_stack_top(and_top, s.invs)
+}
+
+fn unfolded_inv_stack_top(below: Float, invs: [PrimitiveGateParams]) -> Float {
+    if invs == [] {
+        below
+    } else {
+        let g = head(invs);
+        let y = below - lib::columns::decoder::mf_gate_bottom(g.nwidth) + 300.;
+        unfolded_inv_stack_top(y + lib::columns::decoder::mf_gate_top(g.pwidth), tail(invs))
+    }
+}
+
+fn periphery_widths(p: SramLayoutParams) -> PeripheryWidths {
+    // The column peripherals are measured before their select and precharge
+    // rails widen to fit the routing tracks.
+    let cols = bbox(lib::columns::top::column_peripherals_exact(p.standalone_col));
+    let dffs = bbox(lib::logic::dff::dff_array(p.address_dff_count));
+    let rbl = bbox(lib::bitcells::array::replica_cell_array(p.replica_rows, 2));
+    let control = bbox(lib::logic::control::control_logic_replica_v2(p.control));
+    let row_dec = bbox(lib::columns::decoder::row_decoder(p.periphery.row_decoder));
+    let pc_b = bbox(lib::columns::decoder::fanout_buffer(lib::columns::decoder::buffer_layout(p.periphery.pc_b_buffer, 0, false)));
+    let sense_en = bbox(lib::columns::decoder::fanout_buffer(lib::columns::decoder::buffer_layout(p.periphery.sense_en_buffer, 0, false)));
+    let write_en = bbox(lib::columns::decoder::fanout_buffer(lib::columns::decoder::buffer_layout(p.periphery.write_driver_en_buffer, 0, false)));
+    // The unfolded column decoder: one 1900 nm slot per output with a 1000 nm
+    // tap at each end and after every four slots, above its predecode tracks.
+    let outputs = p.sram.mux_ratio;
+    let col_dec_w = 1900 * outputs + 1000 * (1 + (outputs + 3) / 4);
+    let col_dec_h = (unfolded_col_decoder_top(p.periphery.col_decoder) + 160. + (480 * (2 * col_select_bits(p) - 1)) as Float) as Int;
+    let col_dec_wh = col_dec_w * col_dec_h;
+    let addr_width = p.address_dff_count - 2;
+    let total0 = col_dec_wh + rect_area_i(pc_b) + rect_area_i(sense_en) + rect_area_i(write_en);
+    let available0 = lib::columns::util::imax(
+        lib::columns::util::imax(rect_h_i(cols) - rect_h_i(dffs) - 5500 - 1400 * addr_width, rect_h_i(rbl)),
+        rect_w_i(control),
+    ) - 4 * 6000;
+    let col_dec_alloc = lib::columns::util::imax(available0 * col_dec_wh / total0, col_dec_w);
+    let available = available0 - col_dec_alloc;
+    let total = total0 - col_dec_wh;
+    let match_row = col_dec_wh / rect_h_i(row_dec);
+    let col_dec_max = if match_row < 2 * col_dec_alloc { lib::columns::util::imax(match_row, col_dec_alloc) } else { col_dec_alloc };
+    PeripheryWidths {
+        col_decoder: col_dec_max,
+        pc_b_buffer: lib::columns::util::imax(available * rect_area_i(pc_b) / total, 6000),
+        sense_en_buffer: lib::columns::util::imax(available * rect_area_i(sense_en) / total, 6000),
+        write_driver_en_buffer: lib::columns::util::imax(available * rect_area_i(write_en) / total, 6000),
+    }
+}

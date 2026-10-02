@@ -44,8 +44,14 @@ fn pc_power_span(p: PrechargeParams) -> (Float, Float) {
     (start, start + height,)
 }
 
+// The top of the precharge: the input jog that starts at the top of the via
+// from the gate contact to the upper gate stripe.
 fn pc_outline_top(p: PrechargeParams) -> Float {
-    pc_gate_top_span(p).1 + 400.
+    let gate_right = pc_total_device_width(p) + 190.;
+    let track = lib::columns::util::precharge_out_track(1);
+    let gate_x = lib::columns::util::cbox(track.0, 900. + gate_right, track.1, pc_gate_top_span(p).1);
+    let gate_top = lib::columns::util::rect_from_spans((-1200., 2400.,), pc_gate_top_span(p));
+    lib::columns::util::contact_bbox(1, gate_x, gate_top, 0, 0, true).y1 + 420.
 }
 
 fn draw_precharge_xf(layer: Any, r: Rect) -> Rect {
@@ -135,7 +141,6 @@ fn draw_precharge_mos(p: PrechargeParams) -> (Rect, Rect, Rect, Rect, Rect, Rect
     (gate, gate_x, sd10, sd21, sd20, sd11, sd00, sd01,)
 }
 
-
 cell precharge_exact(p: PrechargeParams) {
     let width = 1200.;
     let gate_bot = lib::columns::util::rect_from_spans((-width, 2. * width,), pc_gate_bot_span(p));
@@ -205,7 +210,7 @@ cell precharge_exact(p: PrechargeParams) {
     lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", lib::columns::util::double_right(r3), stripe, 0, 0, true, width);
     lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", o1, gate_bot, 0, 0, true, width);
     let gate_ct = lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", gate_x, gate_top, 0, 0, true, width);
-    let gate_ct_top = gate_ct.1.y1;
+    let gate_ct_top = gate_ct.2.y1;
 
     lib::columns::util::draw_clip("li1.drawing", lib::columns::util::cbox(gate.x0, o1.y0, gate.x1, o1.y1), width);
     lib::columns::util::draw_clip("li1.drawing", lib::columns::util::cbox(gate.x0, gate_x.y0, gate.x1, gate_x.y1), width);
@@ -387,7 +392,6 @@ cell precharge_tap(p: PrechargeParams, both_sides: Bool, via_top: Bool) {
     let en_b = list(en0, en1);
     let outline = crect(x0=0., y0=pc_outline_bottom(p), x1=1300., y1=top);
 }
-
 
 cell precharge(p: PrechargeParams) {
     let base = inst(precharge_exact(p), x=0., y=0.);

@@ -1,0 +1,777 @@
+// SRAM power distribution. Banks of alternating supply rails ring the routing
+// grid, every block feeds its rails to a bank, and straps fill the remaining
+// free tracks. Even tracks carry VDD and odd tracks VSS, and like supplies
+// get a via wherever they cross.
+
+use lib::params::SramLayoutParams;
+use lib::logic::floorplan::Grid;
+use lib::logic::floorplan::SramFloorplan;
+use lib::logic::routing::Shapes;
+use lib::columns::decoder::BufferLayout;
+
+// A power shape on one layer that crossing straps of its supply via onto,
+// except on track `skip`, where it already lands on a bank.
+struct Target {
+    rect: Rect,
+    supply: Int,
+    skip: Int,
+}
+
+struct Power {
+    m1: [Rect],
+    m2: [Rect],
+    m1_targets: [Target],
+    m2_targets: [Target],
+}
+
+fn none() -> Power { Power { m1: [], m2: [], m1_targets: [], m2_targets: [] } }
+
+fn join(a: Power, b: Power) -> Power {
+    Power {
+        m1: lib::logic::routing::concat(a.m1, b.m1),
+        m2: lib::logic::routing::concat(a.m2, b.m2),
+        m1_targets: lib::logic::routing::concat(a.m1_targets, b.m1_targets),
+        m2_targets: lib::logic::routing::concat(a.m2_targets, b.m2_targets),
+    }
+}
+
+fn join_rects(l: [[Rect]]) -> [Rect] {
+    if l == [] { [] } else { lib::logic::routing::concat(head(l), join_rects(tail(l))) }
+}
+
+fn join_all(l: [Power]) -> Power {
+    if l == [] { none() } else { join(head(l), join_all(tail(l))) }
+}
+
+fn cbox(x0: Float, y0: Float, x1: Float, y1: Float) -> Rect { lib::columns::util::cbox(x0, y0, x1, y1) }
+fn from_spans(h: (Float, Float), v: (Float, Float)) -> Rect { lib::columns::util::rect_from_spans(h, v) }
+fn hspan(r: Rect) -> (Float, Float) { lib::columns::util::rect_hspan(r) }
+fn vspan(r: Rect) -> (Float, Float) { lib::columns::util::rect_vspan(r) }
+fn span_union(a: (Float, Float), b: (Float, Float)) -> (Float, Float) { lib::columns::util::span_union(a, b) }
+fn m1(r: Rect) -> Rect { lib::columns::util::draw_box("met1.drawing", r) }
+fn m2(r: Rect) -> Rect { lib::columns::util::draw_box("met2.drawing", r) }
+fn m1_track(g: Grid, i: Int) -> (Float, Float) { lib::logic::routing::m1_track(g, i) }
+fn m2_track(g: Grid, j: Int) -> (Float, Float) { lib::logic::routing::m2_track(g, j) }
+fn cx(g: Grid, i: Int) -> Float { g.x0 + 680. * i as Float }
+fn cy(g: Grid, j: Int) -> Float { g.y0 + 680. * j as Float }
+
+fn power_via(bot: Rect, top: Rect) -> Rect {
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", bot, top, 0, 0, false).2
+}
+
+// Via cuts filling r with 55 nm margins. The crossing strap's 320 nm width
+// gives the other layer its 85 nm enclosure.
+fn via_cuts(r: Rect) -> Rect {
+    let nx = ((r.x1 - r.x0 - 110. + 170.) / 320.) as Int;
+    let ny = ((r.y1 - r.y0 - 110. + 170.) / 320.) as Int;
+    let x0 = lib::columns::util::snap5((r.x0 + r.x1 - 320. * nx as Float + 170.) / 2.);
+    let y0 = lib::columns::util::snap5((r.y0 + r.y1 - 320. * ny as Float + 170.) / 2.);
+    for ix in std::range(nx) {
+        for iy in std::range(ny) {
+            lib::columns::util::draw_box("via.drawing", cbox(x0 + 320. * ix as Float, y0 + 320. * iy as Float, x0 + 320. * ix as Float + 150., y0 + 320. * iy as Float + 150.));
+        }
+    }
+    r
+}
+
+// Bank tracks for a supply (0 for VDD, 1 for VSS) on each edge.
+fn parity_track(t: Int, supply: Int) -> Int { if t % 2 == supply { t } else { t + 1 } }
+fn left_bank(supply: Int) -> Int { 4 + supply }
+fn right_bank(g: Grid, supply: Int) -> Int { parity_track(g.nx - 4, supply) }
+fn bottom_bank(supply: Int) -> Int { 4 + supply }
+fn top_bank(g: Grid, supply: Int) -> Int { parity_track(g.ny - 6, supply) }
+
+// An M2 power shape run sideways onto a bank's M1 track.
+fn feed_m2_to_side(g: Grid, source: Rect, supply: Int, right: Bool) -> Power {
+    let t = if right { right_bank(g, supply) } else { left_bank(supply) };
+    let strap = m1_track(g, t);
+    let feeder = m2(lib::columns::util::rect_with_hspan(source, span_union(hspan(source), strap)));
+    let via = power_via(from_spans(strap, vspan(feeder)), feeder);
+    Power { m1: [], m2: list(feeder, via), m1_targets: [], m2_targets: list(Target { rect: feeder, supply: supply, skip: t }) }
+}
+
+// An M1 power shape run up or down onto a bank's M2 track.
+fn feed_m1_to_edge(g: Grid, source: Rect, supply: Int, top: Bool) -> Power {
+    let t = if top { top_bank(g, supply) } else { bottom_bank(supply) };
+    let rail = m2_track(g, t);
+    let feeder = m1(lib::columns::util::rect_with_vspan(source, span_union(vspan(source), rail)));
+    let via = power_via(feeder, from_spans(hspan(feeder), rail));
+    Power { m1: list(feeder, via), m2: [], m1_targets: list(Target { rect: feeder, supply: supply, skip: t }), m2_targets: [] }
+}
+
+fn feed_all_m2(g: Grid, rails: [Rect], supply: Int, right: Bool) -> Power {
+    if rails == [] { none() } else { join(feed_m2_to_side(g, head(rails), supply, right), feed_all_m2(g, tail(rails), supply, right)) }
+}
+
+// Rails run to the left bank, longest feeder first. A rail that an earlier
+// feeder of its supply already crosses needs no feeder of its own.
+fn feed_left(g: Grid, sources: [Rect], supply: Int) -> Power { feed_left_sorted(g, sort_by_right(sources), supply, []) }
+
+fn insert_by_right(r: Rect, sorted: [Rect]) -> [Rect] {
+    if sorted == [] { list(r) } else if r.x1 >= head(sorted).x1 { cons(r, sorted) } else { cons(head(sorted), insert_by_right(r, tail(sorted))) }
+}
+
+fn sort_by_right(l: [Rect]) -> [Rect] {
+    if l == [] { [] } else { insert_by_right(head(l), sort_by_right(tail(l))) }
+}
+
+fn overlaps_any_v(r: Rect, l: [Rect]) -> Bool {
+    if l == [] { false } else if lib::logic::routing::overlaps_v(r, head(l)) { true } else { overlaps_any_v(r, tail(l)) }
+}
+
+fn feed_left_sorted(g: Grid, sources: [Rect], supply: Int, drawn: [Rect]) -> Power {
+    if sources == [] {
+        none()
+    } else {
+        let s = head(sources);
+        if overlaps_any_v(s, drawn) {
+            feed_left_sorted(g, tail(sources), supply, drawn)
+        } else {
+            join(feed_m2_to_side(g, s, supply, false), feed_left_sorted(g, tail(sources), supply, cons(s, drawn)))
+        }
+    }
+}
+
+fn feed_all_m1(g: Grid, rails: [Rect], supply: Int, top: Bool) -> Power {
+    if rails == [] { none() } else { join(feed_m1_to_edge(g, head(rails), supply, top), feed_all_m1(g, tail(rails), supply, top)) }
+}
+
+// Rails sorted bottom up, with rails less than 400 nm apart merged so that
+// their bank vias do not crowd.
+fn insert_rail(r: Rect, sorted: [Rect]) -> [Rect] {
+    if sorted == [] { list(r) } else if r.y0 <= head(sorted).y0 { cons(r, sorted) } else { cons(head(sorted), insert_rail(r, tail(sorted))) }
+}
+
+fn sort_rails(l: [Rect]) -> [Rect] {
+    if l == [] { [] } else { insert_rail(head(l), sort_rails(tail(l))) }
+}
+
+fn merge_sorted(l: [Rect]) -> [Rect] {
+    if l == [] {
+        []
+    } else if tail(l) == [] {
+        l
+    } else {
+        let a = head(l);
+        let b = head(tail(l));
+        if b.y0 - a.y1 < 400. {
+            merge_sorted(cons(lib::columns::util::rect_union(a, b), tail(tail(l))))
+        } else {
+            cons(a, merge_sorted(tail(l)))
+        }
+    }
+}
+
+// Rails leaving a block's right edge at x, as zero-width stubs there.
+fn edge_stubs(rails: [Rect], x: Float) -> [Rect] {
+    if rails == [] { [] } else { cons(from_spans((x, x,), vspan(head(rails))), edge_stubs(tail(rails), x)) }
+}
+
+fn feed_right_edge(g: Grid, rails: [Rect], x: Float, supply: Int) -> Power {
+    feed_all_m2(g, edge_stubs(merge_sorted(sort_rails(rails)), x), supply, true)
+}
+
+// Rails in a block's own coordinates, placed like the block.
+fn place(l: [Rect], orientation: Int, at: (Float, Float)) -> [Rect] {
+    if l == [] { [] } else { cons(lib::logic::floorplan::moved(lib::logic::floorplan::oriented(head(l), orientation), at), place(tail(l), orientation, at)) }
+}
+
+// M2 stripes ending at a block's top edge, continued just above it and
+// carried up to the top bank on M1.
+fn feed_stripes_up(g: Grid, stripes: [Rect], supply: Int) -> Power {
+    if stripes == [] {
+        none()
+    } else {
+        let s = head(stripes);
+        let stub = m2(from_spans(hspan(s), (s.y1, s.y1 + 700.,)));
+        let piece = from_spans(hspan(s), (s.y1 + 100., s.y1 + 700.,));
+        let up = feed_m1_to_edge(g, piece, supply, true);
+        let via = power_via(piece, stub);
+        join_all(list(Power { m1: [], m2: list(stub, via), m1_targets: [], m2_targets: [] }, up, feed_stripes_up(g, tail(stripes), supply)))
+    }
+}
+
+// M1 rails at a block's right edge, brought up to M2 inside the edge and run
+// to the right bank.
+fn m1_rail_pieces(rails: [Rect], x: Float) -> [Rect] {
+    if rails == [] { [] } else { cons(from_spans((x - 800., x,), vspan(head(rails))), m1_rail_pieces(tail(rails), x)) }
+}
+
+fn feed_m1_rails_right(g: Grid, rails: [Rect], x: Float, supply: Int) -> Power {
+    let pieces = m1_rail_pieces(rails, x);
+    for r in pieces {
+        m2(r);
+        power_via(r, r);
+    }
+    join(Power { m1: [], m2: pieces, m1_targets: [], m2_targets: [] }, feed_right_edge(g, rails, x, supply))
+}
+
+// A stacked block's rails, which run its full height, joined by an M2 bar of
+// each supply: VDD above the block and VSS below it. M2 stripes reach their
+// bar directly; M1 rails reach it on their corridor strip and via onto it.
+fn bar_span(l: [Rect]) -> (Float, Float) {
+    if tail(l) == [] { hspan(head(l)) } else { span_union(hspan(head(l)), bar_span(tail(l))) }
+}
+
+fn rails_reach(l: [Rect], to: Float, on_m1: Bool, supply: Int) -> [Rect] {
+    if l == [] {
+        []
+    } else {
+        let r = head(l);
+        let h = if on_m1 { strip(r, supply) } else { hspan(r) };
+        let piece = if to > r.y1 { from_spans(h, (r.y1, to,)) } else { from_spans(h, (to, r.y0,)) };
+        cons(piece, rails_reach(tail(l), to, on_m1, supply))
+    }
+}
+
+fn draw_block_bars(m1_vdd: [Rect], m1_vss: [Rect], m2_vdd: [Rect], m2_vss: [Rect]) -> Power {
+    let all_vdd = lib::logic::routing::concat(m1_vdd, m2_vdd);
+    let all_vss = lib::logic::routing::concat(m1_vss, m2_vss);
+    let top = head(all_vdd).y1;
+    let bottom = head(all_vss).y0;
+    let vdd_bar = m2(from_spans(bar_span(all_vdd), (top + 400., top + 720.,)));
+    let vss_bar = m2(from_spans(bar_span(all_vss), (bottom - 720., bottom - 400.,)));
+    let m2_up = rails_reach(m2_vdd, vdd_bar.y1, false, 0);
+    let m2_down = rails_reach(m2_vss, vss_bar.y0, false, 1);
+    let m1_up = rails_reach(m1_vdd, vdd_bar.y1, true, 0);
+    let m1_down = rails_reach(m1_vss, vss_bar.y0, true, 1);
+    for r in m2_up { m2(r); }
+    for r in m2_down { m2(r); }
+    for r in m1_up {
+        m1(r);
+        power_via(from_spans(hspan(r), vspan(vdd_bar)), vdd_bar);
+    }
+    for r in m1_down {
+        m1(r);
+        power_via(from_spans(hspan(r), vspan(vss_bar)), vss_bar);
+    }
+    Power {
+        m1: lib::logic::routing::concat(m1_up, m1_down),
+        m2: cons(vdd_bar, cons(vss_bar, lib::logic::routing::concat(m2_up, m2_down))),
+        m1_targets: [],
+        m2_targets: list(Target { rect: vdd_bar, supply: 0, skip: -1 }, Target { rect: vss_bar, supply: 1, skip: -1 }),
+    }
+}
+
+fn buffer_bars(b: BufferLayout, at: (Float, Float)) -> Power {
+    draw_block_bars(
+        place(lib::columns::decoder::buffer_m1_rails(b, true), 2, at),
+        place(lib::columns::decoder::buffer_m1_rails(b, false), 2, at),
+        place(lib::columns::decoder::buffer_m2_rails(b, true), 2, at),
+        place(lib::columns::decoder::buffer_m2_rails(b, false), 2, at),
+    )
+}
+
+// The control logic's row rails run vertically. An M2 feeder on each of its
+// two reserved columns crosses them and vias onto each rail of its supply.
+fn control_feeder(f: SramFloorplan, control: Any, supply: Int) -> Rect {
+    let y = f.control.1 + lib::logic::control::tracks::track_x(supply);
+    let rails = if supply == 0 { control.vdd_rails } else { control.vss_rails };
+    let first = lib::columns::util::rect_cx(control.vdd_rails[0]);
+    let last = lib::columns::util::rect_cx(std::last(rails));
+    for r in rails {
+        let x = lib::columns::util::rect_cx(r);
+        lib::columns::util::draw_box("via.drawing", cbox(x - 75., y - 75., x + 75., y + 75.));
+    }
+    m2(cbox(first - 160., y - 160., last + 160., y + 160.))
+}
+
+// Whether a feeder from the left bank to r would cross the replica array.
+fn crosses_rbl(f: SramFloorplan, r: Rect) -> Bool {
+    let b = f.boxes.rbl;
+    lib::columns::util::band(lib::columns::util::band(r.y0 < b.y1 + 400., b.y0 - 400. < r.y1), b.x1 < r.x0)
+}
+
+fn rbl_clear(f: SramFloorplan, l: [Rect]) -> [Rect] {
+    if l == [] { [] } else if crosses_rbl(f, head(l)) { rbl_clear(f, tail(l)) } else { cons(head(l), rbl_clear(f, tail(l))) }
+}
+
+// A control feeder whose row the replica array blocks passes under the array:
+// M2 to an M1 track right of the array, M1 down past its bottom, and M2 on to
+// the left bank. Each takes the first track and lane clear of the signal
+// routes; VSS goes right of and below VDD so the two never meet on one layer.
+struct Detour {
+    power: Power,
+    track: Int,
+    lane: Int,
+}
+
+fn free_track(g: Grid, i: Int, span: (Float, Float), routes: [Rect]) -> Int {
+    if clear_of_one(from_spans(m1_track(g, i), span), routes) { i } else { free_track(g, i + 1, span, routes) }
+}
+
+// The first lane at or below j, with its track, whose detour avoids the routes.
+fn detour_pick(g: Grid, source: Rect, routes: Shapes, i0: Int, j: Int) -> (Int, Int) {
+    let lane = m2_track(g, j);
+    let i = free_track(g, i0, (lane.0, source.y1,), routes.m1);
+    let t = m1_track(g, i);
+    if clear_of_one(from_spans((m1_track(g, left_bank(0)).0, t.1,), lane), routes.m2) { (i, j,) } else { detour_pick(g, source, routes, i0, j - 1) }
+}
+
+fn feed_under_rbl(g: Grid, f: SramFloorplan, sources: [Rect], supply: Int, routes: Shapes, i0: Int, j0: Int) -> Detour {
+    if sources == [] {
+        Detour { power: none(), track: i0 - 1, lane: j0 + 1 }
+    } else if crosses_rbl(f, head(sources)) == false {
+        Detour { power: none(), track: i0 - 1, lane: j0 + 1 }
+    } else {
+        let source = head(sources);
+        let pick = detour_pick(g, source, routes, i0, j0);
+        let t = m1_track(g, pick.0);
+        let lane = m2_track(g, pick.1);
+        let upper = m2(from_spans((t.0, source.x1,), vspan(source)));
+        let down = m1(from_spans(t, (lane.0, source.y1,)));
+        let corner = from_spans(t, lane);
+        power_via(from_spans(t, vspan(source)), upper);
+        power_via(corner, corner);
+        Detour {
+            power: join(
+                Power { m1: list(down), m2: list(upper), m1_targets: list(Target { rect: down, supply: supply, skip: -1 }), m2_targets: list(Target { rect: upper, supply: supply, skip: -1 }) },
+                feed_m2_to_side(g, corner, supply, false),
+            ),
+            track: pick.0,
+            lane: pick.1,
+        }
+    }
+}
+
+fn feed_control_under_rbl(g: Grid, f: SramFloorplan, vdd: [Rect], vss: [Rect], routes: Shapes) -> Power {
+    let b = f.boxes.rbl;
+    let first = feed_under_rbl(g, f, vdd, 0, routes, lib::logic::routing::m1_starts_after(g, b.x1 + 400.), lib::logic::routing::m2_ends_before(g, b.y0 - 400.));
+    let second = feed_under_rbl(g, f, vss, 1, routes, first.track + 1, first.lane - 1);
+    join(first.power, second.power)
+}
+
+// The enable buffers and the column decoder stack beside the column
+// peripherals. Two M1 corridors follow their rails, jogging in the gaps
+// between blocks, and rise to an open M2 band below the row decoder.
+struct Corridor {
+    vdd: [Rect],
+    vss: [Rect],
+}
+
+// A rail's 320 nm edge strip: the right edge for VDD and the left edge for
+// VSS, which keeps the two supplies apart.
+fn strip(rail: Rect, supply: Int) -> (Float, Float) {
+    if supply == 0 { (rail.x1 - 320., rail.x1,) } else { (rail.x0, rail.x0 + 320.,) }
+}
+
+fn jog(above: Rect, below: Rect, supply: Int, level: (Float, Float)) -> [Rect] {
+    let a = strip(above, supply);
+    let b = strip(below, supply);
+    list(
+        from_spans(a, (level.0, above.y0,)),
+        from_spans(span_union(a, b), level),
+        from_spans(b, (below.y1, level.1,)),
+    )
+}
+
+fn clear_of(a: [Rect], b: [Rect]) -> Bool {
+    if a == [] { true } else { lib::columns::util::band(clear_of_one(head(a), b), clear_of(tail(a), b)) }
+}
+
+fn clear_of_one(r: Rect, l: [Rect]) -> Bool {
+    if l == [] {
+        true
+    } else {
+        let o = head(l);
+        let apart = lib::columns::util::bor(lib::columns::util::bor(o.x0 >= r.x1 + 300., r.x0 >= o.x1 + 300.), lib::columns::util::bor(o.y0 >= r.y1 + 300., r.y0 >= o.y1 + 300.));
+        lib::columns::util::band(apart, clear_of_one(r, tail(l)))
+    }
+}
+
+// Jogs for both supplies across one gap, with the two jog levels ordered so
+// that the corridors do not cross.
+fn gap_jogs(above_vdd: Rect, above_vss: Rect, below_vdd: Rect, below_vss: Rect) -> Corridor {
+    let hi = (above_vdd.y0 - 1320., above_vdd.y0 - 1000.,);
+    let lo = (below_vdd.y1 + 1000., below_vdd.y1 + 1320.,);
+    let vdd_hi = jog(above_vdd, below_vdd, 0, hi);
+    let vss_lo = jog(above_vss, below_vss, 1, lo);
+    if clear_of(vdd_hi, vss_lo) {
+        Corridor { vdd: vdd_hi, vss: vss_lo }
+    } else {
+        let vdd_lo = jog(above_vdd, below_vdd, 0, lo);
+        let vss_hi = jog(above_vss, below_vss, 1, hi);
+        eq(if clear_of(vdd_lo, vss_hi) { 1. } else { 0. }, 1.);
+        Corridor { vdd: vdd_lo, vss: vss_hi }
+    }
+}
+
+fn corridor_targets(l: [Rect], supply: Int) -> [Target] {
+    if l == [] { [] } else { cons(Target { rect: head(l), supply: supply, skip: -1 }, corridor_targets(tail(l), supply)) }
+}
+
+// M2 tracks between the control logic's replica routes and the row decoder.
+fn band_tracks(g: Grid, f: SramFloorplan, control: Any) -> (Int, Int) {
+    (lib::logic::routing::replica_m2_start(g, control) + 3, lib::logic::routing::m2_ends_before(g, f.boxes.row_decoder.y0 - 400.),)
+}
+
+fn band_straps(g: Grid, j: Int, last: Int, vdd_x1: Float, vss_x1: Float, vdd: Rect, vss: Rect) -> Power {
+    if j > last {
+        none()
+    } else {
+        let supply = j % 2;
+        let corridor = if supply == 0 { vdd } else { vss };
+        let strap = m2(from_spans((m1_track(g, 0).0, if supply == 0 { vdd_x1 } else { vss_x1 },), m2_track(g, j)));
+        let via = power_via(from_spans(hspan(corridor), vspan(strap)), strap);
+        join(
+            Power { m1: [], m2: list(strap, via), m1_targets: [], m2_targets: list(Target { rect: strap, supply: supply, skip: -1 }) },
+            band_straps(g, j + 1, last, vdd_x1, vss_x1, vdd, vss),
+        )
+    }
+}
+
+fn feed_buffer_stack(g: Grid, f: SramFloorplan, control: Any, pc_b: Any, sense: Any, col_dec: Any, write: Any) -> Power {
+    let band = band_tracks(g, f, control);
+    let band_top = m2_track(g, band.1).1;
+    let pc_vdd = pc_b.vdd[0];
+    let pc_vss = pc_b.vss[0];
+    let rise_vdd = from_spans(strip(pc_vdd, 0), (pc_vdd.y0, band_top,));
+    let rise_vss = from_spans(strip(pc_vss, 1), (pc_vss.y0, band_top,));
+    let a = gap_jogs(pc_vdd, pc_vss, sense.vdd[0], sense.vss[0]);
+    let b = gap_jogs(sense.vdd[0], sense.vss[0], col_dec.vdd, col_dec.vss);
+    let c = gap_jogs(col_dec.vdd, col_dec.vss, write.vdd[0], write.vss[0]);
+    let vdd = cons(rise_vdd, lib::logic::routing::concat(a.vdd, lib::logic::routing::concat(b.vdd, c.vdd)));
+    let vss = cons(rise_vss, lib::logic::routing::concat(a.vss, lib::logic::routing::concat(b.vss, c.vss)));
+    for r in vdd { m1(r); }
+    for r in vss { m1(r); }
+    let straps = band_straps(g, band.0, band.1, rise_vdd.x1, rise_vss.x1, rise_vdd, rise_vss);
+    join(
+        Power { m1: lib::logic::routing::concat(vdd, vss), m2: [], m1_targets: lib::logic::routing::concat(corridor_targets(vdd, 0), corridor_targets(vss, 1)), m2_targets: [] },
+        straps,
+    )
+}
+
+// Every block's supply connection.
+fn draw_block_feeders(
+    p: SramLayoutParams,
+    g: Grid,
+    f: SramFloorplan,
+    bitcells: Any,
+    cols: Any,
+    dec: Any,
+    gate: Any,
+    wlen: Any,
+    pc_b: Any,
+    sense: Any,
+    write: Any,
+    col_dec: Any,
+    dffs: Any,
+    control: Any,
+    rbl: Any,
+    rpc: Any,
+    nmos: Any,
+    with_control: Bool,
+    routes: Shapes,
+) -> Power {
+    let r = p.periphery.row_decoder;
+    let gate_num = 2 * lib::logic::floorplan::row_bits(p);
+    let wlen_layout = lib::logic::floorplan::wlen_buffer_layout(p);
+    let cd = lib::logic::floorplan::col_decoder_layout(p);
+    let control_vdd = if with_control { list(control_feeder(f, control, 0)) } else { [] };
+    let control_vss = if with_control { list(control_feeder(f, control, 1)) } else { [] };
+    let wlen_vdd = place(lib::columns::decoder::buffer_m2_rails(wlen_layout, true), 0, f.wlen_buffer);
+    let wlen_vss = place(lib::columns::decoder::buffer_m2_rails(wlen_layout, false), 0, f.wlen_buffer);
+    let left_vdd = join_rects(list(wlen_vdd, rbl_clear(f, control_vdd), list(rpc.vdd, nmos.vdd), rbl.vdd_rails));
+    let left_vss = join_rects(list(wlen_vss, rbl_clear(f, control_vss), nmos.vss, rbl.vss_rails));
+    join_all(list(
+            feed_right_edge(g, bitcells.vdd_rails, f.boxes.bitcells.x1, 0),
+            feed_right_edge(g, bitcells.vss_rails, f.boxes.bitcells.x1, 1),
+            feed_right_edge(g, cols.vdd, f.boxes.cols.x1, 0),
+            feed_right_edge(g, cols.vss, f.boxes.cols.x1, 1),
+            feed_all_m1(g, dffs.vdd, 0, false),
+            feed_all_m1(g, dffs.vss, 1, false),
+            feed_all_m1(g, place(lib::columns::decoder::row_decoder_m1_rails(r, true), 2, f.row_decoder), 0, true),
+            feed_all_m1(g, place(lib::columns::decoder::row_decoder_m1_rails(r, false), 2, f.row_decoder), 1, true),
+            feed_stripes_up(g, place(lib::columns::decoder::row_decoder_m2_rails(r, true), 2, f.row_decoder), 0),
+            feed_stripes_up(g, place(lib::columns::decoder::row_decoder_m2_rails(r, false), 2, f.row_decoder), 1),
+            feed_all_m1(g, place(lib::columns::decoder::address_gate_rails(gate_num, true), 4, f.addr_gate), 0, true),
+            feed_all_m1(g, place(lib::columns::decoder::address_gate_rails(gate_num, false), 4, f.addr_gate), 1, true),
+            feed_left(g, left_vdd, 0),
+            feed_left(g, left_vss, 1),
+            feed_control_under_rbl(g, f, control_vdd, control_vss, routes),
+            feed_buffer_stack(g, f, control, pc_b, sense, col_dec, write),
+            buffer_bars(lib::logic::floorplan::pc_b_buffer_layout(p), f.pc_b_buffer),
+            buffer_bars(lib::logic::floorplan::sense_en_buffer_layout(p), f.sense_en_buffer),
+            buffer_bars(lib::logic::floorplan::write_driver_en_buffer_layout(p), f.write_driver_en_buffer),
+            draw_block_bars(place(lib::columns::decoder::col_decoder_m1_rails(cd, true), 4, f.col_decoder), place(lib::columns::decoder::col_decoder_m1_rails(cd, false), 4, f.col_decoder), place(lib::columns::decoder::col_decoder_m2_rails(cd, true), 4, f.col_decoder), place(lib::columns::decoder::col_decoder_m2_rails(cd, false), 4, f.col_decoder)),
+            feed_m1_rails_right(g, place(lib::columns::top::column_m1_power_rails(p.col, true), 0, f.cols), f.boxes.cols.x1, 0),
+            feed_m1_rails_right(g, place(lib::columns::top::column_m1_power_rails(p.col, false), 0, f.cols), f.boxes.cols.x1, 1),
+    ))
+}
+
+// Regions where straps may not run. Blocks keep straps out of their whole
+// bounding box, and the array, column, and decoder regions extend over the
+// bitline and wordline routes.
+fn expand(r: Rect, dx: Float, dy: Float) -> Rect { cbox(r.x0 - dx, r.y0 - dy, r.x1 + dx, r.y1 + dy) }
+fn expand_right(r: Rect, d: Float) -> Rect { cbox(r.x0, r.y0, r.x1 + d, r.y1) }
+
+fn block_keepouts(f: SramFloorplan) -> [Rect] {
+    let b = f.boxes;
+    list(
+        b.bitcells, b.cols, b.row_decoder, b.addr_gate, b.wlen_buffer, b.pc_b_buffer, b.sense_en_buffer, b.col_decoder,
+        b.write_driver_en_buffer, b.control, b.rbl, b.replica_pc, b.replica_nmos, b.replica_routing, b.dffs,
+    )
+}
+
+fn m1_keepouts(f: SramFloorplan) -> [Rect] {
+    let b = f.boxes;
+    let rbl_core = cbox(b.rbl.x0 + 2520., b.rbl.y0, b.rbl.x1 - 2520., b.rbl.y1);
+    lib::logic::routing::concat(block_keepouts(f), list(
+            expand(b.bitcells, 140., 6000.),
+            expand(b.cols, 140., 6000.),
+            expand(rbl_core, 140., 6000.),
+            expand_right(b.row_decoder, 1400.),
+            expand_right(b.col_decoder, 1400.),
+            expand_right(b.pc_b_buffer, 1400.),
+            expand_right(b.sense_en_buffer, 1400.),
+            expand_right(b.write_driver_en_buffer, 1400.),
+    ))
+}
+
+fn m2_keepouts(f: SramFloorplan) -> [Rect] {
+    let b = f.boxes;
+    lib::logic::routing::concat(block_keepouts(f), list(
+            expand(b.bitcells, 6000., 140.),
+            expand(b.cols, 6000., 140.),
+            expand(b.rbl, 3480., 140.),
+            expand_right(b.row_decoder, 6000.),
+    ))
+}
+
+// Free-track runs. A run (t, a, b) is a strap on track t covering crossing
+// tracks a through b, out to the midpoints beyond them. A crossing point is
+// free when the strap there stays 300 nm from every blocker.
+struct Run {
+    t: Int,
+    a: Int,
+    b: Int,
+}
+
+// Floor and ceiling division by a positive divisor. Coordinates are whole
+// nanometers, so this is exact where float comparisons, which snap to the
+// manufacturing grid, are not.
+fn fdiv(a: Int, b: Int) -> Int {
+    let q = a / b;
+    if q * b > a { q - 1 } else { q }
+}
+
+fn cdiv(a: Int, b: Int) -> Int { 0 - fdiv(0 - a, b) }
+
+// Blockers bucketed into stripes of 16 tracks along the strap direction's
+// crossing axis; `vertical` straps are M1.
+fn stripe_lo(o: Float, s: Int) -> Float { o + 680. * (16 * s) as Float - 160. - 300. }
+fn stripe_hi(o: Float, s: Int) -> Float { o + 680. * (16 * s + 15) as Float + 160. + 300. }
+
+fn crosses(r: Rect, lo: Float, hi: Float, vertical: Bool) -> Bool {
+    if vertical { lib::columns::util::band(r.x0 < hi, r.x1 > lo) } else { lib::columns::util::band(r.y0 < hi, r.y1 > lo) }
+}
+
+fn filter_range(l: [Rect], i0: Int, i1: Int, lo: Float, hi: Float, vertical: Bool) -> [Rect] {
+    if i1 - i0 <= 0 {
+        []
+    } else if i1 - i0 == 1 {
+        if crosses(l[i0], lo, hi, vertical) { list(l[i0]) } else { [] }
+    } else {
+        let mid = (i0 + i1) / 2;
+        lib::logic::routing::concat(filter_range(l, i0, mid, lo, hi, vertical), filter_range(l, mid, i1, lo, hi, vertical))
+    }
+}
+
+fn count<T>(l: [T]) -> Int { if l == [] { 0 } else { 1 + count(tail(l)) } }
+
+fn filter_targets(l: [Target], i0: Int, i1: Int, lo: Float, hi: Float, vertical: Bool) -> [Target] {
+    if i1 - i0 <= 0 {
+        []
+    } else if i1 - i0 == 1 {
+        if crosses(l[i0].rect, lo, hi, vertical) { list(l[i0]) } else { [] }
+    } else {
+        let mid = (i0 + i1) / 2;
+        lib::logic::routing::concat(filter_targets(l, i0, mid, lo, hi, vertical), filter_targets(l, mid, i1, lo, hi, vertical))
+    }
+}
+
+fn target_stripes(l: [Target], n: Int, o: Float, s: Int, ns: Int, vertical: Bool) -> [[Target]] {
+    if s == ns { [] } else { cons(filter_targets(l, 0, n, stripe_lo(o, s), stripe_hi(o, s), vertical), target_stripes(l, n, o, s + 1, ns, vertical)) }
+}
+
+fn stripes(l: [Rect], n: Int, o: Float, s: Int, ns: Int, vertical: Bool) -> [[Rect]] {
+    if s == ns { [] } else { cons(filter_range(l, 0, n, stripe_lo(o, s), stripe_hi(o, s), vertical), stripes(l, n, o, s + 1, ns, vertical)) }
+}
+
+// Crossing-track intervals blocked on one track.
+fn blocked(l: [Rect], center: Float, o: Float, n: Int, vertical: Bool) -> [(Int, Int)] {
+    if l == [] {
+        []
+    } else {
+        let r = head(l);
+        let rest = blocked(tail(l), center, o, n, vertical);
+        let lo = center - 160. - 300.;
+        let hi = center + 160. + 300.;
+        if crosses(r, lo, hi, vertical) {
+            let a = if vertical { r.y0 } else { r.x0 };
+            let b = if vertical { r.y1 } else { r.x1 };
+            let j0 = lib::columns::util::imax(fdiv((a - o) as Int - 640, 680) + 1, 0);
+            let j1 = lib::columns::util::imin(cdiv((b - o) as Int + 640, 680) - 1, n - 1);
+            if j0 <= j1 { cons((j0, j1,), rest) } else { rest }
+        } else {
+            rest
+        }
+    }
+}
+
+fn cover_end(ivs: [(Int, Int)], cur: Int) -> Int {
+    if ivs == [] { -1 } else {
+        let iv = head(ivs);
+        let rest = cover_end(tail(ivs), cur);
+        if lib::columns::util::band(iv.0 <= cur, cur <= iv.1) { lib::columns::util::imax(iv.1, rest) } else { rest }
+    }
+}
+
+fn next_start(ivs: [(Int, Int)], cur: Int, best: Int) -> Int {
+    if ivs == [] { best } else {
+        let lo = head(ivs).0;
+        next_start(tail(ivs), cur, if lib::columns::util::band(lo > cur, lo < best) { lo } else { best })
+    }
+}
+
+fn runs_from(ivs: [(Int, Int)], t: Int, cur: Int, last: Int) -> [Run] {
+    if cur > last {
+        []
+    } else {
+        let covered = cover_end(ivs, cur);
+        if covered >= cur {
+            runs_from(ivs, t, covered + 1, last)
+        } else {
+            let stop = next_start(ivs, cur, last + 1);
+            cons(Run { t: t, a: cur, b: stop - 1 }, runs_from(ivs, t, stop, last))
+        }
+    }
+}
+
+// Runs on tracks t through t1 - 1, one list per track, from crossing track
+// `first` to `last`.
+fn track_runs(st: [[Rect]], t: Int, t1: Int, track_o: Float, cross_o: Float, first: Int, last: Int, n_cross: Int, vertical: Bool) -> [[Run]] {
+    if t == t1 {
+        []
+    } else {
+        let center = track_o + 680. * t as Float;
+        let ivs = blocked(st[t / 16], center, cross_o, n_cross, vertical);
+        cons(runs_from(ivs, t, first, last), track_runs(st, t + 1, t1, track_o, cross_o, first, last, n_cross, vertical))
+    }
+}
+
+fn empty_runs(t: Int, t1: Int) -> [[Run]] {
+    if t == t1 { [] } else { cons([], empty_runs(t + 1, t1)) }
+}
+
+fn bank_runs(t: Int, t1: Int, a: Int, b: Int) -> [[Run]] {
+    if t == t1 { [] } else { cons(list(Run { t: t, a: a, b: b }), bank_runs(t + 1, t1, a, b)) }
+}
+
+fn concat_runs(a: [[Run]], b: [[Run]]) -> [[Run]] { lib::logic::routing::concat(a, b) }
+
+// Whether a run on the other layer's track `t` covers crossing point `c`.
+fn covers(runs: [Run], c: Int) -> Bool {
+    if runs == [] { false } else { lib::columns::util::bor(lib::columns::util::band(head(runs).a <= c, c <= head(runs).b), covers(tail(runs), c)) }
+}
+
+// Like-supply crossings of run r with the other layer's runs.
+fn crossing_count(r: Run, other: [[Run]], j: Int) -> Int {
+    if j > r.b { 0 } else {
+        let here = if covers(other[j], r.t) { 1 } else { 0 };
+        here + crossing_count(r, other, j + 2)
+    }
+}
+
+fn first_crossing(r: Run) -> Int { r.a + (r.a + r.t) % 2 }
+
+fn draw_crossings(g: Grid, r: Run, other: [[Run]], j: Int) -> Rect {
+    for k in range_full(j, r.b + 1, 2) {
+        if covers(other[k], r.t) {
+            let x = cx(g, r.t);
+            let y = cy(g, k);
+            lib::columns::util::draw_box("via.drawing", cbox(x - 75., y - 75., x + 75., y + 75.));
+        }
+    }
+    cbox(0., 0., 0., 0.)
+}
+
+// The span a run's strap covers along its track: out to the midpoints past
+// its end crossings, but only to the track edge at the ends of the grid.
+fn run_span(o: Float, r: Run, first: Int, last: Int) -> (Float, Float) {
+    (o + 680. * r.a as Float - if r.a == first { 160. } else { 340. }, o + 680. * r.b as Float + if r.b == last { 160. } else { 340. },)
+}
+
+fn layer_span(g: Grid, r: Run, vertical: Bool) -> (Float, Float) {
+    if vertical { run_span(g.y0, r, 2, g.ny - 1) } else { run_span(g.x0, r, 0, g.nx - 1) }
+}
+
+// Targets a run crosses fully, with matching supply.
+fn hits_target(g: Grid, r: Run, t: Target, vertical: Bool) -> Bool {
+    let track = if vertical { m1_track(g, r.t) } else { m2_track(g, r.t) };
+    let span = layer_span(g, r, vertical);
+    let rect = t.rect;
+    let along = if vertical { lib::columns::util::band(span.0 <= rect.y0, rect.y1 <= span.1) } else { lib::columns::util::band(span.0 <= rect.x0, rect.x1 <= span.1) };
+    let across = if vertical { lib::columns::util::band(rect.x0 <= track.0, track.1 <= rect.x1) } else { lib::columns::util::band(rect.y0 <= track.0, track.1 <= rect.y1) };
+    let tall = if vertical { rect.y1 - rect.y0 >= 260. } else { rect.x1 - rect.x0 >= 260. };
+    lib::columns::util::band(lib::columns::util::band(along, across), lib::columns::util::band(tall, lib::columns::util::band(t.supply == r.t % 2, t.skip != r.t)))
+}
+
+fn target_hits(g: Grid, r: Run, targets: [Target], vertical: Bool) -> Int {
+    if targets == [] { 0 } else { (if hits_target(g, r, head(targets), vertical) { 1 } else { 0 }) + target_hits(g, r, tail(targets), vertical) }
+}
+
+fn draw_target_vias(g: Grid, r: Run, targets: [Target], vertical: Bool) -> Rect {
+    for t in targets {
+        if hits_target(g, r, t, vertical) {
+            let rect = t.rect;
+            let area = if vertical { from_spans(m1_track(g, r.t), vspan(rect)) } else { from_spans(hspan(rect), m2_track(g, r.t)) };
+            via_cuts(area);
+        }
+    }
+    cbox(0., 0., 0., 0.)
+}
+
+// Draws the runs of one layer that connect to anything, with their vias.
+// Crossing vias are drawn from the M1 side only.
+fn draw_runs(g: Grid, tracks: [[Run]], other: [[Run]], target_st: [[Target]], vertical: Bool) -> Int {
+    for runs in tracks {
+        for r in runs {
+            let targets = target_st[r.t / 16];
+            let crossings = crossing_count(r, other, first_crossing(r));
+            if crossings + target_hits(g, r, targets, vertical) > 0 {
+                if vertical {
+                    m1(from_spans(m1_track(g, r.t), layer_span(g, r, vertical)));
+                    draw_crossings(g, r, other, first_crossing(r));
+                } else {
+                    m2(from_spans(layer_span(g, r, vertical), m2_track(g, r.t)));
+                }
+                draw_target_vias(g, r, targets, vertical);
+            }
+        }
+    }
+    0
+}
+
+// Edge banks plus the strap fill.
+fn draw_straps(g: Grid, f: SramFloorplan, routes: Shapes, feeders: Power) -> Rect {
+    let m1_blockers = lib::logic::routing::concat(m1_keepouts(f), lib::logic::routing::concat(routes.m1, feeders.m1));
+    let m2_blockers = lib::logic::routing::concat(m2_keepouts(f), lib::logic::routing::concat(routes.m2, feeders.m2));
+    let m1_stripes = stripes(m1_blockers, count(m1_blockers), g.x0, 0, g.nx / 16 + 1, true);
+    let m2_stripes = stripes(m2_blockers, count(m2_blockers), g.y0, 0, g.ny / 16 + 1, false);
+    // Per-track runs: banks on the six outer tracks of each edge (M2 skips
+    // the two lowest tracks, where the data pins jog), fill in between.
+    let m1_runs = concat_runs(
+        bank_runs(0, 6, 2, g.ny - 1),
+        concat_runs(track_runs(m1_stripes, 6, g.nx - 6, g.x0, g.y0, 2, g.ny - 1, g.ny, true), bank_runs(g.nx - 6, g.nx, 2, g.ny - 1)),
+    );
+    let m2_runs = concat_runs(
+        empty_runs(0, 2),
+        concat_runs(bank_runs(2, 6, 0, g.nx - 1), concat_runs(track_runs(m2_stripes, 6, g.ny - 6, g.y0, g.x0, 0, g.nx - 1, g.nx, false), bank_runs(g.ny - 6, g.ny, 0, g.nx - 1))),
+    );
+    let m2_target_st = target_stripes(feeders.m2_targets, count(feeders.m2_targets), g.x0, 0, g.nx / 16 + 1, true);
+    let m1_target_st = target_stripes(feeders.m1_targets, count(feeders.m1_targets), g.y0, 0, g.ny / 16 + 1, false);
+    draw_runs(g, m1_runs, m2_runs, m2_target_st, true);
+    draw_runs(g, m2_runs, m1_runs, m1_target_st, false);
+    cbox(0., 0., 0., 0.)
+}

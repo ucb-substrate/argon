@@ -185,7 +185,6 @@ cell column_exact(p: ColParams, include_wmask: Bool) {
     lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans(outline_hspan, (16840., 18200.,)));
 }
 
-
 fn contact_top_rect(
     via: Int,
     bot: Rect,
@@ -377,16 +376,24 @@ fn column_wmask_ports_exact(bit: Int, bits: Int, mux: Int, gran: Int, unit_w: Fl
     }
 }
 
-fn column_blbr_ports_exact(idx: Int, cols: Int, p: ColParams, right: Bool) -> [Rect] {
+// The write-mask decoder's M1 power rails in column-peripheral coordinates.
+fn column_m1_power_rails(p: ColParams, vdd: Bool) -> [Rect] {
+    let rw = lib::columns::util::row_w(p.cols, p.mux.mux_ratio);
+    lib::columns::util::shift_rects(wmask_m1_straps(rw, p.wmask_decoder, wmask_placed_y(p.wmask_decoder), vdd, 0), rw / 2., 0.)
+}
+
+// M1 bitline landing pads on the top edge of the column row. Columns
+// alternate in orientation, so the pads swap sides on odd columns.
+fn column_bitline_pads(idx: Int, cols: Int, p: ColParams, right: Bool) -> [Rect] {
     if idx == cols {
         []
     } else {
         let mux = p.mux.mux_ratio;
-        let x = lib::columns::util::bit_x(idx, mux) + if right { 750. } else { 150. };
-        cons(
-            lib::columns::util::cbox(x, 0., x + 300., column_outline_top(p)),
-            column_blbr_ports_exact(idx + 1, cols, p, right)
-        )
+        let even = (idx % mux) % 2 == 0;
+        let offset = if even == right { 715. } else { 345. };
+        let x = lib::columns::util::bit_x(idx, mux) + offset;
+        let top = column_outline_top(p);
+        cons(lib::columns::util::cbox(x, top - 140., x + 140., top), column_bitline_pads(idx + 1, cols, p, right))
     }
 }
 
@@ -401,27 +408,17 @@ fn column_data_var_ports_exact(group: Int, words: Int, mux: Int, dout: Bool) -> 
     }
 }
 
-fn column_select_segments_var(group: Int, words: Int, mux: Int, bit: Int, complement: Bool) -> [Rect] {
-    if group == words {
+// Full-width M2 select rails of the column muxes: complements below the
+// mux devices, true selects above them.
+fn column_select_rails(bit: Int, p: ColParams, rw: Float, complement: Bool) -> [Rect] {
+    if bit == p.mux.mux_ratio {
         []
     } else {
-        let x = lib::columns::util::word_x(group, mux);
-        let y = 54150. + bit as Float * 260. + if complement { 1040. } else { 0. };
-        cons(
-            lib::columns::util::cbox(x, y, x + lib::columns::util::column_w(mux), y + 180.),
-            column_select_segments_var(group + 1, words, mux, bit, complement)
-        )
-    }
-}
-
-fn column_select_ports_var(bit: Int, mux: Int, words: Int, complement: Bool) -> [[Rect]] {
-    if bit == mux {
-        []
-    } else {
-        cons(
-            column_select_segments_var(0, words, mux, bit, complement),
-            column_select_ports_var(bit + 1, mux, words, complement)
-        )
+        let my = column_mux_tap_y(p);
+        let sw = p.mux.sel_width as Float;
+        let pitch = sw + lib::columns::util::fmax(sw / 4., 140.);
+        let y0 = if complement { my - pitch * bit as Float - sw } else { my + lib::columns::mux::tgm_params_nmos_bbox(p.mux).y1 + pitch * bit as Float };
+        cons(lib::columns::util::cbox(0., y0, rw, y0 + sw), column_select_rails(bit + 1, p, rw, complement))
     }
 }
 
@@ -481,12 +478,14 @@ fn draw_column_write_en_routes(bit: Int, gran: Int, decoder: DecoderParams, unit
     draw_column_write_en_group(bit, 0, gran, words, p, y_via.1, yb_via.1)
 }
 
-fn draw_precharge_full_pc_b(rw: Float, p: ColParams) -> Rect {
+fn draw_precharge_full_pc_b(rw: Float, p: ColParams) -> [Rect] {
     let pre_y = column_precharge_y(p);
     let bot = lib::columns::precharge::pc_gate_bot_span(p.pc);
     let top = lib::columns::precharge::pc_gate_top_span(p.pc);
-    lib::columns::util::met2_port(0., pre_y + bot.0, rw, pre_y + bot.1);
-    lib::columns::util::met2_port(0., pre_y + top.0, rw, pre_y + top.1)
+    list(
+        lib::columns::util::met2_port(0., pre_y + bot.0, rw, pre_y + bot.1),
+        lib::columns::util::met2_port(0., pre_y + top.0, rw, pre_y + top.1),
+    )
 }
 
 fn draw_precharge_full_vdd(rw: Float, p: ColParams) -> Rect {
@@ -499,63 +498,87 @@ fn wdrv_power_calc(p: WriteDriverParams, vdd_power: Bool) -> Rect {
     lib::columns::util::rect_from_spans(lib::columns::write_driver::wdrv_sa_hspan(), lib::columns::write_driver::wdrv_power_span(p, vdd_power))
 }
 
-fn draw_column_latch_power_straps(rw: Float, vdd_power: Bool) -> Rect {
-    for row in std::range(3) {
-        let yoff = if row == 0 { 0. } else { if row == 1 { -4890. } else { -7900. } };
+fn draw_column_latch_power_straps(rw: Float, vdd_power: Bool) -> [Rect] {
+    let rows = list(0., -4890., -7900.);
+    let straps = draw_column_latch_row_straps(rw, vdd_power, rows);
+    if vdd_power {
+        straps
+    } else {
+        let mn = lib::columns::diff_latch::lat_center_span(lib::columns::util::rect_cy_i(lib::columns::diff_latch::lat_nmos_inst_port(1, 0., -3010.)), 800.);
+        cons(lib::columns::util::met2_port(0., 27040. + mn.0, rw, 27040. + mn.1), straps)
+    }
+}
+
+fn draw_column_latch_row_straps(rw: Float, vdd_power: Bool, rows: [Float]) -> [Rect] {
+    if rows == [] {
+        []
+    } else {
+        let yoff = head(rows);
         let span = if vdd_power {
             lib::columns::diff_latch::lat_center_span(lib::columns::util::rect_cy_i(lib::columns::diff_latch::lat_finv_inst_port(4, 0., yoff)), 800.)
         } else {
             lib::columns::diff_latch::lat_center_span(lib::columns::util::rect_cy_i(lib::columns::diff_latch::lat_finv_inst_port(2, 0., yoff)), 800.)
         };
-        lib::columns::util::met2_port(0., 27040. + span.0, rw, 27040. + span.1);
-    }
-    if vdd_power {
-        crect(x0=0., y0=0., x1=0., y1=0.)
-    } else {
-        let mn = lib::columns::diff_latch::lat_center_span(lib::columns::util::rect_cy_i(lib::columns::diff_latch::lat_nmos_inst_port(1, 0., -3010.)), 800.);
-        lib::columns::util::met2_port(0., 27040. + mn.0, rw, 27040. + mn.1)
+        cons(lib::columns::util::met2_port(0., 27040. + span.0, rw, 27040. + span.1), draw_column_latch_row_straps(rw, vdd_power, tail(rows)))
     }
 }
 
-fn draw_column_cent_latch_power_straps(rw: Float, vdd_power: Bool) -> Rect {
+fn draw_column_cent_latch_power_straps(rw: Float, vdd_power: Bool) -> [Rect] {
     if vdd_power {
-        lib::columns::util::met2_port(0., 17120., rw, 17920.);
-        lib::columns::util::met2_port(0., 20130., rw, 20930.);
-        lib::columns::util::met2_port(0., 25020., rw, 25820.)
+        list(
+            lib::columns::util::met2_port(0., 17120., rw, 17920.),
+            lib::columns::util::met2_port(0., 20130., rw, 20930.),
+            lib::columns::util::met2_port(0., 25020., rw, 25820.),
+        )
     } else {
-        lib::columns::util::met2_port(0., 18440., rw, 19240.);
-        lib::columns::util::met2_port(0., 21450., rw, 22250.);
-        lib::columns::util::met2_port(0., 23130., rw, 23930.);
-        lib::columns::util::met2_port(0., 26340., rw, 27140.)
+        list(
+            lib::columns::util::met2_port(0., 18440., rw, 19240.),
+            lib::columns::util::met2_port(0., 21450., rw, 22250.),
+            lib::columns::util::met2_port(0., 23130., rw, 23930.),
+            lib::columns::util::met2_port(0., 26340., rw, 27140.),
+        )
     }
 }
 
-fn draw_row_m2_straps(rw: Float, p: ColParams, vdd_power: Bool) -> Rect {
+fn concat_rects(a: [Rect], b: [Rect]) -> [Rect] {
+    if a == [] { b } else { cons(head(a), concat_rects(tail(a), b)) }
+}
+
+// Full-width M2 supply rails of the column row, from bottom-up blocks.
+fn draw_row_m2_straps(rw: Float, p: ColParams, vdd_power: Bool) -> [Rect] {
     let mux = p.mux.mux_ratio;
     let sense_shift = column_write_top(p) - 36385.;
+    let wp = lib::columns::util::rect_translate(wdrv_power_calc(p.wrdriver, vdd_power), column_offset_x(mux) + 2135., column_write_y());
+    let vv = lib::columns::mux::tgm_vdd_vss_spans(p.mux);
+    let mux_y = column_mux_tap_y(p);
     if vdd_power {
-        lib::columns::util::met2_port(0., 5650., rw, 7450.);
-        let wp = lib::columns::util::rect_translate(wdrv_power_calc(p.wrdriver, true), column_offset_x(mux) + 2135., column_write_y());
-        lib::columns::util::met2_port(0., wp.y0, rw, wp.y1);
-        lib::columns::util::met2_port(0., wp.y0, rw, wp.y1);
-        lib::columns::util::met2_port(0., 38925. + sense_shift, rw, 39215. + sense_shift);
-        draw_column_latch_power_straps(rw, true);
-        draw_column_cent_latch_power_straps(rw, true);
-        draw_precharge_full_vdd(rw, p);
-        let vv = lib::columns::mux::tgm_vdd_vss_spans(p.mux);
-        let mux_y = column_mux_tap_y(p);
-        lib::columns::util::met2_port(0., mux_y + vv.0.0, rw, mux_y + vv.0.1)
+        let fixed = list(
+            lib::columns::util::met2_port(0., 5650., rw, 7450.),
+            lib::columns::util::met2_port(0., wp.y0, rw, wp.y1),
+            lib::columns::util::met2_port(0., 38925. + sense_shift, rw, 39215. + sense_shift),
+            draw_precharge_full_vdd(rw, p),
+            lib::columns::util::met2_port(0., mux_y + vv.0.0, rw, mux_y + vv.0.1),
+        );
+        concat_rects(fixed, concat_rects(draw_column_latch_power_straps(rw, true), draw_column_cent_latch_power_straps(rw, true)))
     } else {
-        lib::columns::util::met2_port(0., 9390., rw, 11190.);
-        let wp = lib::columns::util::rect_translate(wdrv_power_calc(p.wrdriver, false), column_offset_x(mux) + 2135., column_write_y());
-        lib::columns::util::met2_port(0., wp.y0, rw, wp.y1);
-        lib::columns::util::met2_port(0., wp.y0, rw, wp.y1);
-        lib::columns::util::met2_port(0., 51485. + sense_shift, rw, 51775. + sense_shift);
-        draw_column_latch_power_straps(rw, false);
-        draw_column_cent_latch_power_straps(rw, false);
-        let vv = lib::columns::mux::tgm_vdd_vss_spans(p.mux);
-        let mux_y = column_mux_tap_y(p);
-        lib::columns::util::met2_port(0., mux_y + vv.1.0, rw, mux_y + vv.1.1)
+        let fixed = list(
+            lib::columns::util::met2_port(0., 9390., rw, 11190.),
+            lib::columns::util::met2_port(0., wp.y0, rw, wp.y1),
+            lib::columns::util::met2_port(0., 51485. + sense_shift, rw, 51775. + sense_shift),
+            lib::columns::util::met2_port(0., mux_y + vv.1.0, rw, mux_y + vv.1.1),
+        );
+        concat_rects(fixed, concat_rects(draw_column_latch_power_straps(rw, false), draw_column_cent_latch_power_straps(rw, false)))
+    }
+}
+
+// The write-mask decoder's M1 power straps, which run the full row width.
+fn wmask_m1_straps(rw: Float, decoder: DecoderParams, wmask_y: Float, vdd_power: Bool, stage: Int) -> [Rect] {
+    if stage == lib::columns::decoder::dec_num_stages(decoder) {
+        []
+    } else {
+        let device_span = if vdd_power { lib::columns::decoder::dec_region_psdm_span(stage, decoder) } else { lib::columns::decoder::dec_region_nsdm_span(stage, decoder) };
+        let y = lib::columns::decoder::dec_tile_abs_y(stage, decoder) + lib::columns::decoder::wmask_stage_y(decoder) + wmask_y;
+        lib::columns::util::concat_rects(lib::columns::decoder::region_straps(device_span, y, 0. - rw / 2., 0), wmask_m1_straps(rw, decoder, wmask_y, vdd_power, stage + 1))
     }
 }
 
@@ -575,7 +598,6 @@ fn draw_wmask_power_straps_to_row(rw: Float, bits: Int, mux: Int, decoder: Decod
         lib::columns::util::met2_port(0., wmask_y + 9390., rw, wmask_y + 11190.)
     }
 }
-
 
 cell column_peripherals_exact(p: ColParams) {
     let cols = p.cols;
@@ -611,8 +633,10 @@ cell column_peripherals_exact(p: ColParams) {
     let dout = column_dout_ports_exact(0, words, mux, wmask_y, wmask_we);
     let wmask = column_wmask_ports_exact(0, bits, mux, gran, unit_w, wmask_y, wmask_y);
 
-    let vdd = draw_row_m2_straps(rw, p, true);
-    let vss = draw_row_m2_straps(rw, p, false);
+    let wmask_vdd = draw_wmask_power_straps_to_row(rw, bits, mux, decoder, unit_w, wmask_y, true);
+    let wmask_vss = draw_wmask_power_straps_to_row(rw, bits, mux, decoder, unit_w, wmask_y, false);
+    let vdd = cons(wmask_vdd, draw_row_m2_straps(rw, p, true));
+    let vss = cons(wmask_vss, draw_row_m2_straps(rw, p, false));
     let pc_b = draw_precharge_full_pc_b(rw, p);
     let precharge_en = pc_b;
     let sense_en = list(
@@ -627,13 +651,11 @@ cell column_peripherals_exact(p: ColParams) {
         lib::columns::util::met2_port(0., 3940., rw, 4260.),
         lib::columns::util::rect_translate(lib::columns::util::cbox(0., 3940., lib::columns::decoder::wmask_full_right(bits, mux, decoder, unit_w), 4260.), 650., wmask_y)
     );
-    draw_wmask_power_straps_to_row(rw, bits, mux, decoder, unit_w, wmask_y, true);
-    draw_wmask_power_straps_to_row(rw, bits, mux, decoder, unit_w, wmask_y, false);
 
     let we = wmask_we;
     let write_en = we;
-    let sel = column_select_ports_var(0, mux, words, false);
-    let sel_b = column_select_ports_var(0, mux, words, true);
-    let bl = column_blbr_ports_exact(0, cols, p, false);
-    let br = column_blbr_ports_exact(0, cols, p, true);
+    let sel = column_select_rails(0, p, rw, false);
+    let sel_b = column_select_rails(0, p, rw, true);
+    let bl = column_bitline_pads(0, cols, p, false);
+    let br = column_bitline_pads(0, cols, p, true);
 }

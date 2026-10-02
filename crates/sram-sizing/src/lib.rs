@@ -9,6 +9,14 @@ use std::fmt::Write as _;
 
 use geometry::snap::snap_to_grid;
 
+mod control;
+
+pub use control::{
+    AndStageSizing, BufferSizing, ControlLogicParams, DecoderNodeSizing, PeripherySizing,
+    RowDecoderSizing,
+    control_logic_params, periphery_sizing,
+};
+
 const GRID: i32 = 50;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -116,6 +124,19 @@ pub struct SramLayoutParams {
     pub replica_precharge: PrechargeParams,
     pub replica_column: ReplicaColumnParams,
     pub replica_routing: ReplicaRoutingParams,
+    pub control: ControlLogicParams,
+    /// `None` for decoder shapes the Argon layout does not build yet.
+    pub periphery: Option<PeripherySizing>,
+    pub routing_tracks: RoutingTracks,
+}
+
+/// Routing tracks for each column control bus, by load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoutingTracks {
+    pub pc_b: i32,
+    pub sense_en: i32,
+    pub write_driver_en: i32,
+    pub col_dec: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -194,6 +215,14 @@ impl SramParams {
         };
         let replica_column = replica_column_params(self, &standalone_col, replica_precharge);
         let replica_routing = replica_routing_params(self, &standalone_col, &col, replica_column);
+        let control = control_logic_params(self, &standalone_col);
+        let periphery = periphery_sizing(self, &standalone_col);
+        let routing_tracks = RoutingTracks {
+            pc_b: pc_b_routing_tracks(&standalone_col),
+            sense_en: sense_en_routing_tracks(&standalone_col),
+            write_driver_en: write_driver_en_routing_tracks(&standalone_col),
+            col_dec: col_decoder_routing_tracks(&standalone_col),
+        };
 
         SramLayoutParams {
             sram: self,
@@ -204,6 +233,9 @@ impl SramParams {
             replica_precharge,
             replica_column,
             replica_routing,
+            control,
+            periphery,
+            routing_tracks,
         }
     }
 }
@@ -292,42 +324,26 @@ fn pc_b_routing_tracks(col: &ColParams) -> i32 {
     )
 }
 
+fn sense_en_routing_tracks(col: &ColParams) -> i32 {
+    // One track per 32 sense amplifiers' load, from 2 to 8 tracks.
+    const SAEN: f64 = 393.347e-15 / 32.0;
+    let saen_cap = SAEN * (col.cols / col.mux.mux_ratio) as f64;
+    ((saen_cap / (SAEN * 32.)).ceil() as i32).clamp(2, 8)
+}
+
+fn write_driver_en_routing_tracks(col: &ColParams) -> i32 {
+    // One track per 8 write drivers' load, from 2 to 8 tracks.
+    const WE: f64 = 36.462e-15 / 4.0;
+    let wmask_bits = col.cols / col.mux.mux_ratio / col.wmask_granularity;
+    ((WE * wmask_bits as f64 / (WE * 8.)).ceil() as i32).clamp(2, 8)
+}
+
 fn col_decoder_routing_tracks(col: &ColParams) -> i32 {
     let outputs = col.cols / col.mux.mux_ratio;
     clamp(ceil_div(outputs * col.mux.pwidth, 64 * 3600), 2, 4)
 }
 
-fn powi(value: f64, exponent: i32) -> f64 {
-    (0..exponent).fold(1.0, |product, _| product * value)
-}
-
-fn nth_root(value: f64, degree: i32) -> f64 {
-    // Match the old Argon implementation exactly: Newton iteration starts at
-    // 3 and runs 24 times.  Avoiding `powf` also avoids platform-dependent
-    // rounding near the 50 nm sizing grid.
-    let mut estimate = 3.0;
-    for _ in 0..24 {
-        estimate =
-            ((degree - 1) as f64 * estimate + value / powi(estimate, degree - 1)) / degree as f64;
-    }
-    estimate
-}
-
 fn decoder_params(granularity: i32, mux_ratio: i32, driver_width: i32) -> DecoderParams {
-    const WRITE_ENABLE_CAP: f64 = 0.000_000_000_000_012_054_7;
-    const INVERTER_INPUT_CAP: f64 = 0.000_000_000_000_004_482_092_764_998_187;
-    const NAND_TO_INV_RESISTANCE: f64 = 1_478.364_147_093_855 / 1_422.118_502_462_849;
-
-    let fanout =
-        granularity as f64 * WRITE_ENABLE_CAP * (driver_width as f64 / 3000.0) / INVERTER_INPUT_CAP;
-    let buffer_inverters = if fanout < 27.0 {
-        2
-    } else if fanout < 243.0 {
-        4
-    } else {
-        6
-    };
-    let effort = nth_root(NAND_TO_INV_RESISTANCE * fanout, buffer_inverters + 1);
     // DecoderStagePhysicalDesignScript caps electrical folding by the width
     // available to one write-mask group. These are the minimum-style decoder
     // pitch/tap values and SRAM bitcell/tap pitches used by SRAM22.
@@ -336,19 +352,9 @@ fn decoder_params(granularity: i32, mux_ratio: i32, driver_width: i32) -> Decode
     let group_pitch = 4 * 1580 + 1000;
     let taps = ceil_div(max_width, group_pitch) + 1;
     let folding_limit = ((max_width - 1000 * taps) / 1580).max(1);
-    let stages = (0..buffer_inverters + 2)
-        .map(|stage| {
-            let scale = powi(effort, stage.min(buffer_inverters)) / NAND_TO_INV_RESISTANCE;
-            let base_n = if stage == 0 {
-                2000
-            } else {
-                scale_width(1000, scale, 500)
-            };
-            let base_p = if stage == 0 {
-                2500
-            } else {
-                scale_width(2500, scale, 1250)
-            };
+    let stages = control::wmask_driver_widths(granularity, driver_width)
+        .into_iter()
+        .map(|(base_n, base_p)| {
             let folds = (base_n.min(base_p) / 1800).max(1).min(folding_limit);
             DecoderStageParams {
                 nwidth: round_positive(base_n as f64 / folds as f64 / 10.0) * 10,
@@ -484,6 +490,93 @@ fn render_decoder(out: &mut String, p: &DecoderParams) {
     .unwrap();
 }
 
+fn render_gate_list(out: &mut String, gates: &[PrimitiveGateParams]) {
+    for gate in gates {
+        out.push_str("cons(");
+        render_gate(out, *gate);
+        out.push_str(", ");
+    }
+    out.push_str("[]");
+    for _ in gates {
+        out.push(')');
+    }
+}
+
+fn render_and_stage(out: &mut String, p: &AndStageSizing) {
+    write!(out, "AndStageSizing {{ inputs: {}, nand: ", p.inputs).unwrap();
+    render_gate(out, p.nand);
+    out.push_str(", inv: ");
+    render_gate(out, p.inv);
+    out.push_str(", invs: ");
+    render_gate_list(out, &p.invs);
+    out.push_str(" }");
+}
+
+fn render_buffer(out: &mut String, p: &BufferSizing) {
+    out.push_str("BufferSizing { stages: ");
+    render_gate_list(out, &p.stages);
+    out.push_str(" }");
+}
+
+fn render_decoder_node(out: &mut String, p: &DecoderNodeSizing) {
+    write!(out, "DecoderNodeSizing {{ inputs: {}, nand: ", p.inputs).unwrap();
+    render_gate(out, p.nand);
+    out.push_str(", inv: ");
+    render_gate(out, p.inv);
+    out.push_str(", invs: ");
+    render_gate_list(out, &p.invs);
+    write!(out, ", num: {}, children: ", p.num).unwrap();
+    for child in &p.children {
+        write!(out, "cons({child}, ").unwrap();
+    }
+    out.push_str("[]");
+    for _ in &p.children {
+        out.push(')');
+    }
+    out.push_str(" }");
+}
+
+fn render_periphery(out: &mut String, p: &PeripherySizing) {
+    out.push_str(
+        "PeripherySizing {
+            row_decoder: RowDecoderSizing {
+                nodes: ",
+    );
+    for (i, node) in p.row_decoder.nodes.iter().enumerate() {
+        out.push_str("cons(");
+        render_decoder_node(out, node);
+        write!(out, ",\n{:indent$}", "", indent = 20 + 4 * i).unwrap();
+    }
+    out.push_str("[]");
+    for _ in &p.row_decoder.nodes {
+        out.push(')');
+    }
+    out.push_str(
+        ",
+            },
+            col_decoder: ",
+    );
+    render_and_stage(out, &p.col_decoder);
+    for (name, buffer) in [
+        ("pc_b_buffer", &p.pc_b_buffer),
+        ("sense_en_buffer", &p.sense_en_buffer),
+        ("write_driver_en_buffer", &p.write_driver_en_buffer),
+        ("wlen_buffer", &p.wlen_buffer),
+    ] {
+        write!(
+            out,
+            ",
+            {name}: "
+        )
+        .unwrap();
+        render_buffer(out, buffer);
+    }
+    out.push_str(
+        ",
+        }",
+    );
+}
+
 fn render_col(out: &mut String, p: &ColParams) {
     out.push_str("ColParams {\n            pc: ");
     render_precharge(out, p.pc);
@@ -517,6 +610,13 @@ pub fn render_argon_module(function_name: &str, p: &SramLayoutParams) -> String 
          use lib::params::SramParams;\n\
          use lib::params::ReplicaColumnParams;\n\
          use lib::params::ReplicaRoutingParams;\n\
+         use lib::params::ControlLogicParams;\n\
+         use lib::params::AndStageSizing;\n\
+         use lib::params::BufferSizing;\n\
+         use lib::params::DecoderNodeSizing;\n\
+         use lib::params::RowDecoderSizing;\n\
+         use lib::params::PeripherySizing;\n\
+         use lib::params::RoutingTracks;\n\
          use lib::params::SramLayoutParams;\n\n",
     );
     writeln!(out, "fn {function_name}() -> SramLayoutParams {{").unwrap();
@@ -533,6 +633,16 @@ pub fn render_argon_module(function_name: &str, p: &SramLayoutParams) -> String 
     out.push_str(",\n");
     writeln!(out, "        replica_column: ReplicaColumnParams {{ gate_target: {}, drain_n_target: {}, drain_p_target: {}, max_height: {}, gate_width: {}, drain_n_width: {}, drain_p_width: {}, units: {} }},", p.replica_column.gate_target, p.replica_column.drain_n_target, p.replica_column.drain_p_target, p.replica_column.max_height, p.replica_column.gate_width, p.replica_column.drain_n_width, p.replica_column.drain_p_width, p.replica_column.units).unwrap();
     writeln!(out, "        replica_routing: ReplicaRoutingParams {{ m0_width: {}, m0_height: {}, m1_width: {}, m1_height: {}, tracks: {} }},", p.replica_routing.m0_width, p.replica_routing.m0_height, p.replica_routing.m1_width, p.replica_routing.m1_height, p.replica_routing.tracks).unwrap();
+    writeln!(out, "        control: ControlLogicParams {{ decoder_delay_invs: {}, wlen_pulse_invs: {}, pc_set_delay_invs: {}, wrdrven_set_delay_invs: {} }},", p.control.decoder_delay_invs, p.control.wlen_pulse_invs, p.control.pc_set_delay_invs, p.control.wrdrven_set_delay_invs).unwrap();
+    out.push_str("        periphery: ");
+    let periphery = p.periphery.as_ref().unwrap_or_else(|| {
+        panic!(
+            "no Argon layout for the column decoder of mux {}: it needs a single AND2 or AND3 stage",
+            p.sram.mux_ratio
+        )
+    });
+    render_periphery(&mut out, periphery);
+    writeln!(out, ",\n        routing_tracks: RoutingTracks {{ pc_b: {}, sense_en: {}, write_driver_en: {}, col_dec: {} }},", p.routing_tracks.pc_b, p.routing_tracks.sense_en, p.routing_tracks.write_driver_en, p.routing_tracks.col_dec).unwrap();
     out.push_str("    }\n}\n");
     out
 }
@@ -599,6 +709,64 @@ mod tests {
                 tracks: 6,
             }
         );
+        assert_eq!(
+            sized.control,
+            ControlLogicParams {
+                decoder_delay_invs: 18,
+                wlen_pulse_invs: 13,
+                pc_set_delay_invs: 16,
+                wrdrven_set_delay_invs: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn control_chains_match_published_sram22_macros() {
+        // (granularity, mux, words, width) and the chain lengths in SRAM22's
+        // published sky130 macros: decoder replica, wordline pulse, precharge
+        // set, and write-driver set delays.
+        let macros = [
+            ((8, 8, 1024, 32), (30, 15, 16, 2)),
+            ((8, 4, 1024, 64), (28, 15, 20, 2)),
+            ((1, 8, 1024, 8), (30, 15, 14, 2)),
+            ((8, 4, 128, 16), (22, 13, 16, 2)),
+            ((8, 4, 128, 24), (22, 13, 16, 2)),
+            ((8, 4, 128, 32), (22, 13, 16, 2)),
+            ((20, 4, 128, 40), (22, 13, 16, 2)),
+            ((8, 8, 2048, 32), (32, 15, 16, 4)),
+            ((8, 8, 2048, 64), (32, 27, 18, 2)),
+            ((1, 8, 2048, 8), (30, 15, 14, 2)),
+            ((8, 4, 256, 128), (22, 27, 18, 2)),
+            ((8, 8, 256, 16), (24, 13, 12, 2)),
+            ((8, 4, 256, 32), (22, 13, 16, 2)),
+            ((8, 4, 256, 64), (22, 13, 18, 2)),
+            ((1, 8, 256, 8), (22, 13, 16, 2)),
+            ((8, 4, 512, 128), (28, 25, 18, 2)),
+            ((8, 4, 512, 32), (26, 15, 18, 2)),
+            ((8, 4, 512, 64), (28, 15, 20, 2)),
+            ((1, 8, 512, 8), (24, 13, 16, 2)),
+            ((22, 4, 64, 22), (18, 13, 18, 2)),
+            ((8, 4, 64, 24), (18, 13, 16, 2)),
+            ((8, 4, 64, 32), (18, 13, 16, 2)),
+        ];
+        for (
+            (granularity, mux_ratio, num_words, data_width),
+            (decoder, pulse, pc_set, wrdrven_set),
+        ) in macros
+        {
+            let p = SramParams::new(granularity, mux_ratio, num_words, data_width).unwrap();
+            let col = practical_col_params(p);
+            assert_eq!(
+                control_logic_params(p, &col),
+                ControlLogicParams {
+                    decoder_delay_invs: decoder,
+                    wlen_pulse_invs: pulse,
+                    pc_set_delay_invs: pc_set,
+                    wrdrven_set_delay_invs: wrdrven_set,
+                },
+                "{num_words}x{data_width}m{mux_ratio}w{granularity}"
+            );
+        }
     }
 
     #[test]
@@ -625,6 +793,12 @@ mod tests {
                         }));
                         assert!(sized.replica_column.units > 0);
                         assert!(sized.replica_routing.tracks > 0);
+                        let control = sized.control;
+                        assert_eq!(control.decoder_delay_invs % 2, 0);
+                        assert_eq!(control.wlen_pulse_invs % 2, 1);
+                        assert_eq!(control.pc_set_delay_invs % 2, 0);
+                        assert_eq!(control.wrdrven_set_delay_invs % 2, 0);
+                        assert!(control.wrdrven_set_delay_invs >= 2);
                     }
                 }
             }

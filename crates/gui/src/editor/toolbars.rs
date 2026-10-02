@@ -1474,6 +1474,9 @@ impl HierarchySideBar {
                                         .get_mut(&scope_path)
                                         .unwrap()
                                         .visible = !visible;
+                                    // Showing one scope can leave others hidden.
+                                    state.all_scopes_visible =
+                                        !visible && state.state.values().all(|scope| scope.visible);
                                     cx.notify();
                                 }
                             })
@@ -1897,6 +1900,7 @@ impl Render for HierarchySideBar {
                                             {
                                                 state.visible = true;
                                             }
+                                            cell.all_scopes_visible = true;
                                         }
                                         cx.notify();
                                     })
@@ -1924,6 +1928,7 @@ impl Render for HierarchySideBar {
                                             {
                                                 state.visible = false;
                                             }
+                                            cell.all_scopes_visible = cell.state.is_empty();
                                         }
                                         cx.notify();
                                     })

@@ -721,6 +721,86 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn sse_edits_from_one_layout_are_placed_after_each_other() {
+        assert_completes("placing consecutive SSE edits", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let source = "cell top() {\n    let r = rect(\"met1\", x0i = 0., y0i = 0., x1i = 10., y1i = 10.)!;\n}\n";
+            let mut session = Session::new(source).await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("sse_edits");
+            let analyzer = session.connect_analyzer().await;
+            analyzer
+                .register(context::current(), session.gui_addr())
+                .await
+                .expect("register headless GUI");
+            let (revision, path) = loop {
+                if let GuiEvent::UpdateCell {
+                    revision,
+                    kind: OutputKind::Data,
+                    scope: Some(scope),
+                    ..
+                } = session.next_event().await
+                {
+                    break (revision, scope.path);
+                }
+            };
+            // Every edit names spans in the layout compiled at `revision`, as
+            // a GUI does while the drags before it are still compiling.
+            let update = |kwarg: &str, value: &str, base_revision: u64| {
+                let start = source.find(kwarg).unwrap() + kwarg.len();
+                let len = source[start..].find([',', ')']).unwrap();
+                let edit = analyzer::rpc::ValueEdit {
+                    span: Span {
+                        path: path.clone(),
+                        span: cfgrammar::Span::new(start, start + len),
+                    },
+                    value: value.to_owned(),
+                };
+                let analyzer = analyzer.clone();
+                async move {
+                    analyzer
+                        .update_values(context::current(), vec![edit], vec![], Some(base_revision))
+                        .await
+                        .expect("SSE edit should reach analyzer")
+                }
+            };
+
+            // Lengthening `x0i` shifts every later span in the file.
+            assert!(update("x0i = ", "12345.", revision).await.is_some());
+            // Sent before that edit has compiled.
+            assert!(update("y0i = ", "7.", revision).await.is_some());
+            loop {
+                if let GuiEvent::UpdateCell {
+                    revision: edited,
+                    kind: OutputKind::Data,
+                    ..
+                } = session.next_event().await
+                    && edited > revision
+                {
+                    break;
+                }
+            }
+            // Sent after the analyzer has compiled the edited source.
+            assert!(update("x1i = ", "20.", revision).await.is_some());
+            assert!(
+                update("y1i = ", "3.", revision + 1000).await.is_none(),
+                "a layout the analyzer did not edit from is rejected"
+            );
+
+            std::fs::write(&session.gui_edit_ack, "ok\n").expect("request the edited source");
+            std::fs::write(&session.ack, "ok\n").expect("acknowledge GUI observations");
+            finish_nvim(child).await;
+            let edited = std::fs::read_to_string(session.project.join("lib.ar"))
+                .expect("read edited source");
+            assert!(
+                edited.contains("x0i = 12345., y0i = 7., x1i = 20., y1i = 10."),
+                "{edited}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn analyzer_errors_are_mirrored_to_the_gui() {
         assert_completes("waiting for analyzer error in GUI", async {
             let _guard = FULL_STACK_LOCK.lock().await;

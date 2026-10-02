@@ -355,6 +355,12 @@ elseif vim.env.ARGON_TEST_MODE == 'navigation' then
       .. ' got '
       .. tostring(shifted.range.start.line)
   )
+elseif vim.env.ARGON_TEST_MODE == 'sse_edits' then
+  -- The Rust test drives SSE edits over RPC, then asks for the result on disk.
+  wait_for('SSE edits', function()
+    return vim.uv.fs_stat(vim.env.ARGON_TEST_GUI_EDIT_ACK) ~= nil
+  end)
+  vim.cmd('write')
 elseif vim.env.ARGON_TEST_MODE == 'rpc_errors' then
   -- The Rust test drives the analyzer RPC directly and acknowledges the
   -- mirrored GUI error after observing it.

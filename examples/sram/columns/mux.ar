@@ -346,7 +346,6 @@ fn draw_tgm_tap_split_pair(center_x: Float, p: TGateMuxParams, width: Float) -> 
     draw_tgm_tap_split_met(tr0, spans.3, center_x, width)
 }
 
-
 cell tgate_mux_unit(p: TGateMuxParams, idx: Int) {
     let width = 1200.;
     let length = p.length as Float;

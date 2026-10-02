@@ -12,6 +12,13 @@ use lib::params::ColParams;
 use lib::params::SramParams;
 use lib::params::ReplicaColumnParams;
 use lib::params::ReplicaRoutingParams;
+use lib::params::ControlLogicParams;
+use lib::params::AndStageSizing;
+use lib::params::BufferSizing;
+use lib::params::DecoderNodeSizing;
+use lib::params::RowDecoderSizing;
+use lib::params::PeripherySizing;
+use lib::params::RoutingTracks;
 use lib::params::SramLayoutParams;
 
 fn sram() -> SramLayoutParams {
@@ -38,5 +45,20 @@ fn sram() -> SramLayoutParams {
         replica_precharge: PrechargeParams { length: 150, pull_up_width: 800, equalizer_width: 500, en_b_width: 360 },
         replica_column: ReplicaColumnParams { gate_target: 550, drain_n_target: 1200, drain_p_target: 1700, max_height: 5840, gate_width: 800, drain_n_width: 1200, drain_p_width: 1700, units: 1 },
         replica_routing: ReplicaRoutingParams { m0_width: 300, m0_height: 1450, m1_width: 2200, m1_height: 6250, tracks: 6 },
+        control: ControlLogicParams { decoder_delay_invs: 18, wlen_pulse_invs: 13, pc_set_delay_invs: 16, wrdrven_set_delay_invs: 2 },
+        periphery: PeripherySizing {
+            row_decoder: RowDecoderSizing {
+                nodes: cons(DecoderNodeSizing { inputs: 2, nand: PrimitiveGateParams { nwidth: 2400, pwidth: 3000, length: 150 }, inv: PrimitiveGateParams { nwidth: 2800, pwidth: 7050, length: 150 }, invs: cons(PrimitiveGateParams { nwidth: 6850, pwidth: 17200, length: 150 }, cons(PrimitiveGateParams { nwidth: 16800, pwidth: 42000, length: 150 }, [])), num: 16, children: cons(1, cons(2, [])) },
+                    cons(DecoderNodeSizing { inputs: 2, nand: PrimitiveGateParams { nwidth: 2000, pwidth: 2500, length: 150 }, inv: PrimitiveGateParams { nwidth: 2350, pwidth: 5900, length: 150 }, invs: [], num: 4, children: [] },
+                        cons(DecoderNodeSizing { inputs: 2, nand: PrimitiveGateParams { nwidth: 2000, pwidth: 2500, length: 150 }, inv: PrimitiveGateParams { nwidth: 2350, pwidth: 5900, length: 150 }, invs: [], num: 4, children: [] },
+                            []))),
+            },
+            col_decoder: AndStageSizing { inputs: 2, nand: PrimitiveGateParams { nwidth: 2000, pwidth: 2500, length: 150 }, inv: PrimitiveGateParams { nwidth: 2300, pwidth: 5800, length: 150 }, invs: cons(PrimitiveGateParams { nwidth: 5550, pwidth: 13900, length: 150 }, cons(PrimitiveGateParams { nwidth: 13400, pwidth: 33500, length: 150 }, [])) },
+            pc_b_buffer: BufferSizing { stages: cons(PrimitiveGateParams { nwidth: 1000, pwidth: 2500, length: 150 }, cons(PrimitiveGateParams { nwidth: 2500, pwidth: 6300, length: 150 }, cons(PrimitiveGateParams { nwidth: 6350, pwidth: 15950, length: 150 }, cons(PrimitiveGateParams { nwidth: 16100, pwidth: 40200, length: 150 }, [])))) },
+            sense_en_buffer: BufferSizing { stages: cons(PrimitiveGateParams { nwidth: 1000, pwidth: 2500, length: 150 }, cons(PrimitiveGateParams { nwidth: 2850, pwidth: 7100, length: 150 }, cons(PrimitiveGateParams { nwidth: 8100, pwidth: 20300, length: 150 }, cons(PrimitiveGateParams { nwidth: 23100, pwidth: 57750, length: 150 }, [])))) },
+            write_driver_en_buffer: BufferSizing { stages: cons(PrimitiveGateParams { nwidth: 1000, pwidth: 2500, length: 150 }, cons(PrimitiveGateParams { nwidth: 2450, pwidth: 6150, length: 150 }, [])) },
+            wlen_buffer: BufferSizing { stages: cons(PrimitiveGateParams { nwidth: 1000, pwidth: 2500, length: 150 }, cons(PrimitiveGateParams { nwidth: 3800, pwidth: 9500, length: 150 }, [])) },
+        },
+        routing_tracks: RoutingTracks { pc_b: 2, sense_en: 2, write_driver_en: 2, col_dec: 2 },
     }
 }

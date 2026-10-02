@@ -15,4 +15,21 @@ cell dff_array(count: Int) {
         let dff = inst(lib::logic::fixed_macros::tapped_dff(), x=dff_origin_x(index), y=0.);
     }
     let outline = crect(x0=0., y0=0., x1=dff_array_width(count), y1=13920.);
+    let d = dff_ports(count, 0, -1570., 125., 760., 390.);
+    let q = dff_ports(count, 0, -2980., 13135., 2650., 170.);
+    let q_n = dff_ports(count, 0, -2900., 10895., 1580., 170.);
+    let clk = lib::columns::util::cbox(0., 6715., dff_array_width(count), 7035.);
+    let rstb = lib::columns::util::cbox(0., 2480., dff_array_width(count), 2800.);
+    let vdd = dff_ports(count, 0, -3575., 0., 490., 13920.);
+    let vss = dff_ports(count, 0, -245., 0., 490., 13920.);
+}
+
+// One port per DFF, given relative to each tile's origin.
+fn dff_ports(count: Int, index: Int, dx: Float, y0: Float, w: Float, h: Float) -> [Rect] {
+    if index == count {
+        []
+    } else {
+        let x0 = dff_origin_x(index) + dx;
+        cons(lib::columns::util::cbox(x0, y0, x0 + w, y0 + h), dff_ports(count, index + 1, dx, y0, w, h))
+    }
 }

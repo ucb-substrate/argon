@@ -1,9 +1,12 @@
 use std::{
-    hash::BuildHasher,
+    collections::HashMap,
     ops::{Deref, DerefMut, Mul},
 };
 
-use argonc::solver::{LinearExpr, Var};
+use argonc::{
+    compile::SseBasis,
+    solver::{LinearExpr, Var},
+};
 use indexmap::{IndexMap, IndexSet};
 
 /// Values with magnitude below this are treated as zero when deciding whether
@@ -29,7 +32,10 @@ impl DerefMut for SparseVec {
 /// Removes all components in the directions of `vecs` from `u`.
 ///
 /// Assumes `vecs` is an orthonormal set of vectors.
-pub(crate) fn remove_component(u: &SparseVec, vecs: &[SparseVec]) -> SparseVec {
+pub(crate) fn remove_component<'a>(
+    u: &SparseVec,
+    vecs: impl IntoIterator<Item = &'a SparseVec>,
+) -> SparseVec {
     let mut out = u.clone();
     for v in vecs {
         let dot = dot(u, v);
@@ -40,7 +46,10 @@ pub(crate) fn remove_component(u: &SparseVec, vecs: &[SparseVec]) -> SparseVec {
 }
 
 /// Projects `u` onto an orthonormal basis directly.
-pub(crate) fn component_in_basis(u: &SparseVec, vecs: &[SparseVec]) -> SparseVec {
+pub(crate) fn component_in_basis<'a>(
+    u: &SparseVec,
+    vecs: impl IntoIterator<Item = &'a SparseVec>,
+) -> SparseVec {
     let mut out = SparseVec(IndexMap::new());
     for vector in vecs {
         let weight = dot(u, vector);
@@ -49,6 +58,14 @@ pub(crate) fn component_in_basis(u: &SparseVec, vecs: &[SparseVec]) -> SparseVec
         }
     }
     out
+}
+
+pub(crate) fn add(a: &SparseVec, b: &SparseVec) -> SparseVec {
+    let mut sum = a.clone();
+    for (var, coefficient) in b.iter() {
+        *sum.entry(*var).or_default() += coefficient;
+    }
+    sum
 }
 
 pub(crate) fn dot(a: &SparseVec, b: &SparseVec) -> f64 {
@@ -98,67 +115,93 @@ pub(crate) fn edge_drag_distance(pixel_delta: (f32, f32), normal: (f32, f32), sc
     normal.0 * layout_dx + normal.1 * layout_dy
 }
 
-/// Computes a null-space move that changes several edge expressions by the
-/// requested distances simultaneously. With one target this implements the
-/// edge-drag form of Algorithm 3; multiple targets support corner handles and
-/// whole-rectangle translation.
-pub(crate) fn drag_delta_multi<S: BuildHasher>(
-    edges: &[SparseVec],
-    rowspace: &[SparseVec],
-    unsolved: &IndexSet<Var, S>,
-    deltas: &[f64],
-) -> Option<SparseVec> {
-    if edges.is_empty() || edges.len() != deltas.len() {
-        return None;
-    }
-
-    let edges = edges
-        .iter()
-        .map(|edge| {
-            SparseVec(
-                edge.iter()
-                    .filter(|(var, _)| unsolved.contains(*var))
-                    .map(|(var, coeff)| (*var, *coeff))
-                    .collect(),
-            )
-        })
-        .collect::<Vec<_>>();
-    // Each residual is the target expression's component in the null space of
-    // the constraint matrix. Any linear combination remains constraint-safe.
-    let residuals = edges
-        .iter()
-        .map(|edge| remove_component(edge, rowspace))
-        .collect::<Vec<_>>();
-    combine_drag(&edges, &residuals, deltas)
+#[derive(Clone, Copy, Debug)]
+enum SseSpaceKind {
+    /// No constraint rows remain, so every unsolved variable moves freely.
+    Free,
+    /// Allowed motion is the projection onto these vectors.
+    Nullspace,
+    /// Allowed motion is what remains after removing these vectors.
+    Rowspace,
 }
 
-/// Variant used when the compiler supplied the null-space basis directly from
-/// sparse QR, avoiding the dense-SVD row-space representation entirely.
-pub(crate) fn drag_delta_multi_nullspace(
-    edges: &[SparseVec],
-    nullspace: &[SparseVec],
-    unsolved: &IndexSet<Var>,
-    deltas: &[f64],
-) -> Option<SparseVec> {
-    if edges.is_empty() || edges.len() != deltas.len() {
-        return None;
+/// A compiled cell's constraint-safe drag directions, indexed by variable.
+///
+/// A basis vector that shares no variable with an edge contributes nothing to
+/// that edge's drag, so a drag only visits the vectors touching its edges.
+#[derive(Debug)]
+pub(crate) struct SseSpace {
+    kind: SseSpaceKind,
+    vectors: Vec<SparseVec>,
+    vectors_by_var: HashMap<Var, Vec<usize>>,
+    unsolved: IndexSet<Var>,
+}
+
+impl SseSpace {
+    pub(crate) fn new(basis: &SseBasis, unsolved: &IndexSet<Var>) -> Self {
+        let (kind, vectors) = match basis {
+            SseBasis::Nullspace(vectors) if vectors.is_empty() => (SseSpaceKind::Free, vectors),
+            SseBasis::Nullspace(vectors) => (SseSpaceKind::Nullspace, vectors),
+            SseBasis::Rowspace(vectors) => (SseSpaceKind::Rowspace, vectors),
+        };
+        let vectors = vectors.iter().map(SparseVec::from).collect::<Vec<_>>();
+        let mut vectors_by_var = HashMap::<Var, Vec<usize>>::new();
+        for (index, vector) in vectors.iter().enumerate() {
+            for var in vector.keys() {
+                vectors_by_var.entry(*var).or_default().push(index);
+            }
+        }
+        Self {
+            kind,
+            vectors,
+            vectors_by_var,
+            unsolved: unsolved.clone(),
+        }
     }
-    let edges = edges
-        .iter()
-        .map(|edge| {
-            SparseVec(
-                edge.iter()
-                    .filter(|(var, _)| unsolved.contains(*var))
-                    .map(|(var, coeff)| (*var, *coeff))
-                    .collect(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let residuals = edges
-        .iter()
-        .map(|edge| component_in_basis(edge, nullspace))
-        .collect::<Vec<_>>();
-    combine_drag(&edges, &residuals, deltas)
+
+    /// Computes a constraint-safe move that changes each edge expression by
+    /// the matching delta. One edge implements the edge drag of Algorithm 3;
+    /// several support corner handles and whole-rectangle translation.
+    pub(crate) fn drag_delta(&self, edges: &[SparseVec], deltas: &[f64]) -> Option<SparseVec> {
+        if edges.is_empty() || edges.len() != deltas.len() {
+            return None;
+        }
+        let edges = edges
+            .iter()
+            .map(|edge| {
+                SparseVec(
+                    edge.iter()
+                        .filter(|(var, _)| self.unsolved.contains(*var))
+                        .map(|(var, coeff)| (*var, *coeff))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut touched = edges
+            .iter()
+            .flat_map(|edge| edge.keys())
+            .filter_map(|var| self.vectors_by_var.get(var))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        touched.sort_unstable();
+        touched.dedup();
+        let basis = touched
+            .into_iter()
+            .map(|index| &self.vectors[index])
+            .collect::<Vec<_>>();
+        // Each residual is the edge's component in the null space of the
+        // constraint matrix. Any linear combination remains constraint-safe.
+        let residuals = edges
+            .iter()
+            .map(|edge| match self.kind {
+                SseSpaceKind::Free => edge.clone(),
+                SseSpaceKind::Nullspace => component_in_basis(edge, basis.iter().copied()),
+                SseSpaceKind::Rowspace => remove_component(edge, basis.iter().copied()),
+            })
+            .collect::<Vec<_>>();
+        combine_drag(&edges, &residuals, deltas)
+    }
 }
 
 fn combine_drag(edges: &[SparseVec], residuals: &[SparseVec], deltas: &[f64]) -> Option<SparseVec> {
@@ -274,9 +317,10 @@ mod tests {
     use approx::assert_relative_eq;
     use argonc::solver::Solver;
 
-    /// Orthonormal rowspace basis of the solver's constraint matrix.
-    fn rowspace(solver: &mut Solver) -> Vec<SparseVec> {
-        solver.rowspace_vecs().iter().map(SparseVec::from).collect()
+    /// Drag space described by the solver's orthonormal constraint rowspace.
+    fn rowspace(solver: &mut Solver) -> SseSpace {
+        let unsolved = solver.unsolved_vars().iter().copied().collect();
+        SseSpace::new(&SseBasis::Rowspace(solver.rowspace_vecs()), &unsolved)
     }
 
     /// Coefficient vector of an edge whose position is exactly a single variable.
@@ -284,13 +328,8 @@ mod tests {
         SparseVec::from(&LinearExpr::from(var))
     }
 
-    fn drag_one<S: BuildHasher>(
-        edge: &SparseVec,
-        rowspace: &[SparseVec],
-        unsolved: &IndexSet<Var, S>,
-        delta: f64,
-    ) -> Option<SparseVec> {
-        drag_delta_multi(std::slice::from_ref(edge), rowspace, unsolved, &[delta])
+    fn drag_one(edge: &SparseVec, space: &SseSpace, delta: f64) -> Option<SparseVec> {
+        space.drag_delta(std::slice::from_ref(edge), &[delta])
     }
 
     #[test]
@@ -332,9 +371,8 @@ mod tests {
         let x1 = solver.new_var();
         solver.solve();
         let rs = rowspace(&mut solver);
-        let unsolved = solver.unsolved_vars().clone();
 
-        let dx = drag_one(&coeff(x1), &rs, &unsolved, 3.).unwrap();
+        let dx = drag_one(&coeff(x1), &rs, 3.).unwrap();
         assert_relative_eq!(dot(&coeff(x1), &dx), 3., epsilon = 1e-9);
         assert_relative_eq!(dot(&coeff(x0), &dx), 0., epsilon = 1e-9);
     }
@@ -346,9 +384,8 @@ mod tests {
         let y = solver.new_var();
         solver.solve();
         let rs = rowspace(&mut solver);
-        let unsolved = solver.unsolved_vars().clone();
 
-        let dv = drag_delta_multi(&[coeff(x), coeff(y)], &rs, &unsolved, &[3.5, -2.25]).unwrap();
+        let dv = rs.drag_delta(&[coeff(x), coeff(y)], &[3.5, -2.25]).unwrap();
         assert_relative_eq!(dot(&coeff(x), &dv), 3.5, epsilon = 1e-9);
         assert_relative_eq!(dot(&coeff(y), &dv), -2.25, epsilon = 1e-9);
     }
@@ -362,10 +399,9 @@ mod tests {
         let y1 = solver.new_var();
         solver.solve();
         let rs = rowspace(&mut solver);
-        let unsolved = solver.unsolved_vars().clone();
         let edges = [coeff(x0), coeff(x1), coeff(y0), coeff(y1)];
 
-        let dv = drag_delta_multi(&edges, &rs, &unsolved, &[4., 4., -6., -6.]).unwrap();
+        let dv = rs.drag_delta(&edges, &[4., 4., -6., -6.]).unwrap();
         for edge in &edges[..2] {
             assert_relative_eq!(dot(edge, &dv), 4., epsilon = 1e-9);
         }
@@ -391,12 +427,11 @@ mod tests {
         });
         solver.solve();
         let rs = rowspace(&mut solver);
-        let unsolved = solver.unsolved_vars().clone();
         let edges = [coeff(x0), coeff(x1), coeff(y0), coeff(y1)];
 
         // The paired x and y equations are redundant because width and height
         // are fixed, but they agree and therefore describe a valid translation.
-        let dv = drag_delta_multi(&edges, &rs, &unsolved, &[3., 3., -2., -2.]).unwrap();
+        let dv = rs.drag_delta(&edges, &[3., 3., -2., -2.]).unwrap();
         for edge in &edges[..2] {
             assert_relative_eq!(dot(edge, &dv), 3., epsilon = 1e-9);
         }
@@ -416,9 +451,8 @@ mod tests {
         });
         solver.solve();
         let rs = rowspace(&mut solver);
-        let unsolved = solver.unsolved_vars().clone();
 
-        assert!(drag_delta_multi(&[coeff(x0), coeff(x1)], &rs, &unsolved, &[1., 2.]).is_none());
+        assert!(rs.drag_delta(&[coeff(x0), coeff(x1)], &[1., 2.]).is_none());
     }
 
     #[test]
@@ -433,11 +467,10 @@ mod tests {
         });
         solver.solve();
         let rs = rowspace(&mut solver);
-        let unsolved = solver.unsolved_vars().clone();
 
         // Dragging the right edge by 2 slides the whole rect by 2 so the width
         // is preserved: both edges move together.
-        let dx = drag_one(&coeff(x1), &rs, &unsolved, 2.).unwrap();
+        let dx = drag_one(&coeff(x1), &rs, 2.).unwrap();
         assert_relative_eq!(dot(&coeff(x1), &dx), 2., epsilon = 1e-9);
         assert_relative_eq!(dot(&coeff(x0), &dx), 2., epsilon = 1e-9);
         // Width (x1 - x0) is unchanged.
@@ -457,10 +490,9 @@ mod tests {
         });
         solver.solve();
         let rs = rowspace(&mut solver);
-        let unsolved = solver.unsolved_vars().clone();
 
         // Dragging `a` drags `b` with it so the alignment constraint holds.
-        let dx = drag_one(&coeff(a), &rs, &unsolved, 2.).unwrap();
+        let dx = drag_one(&coeff(a), &rs, 2.).unwrap();
         assert_relative_eq!(dot(&coeff(a), &dx), 2., epsilon = 1e-9);
         assert_relative_eq!(dot(&coeff(b), &dx), 2., epsilon = 1e-9);
     }
@@ -481,9 +513,8 @@ mod tests {
         });
         solver.solve();
         let rs = rowspace(&mut solver);
-        let unsolved = solver.unsolved_vars().clone();
 
-        assert!(drag_one(&coeff(x1), &rs, &unsolved, 2.).is_none());
+        assert!(drag_one(&coeff(x1), &rs, 2.).is_none());
     }
 
     #[test]
@@ -507,12 +538,39 @@ mod tests {
         let x = solver.new_var();
         let y = solver.new_var();
         let s = 1. / 2f64.sqrt();
-        let nullspace = vec![SparseVec([(x, s), (y, -s)].into_iter().collect())];
-        let unsolved = IndexSet::from([x, y]);
+        let nullspace = SseSpace::new(
+            &SseBasis::Nullspace(vec![vec![(s, x), (-s, y)]]),
+            &IndexSet::from([x, y]),
+        );
 
-        let delta = drag_delta_multi_nullspace(&[coeff(x)], &nullspace, &unsolved, &[2.]).unwrap();
+        let delta = nullspace.drag_delta(&[coeff(x)], &[2.]).unwrap();
         assert_relative_eq!(*delta.get(&x).unwrap(), 2., epsilon = 1e-9);
         assert_relative_eq!(*delta.get(&y).unwrap(), -2., epsilon = 1e-9);
+    }
+
+    #[test]
+    fn drags_are_unaffected_by_basis_vectors_sharing_no_edge_variable() {
+        let mut solver = Solver::new();
+        let x = solver.new_var();
+        let y = solver.new_var();
+        let unrelated = (0..8).map(|_| solver.new_var()).collect::<Vec<_>>();
+        let s = 1. / 2f64.sqrt();
+        let mut basis = vec![vec![(s, x), (s, y)]];
+        basis.extend(unrelated.iter().map(|var| vec![(1., *var)]));
+        let unsolved = [x, y]
+            .into_iter()
+            .chain(unrelated.iter().copied())
+            .collect();
+        let space = SseSpace::new(&SseBasis::Nullspace(basis), &unsolved);
+
+        // `x` and `y` may only move together, and nothing else follows them.
+        let dv = space.drag_delta(&[coeff(x)], &[2.]).unwrap();
+        assert_relative_eq!(dot(&coeff(x), &dv), 2., epsilon = 1e-9);
+        assert_relative_eq!(dot(&coeff(y), &dv), 2., epsilon = 1e-9);
+        assert!(unrelated.iter().all(|var| !dv.contains_key(var)));
+        let dv = space.drag_delta(&[coeff(unrelated[3])], &[5.]).unwrap();
+        assert_eq!(dv.len(), 1);
+        assert_relative_eq!(dv[&unrelated[3]], 5., epsilon = 1e-9);
     }
 
     #[test]

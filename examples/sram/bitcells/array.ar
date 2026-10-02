@@ -196,6 +196,100 @@ cell sp_cell_array(rows: Int, cols: Int, mux_ratio: Int) {
     }
     let ur = inst(corner_ur(), x=left_width + groups as Float * group_width, y=top_y);
     let outline = crect(x0=0., y0=0., x1=array_width(cols, mux_ratio), y1=array_height(rows));
+    let bl = array_bitline_ports(0, cols, mux_ratio, false);
+    let br = array_bitline_ports(0, cols, mux_ratio, true);
+    let wl = array_wordline_ports(0, rows);
+    let right_edge = left_width + groups as Float * group_width + 2. * rowend_width() + bitcell_width();
+    let vdd_rails = array_power_rails(right_edge, row_groups, true);
+    let vss_rails = array_power_rails(right_edge, row_groups, false);
+}
+
+// Bitline landing pads on the bottom edge of the array. Bitcells alternate in
+// orientation, so the pads swap sides on odd columns.
+fn array_bitline_port(idx: Int, mux_ratio: Int, right: Bool) -> Rect {
+    let group = idx / mux_ratio;
+    let bit = idx % mux_ratio;
+    let cell_x = rowend_width() + bitcell_width() + group as Float * array_group_width(mux_ratio) + rowend_width() + bit as Float * bitcell_width();
+    let offset = if bit % 2 == 0 { if right { 715. } else { 350. } } else { if right { 345. } else { 710. } };
+    crect(x0=cell_x + offset, y0=1650., x1=cell_x + offset + 140., y1=1780.)
+}
+
+fn array_bitline_ports(idx: Int, cols: Int, mux_ratio: Int, right: Bool) -> [Rect] {
+    if idx == cols { [] } else { cons(array_bitline_port(idx, mux_ratio, right), array_bitline_ports(idx + 1, cols, mux_ratio, right)) }
+}
+
+// Wordline pads on the left edge, numbered from the top row down. Each strap
+// group holds four rows around its horizontal strap.
+fn array_wordline_port(idx: Int, rows: Int) -> Rect {
+    let group = idx / hstrap_rows();
+    let row = idx % hstrap_rows();
+    let row_offset = if row == 0 { 0. } else if row == 1 { -760. } else if row == 2 { -3160. } else { -3920. };
+    let y = array_bottom_height() + ((rows / hstrap_rows()) - 1 - group) as Float * array_center_height() + 5035. + row_offset;
+    crect(x0=0., y0=y, x1=rowend_width(), y1=y + 170.)
+}
+
+fn array_wordline_ports(idx: Int, rows: Int) -> [Rect] {
+    if idx == rows { [] } else { cons(array_wordline_port(idx, rows), array_wordline_ports(idx + 1, rows)) }
+}
+
+// M2 supply rails where they leave the right edge of the array, top down, as
+// (bottom, top) offsets. Well-tie rails count with the supply they tie to.
+fn array_top_rail_spans(vdd: Bool) -> [(Float, Float)] {
+    if vdd {
+        list((2760., 3040.,), (2160., 2610.,), (295., 555.,))
+    } else {
+        list((3180., 3635.,), (1600., 1985.,), (725., 945.,))
+    }
+}
+
+fn array_bottom_rail_spans(vdd: Bool) -> [(Float, Float)] {
+    if vdd { list((1025., 1475.,), (595., 875.,)) } else { list((1650., 2035.,), (0., 455.,)) }
+}
+
+// Rails of one strap group relative to its well-tie rail. These also exist
+// below the lowest group.
+fn array_strap_rail_spans(vdd: Bool) -> [(Float, Float)] {
+    if vdd {
+        list((-820., -560.,), (-1670., -1410.,))
+    } else {
+        list((0., 170.,), (-390., -170.,), (-2060., -1840.,))
+    }
+}
+
+fn array_row_rail_spans(vdd: Bool) -> [(Float, Float)] {
+    if vdd {
+        list((-3980., -3720.,), (-4830., -4570.,), (-7140., -6880.,))
+    } else {
+        list((-3550., -3330.,), (-5220., -5000.,), (-6710., -6490.,))
+    }
+}
+
+fn spans_to_rails(spans: [(Float, Float)], dy: Float, x0: Float, x1: Float) -> [Rect] {
+    if spans == [] { [] } else { cons(crect(x0=x0, y0=head(spans).0 + dy, x1=x1, y1=head(spans).1 + dy), spans_to_rails(tail(spans), dy, x0, x1)) }
+}
+
+fn concat_rails(a: [Rect], b: [Rect]) -> [Rect] {
+    if a == [] { b } else { cons(head(a), concat_rails(tail(a), b)) }
+}
+
+fn array_group_rails(group: Int, row_groups: Int, x0: Float, x1: Float, vdd: Bool) -> [Rect] {
+    if group > row_groups {
+        []
+    } else {
+        let well = array_bottom_height() - 465. + (row_groups - group) as Float * array_center_height();
+        let strap = spans_to_rails(array_strap_rail_spans(vdd), well, x0, x1);
+        let rows = if group < row_groups { spans_to_rails(array_row_rail_spans(vdd), well, x0, x1) } else { [] };
+        concat_rails(strap, concat_rails(rows, array_group_rails(group + 1, row_groups, x0, x1, vdd)))
+    }
+}
+
+fn array_power_rails(right_edge: Float, row_groups: Int, vdd: Bool) -> [Rect] {
+    let x0 = right_edge - rowend_width();
+    let top_y = array_bottom_height() + row_groups as Float * array_center_height();
+    concat_rails(
+        spans_to_rails(array_top_rail_spans(vdd), top_y, x0, right_edge),
+        concat_rails(array_group_rails(0, row_groups, x0, right_edge, vdd), spans_to_rails(array_bottom_rail_spans(vdd), 0., x0, right_edge)),
+    )
 }
 
 // The replica array reuses the same foundry macros, but has its own two-column
@@ -291,4 +385,29 @@ cell replica_cell_array(rows: Int, cols: Int) {
         let top = inst(replica_top(), x=rowend_width() + col as Float * replica_pair_width(), y=top_y);
     }
     let ur = inst(replica_corner_top(), x=right_x, y=top_y, reflect=true, angle=180);
+    let bl = list(replica_bitline_port(0, false), replica_bitline_port(1, false));
+    let br = list(replica_bitline_port(0, true), replica_bitline_port(1, true));
+    let wl = array_wordline_ports(0, rows);
+    // One cell supply rail of each kind on the left edge, plus every substrate-tie rail.
+    let vdd_rails = list(crect(x0=0., y0=top_y + 2160., x1=rowend_width(), y1=top_y + 2610.));
+    let vss_rails = cons(
+        crect(x0=0., y0=top_y + 3180., x1=rowend_width(), y1=top_y + 3635.),
+        cons(crect(x0=0., y0=top_y + 1600., x1=rowend_width(), y1=top_y + 1985.), cons(crect(x0=0., y0=1650., x1=rowend_width(), y1=2035.), replica_tie_rails(0, row_groups))),
+    );
+}
+
+// Substrate-tie rails under each horizontal strap. The side tap cells connect
+// them to each other but not to the cell supply.
+fn replica_tie_rails(k: Int, row_groups: Int) -> [Rect] {
+    if k > row_groups {
+        []
+    } else {
+        let y = array_bottom_height() + k as Float * array_center_height() - 465.;
+        cons(crect(x0=0., y0=y, x1=rowend_width(), y1=y + 345.), replica_tie_rails(k + 1, row_groups))
+    }
+}
+
+fn replica_bitline_port(idx: Int, right: Bool) -> Rect {
+    let x0 = if idx == 0 { if right { 1650. } else { 2010. } } else { if right { 3210. } else { 2850. } };
+    crect(x0=x0, y0=3995., x1=x0 + 140., y1=4175.)
 }

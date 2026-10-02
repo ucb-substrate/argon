@@ -137,22 +137,37 @@ impl CellCache {
                 translated.push(index);
                 continue;
             }
-            let cell = Arc::make_mut(&mut entry.cell);
-            if cell.rebase_spans(rebase).is_err() {
+            // Sharing a file with a moved declaration does not mean this
+            // cell's own spans moved. Keeping the same `Arc` when they did not
+            // lets consumers recognize the cell as unchanged.
+            let cell_moved = match entry.cell.spans_moved_by(rebase) {
+                Ok(moved) => moved,
+                Err(_) => {
+                    self.stats.rebase_failures += 1;
+                    self.stats.misses += 1;
+                    return None;
+                }
+            };
+            if cell_moved && Arc::make_mut(&mut entry.cell).rebase_spans(rebase).is_err() {
                 self.stats.rebase_failures += 1;
                 self.stats.misses += 1;
                 return None;
             }
+            let mut errors_moved = false;
             for error in &mut entry.errors {
+                let before = error.span.clone();
                 if rebase.rebase_opt(&mut error.span).is_err() {
                     self.stats.rebase_failures += 1;
                     self.stats.misses += 1;
                     return None;
                 }
+                errors_moved |= error.span != before;
             }
             entry.items = items.clone();
             translated.push(index);
-            self.stats.rebased += 1;
+            if cell_moved || errors_moved {
+                self.stats.rebased += 1;
+            }
         }
 
         // Write the translated entries back, so the shift is paid once per

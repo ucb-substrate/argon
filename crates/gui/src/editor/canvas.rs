@@ -1,5 +1,5 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet, VecDeque},
     fmt::Debug,
     ops::{Add, Sub},
@@ -12,7 +12,7 @@ use std::{
 
 use analyzer::rpc::{
     DimensionParams, DrawSegmentConstraint, InitialConditionEdit, InstancePreview, PathParams,
-    PolygonParams, RectangleEditResult, ValueEdit,
+    PolygonParams, RectangleEditResult, ValueEdit, remap_span_after_value_edits,
 };
 #[cfg(test)]
 use argonc::compile::RectInitialCondition;
@@ -41,7 +41,7 @@ use crate::{
         self, CompileOutputState, EditorState, LayerState, PreparedCompilationSnapshot,
         SOURCE_EDIT_REJECTED_MESSAGE, ScopeAddress, input::TextInput,
     },
-    sse::SparseVec,
+    sse::{SparseVec, SseSpace},
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -1232,10 +1232,21 @@ pub struct LayoutCanvas {
     sse_persist_after_revision: Option<u64>,
     sse_targets: Vec<SseDragTarget>,
     sse_delta: Point<Pixels>,
+    /// Motion of earlier drags that the displayed snapshot does not show yet.
+    /// A drag started before the previous one's edit compiled continues from it.
+    sse_offset: Option<SparseVec>,
+    /// Source edits applied since the displayed snapshot, in order, each in the
+    /// coordinates of the text before it. The selection follows them once a
+    /// snapshot showing them is displayed.
+    sse_edit_batches: Vec<Vec<ValueEdit>>,
+    /// Identifies the most recently sent drag edit.
+    sse_source_edit_generation: u64,
     sse_rect_drag_limits: Vec<SseRectDragLimit>,
     // Drag handles and movable rectangle/instance bodies, recomputed each paint.
     sse_handles: Vec<SseHandle>,
     sse_bodies: Vec<SseBody>,
+    /// Indexed drag space of the most recently dragged or painted cell.
+    sse_space: RefCell<Option<(Arc<compile::CompiledCell>, Arc<SseSpace>)>>,
     // drag state
     is_dragging: bool,
     offset_start: Point<Pixels>,
@@ -1334,6 +1345,8 @@ pub struct LayoutCanvas {
     /// indexes without keeping a second map containing every execution scope.
     raster_cell_roots: HashMap<CellId, Arc<editor::hierarchy::PreparedScope>>,
     raster_scope_state: Option<Arc<imbl::HashMap<editor::ScopePath, editor::ScopeState>>>,
+    /// See [`CompileOutputState::all_scopes_visible`]; true without a layout.
+    raster_all_scopes_visible: bool,
     raster_selected_scope: Option<editor::ScopePath>,
     raster_displayed_cell: Option<CellId>,
     raster_layer_visibility: Vec<bool>,
@@ -2196,12 +2209,11 @@ impl Default for RasterSpatialIndex {
 impl RasterSpatialIndex {
     fn for_presentation(
         hierarchy_depth: usize,
-        scopes: Option<&imbl::HashMap<editor::ScopePath, editor::ScopeState>>,
+        all_scopes_visible: bool,
         hide_external_geometry: bool,
     ) -> Self {
-        let fully_expanded = !hide_external_geometry
-            && hierarchy_depth == usize::MAX
-            && scopes.is_none_or(|scopes| scopes.values().all(|scope| scope.visible));
+        let fully_expanded =
+            !hide_external_geometry && hierarchy_depth == usize::MAX && all_scopes_visible;
         Self {
             collapse_instances: fully_expanded,
             flatten_execution_scopes: fully_expanded,
@@ -5717,17 +5729,23 @@ fn remap_scope_name_path(
     Some(address)
 }
 
+/// Motion along `expr` beyond what `sent` already persisted.
+fn unsent_delta(expr: &SparseVec, dv: &SparseVec, sent: Option<&SparseVec>) -> f64 {
+    crate::sse::dot(expr, dv) - sent.map_or(0., |sent| crate::sse::dot(expr, sent))
+}
+
 fn fallback_value_edits(
     fallbacks: &[compile::UsedFallback],
     dv: &SparseVec,
+    sent: Option<&SparseVec>,
     grid: f64,
 ) -> Vec<ValueEdit> {
     fallbacks
         .iter()
         .filter_map(|fallback| {
-            let (value, changed) =
-                crate::sse::initial_condition_after_drag(&fallback.constraint, dv);
-            changed.then(|| ValueEdit {
+            let (value, _) = crate::sse::initial_condition_after_drag(&fallback.constraint, dv);
+            let unsent = unsent_delta(&SparseVec::from(&fallback.constraint), dv, sent);
+            (unsent.abs() >= crate::sse::EPSILON).then(|| ValueEdit {
                 span: fallback.span.clone(),
                 value: crate::sse::format_value(value, grid),
             })
@@ -5741,19 +5759,23 @@ struct DragPersistenceEdits {
     initial_conditions: Vec<InitialConditionEdit>,
 }
 
+/// Source edits that persist the total motion `dv`. Anything `sent` already
+/// persisted is left out unless this drag moved it again.
 fn drag_persistence_edits(
     fallbacks: &[compile::UsedFallback],
     targets: &[SseDragTarget],
     dv: &SparseVec,
+    sent: Option<&SparseVec>,
     grid: f64,
 ) -> DragPersistenceEdits {
-    let values = fallback_value_edits(fallbacks, dv, grid);
+    let values = fallback_value_edits(fallbacks, dv, sent, grid);
     let mut initial_conditions = Vec::<InitialConditionEdit>::new();
     for target in targets {
-        let delta = crate::sse::dot(&SparseVec::from(&target.expr), dv);
-        if delta.abs() < crate::sse::EPSILON {
+        let expr = SparseVec::from(&target.expr);
+        if unsent_delta(&expr, dv, sent).abs() < crate::sse::EPSILON {
             continue;
         }
+        let delta = crate::sse::dot(&expr, dv);
         let Some(source) = &target.source else {
             continue;
         };
@@ -5774,34 +5796,6 @@ fn drag_persistence_edits(
     DragPersistenceEdits {
         values,
         initial_conditions,
-    }
-}
-
-/// Maps a selected object's source span through the value replacements used to
-/// persist an SSE drag. Compiler object IDs are regenerated, so retaining the
-/// adjusted span is what lets the next compile result recognize the same rect.
-fn remap_span_after_value_edits(selected: &Span, edits: &[ValueEdit]) -> Span {
-    let selected_start = selected.span.start();
-    let selected_end = selected.span.end();
-    let mut shift_before = 0isize;
-    let mut shift_within = 0isize;
-
-    for edit in edits.iter().filter(|edit| edit.span.path == selected.path) {
-        let old_start = edit.span.span.start();
-        let old_end = edit.span.span.end();
-        let delta = edit.value.len() as isize - (old_end - old_start) as isize;
-        if old_end <= selected_start {
-            shift_before += delta;
-        } else if old_start < selected_end {
-            shift_within += delta;
-        }
-    }
-
-    let shifted_start = (selected_start as isize + shift_before) as usize;
-    let shifted_end = (selected_end as isize + shift_before + shift_within) as usize;
-    Span {
-        path: selected.path.clone(),
-        span: cfgrammar::Span::new(shifted_start, shifted_end),
     }
 }
 
@@ -6184,7 +6178,7 @@ impl Element for CanvasElement {
                 let scope_address = &solved_cell.selected_scope;
                 let editable_cell = &solved_cell.output.cells[&scope_address.cell];
                 if inner.is_sse_dragging || inner.is_sse_persisting {
-                    sse_dv = inner.sse_drag_delta(editable_cell);
+                    sse_dv = inner.sse_drag_delta(&inner.sse_space(editable_cell));
                 }
                 let direct_world_query = raster_viewport_world_bounds(ViewportTransform {
                     size: bounds.size,
@@ -6950,38 +6944,44 @@ impl Element for CanvasElement {
         let mut sse_handles: Vec<SseHandle> = Vec::new();
         let mut vertex_handle_points = Vec::new();
         let mut sse_bodies: Vec<SseBody> = Vec::new();
-        let sse_cell = solved_cell
+        let sse_space = solved_cell
             .as_ref()
             .filter(|_| replay_direct.is_none())
-            .map(|solved| {
-                let selected = &solved.selected_scope;
-                &solved.output.cells[&selected.cell]
-            });
+            .map(|solved| inner.sse_space(&solved.output.cells[&solved.selected_scope.cell]));
+        let sse_space = sse_space.as_deref();
         let mut movable_corners = HashMap::new();
         for (rect, _) in &rects {
-            let (Some(span), Some(cvars), Some(sse_cell)) = (&rect.id, &rect.cvars, sse_cell)
+            let (Some(span), Some(cvars), Some(sse_space)) = (&rect.id, &rect.cvars, sse_space)
             else {
                 continue;
             };
-            movable_corners.insert(
-                span.clone(),
-                [
-                    (&cvars.left, &cvars.top),
-                    (&cvars.right, &cvars.top),
-                    (&cvars.left, &cvars.bottom),
-                    (&cvars.right, &cvars.bottom),
-                ]
-                .map(|(x, y)| {
-                    LayoutCanvas::sse_targets_support_2d(&corner_sse_targets(x, y), sse_cell)
-                }),
-            );
+            // Corner handles are drawn only on the selected rectangle.
+            if matches!(
+                &tool,
+                ToolState::Select(SelectToolState {
+                    selected_obj: Some(selected),
+                }) if selected == span
+            ) {
+                movable_corners.insert(
+                    span.clone(),
+                    [
+                        (&cvars.left, &cvars.top),
+                        (&cvars.right, &cvars.top),
+                        (&cvars.left, &cvars.bottom),
+                        (&cvars.right, &cvars.bottom),
+                    ]
+                    .map(|(x, y)| {
+                        LayoutCanvas::sse_targets_support_2d(&corner_sse_targets(x, y), sse_space)
+                    }),
+                );
+            }
             let targets = vec![
                 sourced_sse_target(&cvars.left, Point::new(1., 0.), span, &source_coordinates),
                 sourced_sse_target(&cvars.right, Point::new(1., 0.), span, &source_coordinates),
                 sourced_sse_target(&cvars.bottom, Point::new(0., 1.), span, &source_coordinates),
                 sourced_sse_target(&cvars.top, Point::new(0., 1.), span, &source_coordinates),
             ];
-            if LayoutCanvas::sse_targets_support_2d(&targets, sse_cell) {
+            if LayoutCanvas::sse_targets_support_2d(&targets, sse_space) {
                 sse_bodies.push(SseBody {
                     bounds: get_rect_bounds(rect, bounds, scale, offset),
                     span: span.clone(),
@@ -6989,7 +6989,7 @@ impl Element for CanvasElement {
                 });
             }
         }
-        if let Some(sse_cell) = sse_cell {
+        if let Some(sse_space) = sse_space {
             for (polygon, _) in &polygons {
                 let Some(span) = &polygon.id else {
                     continue;
@@ -7017,7 +7017,7 @@ impl Element for CanvasElement {
                     for (point, (x, y)) in points.iter().zip(cvars) {
                         let targets = LayoutCanvas::draggable_point_targets(
                             sourced_corner_sse_targets(x, y, span, &source_coordinates),
-                            sse_cell,
+                            sse_space,
                         );
                         if !targets.is_empty() {
                             let mid = inner.layout_to_px(*point);
@@ -7035,16 +7035,16 @@ impl Element for CanvasElement {
                 }
             }
         }
-        if let Some(sse_cell) = sse_cell {
+        if let Some(sse_space) = sse_space {
             for (rect, span, origin, targets) in instance_sse_candidates {
-                let targets: Vec<_> = if LayoutCanvas::sse_targets_support_2d(&targets, sse_cell) {
+                let targets: Vec<_> = if LayoutCanvas::sse_targets_support_2d(&targets, sse_space) {
                     targets.into_iter().collect()
                 } else {
                     // A one-degree-of-freedom instance remains draggable along
                     // whichever coordinate can control that degree of freedom.
                     targets
                         .into_iter()
-                        .find(|target| LayoutCanvas::sse_target_supported(target, sse_cell))
+                        .find(|target| LayoutCanvas::sse_target_supported(target, sse_space))
                         .into_iter()
                         .collect()
                 };
@@ -8712,9 +8712,13 @@ impl LayoutCanvas {
             sse_persist_after_revision: None,
             sse_targets: Vec::new(),
             sse_delta: Point::default(),
+            sse_offset: None,
+            sse_edit_batches: Vec::new(),
+            sse_source_edit_generation: 0,
             sse_rect_drag_limits: Vec::new(),
             sse_handles: Vec::new(),
             sse_bodies: Vec::new(),
+            sse_space: RefCell::new(None),
             drag_start: Point::default(),
             offset_start: Point::default(),
             mouse_position: Point::default(),
@@ -8747,7 +8751,7 @@ impl LayoutCanvas {
                     );
                     let mut spatial_index = RasterSpatialIndex::for_presentation(
                         canvas.raster_hierarchy_depth,
-                        canvas.raster_scope_state.as_deref(),
+                        canvas.raster_all_scopes_visible,
                         canvas.raster_hide_external_geometry,
                     );
                     if change == RasterPresentationChange::Geometry {
@@ -8821,6 +8825,7 @@ impl LayoutCanvas {
             raster_output: None,
             raster_cell_roots: HashMap::new(),
             raster_scope_state: None,
+            raster_all_scopes_visible: true,
             raster_selected_scope: None,
             raster_displayed_cell: None,
             raster_layer_visibility: Vec::new(),
@@ -8936,10 +8941,14 @@ impl LayoutCanvas {
             hide_external_geometry,
             exclude_editable_geometry,
             dark_mode,
+            all_scopes_visible,
         ) = {
             let state = self.state.read(cx);
             let hide_external_geometry = state.hide_external_geometry;
             let solved_cell = state.displayed_cell(cx);
+            let all_scopes_visible = solved_cell
+                .as_ref()
+                .is_none_or(|solved| solved.all_scopes_visible);
             // The editable cell is cheap to paint live if its own scope and
             // object counts are bounded. Keeping those shapes out of retained
             // tiles makes SSE drags move them without an old-position ghost.
@@ -8990,6 +8999,7 @@ impl LayoutCanvas {
                 hide_external_geometry,
                 exclude_editable_geometry,
                 state.dark_mode,
+                all_scopes_visible,
             )
         };
         let same_output = match (&self.raster_output, &output) {
@@ -9044,6 +9054,7 @@ impl LayoutCanvas {
             .unwrap_or_default();
         self.raster_output = output;
         self.raster_scope_state = scope_state;
+        self.raster_all_scopes_visible = all_scopes_visible;
         self.raster_selected_scope = selected_scope;
         self.raster_displayed_cell = displayed_cell;
         self.raster_layout_bbox = layout_bbox;
@@ -9889,9 +9900,22 @@ impl LayoutCanvas {
         self.sse_source_edit_inflight
     }
 
+    /// The indexed drag space of `cell`, reused until another cell is asked for.
+    fn sse_space(&self, cell: &Arc<compile::CompiledCell>) -> Arc<SseSpace> {
+        let mut cached = self.sse_space.borrow_mut();
+        if let Some((cached_cell, space)) = cached.as_ref()
+            && Arc::ptr_eq(cached_cell, cell)
+        {
+            return space.clone();
+        }
+        let space = Arc::new(SseSpace::new(&cell.sse_basis, &cell.unsolved_vars));
+        *cached = Some((cell.clone(), space.clone()));
+        space
+    }
+
     fn sse_drag_delta_for_targets(
         targets: &[SseDragTarget],
-        cell: &compile::CompiledCell,
+        space: &SseSpace,
         layout_delta: Point<f32>,
     ) -> Option<SparseVec> {
         let edges = targets
@@ -9904,36 +9928,24 @@ impl LayoutCanvas {
                 (target.normal.x * layout_delta.x + target.normal.y * layout_delta.y) as f64
             })
             .collect::<Vec<_>>();
-        match &cell.sse_basis {
-            // An empty sparse basis means there are no remaining constraint
-            // rows. In that case the row-space representation is also empty,
-            // and every still-unsolved variable is free to move.
-            compile::SseBasis::Nullspace(vectors) if vectors.is_empty() => {
-                crate::sse::drag_delta_multi(&edges, &[], &cell.unsolved_vars, &deltas)
-            }
-            compile::SseBasis::Nullspace(vectors) => {
-                let vectors = vectors.iter().map(SparseVec::from).collect::<Vec<_>>();
-                crate::sse::drag_delta_multi_nullspace(
-                    &edges,
-                    &vectors,
-                    &cell.unsolved_vars,
-                    &deltas,
-                )
-            }
-            compile::SseBasis::Rowspace(vectors) => {
-                let vectors = vectors.iter().map(SparseVec::from).collect::<Vec<_>>();
-                crate::sse::drag_delta_multi(&edges, &vectors, &cell.unsolved_vars, &deltas)
-            }
-        }
+        space.drag_delta(&edges, &deltas)
     }
 
     fn sse_rect_drag_limits(
         targets: &[SseDragTarget],
         cell: &compile::CompiledCell,
+        space: &SseSpace,
+        offset: Option<&SparseVec>,
     ) -> Vec<SseRectDragLimit> {
+        let moved = |expr: &(f64, LinearExpr)| {
+            expr.0
+                + offset.map_or(0., |offset| {
+                    crate::sse::dot(&SparseVec::from(&expr.1), offset)
+                })
+        };
         let (Some(x_move), Some(y_move)) = (
-            Self::sse_drag_delta_for_targets(targets, cell, Point::new(1., 0.)),
-            Self::sse_drag_delta_for_targets(targets, cell, Point::new(0., 1.)),
+            Self::sse_drag_delta_for_targets(targets, space, Point::new(1., 0.)),
+            Self::sse_drag_delta_for_targets(targets, space, Point::new(0., 1.)),
         ) else {
             return Vec::new();
         };
@@ -9947,8 +9959,8 @@ impl LayoutCanvas {
                 let y0 = SparseVec::from(&rect.y0.1);
                 let y1 = SparseVec::from(&rect.y1.1);
                 let limit = SseRectDragLimit {
-                    width: rect.x1.0 - rect.x0.0,
-                    height: rect.y1.0 - rect.y0.0,
+                    width: moved(&rect.x1) - moved(&rect.x0),
+                    height: moved(&rect.y1) - moved(&rect.y0),
                     width_dx: crate::sse::dot(&x1, &x_move) - crate::sse::dot(&x0, &x_move),
                     width_dy: crate::sse::dot(&x1, &y_move) - crate::sse::dot(&x0, &y_move),
                     height_dx: crate::sse::dot(&y1, &x_move) - crate::sse::dot(&y0, &x_move),
@@ -9963,37 +9975,43 @@ impl LayoutCanvas {
             .collect()
     }
 
-    fn sse_drag_delta(&self, cell: &compile::CompiledCell) -> Option<SparseVec> {
+    /// Total motion since the displayed snapshot: earlier drags plus this one.
+    fn sse_drag_delta(&self, space: &SseSpace) -> Option<SparseVec> {
         let pixel_delta = (
             self.sse_delta.x.to_f64() as f32,
             self.sse_delta.y.to_f64() as f32,
         );
-        Self::sse_drag_delta_for_targets(
+        let drag = Self::sse_drag_delta_for_targets(
             &self.sse_targets,
-            cell,
+            space,
             Point::new(
                 crate::sse::edge_drag_distance(pixel_delta, (1., 0.), self.scale),
                 crate::sse::edge_drag_distance(pixel_delta, (0., 1.), self.scale),
             ),
-        )
+        );
+        match (&self.sse_offset, drag) {
+            (Some(offset), Some(drag)) => Some(crate::sse::add(offset, &drag)),
+            (Some(offset), None) => Some(offset.clone()),
+            (None, drag) => drag,
+        }
     }
 
-    fn sse_targets_support_2d(targets: &[SseDragTarget], cell: &compile::CompiledCell) -> bool {
+    fn sse_targets_support_2d(targets: &[SseDragTarget], space: &SseSpace) -> bool {
         [Point::new(1., 0.), Point::new(0., 1.)]
             .into_iter()
-            .all(|delta| Self::sse_drag_delta_for_targets(targets, cell, delta).is_some())
+            .all(|delta| Self::sse_drag_delta_for_targets(targets, space, delta).is_some())
     }
 
-    fn sse_target_supported(target: &SseDragTarget, cell: &compile::CompiledCell) -> bool {
-        Self::sse_drag_delta_for_targets(std::slice::from_ref(target), cell, target.normal)
+    fn sse_target_supported(target: &SseDragTarget, space: &SseSpace) -> bool {
+        Self::sse_drag_delta_for_targets(std::slice::from_ref(target), space, target.normal)
             .is_some()
     }
 
     fn draggable_point_targets(
         targets: Vec<SseDragTarget>,
-        cell: &compile::CompiledCell,
+        space: &SseSpace,
     ) -> Vec<SseDragTarget> {
-        if Self::sse_targets_support_2d(&targets, cell) {
+        if Self::sse_targets_support_2d(&targets, space) {
             targets
         } else {
             // A point constrained in one axis (or to a one-dimensional path)
@@ -10001,7 +10019,7 @@ impl LayoutCanvas {
             // remaining degree of freedom.
             targets
                 .into_iter()
-                .find(|target| Self::sse_target_supported(target, cell))
+                .find(|target| Self::sse_target_supported(target, space))
                 .into_iter()
                 .collect()
         }
@@ -10383,6 +10401,7 @@ impl LayoutCanvas {
         let layout_mouse_position = self.px_to_layout(event.position);
         let snapped_layout_mouse_position = snap_layout_point(layout_mouse_position, grid);
         let mut rectangle = None;
+        let was_sse_persisting = self.is_sse_persisting;
         let edit_dim = self.state.read(cx).tool.clone().update(cx, |tool, cx| {
             let mut edit_dim = false;
             match tool {
@@ -10957,14 +10976,12 @@ impl LayoutCanvas {
                         .find(|h| h.bounds.contains(&event.position))
                         .cloned();
                     if let Some(handle) = handle {
-                        self.is_sse_persisting = false;
-                        self.pending_sse_values.clear();
-                        self.deferred_snapshot = None;
-                        self.sse_persist_after_revision = None;
-                        self.is_sse_dragging = true;
-                        self.drag_start = event.position;
-                        self.sse_delta = Point::default();
-                        self.sse_targets = handle.targets;
+                        if self.can_begin_sse_drag(cx) {
+                            self.is_sse_dragging = true;
+                            self.drag_start = event.position;
+                            self.sse_delta = Point::default();
+                            self.sse_targets = handle.targets;
+                        }
                         cx.notify();
                     } else {
                         let selected_hit = choose_selection_hit(
@@ -10983,11 +11000,8 @@ impl LayoutCanvas {
                                     body.span == span && body.bounds.contains(&event.position)
                                 })
                                 .cloned()
+                                && self.can_begin_sse_drag(cx)
                             {
-                                self.is_sse_persisting = false;
-                                self.pending_sse_values.clear();
-                                self.deferred_snapshot = None;
-                                self.sse_persist_after_revision = None;
                                 self.is_sse_dragging = true;
                                 self.drag_start = event.position;
                                 self.sse_delta = Point::default();
@@ -11008,18 +11022,24 @@ impl LayoutCanvas {
             }
             edit_dim
         });
+        if was_sse_persisting && !self.is_sse_persisting {
+            cx.notify();
+        }
         if self.is_sse_dragging {
-            self.sse_rect_drag_limits = {
-                let state = self.state.read(cx);
-                let solved = state.solved_cell.read(cx);
-                solved
-                    .as_ref()
-                    .map(|solved| {
-                        let cell = &solved.output.cells[&solved.selected_scope.cell];
-                        Self::sse_rect_drag_limits(&self.sse_targets, cell)
-                    })
-                    .unwrap_or_default()
-            };
+            self.sse_rect_drag_limits = self
+                .state
+                .read(cx)
+                .displayed_cell(cx)
+                .map(|solved| {
+                    let cell = &solved.output.cells[&solved.selected_scope.cell];
+                    Self::sse_rect_drag_limits(
+                        &self.sse_targets,
+                        cell,
+                        &self.sse_space(cell),
+                        self.sse_offset.as_ref(),
+                    )
+                })
+                .unwrap_or_default();
         }
         if let Some((p0, p1)) = rectangle {
             self.place_rectangle(p0, p1, grid, cx);
@@ -11613,23 +11633,25 @@ impl LayoutCanvas {
     }
 
     /// Computes replacements for existing fallbacks plus AST-aware requests to
-    /// insert any missing geometry initial conditions on the first drag.
-    fn sse_source_edits(&self, cx: &mut Context<Self>) -> DragPersistenceEdits {
-        let solved = self.state.read(cx).solved_cell.read(cx);
-        let Some(solved) = solved.as_ref() else {
-            return DragPersistenceEdits::default();
+    /// insert any missing geometry initial conditions on the first drag, and
+    /// the compile revision their spans refer to.
+    fn sse_source_edits(&self, cx: &mut Context<Self>) -> (DragPersistenceEdits, Option<u64>) {
+        let (solved, revision) = self.state.read(cx).displayed_cell_and_revision(cx);
+        let Some(solved) = solved else {
+            return (DragPersistenceEdits::default(), revision);
         };
-        let selected = &solved.selected_scope;
-        let editable_cell = &solved.output.cells[&selected.cell];
-        let Some(dv) = self.sse_drag_delta(editable_cell) else {
-            return DragPersistenceEdits::default();
+        let editable_cell = &solved.output.cells[&solved.selected_scope.cell];
+        let Some(dv) = self.sse_drag_delta(&self.sse_space(editable_cell)) else {
+            return (DragPersistenceEdits::default(), revision);
         };
-        drag_persistence_edits(
+        let edits = drag_persistence_edits(
             &editable_cell.fallback_constraints_used,
             &self.sse_targets,
             &dv,
+            self.sse_offset.as_ref(),
             solved.output.tech.grid_step(),
-        )
+        );
+        (edits, revision)
     }
 
     pub(crate) fn on_left_mouse_up(
@@ -11643,19 +11665,24 @@ impl LayoutCanvas {
         // Persist the drag by replacing existing fallbacks and inserting any
         // missing initial-condition kwargs before recompiling.
         if was_sse_dragging {
-            let edits = self.sse_source_edits(cx);
+            let (edits, base_revision) = self.sse_source_edits(cx);
             if edits.values.is_empty() && edits.initial_conditions.is_empty() {
                 self.is_sse_dragging = false;
-                self.pending_sse_values.clear();
+                if !self.is_sse_persisting {
+                    self.pending_sse_values.clear();
+                }
+                // Earlier drags this one continued from remain on screen.
                 self.sse_delta = Point::default();
                 self.sse_targets.clear();
             } else {
                 self.is_sse_dragging = false;
                 self.is_sse_persisting = true;
                 self.sse_source_edit_inflight = true;
+                self.sse_source_edit_generation += 1;
+                let generation = self.sse_source_edit_generation;
                 self.pending_sse_values =
                     pending_sse_values(&edits.values, &edits.initial_conditions);
-                self.sse_persist_after_revision = self.state.read(cx).compilation_revision;
+                self.sse_persist_after_revision = base_revision;
                 // Anything deferred during the gesture belongs to the old
                 // source. Keep the moved geometry visible while Neovim accepts
                 // the edit instead of blocking this mouse-up paint.
@@ -11665,9 +11692,13 @@ impl LayoutCanvas {
                 cx.spawn(async move |_, _| {
                     let initial_conditions = edits.initial_conditions;
                     let result = client
-                        .update_values_async(edits.values, initial_conditions.clone())
+                        .update_values_async(
+                            edits.values,
+                            initial_conditions.clone(),
+                            base_revision,
+                        )
                         .await;
-                    client.dispatch_sse_source_edit_result(result, initial_conditions);
+                    client.dispatch_sse_source_edit_result(generation, result, initial_conditions);
                 })
                 .detach();
             }
@@ -11678,11 +11709,25 @@ impl LayoutCanvas {
 
     pub(crate) fn complete_sse_source_edit(
         &mut self,
+        generation: u64,
         result: anyhow::Result<Option<Vec<ValueEdit>>>,
         initial_conditions: &[InitialConditionEdit],
         cx: &mut Context<Self>,
     ) {
-        if !self.sse_source_edit_inflight {
+        if let Ok(Some(applied_edits)) = &result {
+            self.sse_edit_batches.push(applied_edits.clone());
+        }
+        // A newer drag's edit, sent after this one, now decides the preview.
+        let superseded = generation != self.sse_source_edit_generation;
+        if superseded || !self.sse_source_edit_inflight {
+            if superseded && !matches!(result, Ok(Some(_))) {
+                self.state.update(cx, |state, cx| {
+                    if state.message.is_none() {
+                        state.show_message(MessageType::ERROR, SOURCE_EDIT_REJECTED_MESSAGE);
+                    }
+                    cx.notify();
+                });
+            }
             return;
         }
         self.sse_source_edit_inflight = false;
@@ -11691,24 +11736,6 @@ impl LayoutCanvas {
                 if self.is_sse_persisting {
                     self.pending_sse_values =
                         pending_sse_values(&applied_edits, initial_conditions);
-                }
-                let selected_after_edits = {
-                    let tool = self.state.read(cx).tool.read(cx);
-                    match tool {
-                        ToolState::Select(SelectToolState {
-                            selected_obj: Some(selected),
-                        }) => Some(remap_span_after_value_edits(selected, &applied_edits)),
-                        _ => None,
-                    }
-                };
-                if let Some(selected) = selected_after_edits {
-                    let tool = self.state.read(cx).tool.clone();
-                    tool.update(cx, |tool, cx| {
-                        if let ToolState::Select(select) = tool {
-                            select.selected_obj = Some(selected);
-                            cx.notify();
-                        }
-                    });
                 }
             }
             Ok(None) => {
@@ -11734,6 +11761,50 @@ impl LayoutCanvas {
             }
         }
         cx.notify();
+    }
+
+    /// Whether a new SSE drag may start from the displayed geometry.
+    ///
+    /// While an earlier drag is persisting, the new one continues from where
+    /// that drag left the geometry. A newer compile that never showed the
+    /// persisted values ends the wait instead; the editor applies that
+    /// deferred snapshot on mouse-up.
+    fn can_begin_sse_drag(&mut self, cx: &App) -> bool {
+        if !self.is_sse_persisting {
+            return true;
+        }
+        let superseded = !self.sse_source_edit_inflight
+            && self.deferred_snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot_follows_revision(snapshot.revision, self.sse_persist_after_revision)
+            });
+        if superseded {
+            self.end_sse_persist();
+            return false;
+        }
+        self.sse_offset = self.state.read(cx).displayed_cell(cx).and_then(|solved| {
+            let cell = &solved.output.cells[&solved.selected_scope.cell];
+            self.sse_drag_delta(&self.sse_space(cell))
+        });
+        true
+    }
+
+    /// Moves the selection onto the text a newly displayed snapshot was
+    /// compiled from, following the drag edits applied since the last one.
+    pub(crate) fn follow_sse_source_edits(&mut self, cx: &mut Context<Self>) {
+        let batches = std::mem::take(&mut self.sse_edit_batches);
+        let tool = self.state.read(cx).tool.clone();
+        tool.update(cx, |tool, cx| {
+            if let ToolState::Select(SelectToolState {
+                selected_obj: Some(selected),
+            }) = tool
+                && !batches.is_empty()
+            {
+                for batch in &batches {
+                    *selected = remap_span_after_value_edits(selected, batch);
+                }
+                cx.notify();
+            }
+        });
     }
 
     /// Ends the optimistic drag preview once a compile result based on the
@@ -11762,14 +11833,23 @@ impl LayoutCanvas {
     }
 
     pub(crate) fn finish_sse_persist(&mut self, cx: &mut Context<Self>) {
-        if self.is_sse_persisting {
-            self.is_sse_persisting = false;
-            self.pending_sse_values.clear();
-            self.sse_persist_after_revision = None;
-            self.sse_delta = Point::default();
-            self.sse_targets.clear();
+        if self.end_sse_persist() {
             cx.notify();
         }
+    }
+
+    /// Clears the optimistic drag preview, returning whether one was showing.
+    fn end_sse_persist(&mut self) -> bool {
+        if !self.is_sse_persisting {
+            return false;
+        }
+        self.is_sse_persisting = false;
+        self.pending_sse_values.clear();
+        self.sse_persist_after_revision = None;
+        self.sse_delta = Point::default();
+        self.sse_targets.clear();
+        self.sse_offset = None;
+        true
     }
 
     pub(crate) fn on_scroll_wheel(
@@ -11950,6 +12030,10 @@ mod render_regression;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sse_space(cell: &compile::CompiledCell) -> SseSpace {
+        SseSpace::new(&cell.sse_basis, &cell.unsolved_vars)
+    }
 
     fn polygon_area(points: &[Point<Pixels>]) -> f32 {
         points
@@ -13981,10 +14065,12 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         };
         let mut state = imbl::HashMap::new();
         let (selected_scope, _) = visit_scope(&output, root, None, &mut state);
+        let all_scopes_visible = state.values().all(|scope| scope.visible);
         CompileOutputState {
             output,
             selected_scope,
             state: Arc::new(state),
+            all_scopes_visible,
         }
     }
 
@@ -14125,6 +14211,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                 output: Arc::new(output),
                 selected_scope: root,
                 state: Arc::new(state.state),
+                all_scopes_visible: true,
             };
             if let Some(previous) = &previous {
                 let started = std::time::Instant::now();
@@ -14147,7 +14234,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                 );
             }
             let mut index =
-                RasterSpatialIndex::for_presentation(usize::MAX, Some(&solved.state), false);
+                RasterSpatialIndex::for_presentation(usize::MAX, solved.all_scopes_visible, false);
             if let (Some(previous), Some(previous_index)) = (&previous, &previous_index) {
                 index.reuse_ready_cells(previous_index, |cell| {
                     previous
@@ -14386,9 +14473,13 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         assert_eq!(styles, [BorderStyle::Dashed, BorderStyle::Dashed]);
 
         let (x, y) = &path.points[2];
-        let targets = LayoutCanvas::draggable_point_targets(corner_sse_targets(&x.1, &y.1), cell);
+        let targets =
+            LayoutCanvas::draggable_point_targets(corner_sse_targets(&x.1, &y.1), &sse_space(cell));
         assert_eq!(targets.len(), 2);
-        assert!(LayoutCanvas::sse_targets_support_2d(&targets, cell));
+        assert!(LayoutCanvas::sse_targets_support_2d(
+            &targets,
+            &sse_space(cell)
+        ));
     }
 
     #[test]
@@ -14427,11 +14518,16 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         );
 
         let (x, y) = &polygon.points[2];
-        let targets = LayoutCanvas::draggable_point_targets(corner_sse_targets(&x.1, &y.1), cell);
+        let targets =
+            LayoutCanvas::draggable_point_targets(corner_sse_targets(&x.1, &y.1), &sse_space(cell));
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].expr, x.1);
-        let drag = LayoutCanvas::sse_drag_delta_for_targets(&targets, cell, Point::new(12., 20.))
-            .expect("the free x coordinate should drag");
+        let drag = LayoutCanvas::sse_drag_delta_for_targets(
+            &targets,
+            &sse_space(cell),
+            Point::new(12., 20.),
+        )
+        .expect("the free x coordinate should drag");
         assert!((crate::sse::dot(&SparseVec::from(&x.1), &drag) - 12.).abs() < 1e-6);
         assert!(crate::sse::dot(&SparseVec::from(&y.1), &drag).abs() < 1e-6);
     }
@@ -14481,14 +14577,22 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                 }),
             },
         ];
-        assert!(LayoutCanvas::sse_targets_support_2d(&targets, cell));
+        assert!(LayoutCanvas::sse_targets_support_2d(
+            &targets,
+            &sse_space(cell)
+        ));
 
-        let drag = LayoutCanvas::sse_drag_delta_for_targets(&targets, cell, Point::new(12.3, -4.5))
-            .expect("both vertex axes should be draggable");
+        let drag = LayoutCanvas::sse_drag_delta_for_targets(
+            &targets,
+            &sse_space(cell),
+            Point::new(12.3, -4.5),
+        )
+        .expect("both vertex axes should be draggable");
         assert!((crate::sse::dot(&SparseVec::from(&x.1), &drag) - 12.3).abs() < 1e-6);
         assert!((crate::sse::dot(&SparseVec::from(&y.1), &drag) + 4.5).abs() < 1e-6);
 
-        let edits = drag_persistence_edits(&cell.fallback_constraints_used, &targets, &drag, 0.1);
+        let edits =
+            drag_persistence_edits(&cell.fallback_constraints_used, &targets, &drag, None, 0.1);
         let x_fallback = cell
             .fallback_constraints_used
             .iter()
@@ -14524,7 +14628,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                 .any(|edit| edit.span == y_fallback.span && edit.value == "70.5")
         );
 
-        let inserted = drag_persistence_edits(&[], &targets, &drag, 0.1);
+        let inserted = drag_persistence_edits(&[], &targets, &drag, None, 0.1);
         assert!(inserted.values.is_empty());
         assert!(inserted.initial_conditions.iter().any(|edit| {
             edit.name == "x2i"
@@ -14591,7 +14695,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
             .collect(),
         );
 
-        let edits = drag_persistence_edits(&[], &targets, &drag, 0.1);
+        let edits = drag_persistence_edits(&[], &targets, &drag, None, 0.1);
         assert!(edits.values.is_empty());
         assert!(edits.initial_conditions.iter().any(|edit| {
             edit.call_span == rect_span && edit.name == "x0i" && edit.value == "15."
@@ -14693,12 +14797,12 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
             normal: Point::new(1., 0.),
             source: None,
         }];
-        let limits = LayoutCanvas::sse_rect_drag_limits(&targets, cell);
+        let limits = LayoutCanvas::sse_rect_drag_limits(&targets, cell, &sse_space(cell), None);
         assert!(!limits.is_empty());
         let limited = limited_sse_pointer_delta(Point::new(px(50.), px(0.)), 1., 0.1, &limits);
         let dv = LayoutCanvas::sse_drag_delta_for_targets(
             &targets,
-            cell,
+            &sse_space(cell),
             Point::new(f32::from(limited.x), 0.),
         )
         .unwrap();
@@ -15059,6 +15163,7 @@ cell top() {
             output: Arc::new(output),
             selected_scope: scope,
             state: Arc::default(),
+            all_scopes_visible: true,
         };
 
         assert_eq!(

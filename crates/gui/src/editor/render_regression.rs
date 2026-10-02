@@ -163,6 +163,92 @@ fn sse_keeps_the_moved_preview_until_its_source_edit_is_acknowledged(
 }
 
 #[gpui::test]
+fn sse_drags_continue_from_a_drag_that_is_still_persisting(cx: &mut gpui::TestAppContext) {
+    let canvas = test_canvas(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    std::fs::write(
+        &source,
+        "cell top() { let r = rect(\"met1\", x0i=1., y0i=0., x1i=10., y1i=10.)!; }",
+    )
+    .unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+    ));
+    let mut compiler = argonc::incremental::IncrementalCompiler::new();
+    let output = compiler.compile_cell(&config, &["top".into()], vec![]);
+    let x1 = match &output {
+        CompileOutput::Valid(data) => data,
+        CompileOutput::ExecErrors(errors) => errors.output.as_ref().unwrap(),
+        _ => panic!("SSE fixture did not compile"),
+    }
+    .cells
+    .values()
+    .find_map(|cell| cell.objects.values().find_map(SolvedValue::get_rect))
+    .unwrap()
+    .x1
+    .1
+    .clone();
+    let newer = prepare_compilation_snapshot(
+        CompilationSnapshot {
+            revision: 2,
+            output: compiler.compile_cell(&config, &["top".into()], vec![]),
+        },
+        canvas.read_with(cx, |canvas, cx| {
+            canvas.state.read(cx).compilation_preparation_context(cx)
+        }),
+    );
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.update(cx, |state, cx| {
+            state.compilation_revision = Some(1);
+            state.update(cx, output);
+        });
+        let drag_x1 = |canvas: &mut LayoutCanvas, pixels: f32| {
+            canvas.sse_targets = vec![SseDragTarget {
+                expr: x1.clone(),
+                normal: Point::new(1., 0.),
+                source: None,
+            }];
+            canvas.sse_delta = Point::new(px(pixels), px(0.));
+        };
+        let x1_edits = |canvas: &mut LayoutCanvas, cx: &mut Context<LayoutCanvas>| {
+            let (edits, base_revision) = canvas.sse_source_edits(cx);
+            assert_eq!(base_revision, Some(1));
+            edits
+                .values
+                .into_iter()
+                .map(|edit| edit.value)
+                .collect::<Vec<_>>()
+        };
+        // A drag moved `x1` by 5 and its source edit is still in flight.
+        drag_x1(canvas, 5.);
+        canvas.is_sse_persisting = true;
+        canvas.sse_source_edit_inflight = true;
+        canvas.sse_persist_after_revision = Some(1);
+        assert!(canvas.can_begin_sse_drag(cx));
+        // The next drag starts where that one left `x1`.
+        drag_x1(canvas, 3.);
+        assert_eq!(x1_edits(canvas, cx), ["18."]);
+        // Ending where the first drag did needs no further edit, and returning
+        // to the compiled position has to undo it.
+        drag_x1(canvas, 0.);
+        assert!(x1_edits(canvas, cx).is_empty());
+        drag_x1(canvas, -5.);
+        assert_eq!(x1_edits(canvas, cx), ["10."]);
+
+        // A newer compile that never showed the persisted values ends the
+        // wait instead of continuing from outdated geometry.
+        canvas.sse_source_edit_inflight = false;
+        canvas.deferred_snapshot = Some(newer);
+        assert!(!canvas.can_begin_sse_drag(cx));
+        assert!(!canvas.is_sse_persisting);
+        assert!(canvas.sse_offset.is_none());
+        assert!(canvas.deferred_snapshot.is_some());
+        assert!(canvas.can_begin_sse_drag(cx));
+    });
+}
+
+#[gpui::test]
 fn focused_preview_changes_canvas_geometry_without_retargeting_source_edits(
     cx: &mut gpui::TestAppContext,
 ) {
@@ -241,6 +327,7 @@ fn focused_preview_changes_canvas_geometry_without_retargeting_source_edits(
     let PreparedCompileOutput {
         selected_scope,
         state: scopes,
+        all_scopes_visible,
         ..
     } = prepared.prepared_output.unwrap();
     let CompileOutput::Valid(data) = prepared.output else {
@@ -256,6 +343,7 @@ fn focused_preview_changes_canvas_geometry_without_retargeting_source_edits(
                     output: Arc::new(data),
                     selected_scope,
                     state: Arc::new(scopes),
+                    all_scopes_visible,
                 });
                 cx.notify();
             });
@@ -443,6 +531,7 @@ fn prepare(
             output: Arc::new(output),
             selected_scope: prepared.selected_scope,
             state: Arc::new(prepared.state),
+            all_scopes_visible: prepared.all_scopes_visible,
         },
         Arc::new(prepared.layers),
     )
@@ -617,7 +706,7 @@ cell top() { let child = inst(branch(), x=0., y=0.); }
         let hierarchy_depth = if hidden { usize::MAX } else { 2 };
         let spatial_index = Arc::new(RasterSpatialIndex::for_presentation(
             hierarchy_depth,
-            Some(&solved.state),
+            solved.state.values().all(|scope| scope.visible),
             false,
         ));
         assert!(!spatial_index.collapse_instances);
@@ -1071,6 +1160,7 @@ fn early_sse_cell_preview_is_applied_as_soon_as_neovim_acknowledges_the_edit(
     editor.update(cx, |editor, cx| {
         editor.finish_sse_source_edit(
             cx,
+            0,
             Ok(Some(vec![])),
             vec![analyzer::rpc::InitialConditionEdit {
                 call_span: Span {
@@ -1604,6 +1694,7 @@ cell top() { let a = inst(leaf(), x=0., y=0.); let b = inst(unchanged(), x=70., 
         output: Arc::new(prepared.output.unwrap_valid()),
         selected_scope: metadata.selected_scope,
         state: Arc::new(metadata.state),
+        all_scopes_visible: metadata.all_scopes_visible,
     };
     let mut reused = RasterSpatialIndex::default();
     reused.reuse_ready_cells(&old_index, |cell| after.same_cell(&before, cell));
@@ -2050,4 +2141,121 @@ cell top() { for row in std::range(96) { for col in std::range(96) {
         0
     );
     assert!(canvas.read_with(cx, |canvas, _| canvas.painted_complete_frame));
+}
+
+/// Times how long the full editor takes to settle after deleting one of many
+/// unconstrained rectangles from the SRAM top cell.
+#[gpui::test]
+#[ignore = "SRAM unconstrained-rectangle editor benchmark; run in release with --nocapture"]
+fn bench_sram_unconstrained_rect_delete_editor(cx: &mut gpui::TestAppContext) {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/sram");
+    let source = workspace.join("lib.ar");
+    let original = std::fs::read_to_string(&source).unwrap();
+    let config = argonc::WorkspaceConfig::new(&source)
+        .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")));
+    let rects = |count: usize| {
+        (0..count)
+            .map(|i| {
+                let x = 30000. * (i % 9) as f64;
+                let y = 12000. * (i / 9) as f64;
+                format!(
+                    "let bench_rect{i} = rect(\"prBoundary.boundary\", x0i = {x}., y0i = {y}., x1i = {}., y1i = {}.)!;\n",
+                    x + 20000.,
+                    y + 8000.
+                )
+            })
+            .collect::<String>()
+    };
+    let opening = "cell example_no_control_logic() {\n";
+    let with_rects =
+        |count: usize| original.replacen(opening, &format!("{opening}{}", rects(count)), 1);
+    let cell = vec!["example_no_control_logic".to_owned()];
+    let mut compiler = argonc::incremental::IncrementalCompiler::new();
+    compiler.set_source_text(source.clone(), with_rects(73));
+    let first = compiler.compile_cell(&config, &cell, vec![]);
+    let canvas = test_canvas(cx);
+    let editor = test_editor(&canvas, cx);
+    editor.update(cx, |editor, cx| {
+        let context = editor.begin_snapshot_preparation(cx, 1);
+        let prepared = editor::prepare_compilation_snapshot(
+            analyzer::rpc::CompilationSnapshot {
+                revision: 1,
+                output: first,
+            },
+            context,
+        );
+        editor.finish_snapshot_preparation(cx, 1, prepared);
+    });
+    let cx = cx.add_empty_window();
+    let draw_time = std::cell::Cell::new(std::time::Duration::ZERO);
+    let draws = std::cell::Cell::new(0);
+    let draw = |cx: &mut gpui::VisualTestContext| {
+        let started = std::time::Instant::now();
+        editor.update(cx, |_, cx| cx.notify());
+        cx.draw(
+            Point::default(),
+            Size::new(px(1200.), px(800.)).map(gpui::AvailableSpace::Definite),
+            |_, _| div().size_full().child(editor.clone()),
+        );
+        draw_time.set(draw_time.get() + started.elapsed());
+        draws.set(draws.get() + 1);
+    };
+    let settle = |cx: &mut gpui::VisualTestContext| {
+        for _ in 0..4096 {
+            draw(cx);
+            let pending = canvas.read_with(cx, |canvas, _| {
+                canvas.raster_worker_active
+                    || canvas.raster_decision_refinement.is_some()
+                    || canvas.raster_overview_requested_revision.is_some()
+            });
+            if !pending {
+                return;
+            }
+            assert!(cx.dispatcher.tick(false));
+        }
+        panic!("renderer did not settle");
+    };
+    draw(cx);
+    editor.update(cx, |editor, cx| editor.fit_to_screen(cx));
+    let started = std::time::Instant::now();
+    settle(cx);
+    eprintln!(
+        "sram_unconstrained_rect_editor_initial,settle_ms={},draws={},draw_ms={}",
+        started.elapsed().as_millis(),
+        draws.get(),
+        draw_time.get().as_millis(),
+    );
+    for count in [72, 71] {
+        draws.set(0);
+        draw_time.set(std::time::Duration::ZERO);
+        compiler.set_source_text(source.clone(), with_rects(count));
+        let started = std::time::Instant::now();
+        let output = compiler.compile_cell(&config, &cell, vec![]);
+        let compile = started.elapsed();
+        let started = std::time::Instant::now();
+        editor.update(cx, |editor, cx| {
+            let id = 75 - count as u64;
+            let context = editor.begin_snapshot_preparation(cx, id);
+            let prepared = editor::prepare_compilation_snapshot(
+                analyzer::rpc::CompilationSnapshot {
+                    revision: id,
+                    output,
+                },
+                context,
+            );
+            editor.finish_snapshot_preparation(cx, id, prepared);
+        });
+        let apply = started.elapsed();
+        let started = std::time::Instant::now();
+        settle(cx);
+        eprintln!(
+            "sram_unconstrained_rect_editor_delete,rects={count},compile_ms={},apply_ms={},settle_ms={},draws={},draw_ms={},sse_bodies={}",
+            compile.as_millis(),
+            apply.as_millis(),
+            started.elapsed().as_millis(),
+            draws.get(),
+            draw_time.get().as_millis(),
+            canvas.read_with(cx, |canvas, _| canvas.sse_bodies.len()),
+        );
+    }
 }

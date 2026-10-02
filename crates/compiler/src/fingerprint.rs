@@ -1198,20 +1198,42 @@ impl SpanRebase {
     /// A span in a file with no declarations at all is left alone: that is the
     /// GDS-import case, whose spans name a `.gds` file at offset `0..0`.
     pub fn rebase(&self, span: &mut crate::ast::Span) -> Result<(), RebaseError> {
-        let Some(extents) = self.from.get(&span.path) else {
+        let Some((path, shift)) = self.translation(span)? else {
             return Ok(());
+        };
+        let shifted = |offset: usize| (offset as isize + shift) as usize;
+        span.path = path.clone();
+        span.span = cfgrammar::Span::new(shifted(span.span.start()), shifted(span.span.end()));
+        Ok(())
+    }
+
+    /// Whether [`Self::rebase`] would change `span`, with the same errors.
+    pub fn moves(&self, span: &crate::ast::Span) -> Result<bool, RebaseError> {
+        Ok(self
+            .translation(span)?
+            .is_some_and(|(path, shift)| shift != 0 || path != &span.path))
+    }
+
+    /// The file and offset shift that translate `span`, or `None` when it lies
+    /// outside every declaration.
+    fn translation(
+        &self,
+        span: &crate::ast::Span,
+    ) -> Result<Option<(&PathBuf, isize)>, RebaseError> {
+        let Some(extents) = self.from.get(&span.path) else {
+            return Ok(None);
         };
         let start = span.span.start();
         // Extents within a file never overlap or nest, so the last one
         // beginning at or before `start` is the only candidate.
         let index = extents.partition_point(|(extent, _)| extent.start <= start);
         let Some((extent, fingerprint)) = index.checked_sub(1).map(|index| &extents[index]) else {
-            return Ok(());
+            return Ok(None);
         };
         if start >= extent.end {
             // Between declarations: whitespace, a comment, or a `use`. Nothing
             // the executor records a span for lives here.
-            return Ok(());
+            return Ok(None);
         }
         let Some((path, moved)) = self.to.get(fingerprint) else {
             return Err(RebaseError::UnknownDeclaration);
@@ -1219,11 +1241,7 @@ impl SpanRebase {
         if moved.end - moved.start != extent.end - extent.start {
             return Err(RebaseError::LengthChanged);
         }
-        let shift = moved.start as isize - extent.start as isize;
-        let shifted = |offset: usize| (offset as isize + shift) as usize;
-        span.path = path.clone();
-        span.span = cfgrammar::Span::new(shifted(span.span.start()), shifted(span.span.end()));
-        Ok(())
+        Ok(Some((path, moved.start as isize - extent.start as isize)))
     }
 
     /// Translates an optional span, leaving `None` alone.

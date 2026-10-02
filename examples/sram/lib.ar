@@ -51,6 +51,10 @@ cell bitcell_array(p: SramLayoutParams) {
     );
 }
 
+cell example_control_logic() {
+    let native = inst(logic::control::control_logic_replica_v2(generated::sram().control), x=0., y=0.);
+}
+
 cell example_bitcell_array() {
     let native = inst(bitcell_array(generated::sram()), x=0., y=0.);
 }
@@ -96,8 +100,9 @@ cell example_replica_metal_routing() {
 }
 
 cell example_guard_ring() {
-    // The 64-word x 24-bit reference's SRAM-inner bbox expanded by 1 um.
-    let native = inst(logic::guard_ring::guard_ring(-126960., -135120., 163000., 47400.), x=0., y=0.);
+    let p = generated::sram();
+    let hole = logic::sram::ring_hole(logic::floorplan::sram_grid(p, logic::floorplan::sram_floorplan(p)));
+    let native = inst(logic::guard_ring::guard_ring(hole.x0, hole.y0, hole.x1, hole.y1), x=0., y=0.);
 }
 
 cell example_address_gate() {
@@ -109,7 +114,8 @@ cell example_address_gate_stage() {
 }
 
 cell example_row_leaf_decoder_stage() {
-    let native = inst(columns::decoder::row_leaf_decoder_stage(0), x=0., y=0.);
+    let r = generated::sram().periphery.row_decoder;
+    let native = inst(columns::decoder::row_decoder_node(r, 1, 30000), x=0., y=0.);
 }
 
 cell example_multifinger_inv(nwidth: Int, pwidth: Int) {
@@ -125,11 +131,12 @@ cell example_multifinger_decoder_tap(nwidth: Int, pwidth: Int) {
 }
 
 cell example_row_root_decoder_stage() {
-    let native = inst(columns::decoder::row_root_decoder_stage(0), x=0., y=0.);
+    let r = generated::sram().periphery.row_decoder;
+    let native = inst(columns::decoder::row_decoder_stage(columns::decoder::node_stage(r, 0, 0)), x=0., y=0.);
 }
 
 cell example_row_decoder() {
-    let native = inst(columns::decoder::row_decoder_64(), x=0., y=0.);
+    let native = inst(columns::decoder::row_decoder(generated::sram().periphery.row_decoder), x=0., y=0.);
 }
 
 cell example_relaxed_nand2_decoder_gate() {
@@ -141,86 +148,33 @@ cell example_relaxed_nand2_decoder_tap() {
 }
 
 cell example_column_decoder_stage() {
-    let native = inst(columns::decoder::column_decoder_stage_64x24(0), x=0., y=0.);
+    let native = inst(columns::decoder::column_decoder_stage(columns::decoder::col_decoder_layout(generated::sram().periphery.col_decoder, 37000), 0), x=0., y=0.);
 }
 
 cell example_column_decoder() {
-    let native = inst(columns::decoder::column_decoder_64x24(), x=0., y=0.);
+    let native = inst(columns::decoder::column_decoder(columns::decoder::col_decoder_layout(generated::sram().periphery.col_decoder, 37000)), x=0., y=0.);
 }
 
 cell example_precharge_buffer() {
-    let native = inst(columns::decoder::horizontal_fanout_buffer_64(0), x=0., y=0.);
+    let native = inst(columns::decoder::fanout_buffer(columns::decoder::buffer_layout(generated::sram().periphery.pc_b_buffer, 13000, false)), x=0., y=0.);
 }
 
 cell example_write_enable_buffer() {
-    let native = inst(columns::decoder::horizontal_fanout_buffer_64(1), x=0., y=0.);
+    let native = inst(columns::decoder::fanout_buffer(columns::decoder::buffer_layout(generated::sram().periphery.write_driver_en_buffer, 6000, false)), x=0., y=0.);
 }
 
 cell example_sense_enable_buffer() {
-    let native = inst(columns::decoder::horizontal_fanout_buffer_64(2), x=0., y=0.);
+    let native = inst(columns::decoder::fanout_buffer(columns::decoder::buffer_layout(generated::sram().periphery.sense_en_buffer, 18500, false)), x=0., y=0.);
 }
 
 cell example_wordline_enable_buffer() {
-    let native = inst(columns::decoder::horizontal_fanout_buffer_64(3), x=0., y=0.);
+    let native = inst(columns::decoder::fanout_buffer(columns::decoder::buffer_layout(generated::sram().periphery.wlen_buffer, 13640, true)), x=0., y=0.);
 }
 
-// Native top-level assembly for the representative practical SRAM sizing.
-// These coordinates follow SRAM22's alignment policy. Routing is generated
-// below in Argon; there is no GDS import or reference-layout dependency.
-cell no_control_logic_components_64x24(p: SramLayoutParams) {
-    eq(p.sram.num_words as Float, 64.);
-    eq(p.sram.data_width as Float, 24.);
-    eq(p.sram.mux_ratio as Float, 4.);
-    eq(p.sram.wmask_granularity as Float, 8.);
-    let bitcells = inst(bitcells::array::sp_cell_array(16, 96, 4), x=0., y=0.);
-    let cols = inst(columns::top::column_peripherals_exact(p.col), x=2500., y=-79240.);
-    let row_decoder = inst(columns::decoder::row_decoder_64(), x=-79160., y=3635., angle=270);
-    let address_gate = inst(columns::decoder::address_gate_stage(8), x=-114390., y=23255., reflect=true, angle=90);
-    let wordline_enable = inst(columns::decoder::horizontal_fanout_buffer_64(3), x=-104390., y=3795.);
-    let precharge_buffer = inst(columns::decoder::horizontal_fanout_buffer_64(0), x=-45740., y=-9240., angle=270);
-    let column_decoder = inst(columns::decoder::column_decoder_64x24(), x=-50070., y=-45700., reflect=true, angle=90);
-    let sense_enable = inst(columns::decoder::horizontal_fanout_buffer_64(2), x=-45310., y=-30590., angle=270);
-    let write_enable = inst(columns::decoder::horizontal_fanout_buffer_64(1), x=-30910., y=-88890., angle=270);
-    let dffs = inst(logic::dff::dff_array(8), x=-68800., y=-128215.);
-    let replica_cells = inst(bitcells::array::replica_cell_array(4, 2), x=-92590., y=-30295.);
-    let replica_pc = inst(columns::precharge::replica_precharge(p.replica_precharge), x=-92590., y=-5740., reflect=true);
-    let replica_mos = inst(logic::replica::replica_column_mos(p.replica_column), x=-109390., y=-6455.);
-    let replica_routing = inst(logic::replica::replica_metal_routing(p.replica_routing), x=-114390., y=-2365., reflect=true);
-}
-
-cell example_no_control_logic_components() {
-    let native = inst(no_control_logic_components_64x24(generated::sram()), x=0., y=0.);
-}
-
-cell no_control_logic_64x24(p: SramLayoutParams) {
-    let components = inst(no_control_logic_components_64x24(p), x=0., y=0.);
-    let routes = inst(logic::sram::core_routes_64x24(p.col), x=0., y=0.);
-    let power = inst(logic::sram::dense_power_grid_64x24(), x=0., y=0.);
-}
-
-cell no_control_logic_guarded_64x24(p: SramLayoutParams) {
-    let inner = inst(no_control_logic_64x24(p), x=0., y=0.);
-    let ring = inst(logic::guard_ring::guard_ring(-126960., -135120., 163000., 47400.), x=0., y=0.);
-    let connections = inst(logic::sram::guard_connections_64x24(p.col), x=0., y=0.);
-    let addr = connections.addr;
-    let ce = connections.ce;
-    let we = connections.we;
-    let clk = connections.clk;
-    let rstb = connections.rstb;
-    let din = connections.din;
-    let dout = connections.dout;
-    let wmask = connections.wmask;
-    let vdd = connections.vdd;
-    let vss = connections.vss;
-}
-
-cell example_no_control_logic_inner() {
-    let native = inst(no_control_logic_64x24(generated::sram()), x=0., y=0.);
-}
-
-// Normalized guarded SRAM: the lower-left of the complete layout is at (0, 0).
-cell example_no_control_logic() {
-    let native = inst(no_control_logic_guarded_64x24(generated::sram()), x=131200., y=139360.);
+// The complete SRAM for the generated sizing, with its lower-left corner at
+// the origin.
+cell example_sram() {
+    let native = inst(logic::sram::sram_macro(generated::sram(), true), x=0., y=0.);
     let addr = native.addr;
     let ce = native.ce;
     let we = native.we;
@@ -231,4 +185,33 @@ cell example_no_control_logic() {
     let wmask = native.wmask;
     let vdd = native.vdd;
     let vss = native.vss;
+}
+
+// The SRAM inside its guard rings, with the bitcell array at the origin.
+cell example_sram_inner() {
+    let native = inst(logic::sram::sram_inner(generated::sram(), true), x=0., y=0.);
+}
+
+// The same SRAM without its control logic block; routes stop at its pins.
+cell example_no_control_logic() {
+    let native = inst(logic::sram::sram_macro(generated::sram(), false), x=0., y=0.);
+    let addr = native.addr;
+    let ce = native.ce;
+    let we = native.we;
+    let clk = native.clk;
+    let rstb = native.rstb;
+    let din = native.din;
+    let dout = native.dout;
+    let wmask = native.wmask;
+    let vdd = native.vdd;
+    let vss = native.vss;
+}
+
+// The signal routes on their own, for comparing against other layouts.
+cell example_sram_routes() {
+    let native = inst(logic::sram::sram_routes(generated::sram()), x=0., y=0.);
+}
+
+cell example_no_control_logic_inner() {
+    let native = inst(logic::sram::sram_inner(generated::sram(), false), x=0., y=0.);
 }
