@@ -7,6 +7,8 @@ description: The canvas tools for geometry, dimensions, and instances.
 
 Canvas shortcuts work while the canvas has focus and no text field is active.
 
+Rectangles, polygons, paths, and instances that the GUI adds at the top level of a cell are bound with [`pub let`](/language/cells-functions#public-fields), so a parent cell can read them through an instance. Inside a loop, branch, or block they're bound with a plain `let`.
+
 ## Select
 
 Press <kbd>S</kbd>. You can select shapes, instances, edges, and dimension labels; what's selected determines which edits are available. Press <kbd>Q</kbd> to edit a selected dimension.
