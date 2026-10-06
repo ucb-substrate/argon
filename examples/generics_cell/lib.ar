@@ -6,7 +6,7 @@ fn count<T>(items: [T]) -> Int {
 // other cell; the type parameter only lets the checker follow the elements.
 cell row<T>(items: [T], pitch: Float) {
     let first = head(items);
-    let r = rect("met1", x0=0., y0=0., w=pitch * (count(items) as Float), h=pitch);
+    pub let r = rect("met1", x0=0., y0=0., w=pitch * (count(items) as Float), h=pitch);
 }
 
 cell top() {

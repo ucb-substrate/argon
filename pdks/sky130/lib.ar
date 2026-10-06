@@ -1,6 +1,6 @@
 cell fet1v8(nfet: Bool, w: Float, nf: Int) {
     let poly = crect(layer="poly.drawing", x0=0., y0=0., w=150., h = w + 260.);
-    let poly_bbox = std::array(poly, nf, 430., 0.);
+    pub let poly_bbox = std::array(poly, nf, 430., 0.);
     eq(poly_bbox.x0, 0.);
     eq(poly_bbox.y0, 0.);
     let diff = rect(
@@ -11,10 +11,10 @@ cell fet1v8(nfet: Bool, w: Float, nf: Int) {
         y1 = poly_bbox.y1 - 130.
     )!;
     let li1 = crect(layer="li1.drawing", x1=poly_bbox.x0 - 55., y0=diff.y0 - 100., w=170., y1=diff.y1 + 100.);
-    let li1_bbox = std::array(li1, nf + 1, 430., 0.);
+    pub let li1_bbox = std::array(li1, nf + 1, 430., 0.);
     eq(li1_bbox.x0, li1.x0);
     eq(li1_bbox.y0, li1.y0);
-    let sdm = rect(if nfet { "nsdm.drawing" } else { "psdm.drawing" }, x0 = diff.x0 - 130., x1=diff.x1 + 130., y0=diff.y0 - 130., y1=diff.y1+130.);
+    pub let sdm = rect(if nfet { "nsdm.drawing" } else { "psdm.drawing" }, x0 = diff.x0 - 130., x1=diff.x1 + 130., y0=diff.y0 - 130., y1=diff.y1+130.);
 
     let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
     let ny = (diff.h + 170. - 80.) as Int / 340. as Int;
@@ -22,9 +22,9 @@ cell fet1v8(nfet: Bool, w: Float, nf: Int) {
 }
 
 cell tap(ntap: Int, w: Float, h: Float) {
-    let tap = rect("tap.drawing", x0=0., y0=0., w=w, h=h);
-    let li1 = rect("li1.drawing", x0=tap.x0 + 40., y0=tap.y0 + 40., x1 = tap.x1 - 40., y1 = tap.y1 - 40.);
-    let sdm = rect(if ntap == 1 { "nsdm.drawing" } else { "psdm.drawing" }, x0=tap.x0 - 130., x1=tap.x1 + 130., y0=tap.y0 - 130., y1=tap.y1 + 130.);
+    pub let tap = rect("tap.drawing", x0=0., y0=0., w=w, h=h);
+    pub let li1 = rect("li1.drawing", x0=tap.x0 + 40., y0=tap.y0 + 40., x1 = tap.x1 - 40., y1 = tap.y1 - 40.);
+    pub let sdm = rect(if ntap == 1 { "nsdm.drawing" } else { "psdm.drawing" }, x0=tap.x0 - 130., x1=tap.x1 + 130., y0=tap.y0 - 130., y1=tap.y1 + 130.);
     let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
     let cons = crect(x0=li1.x0, x1=li1.x1, y0=li1.y0+80., y1=li1.y1-80.);
     std::center_rects(cons, std::max_array(licon, cons.w, cons.h, 340., 340.));
@@ -32,24 +32,24 @@ cell tap(ntap: Int, w: Float, h: Float) {
 
 cell inv(nw: Float, pw: Float, nf: Int) {
     let nmos = inst(fet1v8(true, nw, nf), x=0., y=0.);
-    let ptap = inst(tap(0, nmos.sdm.w - 260., 800.));
+    pub let ptap = inst(tap(0, nmos.sdm.w - 260., 800.));
     eq(ptap.sdm.y1 + 100., nmos.sdm.y0);
     eq(ptap.sdm.x0, nmos.sdm.x0);
-    let pmos = inst(fet1v8(false, pw, nf), x=0.);
-    let ntap = inst(tap(1, pmos.sdm.w - 260., 800.));
+    pub let pmos = inst(fet1v8(false, pw, nf), x=0.);
+    pub let ntap = inst(tap(1, pmos.sdm.w - 260., 800.));
     eq(pmos.li1_bbox.y1 + 100., ntap.sdm.y0);
     eq(ntap.sdm.x0, pmos.sdm.x0);
 
-    let nwell = rect("nwell.drawing", x0=pmos.sdm.x0-180., x1=pmos.sdm.x1+180., y0=pmos.sdm.y0-180., y1=ntap.sdm.y1+180.);
+    pub let nwell = rect("nwell.drawing", x0=pmos.sdm.x0-180., x1=pmos.sdm.x1+180., y0=pmos.sdm.y0-180., y1=ntap.sdm.y1+180.);
 
     // Draw horizontal LI1 rails.
     let o_li_bot = rect("li1.drawing", x0=nmos.li1_bbox.x0 + 430., y0=nmos.li1_bbox.y1 + 170., h=170.);
-    let a_li_mid = rect("li1.drawing", x0=nmos.poly_bbox.x0 - 90., x1=nmos.poly_bbox.x1 + 90., y0=o_li_bot.y1 + 170., h=170.)!;
+    pub let a_li_mid = rect("li1.drawing", x0=nmos.poly_bbox.x0 - 90., x1=nmos.poly_bbox.x1 + 90., y0=o_li_bot.y1 + 170., h=170.)!;
     let o_li_top = rect("li1.drawing", x0=nmos.li1_bbox.x0 + 430., x1=o_li_bot.x1, y0=a_li_mid.y1 + 170., h=170.)!;
     eq(o_li_top.y1 + 170., pmos.li1_bbox.y0);
 
     // Connect output LI1 rectangles.
-    let o_li_right = rect("li1.drawing", x0=a_li_mid.x1 + 170., w=170., y0=o_li_bot.y0, y1=o_li_top.y1);
+    pub let o_li_right = rect("li1.drawing", x0=a_li_mid.x1 + 170., w=170., y0=o_li_bot.y0, y1=o_li_top.y1);
     eq(o_li_bot.x1, o_li_right.x1);
     let li1 = crect(layer="li1.drawing", x1=o_li_bot.x0, w=170., y0=nmos.li1_bbox.y0, y1=o_li_bot.y1);
     let li1_bbox_bot = std::array(li1, (nf + 1) / 2, 860., 0.);
@@ -88,11 +88,11 @@ cell inv(nw: Float, pw: Float, nf: Int) {
 }
 
 cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_xcoupled: Int) {
-    let main_p = inst(inv(nw, pw, nf_main), x=0., y=0.);
-    let main_n = inst(inv(nw, pw, nf_main), reflect=true);
+    pub let main_p = inst(inv(nw, pw, nf_main), x=0., y=0.);
+    pub let main_n = inst(inv(nw, pw, nf_main), reflect=true);
     eq(main_p.ntap.tap.x0, main_n.ntap.tap.x0);
     eq(main_p.ntap.tap.y0, main_n.ntap.tap.y0);
-    let xcoupled_p = inst(inv(nw, pw, nf_xcoupled), y=0.);
+    pub let xcoupled_p = inst(inv(nw, pw, nf_xcoupled), y=0.);
     let xcoupled_n = inst(inv(nw, pw, nf_xcoupled), x=xcoupled_p.x, reflect=true);
     eq(xcoupled_p.ntap.tap.x0, xcoupled_n.ntap.tap.x0);
     eq(xcoupled_p.ntap.tap.y0, xcoupled_n.ntap.tap.y0);
@@ -101,8 +101,8 @@ cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_xcoupled: Int) {
     eq(m2p.x1 + 300., m2n.x0);
     let cyp = (xcoupled_p.o_li_right.y1 + xcoupled_p.o_li_right.y0) / 2.;
     let cyn = (xcoupled_n.o_li_right.y1 + xcoupled_n.o_li_right.y0) / 2.;
-    let m1p = rect("met1.drawing", h=300., x0=m2p.x0-10., x1=xcoupled_n.o_li_right.x1+60., y0=cyp-150.)!;
-    let m1n = rect("met1.drawing", h=300., x0=m2p.x0-10., x1=xcoupled_p.o_li_right.x1+60., y0=cyn-150.)!;
+    pub let m1p = rect("met1.drawing", h=300., x0=m2p.x0-10., x1=xcoupled_n.o_li_right.x1+60., y0=cyp-150.)!;
+    pub let m1n = rect("met1.drawing", h=300., x0=m2p.x0-10., x1=xcoupled_p.o_li_right.x1+60., y0=cyn-150.)!;
     eq(m2p.x0, main_p.o_li_right.x1+340.);
     eq(m2n.x1, xcoupled_p.pmos.sdm.x0-340.);
     eq(m2p.y1, m1n.y1+10.);
@@ -128,9 +128,9 @@ cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_xcoupled: Int) {
     rect("mcon.drawing", w=170., h=170., x0=xcoupled_p.o_li_right.x0, y0=cyn-85.);
     rect("via.drawing", w=150., h=150., x0=m2n.x0 + m2n.w/2.-75., y0=cyn-75.);
 
-    let vss1 = rect("met1.drawing", x0=main_p.ptap.li1.x0, x1=xcoupled_p.ptap.li1.x1, y0=main_p.ptap.li1.y0, y1=main_p.ptap.li1.y1);
-    let vdd_m1 = rect("met1.drawing", x0=main_p.ntap.li1.x0, x1=xcoupled_p.ntap.li1.x1, y0=main_p.ntap.li1.y0, y1=main_p.ntap.li1.y1);
-    let vss2 = rect("met1.drawing", x0=main_n.ptap.li1.x0, x1=xcoupled_n.ptap.li1.x1, y0=main_n.ptap.li1.y0, y1=main_n.ptap.li1.y1);
+    pub let vss1 = rect("met1.drawing", x0=main_p.ptap.li1.x0, x1=xcoupled_p.ptap.li1.x1, y0=main_p.ptap.li1.y0, y1=main_p.ptap.li1.y1);
+    pub let vdd_m1 = rect("met1.drawing", x0=main_p.ntap.li1.x0, x1=xcoupled_p.ntap.li1.x1, y0=main_p.ntap.li1.y0, y1=main_p.ntap.li1.y1);
+    pub let vss2 = rect("met1.drawing", x0=main_n.ptap.li1.x0, x1=xcoupled_n.ptap.li1.x1, y0=main_n.ptap.li1.y0, y1=main_n.ptap.li1.y1);
 
     let via = crect(layer="mcon.drawing", w=170., h=170., x0=0., y0=0.);
     centered_via_array(vss1, main_p.ptap.li1, via, 360., 360.);
@@ -153,11 +153,11 @@ cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_xcoupled: Int) {
     centered_via_array(m2p, m1_int_top, via, 320., 320.);
     centered_via_array(m2n, m1_int_bot, via, 320., 320.);
 
-    let vinp = rect("met1.drawing", x0=main_p.pmos.sdm.x0, x1=main_p.a_li_mid.x0+315., y0=m1n.y0, h=300.);
+    pub let vinp = rect("met1.drawing", x0=main_p.pmos.sdm.x0, x1=main_p.a_li_mid.x0+315., y0=m1n.y0, h=300.);
     let via = rect("mcon.drawing", w=170., h=170., x1=vinp.x1-60.);
     eq(via.y0-vinp.y0, vinp.y1-via.y1);
 
-    let vinn = rect("met1.drawing", x0=main_p.pmos.sdm.x0, x1=main_p.a_li_mid.x0+315., y0=m1p.y0, h=300.);
+    pub let vinn = rect("met1.drawing", x0=main_p.pmos.sdm.x0, x1=main_p.a_li_mid.x0+315., y0=m1p.y0, h=300.);
     let via = rect("mcon.drawing", w=170., h=170., x1=vinn.x1-60.);
     eq(via.y0-vinn.y0, vinn.y1-via.y1);
 

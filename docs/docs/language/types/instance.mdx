@@ -24,7 +24,7 @@ A cell value isn't placed anywhere until you pass it to [`inst`](/language/built
 <FieldTable rows={[
   {name: 'x', type: 'Float', typeHref: '/language/types/scalars#float', description: 'x position.'},
   {name: 'y', type: 'Float', typeHref: '/language/types/scalars#float', description: 'y position.'},
-  {name: '<cell field>', type: 'Declared type', description: 'A field exported by the cell, moved into the parent coordinate system where that applies.'},
+  {name: '<cell field>', type: 'Declared type', description: 'A public field of the cell, moved into the parent coordinate system where that applies.'},
 ]} />
 
 ```argon
@@ -32,6 +32,6 @@ let placed = inst(inverter(1200., 2000., 4), x=100., y=50.);
 let bounds = bbox(placed);
 ```
 
-Any top-level `let` of the cell can be read this way. The exception is a field that holds a function, cell function, or variant constructor, which can't be read through an instance.
+Only the fields the cell declares with [`pub let`](/language/cells-functions#public-fields) can be read this way. Reading another top-level `let` of the cell is an error. A field that holds a function, cell function, or variant constructor also can't be read through an instance.
 
 Imported GDS cells expose fields found in the file, including pin names when pin layers are configured.

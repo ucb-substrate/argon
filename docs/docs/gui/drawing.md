@@ -29,6 +29,8 @@ Choose Path from the Tools menu or the tool strip, pick a layer, and click the c
 
 Press <kbd>D</kbd>, click two compatible edges, then click where the label should go. <kbd>Backspace</kbd> deselects the last edge. Type a float such as `50.` or a cell parameter such as `width`.
 
+An edge of a shape inside a child instance can be picked only if the child cell declares that shape with [`pub let`](/language/cells-functions#public-fields), since the dimension reads it through the instance.
+
 Dimensions also work on rectangles imported from GDS. If the technology file configures pin layers, imported pin labels become fields you can refer to.
 
 ## Instance

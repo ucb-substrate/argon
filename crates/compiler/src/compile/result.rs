@@ -50,6 +50,12 @@ pub enum StaticErrorKind {
     /// A field was read from a cell function that was never called.
     #[error("`{cell}` is a cell function; call it as `{cell}(...)` before reading field `{field}`")]
     CellFnFieldAccess { cell: String, field: String },
+    /// A field that is not declared with `pub let` was read from outside its cell.
+    #[error("field `{field}` of cell `{cell}` is private; declare it with `pub let`")]
+    PrivateField { field: String, cell: String },
+    /// `pub` was applied to a `let` that is not at the top level of a cell body.
+    #[error("`pub` only applies to `let` statements at the top level of a cell body")]
+    MisplacedPub,
     /// Attempted to treat a non-enum object like an enum using the `::` operator.
     #[error("expected an enum")]
     NotAnEnum,
@@ -355,6 +361,11 @@ pub enum ExecErrorKind {
     /// plain misspelling lands here.
     #[error("no field `{field}` on instance of cell `{cell}`")]
     NoFieldOnInstance { field: String, cell: String },
+    /// A field that is not declared with `pub let` was read from an instance.
+    ///
+    /// The type checker rejects this unless the instance arrived as `Any`.
+    #[error("field `{field}` of cell `{cell}` is private; declare it with `pub let`")]
+    PrivateField { field: String, cell: String },
     /// A field was read from an instance whose cell holds a value, such as a
     /// function, that cannot leave the cell.
     #[error(

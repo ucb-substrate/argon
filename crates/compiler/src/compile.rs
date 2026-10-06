@@ -100,9 +100,10 @@ pub(crate) const MAX_TEXT_LEN: usize = 512;
 /// Field names an instance already answers, so a cell's top-level `let` may
 /// not shadow one.
 ///
-/// A cell's public fields are exactly its top-level `let` bindings, and
-/// `inst.x` / `inst.y` are the instance's position. The reserved-name check
-/// and the `Ty::Inst` field-access arm both read this list.
+/// A cell's fields are its top-level `let` bindings, of which an instance
+/// reads only the `pub` ones, and `inst.x` / `inst.y` are the instance's
+/// position. The reserved-name check and the `Ty::Inst` field-access arm both
+/// read this list.
 ///
 /// The evaluator's `ValueRef::Inst` field dispatch is the third site and
 /// cannot: each name maps to a different field of the instance, so it matches
@@ -1168,7 +1169,15 @@ pub(crate) struct VarIdTyFrame {
 }
 
 /// The fields of a fully typed cell, by name.
-type CellFields = IndexMap<String, Ty>;
+type CellFields = IndexMap<String, CellField>;
+
+/// A top-level `let` binding of a cell.
+#[derive(Debug, Clone)]
+struct CellField {
+    ty: Ty,
+    /// Whether the binding is a `pub let`, which an instance may read.
+    public: bool,
+}
 
 pub(crate) struct VarIdTyPass<'a> {
     ast: &'a AnnotatedAst<ParseMetadata>,
@@ -1217,7 +1226,7 @@ struct CellTyping<'a> {
     /// Top-level `let` name to the indices of the statements declaring it,
     /// ascending. A name declared more than once is re-bound in sequence: a
     /// statement sees the nearest `let` above it, and the field an instance
-    /// answers is the last.
+    /// answers is the last, whose `pub` decides its visibility.
     lets: IndexMap<Substr, Vec<usize>>,
     /// The typed parameters and the frame binding them, once typed.
     params: Option<(Vec<ArgDecl<Substr, VarIdTyMetadata>>, VarIdTyFrame)>,
@@ -2820,10 +2829,16 @@ impl<'a> VarIdTyPass<'a> {
                 kind: StaticErrorKind::CellWithTailExpr,
             });
         }
+        // A name bound again replaces the earlier binding, so the last one
+        // decides both the type and the visibility.
         let fields = stmts
             .iter()
-            .flat_map(typed_let_bindings)
-            .map(|(name, _, ty)| (name.name.to_string(), ty))
+            .flat_map(|stmt| {
+                let public = stmt.public().is_some();
+                typed_let_bindings(stmt)
+                    .into_iter()
+                    .map(move |(name, _, ty)| (name.name.to_string(), CellField { ty, public }))
+            })
             .collect();
         self.finished_cell_fields.insert(cell, fields);
         let scope = Scope {
@@ -2873,9 +2888,9 @@ impl<'a> VarIdTyPass<'a> {
         true
     }
 
-    /// Whether an instance of `cell` would answer `field`.
+    /// Whether `cell` declares `field`, publicly or not.
     ///
-    /// A cell's public fields are its top-level `let` bindings plus
+    /// A cell's fields are its top-level `let` bindings plus
     /// [`RESERVED_CELL_FIELDS`]; a GDS-backed cell publishes its geometry at
     /// execution time, so it answers anything.
     fn cell_declares_field(&self, cell: &CellTy, field: &str) -> bool {
@@ -2896,12 +2911,50 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
+    /// Whether `cell` declares `field` without `pub`.
+    ///
+    /// GDS-backed cells and [`RESERVED_CELL_FIELDS`] are always public.
+    fn is_private_field(&self, cell: &CellTy, field: &str) -> bool {
+        if cell.dynamic_fields || RESERVED_CELL_FIELDS.contains(&field) {
+            return false;
+        }
+        let Some(def) = cell.def else {
+            return false;
+        };
+        if let Some(fields) = self.finished_cell_fields.get(&def) {
+            fields.get(field).is_some_and(|field| !field.public)
+        } else if let Some(typing) = self.cells.get(&def) {
+            typing
+                .lets
+                .get(field)
+                .and_then(|stmts| stmts.last())
+                .is_some_and(|&stmt| typing.decl.scope.stmts[stmt].public().is_none())
+        } else {
+            self.cell_fields
+                .get(&def)
+                .and_then(|fields| fields.get(field))
+                .is_some_and(|field| !field.public)
+        }
+    }
+
+    /// Reports a read of the private `field` of `cell`.
+    fn private_field(&mut self, cell: &CellTy, field: &Ident<Substr, VarIdTyMetadata>) {
+        self.errors.push(StaticError {
+            span: self.span(field.span),
+            kind: StaticErrorKind::PrivateField {
+                field: field.name.to_string(),
+                cell: cell.name.clone(),
+            },
+        });
+    }
+
     /// The type of `field` read from an instance of `cell`, whose type is
     /// `base_ty`.
     ///
     /// A field of a cell of this module whose statement has not been typed yet
     /// is a demand: the read types `Unknown` for now and the statement making
-    /// it is retried once the field is typed.
+    /// it is retried once the field is typed. A private field is reported
+    /// without a demand.
     fn inst_field_ty(
         &mut self,
         cell: &CellTy,
@@ -2918,12 +2971,16 @@ impl<'a> VarIdTyPass<'a> {
         let Some(def) = cell.def else {
             return Ty::Any;
         };
+        if self.is_private_field(cell, name) {
+            self.private_field(cell, field);
+            return Ty::Unknown;
+        }
         // Field types mention the cell's own type parameters; an instance
         // reads them with its arguments substituted.
         let map = cell.param_map();
         if let Some(fields) = self.finished_cell_fields.get(&def) {
             return match fields.get(name) {
-                Some(ty) => subst(ty, &map),
+                Some(field) => subst(&field.ty, &map),
                 None => self.no_field_on_ty(field, base_ty.clone()),
             };
         }
@@ -2952,7 +3009,7 @@ impl<'a> VarIdTyPass<'a> {
             .get(&def)
             .and_then(|fields| fields.get(name))
         {
-            Some(ty) => subst(ty, &map),
+            Some(field) => subst(&field.ty, &map),
             None => self.no_field_on_ty(field, base_ty.clone()),
         }
     }
@@ -5011,24 +5068,35 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             // Only when the field exists, though: telling someone who
             // misspelled a field to place the cell first is advice that
             // cannot help, so an unknown name still gets the no-field error.
+            //
+            // A private field is reported as such first, since placing the
+            // cell would not make it readable.
             Ty::Cell(ref c) if self.cell_declares_field(c, field.name.as_str()) => {
-                self.errors.push(StaticError {
-                    span: self.span(field.span),
-                    kind: StaticErrorKind::CellFieldBeforePlacement {
-                        cell: c.name.clone(),
-                        field: field.name.to_string(),
-                    },
-                });
+                if self.is_private_field(c, &field.name) {
+                    self.private_field(c, field);
+                } else {
+                    self.errors.push(StaticError {
+                        span: self.span(field.span),
+                        kind: StaticErrorKind::CellFieldBeforePlacement {
+                            cell: c.name.clone(),
+                            field: field.name.to_string(),
+                        },
+                    });
+                }
                 Ty::Unknown
             }
             Ty::CellFn(ref c) if self.cell_declares_field(&c.cell, &field.name) => {
-                self.errors.push(StaticError {
-                    span: self.span(field.span),
-                    kind: StaticErrorKind::CellFnFieldAccess {
-                        cell: c.cell.name.clone(),
-                        field: field.name.to_string(),
-                    },
-                });
+                if self.is_private_field(&c.cell, &field.name) {
+                    self.private_field(&c.cell, field);
+                } else {
+                    self.errors.push(StaticError {
+                        span: self.span(field.span),
+                        kind: StaticErrorKind::CellFnFieldAccess {
+                            cell: c.cell.name.clone(),
+                            field: field.name.to_string(),
+                        },
+                    });
+                }
                 Ty::Unknown
             }
             Ty::Struct(ref s) => {
@@ -5343,10 +5411,18 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_scope(
         &mut self,
-        _input: &Scope<Substr, Self::InputMetadata>,
+        input: &Scope<Substr, Self::InputMetadata>,
         _stmts: &[Statement<Substr, Self::OutputMetadata>],
         tail: &Option<Expr<Substr, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::Scope {
+        // A cell body is typed one statement at a time and never reaches
+        // here, so every scope that does is one `pub` does not apply to.
+        for public in input.stmts.iter().filter_map(Statement::public) {
+            self.errors.push(StaticError {
+                span: self.span(public),
+                kind: StaticErrorKind::MisplacedPub,
+            });
+        }
         tail.as_ref().map(|tail| tail.ty()).unwrap_or(Ty::Nil)
     }
 
@@ -5391,6 +5467,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let pattern = self.type_pattern(&input.pattern, &value_ty);
         self.check_let_pattern(&pattern, &value);
         LetPattern {
+            public: input.public,
             pattern,
             value,
             span: input.span,
@@ -6172,6 +6249,7 @@ impl AstTransformer for Zonker<'_> {
         let ty = input.ty.as_ref().map(|ty| self.transform_ty_spec(ty));
         let value = self.transform_expr(&input.value);
         LetBinding {
+            public: input.public,
             name,
             ty,
             value,
@@ -6941,7 +7019,10 @@ struct CellState {
     name: String,
     solve_iters: u64,
     solver: Solver,
+    /// Every top-level `let` binding, public or not.
     fields: IndexMap<String, ValueId>,
+    /// The names in `fields` whose last binding is a `pub let`.
+    public_fields: IndexSet<String>,
     emit: Vec<Emit>,
     object_emit: Vec<ObjectEmit>,
     objects: IndexMap<ObjectId, Object>,
@@ -7725,6 +7806,7 @@ impl<'a> ExecPass<'a> {
                         solve_iters: 0,
                         solver: Solver::with_grid(self.tech.grid_step()),
                         fields: Default::default(),
+                        public_fields: Default::default(),
                         emit: Vec::new(),
                         object_emit: Vec::new(),
                         deferred: Default::default(),
@@ -8303,6 +8385,7 @@ impl<'a> ExecPass<'a> {
                         .iter()
                         .map(|(name, ids)| (name.clone(), FieldValue::from_objects(ids)))
                         .collect(),
+                    private_fields: IndexSet::new(),
                     sse_basis: SseBasis::Nullspace(Vec::new()),
                     objects,
                     fallback_constraints_used: Vec::new(),
@@ -8552,6 +8635,7 @@ impl<'a> ExecPass<'a> {
             scopes: IndexMap::new(),
             root: state.root_scope,
             fields: IndexMap::new(),
+            private_fields: IndexSet::new(),
             sse_basis: state.sse_basis.clone(),
             fallback_constraints_used: state.fallback_constraints_used.clone(),
             unsolved_vars: state.unsolved_vars.clone().unwrap_or_default(),
@@ -8624,6 +8708,10 @@ impl<'a> ExecPass<'a> {
         }
 
         for (name, vid) in state.fields.iter() {
+            if !state.public_fields.contains(name) {
+                ccell.private_fields.insert(name.clone());
+                continue;
+            }
             let value = self.values[vid]
                 .as_ref()
                 .into_ready()
@@ -8791,7 +8879,8 @@ impl<'a> ExecPass<'a> {
         match stmt {
             Statement::LetBinding(binding) => {
                 let value = self.visit_expr(loc, &binding.value);
-                self.bind_let(loc, binding.metadata, &binding.name.name, value, top_level);
+                let field = top_level.then_some(binding.public.is_some());
+                self.bind_let(loc, binding.metadata, &binding.name.name, value, field);
                 loc.seq_num.next()
             }
             Statement::LetPattern(binding) => {
@@ -8804,6 +8893,7 @@ impl<'a> ExecPass<'a> {
                     Ty::Struct(ty) => Some(ty.name.clone()),
                     _ => None,
                 };
+                let public = top_level.then_some(binding.public.is_some());
                 for field in fields {
                     let Pattern::Binding { name, metadata } = &field.pattern else {
                         continue;
@@ -8817,7 +8907,7 @@ impl<'a> ExecPass<'a> {
                             span: field.span,
                         }))
                     });
-                    self.bind_let(loc, metadata.0, &name.name, element, top_level);
+                    self.bind_let(loc, metadata.0, &name.name, element, public);
                     seq_num = seq_num.next();
                 }
                 seq_num
@@ -8834,15 +8924,31 @@ impl<'a> ExecPass<'a> {
     }
 
     /// Binds the `let` name `name`, with id `id`, to `value` at `loc`.
-    fn bind_let(&mut self, loc: DynLoc, id: VarId, name: &str, value: ValueId, field: bool) {
+    ///
+    /// `field` is `Some(public)` for a top-level `let` of a cell, which also
+    /// becomes a field of the cell.
+    fn bind_let(
+        &mut self,
+        loc: DynLoc,
+        id: VarId,
+        name: &str,
+        value: ValueId,
+        field: Option<bool>,
+    ) {
         self.frames
             .get_mut(&loc.frame)
             .unwrap()
             .bindings
             .insert(id, value);
         let state = self.cell_state_mut(loc.cell);
-        if field {
+        if let Some(public) = field {
             state.fields.insert(name.to_string(), value);
+            // A later binding of the same name decides its visibility.
+            if public {
+                state.public_fields.insert(name.to_string());
+            } else {
+                state.public_fields.shift_remove(name);
+            }
         }
         state
             .scopes
@@ -11453,6 +11559,12 @@ impl<'a> ExecPass<'a> {
                                                 })
                                             }
                                             Some(field_value) => Ok(field_value),
+                                            None if cell.private_fields.contains(field) => {
+                                                Err(ExecErrorKind::PrivateField {
+                                                    field: field.to_string(),
+                                                    cell: cell.name.clone(),
+                                                })
+                                            }
                                             None => Err(ExecErrorKind::NoFieldOnInstance {
                                                 field: field.to_string(),
                                                 cell: cell.name.clone(),
@@ -12447,8 +12559,10 @@ pub struct CompiledCell {
     pub name: String,
     pub scopes: IndexMap<ScopeId, CompiledScope>,
     pub root: ScopeId,
-    /// The cell's top-level `let` bindings, which an instance of it reads.
+    /// The cell's `pub let` bindings, which an instance of it reads.
     pub fields: IndexMap<String, FieldValue>,
+    /// The names of the cell's other top-level `let` bindings.
+    pub private_fields: IndexSet<String>,
     pub sse_basis: SseBasis,
     pub objects: IndexMap<ObjectId, SolvedValue>,
     pub fallback_constraints_used: Vec<UsedFallback>,
@@ -12776,6 +12890,7 @@ impl CompiledCell {
             scopes,
             root: _,
             fields: _,
+            private_fields: _,
             sse_basis: _,
             objects,
             fallback_constraints_used,
@@ -13701,6 +13816,28 @@ fn object_id(id: &mut u64) -> ObjectId {
     ObjectId(next_id)
 }
 
+/// The index suffix (`[i][j]`) at which `value` holds `object`, preferring
+/// later entries.
+fn array_suffix(value: &Arrayed<ObjectId>, object: ObjectId) -> Option<String> {
+    match value {
+        Arrayed::Elem(id) => (*id == object).then(String::new),
+        Arrayed::Array(values) => values.iter().enumerate().rev().find_map(|(i, value)| {
+            array_suffix(value, object).map(|suffix| format!("[{i}]{suffix}"))
+        }),
+    }
+}
+
+/// Whether `object` is a kind of object that a binding can name.
+fn is_nameable(object: &SolvedValue) -> bool {
+    matches!(
+        object,
+        SolvedValue::Rect(_)
+            | SolvedValue::Polygon(_)
+            | SolvedValue::Path(_)
+            | SolvedValue::Instance(_)
+    )
+}
+
 impl CompiledData {
     /// Resolve one object's source name without allocating names for every
     /// reachable object. Later bindings and array entries win, as they do in
@@ -13712,23 +13849,8 @@ impl CompiledData {
         scope: ScopeId,
         object: ObjectId,
     ) -> Option<String> {
-        fn array_suffix(value: &Arrayed<ObjectId>, object: ObjectId) -> Option<String> {
-            match value {
-                Arrayed::Elem(id) => (*id == object).then(String::new),
-                Arrayed::Array(values) => values.iter().enumerate().rev().find_map(|(i, value)| {
-                    array_suffix(value, object).map(|suffix| format!("[{i}]{suffix}"))
-                }),
-            }
-        }
-
         let cell = &self.cells[&cell];
-        if !matches!(
-            cell.objects.get(&object)?,
-            SolvedValue::Rect(_)
-                | SolvedValue::Polygon(_)
-                | SolvedValue::Path(_)
-                | SolvedValue::Instance(_)
-        ) {
+        if !is_nameable(cell.objects.get(&object)?) {
             return None;
         }
         let mut scope = scope;
@@ -13746,6 +13868,24 @@ impl CompiledData {
             scope = parent;
             before = seq;
         }
+    }
+
+    /// The name through which an instance of `cell` reads `object`: a
+    /// root-scope binding of `cell` that is a public field, with any index
+    /// suffix. Later bindings and array entries win.
+    pub fn reachable_field_name(&self, cell: CellId, object: ObjectId) -> Option<String> {
+        let cell = &self.cells[&cell];
+        if !is_nameable(cell.objects.get(&object)?) {
+            return None;
+        }
+        cell.scopes[&cell.root]
+            .bindings
+            .values()
+            .rev()
+            .filter(|(name, _)| cell.fields.contains_key(name))
+            .find_map(|(name, value)| {
+                array_suffix(value, object).map(|suffix| format!("{name}{suffix}"))
+            })
     }
 
     pub fn reachable_objs(&self, cell: CellId, scope: ScopeId) -> IndexMap<ObjectId, String> {

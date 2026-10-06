@@ -34,6 +34,11 @@ pub enum CompletionSite {
     /// At the start of a statement that could instead be an `else`
     /// continuing the `if` just closed. Both sets of candidates apply.
     StatementOrElse,
+    /// Like [`Self::Statement`], at the top level of a cell body, where a
+    /// statement may also be a `pub let`.
+    CellStatement,
+    /// Like [`Self::StatementOrElse`], at the top level of a cell body.
+    CellStatementOrElse,
     /// Somewhere an expression is expected.
     Expression,
     /// Somewhere a type specification is expected.
@@ -59,10 +64,10 @@ impl CompletionSite {
             // descending into a direct expression. First-wins preserves that
             // distinction, while a nested expression recorded later is not
             // overwritten when the scope closes at the same cursor.
-            Self::Statement | Self::Expression => 2,
+            Self::Statement | Self::CellStatement | Self::Expression => 2,
             // Outranks `Statement`, which the statement loop records at the
             // same offset.
-            Self::StatementOrElse => 3,
+            Self::StatementOrElse | Self::CellStatementOrElse => 3,
             Self::Type | Self::Pattern | Self::ImportPath | Self::Keyword(_) => 3,
             Self::NewIdentifier => 4,
             Self::Suppressed => 5,
@@ -242,12 +247,18 @@ mod tests {
             ("cell top() { let | = 1.; }", NewIdentifier),
             ("cell top() { for | in [] {} }", NewIdentifier),
             ("cell top() { let value = re|; }", Expression),
-            ("cell top() { re|; }", Statement),
+            ("cell top() { re|; }", CellStatement),
+            ("fn f() { re|; }", Statement),
+            ("cell top() { for i in [] { re|; } }", Statement),
+            ("cell top() { { re|; } }", Statement),
+            ("cell top() { pub | }", Keyword("let")),
             ("cell top() { rect(|); }", Expression),
             ("cell top() { for item | [] {} }", Keyword("in")),
             // The `else` is optional in statement position, required in
             // expression position.
-            ("cell top() { if true {} | {} }", StatementOrElse),
+            ("cell top() { if true {} | {} }", CellStatementOrElse),
+            ("fn f() { if true {} | {} }", StatementOrElse),
+            ("cell top() { if true { if true {} | } }", StatementOrElse),
             ("cell top() { let x = if true {} | ; }", Keyword("else")),
             ("cell top() { match m { | } }", Pattern),
             ("cell top() { match m { Some(|) => 1, } }", Pattern),
@@ -621,6 +632,66 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(names, ["w", "tall"]);
         assert!(matches!(&cell.scope.stmts[1], Statement::LetBinding(_)));
+    }
+
+    /// `pub` prefixes a `let` or a `let` pattern, and its span is recorded
+    /// as part of the statement.
+    #[test]
+    fn pub_let_parses() {
+        use crate::ast::{Decl, Statement};
+
+        let src = "cell c() { pub let a = 1.; pub let Size { w, h } = s; let b = 2.; }";
+        let ast = parse(src).unwrap();
+        let Decl::Cell(cell) = &ast.ast.decls[0] else {
+            panic!("expected a cell");
+        };
+        let text = |span: cfgrammar::Span| &src[span.start()..span.end()];
+        let Statement::LetBinding(a) = &cell.scope.stmts[0] else {
+            panic!("expected a let");
+        };
+        assert_eq!(text(a.public.expect("public")), "pub");
+        assert_eq!(text(a.span), "pub let a = 1.");
+        let Statement::LetPattern(size) = &cell.scope.stmts[1] else {
+            panic!("expected a let pattern");
+        };
+        assert_eq!(text(size.public.expect("public")), "pub");
+        assert_eq!(text(size.span), "pub let Size { w, h } = s");
+        let Statement::LetBinding(b) = &cell.scope.stmts[2] else {
+            panic!("expected a let");
+        };
+        assert!(b.public.is_none());
+
+        // Placement inside a cell is checked by the type checker, not here.
+        assert!(parse("fn f() { pub let a = 1.; }").is_ok());
+    }
+
+    #[test]
+    fn misplaced_pub_is_a_parse_error() {
+        for (src, message) in [
+            ("cell c() { pub a = 1.; }", "expected `let` after `pub`"),
+            (
+                "cell c() { pub for i in [] {} }",
+                "expected `let` after `pub`",
+            ),
+            (
+                "pub fn f() {}",
+                "`pub` only applies to `let` statements in a cell",
+            ),
+            (
+                "pub cell c() {}",
+                "`pub` only applies to `let` statements in a cell",
+            ),
+            (
+                "pub let a = 1.;",
+                "`pub` only applies to `let` statements in a cell",
+            ),
+        ] {
+            let errors = parse(src).expect_err("a misplaced `pub` should be rejected");
+            assert!(
+                errors.iter().any(|error| error.message == message),
+                "`{src}` should report `{message}`, got {errors:?}"
+            );
+        }
     }
 
     /// A struct variant's fields keep their declared order and spans, and a

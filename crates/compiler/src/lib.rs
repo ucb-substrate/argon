@@ -1412,7 +1412,7 @@ mod tests {
                  let w = l.met1.w;\n\
              }\n\
              cell bot() {\n\
-                 let met1 = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);\n\
+                 pub let met1 = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);\n\
              }\n",
         );
         assert!(errors.is_empty(), "{errors:?}");
@@ -1424,7 +1424,7 @@ mod tests {
                      eq(l.met2.x0, 0.);\n\
                  }\n\
                  cell bot() {\n\
-                     let met1 = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);\n\
+                     pub let met1 = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);\n\
                  }\n"
             )
             .as_slice(),
@@ -1498,7 +1498,7 @@ mod tests {
     fn cells_may_instantiate_each_other() {
         let data = compile_source(
             "cell a(n: Int) {\n\
-                 let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
+                 pub let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
                  if n > 0 {\n\
                      let b = inst(b(n - 1));\n\
                      eq(b.r.x0, r.x1);\n\
@@ -1507,7 +1507,7 @@ mod tests {
                  };\n\
              }\n\
              cell b(n: Int) {\n\
-                 let r = rect(\"met2\", x0=0., y0=0., x1=10., y1=10.);\n\
+                 pub let r = rect(\"met2\", x0=0., y0=0., x1=10., y1=10.);\n\
                  if n > 0 {\n\
                      let a = inst(a(n - 1));\n\
                      eq(a.r.x0, r.x1);\n\
@@ -1529,7 +1529,7 @@ mod tests {
         let errors = static_errors_of(
             "cell a(n: Int) {\n\
                  let k = if n > 0 { inst(a(n - 1)).z.w } else { 0. };\n\
-                 let z = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
+                 pub let z = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
              }\n",
         );
         assert!(errors.is_empty(), "{errors:?}");
@@ -1545,10 +1545,10 @@ mod tests {
                  eq(inst(a()).f.x0, inst(b()).g.x0);\n\
              }\n\
              cell a() {\n\
-                 let f = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                 pub let f = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
              }\n\
              cell b() {\n\
-                 let g = inst(a()).f;\n\
+                 pub let g = inst(a()).f;\n\
              }\n",
         );
         assert!(errors.is_empty(), "{errors:?}");
@@ -1565,7 +1565,7 @@ mod tests {
              }\n\
              cell top() {\n\
                  let bot = 5.;\n\
-                 let a = bot + 1.;\n\
+                 pub let a = bot + 1.;\n\
              }\n\
              cell bot() {\n\
                  let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
@@ -1587,7 +1587,7 @@ mod tests {
                  let r = 1.;\n\
                  let s = r + 1.;\n\
                  let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
-                 let c = r.w + s;\n\
+                 pub let c = r.w + s;\n\
              }\n",
         );
         assert!(errors.is_empty(), "{errors:?}");
@@ -1597,7 +1597,7 @@ mod tests {
     /// closes the cycle, and nothing else cascades from it.
     #[test]
     fn a_field_whose_type_depends_on_itself_is_an_error() {
-        let errors = static_errors_of("cell a(n: Int) {\n    let f = inst(a(n - 1)).f;\n}\n");
+        let errors = static_errors_of("cell a(n: Int) {\n    pub let f = inst(a(n - 1)).f;\n}\n");
         assert!(
             matches!(
                 errors.as_slice(),
@@ -1606,8 +1606,7 @@ mod tests {
             "{errors:?}"
         );
 
-        let source =
-            "cell a() {\n    let f = inst(b()).g;\n}\ncell b() {\n    let g = inst(a()).f;\n}\n";
+        let source = "cell a() {\n    pub let f = inst(b()).g;\n}\ncell b() {\n    pub let g = inst(a()).f;\n}\n";
         let errors = static_errors(source);
         assert!(
             matches!(
@@ -1620,7 +1619,7 @@ mod tests {
 
         // Through a local: `z` reads `k`, whose type needs `z`.
         let errors = static_errors_of(
-            "cell a(n: Int) {\n    let k = inst(a(n - 1)).z;\n    let z = k;\n}\n",
+            "cell a(n: Int) {\n    pub let k = inst(a(n - 1)).z;\n    pub let z = k;\n}\n",
         );
         assert!(
             matches!(
@@ -1662,7 +1661,7 @@ mod tests {
         let cells = "cell top() {\n\
                          let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
                          let s = r.w;\n\
-                         let r = 5.;\n\
+                         pub let r = 5.;\n\
                          let t = r + 1.;\n\
                      }\n";
         let errors = static_errors_of(cells);
@@ -2302,7 +2301,7 @@ struct Pair {
 }
 
 cell leaf() {
-    let m = rect("met1", x0=0., y0=0., w=10., h=10.);
+    pub let m = rect("met1", x0=0., y0=0., w=10., h=10.);
 }
 
 cell child(rs: [Rect], p: Pair, proxied: Rect) {
@@ -4798,7 +4797,7 @@ cell top() {
         // map `{"r": Rect}` that contained it. The evaluator refuses the same
         // read, so the type checker now agrees with it.
         let errors = check_source(
-            "cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
+            "cell child() { pub let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
              cell top() {
                  let c = child();
                  text(\"t\", \"text.label\", c.r.x0, 0.);
@@ -4815,7 +4814,7 @@ cell top() {
 
         // The same read on an uncalled cell function names the call it needs.
         let errors = check_source(
-            "cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
+            "cell child() { pub let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
              cell top() { text(\"t\", \"text.label\", child.r.x0, 0.); }",
         );
         assert!(
@@ -4893,14 +4892,251 @@ cell top() {
     }
 
     #[test]
+    fn only_pub_fields_are_readable_through_an_instance() {
+        let source = "cell child() {
+                 pub let a = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);
+                 let b = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);
+             }
+             cell top() {
+                 let i = inst(child());
+                 let w = i.a.w + i.b.w + i.x;
+             }";
+        let errors = static_errors(source);
+        let [error] = errors.as_slice() else {
+            panic!("{errors:#?}");
+        };
+        assert!(
+            matches!(&error.kind, StaticErrorKind::PrivateField { field, cell }
+                if field == "b" && cell == "child"),
+            "{errors:#?}"
+        );
+        assert_eq!(
+            error.kind.to_string(),
+            "field `b` of cell `child` is private; declare it with `pub let`"
+        );
+        let read = source.find("i.b").unwrap() + 2;
+        assert_eq!(error.span.span, cfgrammar::Span::new(read, read + 1));
+    }
+
+    /// Visibility is checked whether the child cell is typed before the
+    /// reader, after it, or in another module.
+    #[test]
+    fn a_field_is_private_whatever_order_its_cell_is_typed_in() {
+        let child = "cell child() {
+                 pub let shown = 1.;
+                 let hidden = 2.;
+             }\n";
+        let top = "cell top() {
+                 let i = inst(child());
+                 let v = i.shown + i.hidden;
+             }\n";
+        for source in [format!("{child}{top}"), format!("{top}{child}")] {
+            let errors = static_errors_of(&source);
+            assert!(
+                matches!(errors.as_slice(), [StaticErrorKind::PrivateField { field, .. }]
+                    if field == "hidden"),
+                "{source}\n{errors:?}"
+            );
+        }
+
+        let root = parse_source_text(
+            "cell top() {
+                 let i = inst(cells::child());
+                 let v = i.shown + i.hidden;
+             }",
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let cells = parse_source_text(child, PathBuf::from("/virtual/cells.ar")).unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["cells".to_owned()], cells)]);
+        let (_, output) = static_compile(&ast).unwrap();
+        assert!(
+            matches!(
+                output.errors.as_slice(),
+                [crate::compile::StaticError {
+                    kind: StaticErrorKind::PrivateField { field, cell },
+                    ..
+                }] if field == "hidden" && cell == "cells::child"
+            ),
+            "{:?}",
+            output.errors
+        );
+    }
+
+    /// When a name is bound more than once, the last binding is the field, so
+    /// its `pub` decides whether an instance can read it.
+    #[test]
+    fn the_last_binding_of_a_field_decides_its_visibility() {
+        let errors = static_errors_of(
+            "cell child() {
+                 pub let a = 1.;
+                 let a = 2.;
+                 let b = 1.;
+                 pub let b = 2.;
+             }
+             cell top() {
+                 let i = inst(child());
+                 let v = i.a + i.b;
+             }",
+        );
+        assert!(
+            matches!(errors.as_slice(), [StaticErrorKind::PrivateField { field, .. }] if field == "a"),
+            "{errors:?}"
+        );
+
+        let data = compile_top(
+            "cell top() {
+                 pub let a = 1.;
+                 let a = 2.;
+                 let b = 1.;
+                 pub let b = 2.;
+                 let c = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);
+                 pub let Pair { first, second } = Pair { first: 1., second: 2. };
+             }
+             struct Pair { first: Float, second: Float }",
+        );
+        let top = &data.cells[&data.top];
+        assert_eq!(
+            top.fields.keys().collect::<Vec<_>>(),
+            ["b", "first", "second"]
+        );
+        assert_eq!(top.private_fields.iter().collect::<Vec<_>>(), ["a", "c"]);
+    }
+
+    /// A private field is reported before any check that would suggest
+    /// placing or calling the cell, which would not make it readable.
+    #[test]
+    fn a_private_field_of_an_unplaced_cell_is_reported_as_private() {
+        for source in [
+            "cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
+             cell top() {
+                 let c = child();
+                 text(\"t\", \"text.label\", c.r.x0, 0.);
+             }",
+            "cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
+             cell top() { text(\"t\", \"text.label\", child.r.x0, 0.); }",
+        ] {
+            let errors = check_source(source);
+            assert!(
+                matches!(errors.as_slice(), [StaticErrorKind::PrivateField { field, cell }]
+                    if field == "r" && cell == "child"),
+                "{source}\n{errors:#?}"
+            );
+        }
+    }
+
+    /// Reading a private field raises no demand to type it, so a private
+    /// field that reads itself is not a cycle.
+    #[test]
+    fn a_private_field_is_not_typed_on_demand() {
+        let errors = static_errors_of("cell a(n: Int) {\n    let f = inst(a(n - 1)).f;\n}\n");
+        assert!(
+            matches!(errors.as_slice(), [StaticErrorKind::PrivateField { field, cell }]
+                if field == "f" && cell == "a"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn pub_applies_only_at_the_top_level_of_a_cell() {
+        for source in [
+            "fn f() -> Float { pub let a = 1.; a }",
+            "cell top() { for i in std::range(2) { pub let a = 1.; } }",
+            "cell top() { if true { pub let a = 1.; } }",
+            "cell top() { if true { } else { pub let a = 1.; }; }",
+            "cell top() { let v = { pub let a = 1.; a }; }",
+            "enum E { A, B, }
+             cell top() { let v = match E::A { E::A => { pub let a = 1.; a }, E::B => 0., }; }",
+            "struct S { a: Float }
+             fn f() -> Float { pub let S { a } = S { a: 1. }; a }",
+        ] {
+            let errors = static_errors(source);
+            assert!(
+                matches!(
+                    errors.as_slice(),
+                    [crate::compile::StaticError { kind: StaticErrorKind::MisplacedPub, span }]
+                        if &source[span.span.start()..span.span.end()] == "pub"
+                ),
+                "{source}\n{errors:?}"
+            );
+        }
+        assert!(
+            static_errors(
+                "struct S { a: Float }
+                 cell top() { pub let b = 1.; pub let S { a } = S { a: b }; }"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_private_field_read_through_any_is_a_run_time_error() {
+        assert_reports(
+            &run_source(
+                "fn width(i: Any) -> Any { i.secret.w }
+                 cell pad() { let secret = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }
+                 cell top() {
+                     let p = inst(pad(), x=0., y=0.);
+                     let r = rect(\"met2\", x0=0., y0=0., w=width(p), h=10.);
+                 }",
+            ),
+            |error| {
+                matches!(error, ExecErrorKind::PrivateField { field, cell }
+                if field == "secret" && cell == "pad")
+            },
+        );
+    }
+
+    /// The GUI writes the names `reachable_field_name` returns into source,
+    /// so a name that crosses into a child cell must be a public field.
+    #[test]
+    fn reachable_field_names_are_public_fields() {
+        let data = compile_top(
+            "cell child() {
+                 pub let a = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);
+                 let alias = a;
+                 let hidden = rect(\"met1\", x0=2., y0=0., x1=3., y1=1.);
+                 pub let row = [
+                     rect(\"met1\", x0=4., y0=0., x1=5., y1=1.),
+                     rect(\"met1\", x0=6., y0=0., x1=7., y1=1.),
+                 ];
+             }
+             cell top() { let i = inst(child(), x=0., y=0.); }",
+        );
+        let (&id, child) = data
+            .cells
+            .iter()
+            .find(|(_, cell)| cell.name == "child")
+            .unwrap();
+        let rect_at = |x0: f64| {
+            child
+                .objects
+                .iter()
+                .find(|(_, object)| object.get_rect().is_some_and(|rect| rect.x0.0 == x0))
+                .map(|(object, _)| *object)
+                .unwrap()
+        };
+        let name = |x0| data.reachable_field_name(id, rect_at(x0));
+        // Inside the cell, the latest binding names `a`.
+        assert_eq!(
+            data.reachable_obj_name(id, child.root, rect_at(0.))
+                .as_deref(),
+            Some("alias")
+        );
+        assert_eq!(name(0.).as_deref(), Some("a"));
+        assert_eq!(name(2.), None);
+        assert_eq!(name(6.).as_deref(), Some("row[1]"));
+    }
+
+    #[test]
     fn instances_read_scalar_fields() {
         let data = compile_top(
             "fn width_of(i: Any) -> Any { i.width }
              cell pad() {
-                 let count = 3;
-                 let width = 2.5;
-                 let layer = \"met2\";
-                 let wide = true;
+                 pub let count = 3;
+                 pub let width = 2.5;
+                 pub let layer = \"met2\";
+                 pub let wide = true;
                  let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
              }
              cell top() {
@@ -4925,7 +5161,7 @@ cell top() {
             "struct Pins { pad: Rect, tip: Point, count: Int }
              cell pad() {
                  let tri = polygon(\"met1\", 3, x0=0., y0=0., x1=10., y1=0., x2=10., y2=20.);
-                 let pins = Pins {
+                 pub let pins = Pins {
                      pad: rect(\"met2\", x0=0., y0=0., x1=10., y1=5.),
                      tip: tri.points[2],
                      count: 2,
@@ -4955,7 +5191,7 @@ cell top() {
     fn a_cell_held_in_a_field_can_be_placed_by_the_parent() {
         let data = compile_top(
             "cell leaf() { let r = rect(\"met1\", x0=0., y0=0., x1=5., y1=5.); }
-             cell holder() { let c = leaf(); }
+             cell holder() { pub let c = leaf(); }
              cell top() {
                  let h = inst(holder(), x=0., y=0.);
                  let l = inst(h.c, x=10., y=0.);
@@ -4968,8 +5204,8 @@ cell top() {
     fn an_instance_reads_the_last_binding_of_a_shadowed_field() {
         let data = compile_top(
             "cell pad() {
-                 let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
-                 let a = 4.;
+                 pub let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
+                 pub let a = 4.;
              }
              cell top() {
                  let p = inst(pad(), x=0., y=0.);
@@ -4989,7 +5225,7 @@ cell top() {
         let errors = run_source(
             "cell pad() {
                  let c = crect(x0=0., y0=0., x1=10., y1=10.);
-                 let layer = c.layer;
+                 pub let layer = c.layer;
              }
              cell top() {
                  let p = inst(pad(), x=0., y=0.);
@@ -5006,7 +5242,7 @@ cell top() {
     fn reading_a_function_field_through_an_instance_is_a_static_error() {
         let errors = check_source(
             "fn double(x: Int) -> Int { x * 2 }
-             cell pad() { let f = double; let fs = [double]; }
+             cell pad() { pub let f = double; pub let fs = [double]; }
              cell top() {
                  let p = inst(pad(), x=0., y=0.);
                  let f = p.f;
@@ -5033,7 +5269,7 @@ cell top() {
             &run_source(
                 "fn double(x: Int) -> Int { x * 2 }
                  fn read_f(i: Any) -> Any { i.f }
-                 cell pad() { let f = double; }
+                 cell pad() { pub let f = double; }
                  cell top() {
                      let p = inst(pad(), x=0., y=0.);
                      let f = read_f(p);
@@ -5250,9 +5486,9 @@ cell top() {
         // rather than with the design.
         let data = compile_top(
             "cell bot() {
-                 let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);
-                 let p = polygon(\"met2\", 3, x0=0., y0=0., x1=10., y1=0., x2=5., y2=10.);
-                 let q = path(\"met3\", 2, width=10., begin_extension=0., end_extension=0.,
+                 pub let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);
+                 pub let p = polygon(\"met2\", 3, x0=0., y0=0., x1=10., y1=0., x2=5., y2=10.);
+                 pub let q = path(\"met3\", 2, width=10., begin_extension=0., end_extension=0.,
                               x0=0., y0=0., x1=50., y1=0.);
              }
              cell top() {
@@ -5286,7 +5522,7 @@ cell top() {
         // proxy of its geometry appeared in the parent with no corresponding
         // struct anywhere in the file.
         let data = compile_top(
-            "cell bot() { let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=50.); }
+            "cell bot() { pub let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=50.); }
              cell top() {
                  let i = inst(bot(), x=1000., y=0., construction=true);
                  let r = rect(\"met2\", x0=i.m.x0, y0=0., x1=i.m.x1, y1=1.);
@@ -5306,9 +5542,9 @@ cell top() {
         let data = compile_top(
             "fn second(lst: [Any]) -> Any { head(tail(lst)) }
              cell bot() {
-                 let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);
-                 let n = rect(\"met1\", x0=200., y0=0., x1=300., y1=100.);
-                 let both = [m, n];
+                 pub let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);
+                 pub let n = rect(\"met1\", x0=200., y0=0., x1=300., y1=100.);
+                 pub let both = [m, n];
              }
              cell top() {
                  let i = inst(bot(), x=1000., y=0.);
@@ -6257,7 +6493,7 @@ cell top() {
                  let r = rect(\"met2\", x0=0., y0=0., w=p.shape.w, h=p.via.h);
              }
              cell pad() {
-                 let Pad { r: shape, via } = Pad {
+                 pub let Pad { r: shape, via } = Pad {
                      r: rect(\"met1\", x0=0., y0=0., w=30., h=10.),
                      via: rect(\"via1\", x0=0., y0=0., w=2., h=4.),
                  };

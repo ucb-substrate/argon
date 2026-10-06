@@ -20,6 +20,7 @@ use std::{
 };
 
 use arcstr::ArcStr;
+use indexmap::IndexMap;
 
 use crate::{
     ast::{
@@ -215,9 +216,10 @@ pub struct NavIndex {
     scope_bindings: HashMap<PathBuf, Vec<ScopeBinding>>,
     expression_types: HashMap<PathBuf, Vec<(cfgrammar::Span, Ty)>>,
     hover_details: HashMap<PathBuf, Vec<(cfgrammar::Span, String)>>,
-    /// Cell `VarId` to the name and type of each of its fields, in declaration
-    /// order. Cell types are nominal and carry no fields of their own, so an
-    /// instance's completions come from the declaring cell's `let` bindings.
+    /// Cell `VarId` to the name and type of each of its public fields, in
+    /// declaration order. Cell types are nominal and carry no fields of their
+    /// own, so an instance's completions come from the declaring cell's
+    /// `pub let` bindings.
     cell_field_types: HashMap<VarId, Vec<(String, Ty)>>,
     /// Struct and enum definitions, for field completions on a struct.
     type_defs: Arc<TypeDefs>,
@@ -717,9 +719,9 @@ const PRIMITIVE_TYPES: [&str; 9] = [
     "Any", "Bool", "Float", "Int", "Path", "Point", "Polygon", "Rect", "String",
 ];
 
-const KEYWORDS: [&str; 16] = [
+const KEYWORDS: [&str; 17] = [
     "_", "as", "cell", "else", "enum", "false", "fn", "for", "if", "in", "let", "match", "mod",
-    "true", "struct", "use",
+    "pub", "true", "struct", "use",
 ];
 
 fn completion_kind(kind: SymbolKind) -> CompletionKind {
@@ -1137,9 +1139,19 @@ impl<'a> Builder<'a> {
                             .map(|(name, id, _)| (name.name.to_string(), *id))
                             .collect();
                         self.cell_fields.insert(decl.metadata.1, fields);
-                        let field_types = bindings
+                        // The last binding of a name is the field, and its
+                        // `pub` decides whether an instance can read it.
+                        let mut field_types = IndexMap::new();
+                        for stmt in &decl.scope.stmts {
+                            let public = stmt.public().is_some();
+                            for (name, _, ty) in typed_let_bindings(stmt) {
+                                field_types.insert(name.name.to_string(), (ty, public));
+                            }
+                        }
+                        let field_types = field_types
                             .into_iter()
-                            .map(|(name, _, ty)| (name.name.to_string(), ty))
+                            .filter(|(_, (_, public))| *public)
+                            .map(|(name, (ty, _))| (name, ty))
                             .collect();
                         self.index
                             .cell_field_types
@@ -2463,7 +2475,7 @@ cell top() {
 }
 
 cell later() {
-    let r = rect("met1");
+    pub let r = rect("met1");
 }
 "#,
             &["later#1", "r#3"],
@@ -2477,7 +2489,7 @@ cell later() {
         check(
             r#"
 cell tree(n: Int) {
-    let leaf = rect("met1", x0=0., y0=0., w=10., h=10.);
+    pub let leaf = rect("met1", x0=0., y0=0., w=10., h=10.);
     if n > 0 {
         let child = inst(tr$0ee(n - 1));
         eq(child.le$0af.x0, leaf.x1);
@@ -2623,7 +2635,7 @@ fn pick(s: Size) -> Float {
 }
 
 cell pad() {
-    let Size { width: wi$0de, .. } = Size { width: 1., height: 2. };
+    pub let Size { width: wi$0de, .. } = Size { width: 1., height: 2. };
     let r = rect("met1", x0=0., y0=0., w=wi$0de, h=1.);
 }
 
@@ -2710,7 +2722,7 @@ cell top() {
         check(
             r#"
 cell inner() {
-    let met = rect("met1");
+    pub let met = rect("met1");
 }
 
 cell top() {
@@ -3114,6 +3126,29 @@ cell later_cell() {}
             !labels.iter().any(|label| label == "later"),
             "a binding declared below the cursor is out of scope: {labels:?}"
         );
+    }
+
+    /// An instance completes only the fields it can read: the cell's
+    /// `pub let` bindings, decided by the last binding of each name.
+    #[test]
+    fn instance_member_completions_list_only_public_fields() {
+        let source = r#"
+cell child() {
+    pub let shown = rect("met1");
+    let hidden = rect("met1");
+    pub let rebound = 1.;
+    let rebound = 2.;
+}
+cell top() {
+    let i = inst(child());
+    eq(i.x, 0.);
+}
+"#;
+        let (source, index, _) = index(source);
+        let base_end = source.find("i.x").unwrap() + 1;
+        let mut fields = labels(index.member_completions_at(Path::new(ROOT), base_end));
+        fields.sort();
+        assert_eq!(fields, ["shown", "x", "y"]);
     }
 
     #[test]

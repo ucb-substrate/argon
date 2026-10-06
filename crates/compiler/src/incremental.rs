@@ -1614,7 +1614,7 @@ mod tests {
     #[test]
     fn reusing_a_cell_reinstates_the_cells_its_fields_hold() {
         let source = "cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
-                      cell holder() { let c = leaf(); }\n\
+                      cell holder() { pub let c = leaf(); }\n\
                       cell parent() {\n    let h = inst(holder(), x = 0., y = 0.);\n    \
                       let l = inst(h.c, x = 10., y = 0.);\n}\n";
         let (_dir, config) = scratch_workspace(source);
@@ -1640,6 +1640,41 @@ mod tests {
             geometry(&second),
             geometry(&fresh.compile_cell(&config, &cell, Vec::new()))
         );
+    }
+
+    /// A reused cell still tells a private field from a missing one, so a read
+    /// through `Any` reports the same error whether or not the cell is reused.
+    #[test]
+    fn a_reused_cell_still_reports_its_private_fields() {
+        let source = "fn width(i: Any) -> Any { i.secret.w }\n\
+                      cell pad() { let secret = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+                      cell parent() {\n    let p = inst(pad(), x = 0., y = 0.);\n    \
+                      let r = rect(\"met2\", x0 = 0., y0 = 0., w = width(p), h = 1.);\n}\n";
+        let (_dir, config) = scratch_workspace(source);
+        let root = config.root_lib().to_path_buf();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = config.with_tech(Some(tech));
+        let cell = vec!["parent".to_owned()];
+        let private_field = |output: &CompileOutput| match output {
+            CompileOutput::ExecErrors(errors) => errors.errors.iter().any(|error| {
+                matches!(&error.kind, compile::ExecErrorKind::PrivateField { field, cell }
+                    if field == "secret" && cell == "pad")
+            }),
+            _ => false,
+        };
+
+        let mut session = IncrementalCompiler::new();
+        session.set_source_text(root.clone(), source);
+        let first = session.compile_cell(&config, &cell, Vec::new());
+        assert!(private_field(&first), "{first:?}");
+
+        let edited = source.replace("h = 1.", "h = 2.");
+        assert_ne!(edited, source);
+        session.set_source_text(root, edited);
+        let second = session.compile_cell(&config, &cell, Vec::new());
+        assert!(session.stats().cell_cache.hits > 0, "`pad` is reused");
+        assert!(private_field(&second), "{second:?}");
     }
 
     /// A child that actually changed must be re-executed, and only it.

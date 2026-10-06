@@ -11481,10 +11481,18 @@ pub(crate) fn find_obj_path(
     if path.is_empty() {
         panic!("need non-empty object path");
     }
+    // Past the first hop, the path reads a child cell's objects through an
+    // instance, which sees only its public fields.
+    let mut in_child = false;
+    let name_of = |scope: ScopeAddress, in_child: bool, obj: ObjectId| {
+        if in_child {
+            cell.output.reachable_field_name(scope.cell, obj)
+        } else {
+            cell.output.reachable_obj_name(scope.cell, scope.scope, obj)
+        }
+    };
     for obj in &path[0..path.len() - 1] {
-        if let Some(name) =
-            cell.output
-                .reachable_obj_name(current_scope.cell, current_scope.scope, *obj)
+        if let Some(name) = name_of(current_scope, in_child, *obj)
             && let Some(inst) = cell.output.cells[&current_scope.cell].objects[obj].get_instance()
         {
             string_path.push(name);
@@ -11492,16 +11500,14 @@ pub(crate) fn find_obj_path(
                 cell: inst.cell,
                 scope: cell.output.cells[&inst.cell].root,
             };
+            in_child = true;
         } else {
             reachable = false;
             break;
         }
     }
     let obj = path.last().unwrap();
-    if let Some(name) =
-        cell.output
-            .reachable_obj_name(current_scope.cell, current_scope.scope, *obj)
-    {
+    if let Some(name) = name_of(current_scope, in_child, *obj) {
         match &cell.output.cells[&current_scope.cell].objects[obj] {
             SolvedValue::Rect(_) | SolvedValue::Polygon(_) | SolvedValue::Path(_) => {
                 string_path.push(name)
@@ -14363,7 +14369,8 @@ cell top() {
             &source_path,
             r#"
 cell child() {
-    let shape = rect("met1", x0=0., y0=0., x1=10., y1=5.);
+    pub let shape = rect("met1", x0=0., y0=0., x1=10., y1=5.);
+    let hidden = rect("met1", x0=20., y0=0., x1=30., y1=5.);
 }
 cell top() {
     let child_instance = inst(child(), x=3., y=4.);
@@ -14390,11 +14397,16 @@ cell top() {
             .unwrap();
         let instance_id = instance.id;
         let child_cell = &output.cells[&instance.cell];
-        let child_rect_id = child_cell
-            .objects
-            .values()
-            .find_map(|object| object.get_rect().map(|rect| rect.id))
-            .unwrap();
+        let child_rect_at = |x0: f64| {
+            child_cell
+                .objects
+                .values()
+                .find_map(|object| object.get_rect().filter(|rect| rect.x0.0 == x0))
+                .map(|rect| rect.id)
+                .unwrap()
+        };
+        let child_rect_id = child_rect_at(0.);
+        let hidden_rect_id = child_rect_at(20.);
         let state = CompileOutputState {
             output: Arc::new(output),
             selected_scope: Vec::new(),
@@ -14415,6 +14427,9 @@ cell top() {
             find_obj_path(&[instance_id, child_rect_id], &state, scope),
             (true, vec!["child_instance".to_owned(), "shape".to_owned()])
         );
+        // An instance reads only public fields, so a private one is not a
+        // path the GUI may write into source.
+        assert!(!find_obj_path(&[instance_id, hidden_rect_id], &state, scope).0);
         assert_eq!(
             exact_object_bounds(&[instance_id, child_rect_id], &state, scope),
             Some(ExactLayoutBounds {

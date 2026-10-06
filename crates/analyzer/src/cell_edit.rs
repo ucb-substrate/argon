@@ -17,7 +17,7 @@ use crate::document::{Document, PositionEncoding};
 
 const KEYWORDS: &[&str] = &[
     "as", "cell", "const", "else", "enum", "false", "fn", "for", "if", "in", "let", "match", "mod",
-    "struct", "true", "use",
+    "pub", "struct", "true", "use",
 ];
 
 pub(crate) struct RenameCellEdit {
