@@ -23,7 +23,7 @@ import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReferenc
   {name: 'construction', type: 'Bool', typeHref: '/language/types/scalars#bool', requirement: 'Optional; false', description: 'When true, leave the instance out of layout export and of the parent bounding box.'},
 ]} />
 
-<Returns type="Inst" href="/language/types/instance#instance-values">The instance, with its position and the fields its cell exports.</Returns>
+<Returns type="Inst" href="/language/types/instance#instance-values">The instance, with its position and the public fields of its cell.</Returns>
 
 ```argon
 let placed = inst(inverter(1200., 2000., 4), x=100., y=50., angle=90);

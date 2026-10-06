@@ -325,7 +325,7 @@ nesting depth:
 
 ```rust
 cell tree(n: Int) {
-    let leaf = rect("met1", x0=0., y0=0., w=100., h=100.);
+    pub let leaf = rect("met1", x0=0., y0=0., w=100., h=100.);
     if n > 0 {
         let child = inst(tree(n - 1));
         eq(child.leaf.x0, leaf.x1 + 50.);
@@ -333,6 +333,10 @@ cell tree(n: Int) {
     }
 }
 ```
+
+An instance reads only the fields its cell declares with `pub let`, such as
+`child.leaf` above. `pub` applies only to a `let` at the top level of a cell
+body, and a `pub let` with a pattern makes every name it binds public.
 
 Cell types are nominal: two cells with the same fields are different types,
 and a function that accepts either takes `Any`. The type of an instance field

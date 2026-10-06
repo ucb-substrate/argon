@@ -3,9 +3,9 @@
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
 
 use argonc::{
-    ast::Span,
+    ast::{Decl, Span},
     compile::{BasicRect, CellId, CompileOutput, CompiledData},
-    parse::WorkspaceParseAst,
+    parse::{AnnotatedParseAst, WorkspaceParseAst},
 };
 
 use serde::{Deserialize, Serialize};
@@ -309,6 +309,21 @@ pub(crate) fn insert_statement(
     }
 }
 
+/// The start of a `let` binding `name` in `scope`. Bindings at the top level
+/// of a cell are `pub`, so that a parent can read them through an instance.
+fn let_prefix(ast: &AnnotatedParseAst, scope: cfgrammar::Span, name: &str) -> String {
+    let cell_body = ast
+        .ast
+        .decls
+        .iter()
+        .any(|decl| matches!(decl, Decl::Cell(cell) if cell.scope.span == scope));
+    if cell_body {
+        format!("pub let {name} = ")
+    } else {
+        format!("let {name} = ")
+    }
+}
+
 fn polygon_expression(polygon: &PolygonParams) -> String {
     let coordinates = polygon
         .points
@@ -607,7 +622,7 @@ impl LangServer for State {
             argonc::compile::format_initial_condition(rect.x1, grid),
             argonc::compile::format_initial_condition(rect.y1, grid),
         );
-        let prefix = format!("let {var_name} = ");
+        let prefix = let_prefix(ast, scope.span, &var_name);
         let insertion = insert_statement(
             &document,
             scope.span,
@@ -654,7 +669,7 @@ impl LangServer for State {
         let scope = ast.span2scope.get(&scope_span)?;
         let document = self.document(&ast.source_text);
         let expression = polygon_expression(&polygon);
-        let prefix = format!("let {var_name} = ");
+        let prefix = let_prefix(ast, scope.span, &var_name);
         let constraints = segment_constraint_statements(&var_name, &polygon.constraints);
         let insertion = insert_statement(
             &document,
@@ -698,7 +713,7 @@ impl LangServer for State {
         let scope = ast.span2scope.get(&scope_span)?;
         let document = self.document(&ast.source_text);
         let expression = path_expression(&path);
-        let prefix = format!("let {var_name} = ");
+        let prefix = let_prefix(ast, scope.span, &var_name);
         let constraints = segment_constraint_statements(&var_name, &path.constraints);
         let insertion = insert_statement(
             &document,
@@ -749,7 +764,7 @@ impl LangServer for State {
             .map(|index| format!("inst{index}"))
             .find(|name| !names.contains(name.as_str()))?;
         let expression = instance_placement_expression(&invocation, x, y);
-        let prefix = format!("let {var_name} = ");
+        let prefix = let_prefix(ast, scope.span, &var_name);
         let insertion = insert_statement(
             &document,
             scope.span,
@@ -1147,9 +1162,9 @@ cell top() { let a = inst(leaf(), x=0., y=0.); }
     use tower_lsp_server::ls_types::{Position, Uri};
 
     use super::{
-        Document, DrawSegmentConstraint, PathParams, PolygonParams,
+        Document, DrawSegmentConstraint, PathBuf, PathParams, PolygonParams,
         READ_ONLY_GENERATED_SOURCE_MESSAGE, editor_buffers_are_current, insert_statement,
-        instance_placement_expression, missing_initial_condition_edit, path_expression,
+        instance_placement_expression, let_prefix, missing_initial_condition_edit, path_expression,
         polygon_expression, segment_constraint_statements, source_edit_error,
     };
     use crate::{PublishedState, SourceState, document::PositionEncoding};
@@ -1327,6 +1342,25 @@ cell top() { let a = inst(leaf(), x=0., y=0.); }
             ),
             "cell top() {\n    let r = rect(\"met1\",\n        x0=0.,\n        x1i=20., y1i=30.,\n    );\n}"
         );
+    }
+
+    #[test]
+    fn only_a_binding_at_the_top_level_of_a_cell_is_public() {
+        let source = "cell top() {\n    for i in std::range(2) {\n    }\n}\nfn f() {\n}\n";
+        let ast = parse::parse_source_text(source, PathBuf::from("/virtual/lib.ar"))
+            .expect("source should parse");
+        let prefix_at = |brace: usize| {
+            let scope = ast
+                .span2scope
+                .values()
+                .find(|scope| scope.span.start() == brace)
+                .expect("scope should be indexed");
+            let_prefix(&ast, scope.span, "r")
+        };
+
+        assert_eq!(prefix_at(source.find('{').unwrap()), "pub let r = ");
+        assert_eq!(prefix_at(source.find("2) {").unwrap() + 3), "let r = ");
+        assert_eq!(prefix_at(source.find("f() {").unwrap() + 4), "let r = ");
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub enum TokenKind {
     KwFn,
     KwElse,
     KwLet,
+    KwPub,
     KwFor,
     KwIn,
     KwAs,
@@ -90,6 +91,7 @@ impl TokenKind {
             KwFn => "'fn'",
             KwElse => "'else'",
             KwLet => "'let'",
+            KwPub => "'pub'",
             KwFor => "'for'",
             KwIn => "'in'",
             KwAs => "'as'",
@@ -152,7 +154,7 @@ impl Token {
 }
 
 /// Classify a freshly scanned identifier slice as a keyword or a plain
-/// identifier. There are only 15 short, disjoint keywords, so a `match` on
+/// identifier. There are only a few short, disjoint keywords, so a `match` on
 /// `(len, bytes)` lowers to a jump table + `memcmp` and beats a hash map with
 /// zero setup cost.
 #[inline]
@@ -168,6 +170,7 @@ pub fn keyword_or_ident(s: &[u8]) -> TokenKind {
         },
         3 => match s {
             b"let" => KwLet,
+            b"pub" => KwPub,
             b"for" => KwFor,
             b"mod" => KwMod,
             b"use" => KwUse,

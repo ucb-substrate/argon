@@ -269,10 +269,21 @@ impl<S, T: AstMetadata> Statement<S, T> {
             Self::Expr { .. } | Self::ForLoop(_) => Vec::new(),
         }
     }
+
+    /// The span of the `pub` keyword of a `pub let` statement.
+    pub fn public(&self) -> Option<cfgrammar::Span> {
+        match self {
+            Self::LetBinding(binding) => binding.public,
+            Self::LetPattern(binding) => binding.public,
+            Self::Expr { .. } | Self::ForLoop(_) => None,
+        }
+    }
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct LetBinding<S, T: AstMetadata> {
+    /// The span of the `pub` keyword, if the binding is public.
+    pub public: Option<cfgrammar::Span>,
     pub name: Ident<S, T>,
     /// The declared type, `let x: T = ..`.
     pub ty: Option<TySpec<S, T>>,
@@ -285,6 +296,8 @@ pub struct LetBinding<S, T: AstMetadata> {
 /// binds carries its own metadata.
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct LetPattern<S, T: AstMetadata> {
+    /// The span of the `pub` keyword, if every name the pattern binds is public.
+    pub public: Option<cfgrammar::Span>,
     pub pattern: Pattern<S, T>,
     pub value: Expr<S, T>,
     pub span: cfgrammar::Span,
@@ -1141,6 +1154,7 @@ pub trait AstTransformer {
         let value = self.transform_expr(&input.value);
         let metadata = self.dispatch_let_binding(input, &name, &value);
         LetBinding {
+            public: input.public,
             name,
             ty,
             value,
@@ -1156,6 +1170,7 @@ pub trait AstTransformer {
         let value = self.transform_expr(&input.value);
         let pattern = self.transform_pattern(&input.pattern);
         LetPattern {
+            public: input.public,
             pattern,
             value,
             span: input.span,

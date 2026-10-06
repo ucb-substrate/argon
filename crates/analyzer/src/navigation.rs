@@ -577,8 +577,11 @@ fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> 
                 )
         }
         // `StatementOrElse` also accepts an `else` continuing the `if` just
-        // closed.
-        CompletionSite::Statement | CompletionSite::StatementOrElse => match candidate.kind {
+        // closed, and a cell body's statements also accept `pub`.
+        CompletionSite::Statement
+        | CompletionSite::StatementOrElse
+        | CompletionSite::CellStatement
+        | CompletionSite::CellStatementOrElse => match candidate.kind {
             Kind::Function
             | Kind::Cell
             | Kind::Variable
@@ -587,12 +590,18 @@ fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> 
             | Kind::Variant
             | Kind::Struct
             | Kind::Module => true,
-            Kind::Keyword => {
-                matches!(
-                    candidate.label.as_str(),
-                    "false" | "for" | "if" | "let" | "match" | "true"
-                ) || (site == CompletionSite::StatementOrElse && candidate.label == "else")
-            }
+            Kind::Keyword => match candidate.label.as_str() {
+                "false" | "for" | "if" | "let" | "match" | "true" => true,
+                "else" => matches!(
+                    site,
+                    CompletionSite::StatementOrElse | CompletionSite::CellStatementOrElse
+                ),
+                "pub" => matches!(
+                    site,
+                    CompletionSite::CellStatement | CompletionSite::CellStatementOrElse
+                ),
+                _ => false,
+            },
             Kind::Field | Kind::Type => false,
         },
         CompletionSite::Expression => match candidate.kind {
@@ -1205,6 +1214,7 @@ mod tests {
             candidate("struct", Kind::Keyword),
             candidate("else", Kind::Keyword),
             candidate("let", Kind::Keyword),
+            candidate("pub", Kind::Keyword),
             candidate("true", Kind::Keyword),
             candidate("rect", Kind::Function),
             candidate("Widget", Kind::Cell),
@@ -1251,6 +1261,20 @@ mod tests {
             labels(CompletionSite::StatementOrElse),
             [
                 "else", "let", "true", "rect", "Widget", "Mode", "Size", "lib", "width", "Some"
+            ]
+        );
+        // A cell body's statements also accept `pub`.
+        assert_eq!(
+            labels(CompletionSite::CellStatement),
+            [
+                "let", "pub", "true", "rect", "Widget", "Mode", "Size", "lib", "width", "Some"
+            ]
+        );
+        assert_eq!(
+            labels(CompletionSite::CellStatementOrElse),
+            [
+                "else", "let", "pub", "true", "rect", "Widget", "Mode", "Size", "lib", "width",
+                "Some"
             ]
         );
         assert_eq!(labels(CompletionSite::Keyword("else")), ["else"]);

@@ -447,7 +447,7 @@ mod tests {
             finish_nvim(child).await;
             let source = std::fs::read_to_string(session.project.join("lib.ar"))
                 .expect("read round-tripped source");
-            assert!(source.contains("let gui_rect = rect("));
+            assert!(source.contains("pub let gui_rect = rect("));
             assert!(source.contains("x0i = 1.2, y0i = 0., x1i = 10.3, y1i = 10."));
             assert!(source.contains("let editor_rect = rect("));
         })

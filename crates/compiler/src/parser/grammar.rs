@@ -149,6 +149,9 @@ pub struct Parser<'a> {
     /// Whether `name {` must be read as an identifier followed by a scope
     /// rather than as a struct literal. See [`Parser::with_struct_literals`].
     no_struct_literal: bool,
+    /// Whether the innermost scope being parsed is a cell's body, the only
+    /// place a `pub let` belongs.
+    cell_body: bool,
     pub errors: Vec<ParseError>,
     completion: Option<CompletionProbe>,
 }
@@ -177,6 +180,7 @@ impl<'a> Parser<'a> {
             scope_orders: vec![0],
             depth: 0,
             no_struct_literal: false,
+            cell_body: false,
             errors: Vec::new(),
             completion: None,
         }
@@ -560,7 +564,7 @@ impl<'a> Parser<'a> {
         use TokenKind::*;
         while !self.at(Eof) {
             match self.cur.kind {
-                KwEnum | KwStruct | KwCell | KwFn | KwConst | KwMod | KwUse => break,
+                KwEnum | KwStruct | KwCell | KwFn | KwConst | KwMod | KwUse | KwPub => break,
                 _ => {
                     self.bump();
                 }
@@ -574,6 +578,13 @@ impl<'a> Parser<'a> {
 
     fn parse_decl(&mut self) -> Option<Decl<&'a str, Md>> {
         use TokenKind::*;
+        while self.at(KwPub) {
+            self.error_at(
+                self.span(self.cur),
+                "`pub` only applies to `let` statements in a cell".to_string(),
+            );
+            self.bump();
+        }
         Some(match self.cur.kind {
             KwEnum => Decl::Enum(self.parse_enum_decl()),
             KwStruct => Decl::Struct(self.parse_struct_decl()),
@@ -737,7 +748,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::LParen);
         let args = self.parse_arg_decls();
         self.expect(TokenKind::RParen);
-        let scope = self.parse_scope();
+        let scope = self.with_struct_literals(true, |p| p.parse_scope_inner(0, true));
         CellDecl {
             name,
             params,
@@ -881,10 +892,19 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unannotated_scope(&mut self, scope_order: u64) -> Scope<&'a str, Md> {
-        self.with_struct_literals(true, |p| p.parse_unannotated_scope_inner(scope_order))
+        self.with_struct_literals(true, |p| p.parse_scope_inner(scope_order, false))
     }
 
-    fn parse_unannotated_scope_inner(&mut self, scope_order: u64) -> Scope<&'a str, Md> {
+    /// The statement completion site of the innermost scope.
+    fn statement_site(&self) -> CompletionSite {
+        if self.cell_body {
+            CompletionSite::CellStatement
+        } else {
+            CompletionSite::Statement
+        }
+    }
+
+    fn parse_scope_inner(&mut self, scope_order: u64, cell_body: bool) -> Scope<&'a str, Md> {
         if !self.enter_depth() {
             self.error_at(self.span(self.cur), "nesting too deep".to_string());
             let lo = self.cur.start;
@@ -899,18 +919,34 @@ impl<'a> Parser<'a> {
         let lb = self.expect(TokenKind::LBrace);
         let lo = lb.start;
         self.scope_orders.push(0);
+        let outer_cell_body = std::mem::replace(&mut self.cell_body, cell_body);
         let mut stmts = Vec::new();
         let mut tail: Option<Expr<&'a str, Md>> = None;
 
-        self.record_completion_site(CompletionSite::Statement);
+        self.record_completion_site(self.statement_site());
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let mark = self.ntok;
-            self.record_completion_site(CompletionSite::Statement);
+            self.record_completion_site(self.statement_site());
             match self.cur.kind {
                 TokenKind::KwLet => {
-                    let stmt = self.parse_let();
+                    let stmt = self.parse_let(None);
                     self.expect(TokenKind::Semi);
                     stmts.push(stmt);
+                }
+                TokenKind::KwPub => {
+                    let pub_token = self.bump();
+                    let public = self.span(pub_token);
+                    self.record_completion_site(CompletionSite::Keyword("let"));
+                    if self.at(TokenKind::KwLet) {
+                        let stmt = self.parse_let(Some(public));
+                        self.expect(TokenKind::Semi);
+                        stmts.push(stmt);
+                    } else {
+                        self.error_at(
+                            self.span(self.cur),
+                            "expected `let` after `pub`".to_string(),
+                        );
+                    }
                 }
                 TokenKind::KwFor => {
                     stmts.push(Statement::ForLoop(self.parse_for_loop()));
@@ -977,9 +1013,10 @@ impl<'a> Parser<'a> {
                 self.bump();
             }
         }
-        self.record_completion_site(CompletionSite::Statement);
+        self.record_completion_site(self.statement_site());
         self.expect(TokenKind::RBrace);
         self.scope_orders.pop();
+        self.cell_body = outer_cell_body;
 
         // No separate tail fixup is needed: the statement loop above already
         // routes a trailing un-semicoloned expression into `tail`. The only
@@ -996,13 +1033,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `letStmt : LET (ident (COLON tySpec)? | pattern) EQ expr` (span
+    /// `letStmt : PUB? LET (ident (COLON tySpec)? | pattern) EQ expr` (span
     /// excludes the trailing SEMI, which belongs to the enclosing `statement`).
     ///
     /// A name followed by `{` or `::` begins a pattern, as in
     /// `let geom::Size { w, .. } = s`; any other name is a plain binding.
-    fn parse_let(&mut self) -> Statement<&'a str, Md> {
-        let lo = self.cur.start;
+    /// `public` is the span of a `pub` the caller already consumed.
+    fn parse_let(&mut self, public: Option<Span>) -> Statement<&'a str, Md> {
+        let lo = public.map_or(self.cur.start, |span| span.start() as u32);
         self.expect(TokenKind::KwLet);
         if self.at(TokenKind::Ident)
             && matches!(self.nxt.kind, TokenKind::LBrace | TokenKind::PathSep)
@@ -1011,6 +1049,7 @@ impl<'a> Parser<'a> {
             self.expect(TokenKind::Eq);
             let value = self.parse_expr(0);
             return Statement::LetPattern(LetPattern {
+                public,
                 pattern,
                 value,
                 span: self.finish_span(lo),
@@ -1021,6 +1060,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Eq);
         let value = self.parse_expr(0);
         Statement::LetBinding(LetBinding {
+            public,
             name,
             ty,
             value,
@@ -1063,7 +1103,11 @@ impl<'a> Parser<'a> {
             Some(self.parse_else_body(require_else))
         } else {
             // Either a statement or an `else` may follow.
-            self.record_completion_site(CompletionSite::StatementOrElse);
+            self.record_completion_site(if self.cell_body {
+                CompletionSite::CellStatementOrElse
+            } else {
+                CompletionSite::StatementOrElse
+            });
             self.eat(TokenKind::KwElse)
                 .then(|| self.parse_else_body(require_else))
         };
