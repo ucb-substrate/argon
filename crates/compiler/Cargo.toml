@@ -17,6 +17,8 @@ anyhow = { workspace = true }
 cfgrammar = { workspace = true }
 itertools = { workspace = true }
 fnv = { workspace = true }
+rustc-hash = { workspace = true }
+smallvec = { workspace = true }
 enumify = { workspace = true }
 arcstr = { workspace = true }
 serde = { workspace = true }

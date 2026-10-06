@@ -238,7 +238,7 @@ impl IncrementalCompiler {
                     if coverage.is_empty() {
                         return None;
                     }
-                    let tracked = typed.values().map(|module| module.path.as_path()).collect();
+                    let tracked = typed.values().map(|module| &*module.path).collect();
                     let usable = match &self.last_good_nav {
                         Some(previous) => previous.covered_by(&coverage, &tracked),
                         // Nothing better to fall back to.
@@ -647,7 +647,7 @@ impl IncrementalCompiler {
         let mut files = analysis
             .ast
             .values()
-            .map(|ast| ast.path.clone())
+            .map(|ast| ast.path.to_path_buf())
             .filter(|path| path.extension().is_some_and(|extension| extension == "ar"))
             .collect::<Vec<_>>();
         // The parsed files above are only the modules that won resolution, so

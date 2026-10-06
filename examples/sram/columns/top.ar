@@ -212,7 +212,7 @@ fn rect_expand_top(r: Rect, amount: Float) -> Rect {
 }
 
 fn draw_col_li_met1_via(bot: Rect, longer: Bool) -> (Rect, Rect) {
-    let long_horizontal = lib::columns::util::band(lib::columns::util::band(longer, lib::columns::util::rect_w(bot) >= 530.), lib::columns::util::rect_w(bot) > lib::columns::util::rect_h(bot));
+    let long_horizontal = ((longer && lib::columns::util::rect_w(bot) >= 530.) && lib::columns::util::rect_w(bot) > lib::columns::util::rect_h(bot));
     let use_top_horiz = if long_horizontal { false } else { longer };
     let top_ext = if use_top_horiz { 1 } else { 0 };
     let via = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", bot, bot, 0, top_ext, longer);
@@ -280,14 +280,14 @@ fn column_we_global(group: Int, p: ColParams, en_b: Bool) -> Rect {
 fn col_offset_jog_r1(src: Rect, space: Float) -> Rect {
     let line = lib::columns::util::rect_w(src);
     let p1 = src.y1 + line + space;
-    lib::columns::util::cbox(src.x0, lib::columns::util::fmin(src.y0, p1), src.x1, lib::columns::util::fmax(src.y1, p1))
+    lib::columns::util::cbox(src.x0, min_float(src.y0, p1), src.x1, max_float(src.y1, p1))
 }
 
 fn col_offset_jog_r2(src: Rect, dst: Float, space: Float) -> Rect {
     let line = lib::columns::util::rect_w(src);
     let p1 = src.y1 + line + space;
     let p2 = src.y1 + space;
-    lib::columns::util::cbox(lib::columns::util::fmin(src.x0, dst), lib::columns::util::fmin(p1, p2), lib::columns::util::fmax(src.x1, dst), lib::columns::util::fmax(p1, p2))
+    lib::columns::util::cbox(min_float(src.x0, dst), min_float(p1, p2), max_float(src.x1, dst), max_float(p1, p2))
 }
 
 fn wmask_placed_y(p: DecoderParams) -> Float {
@@ -344,36 +344,17 @@ fn draw_column_route_wmask_to_bottom(dff_in: Rect, din_rect: Rect, wmask_bot: Fl
 }
 
 fn column_din_ports_exact(group: Int, words: Int, mux: Int, wmask_bot: Float, we_rect: Rect) -> [Rect] {
-    if group == words {
-        []
-    } else {
-        cons(
-            draw_column_route_data_to_bottom(column_din_global(group, mux), wmask_bot, we_rect),
-            column_din_ports_exact(group + 1, words, mux, wmask_bot, we_rect)
-        )
-    }
+    [for g in range_full(group, words, 1) { draw_column_route_data_to_bottom(column_din_global(g, mux), wmask_bot, we_rect) }]
 }
 
 fn column_dout_ports_exact(group: Int, words: Int, mux: Int, wmask_bot: Float, we_rect: Rect) -> [Rect] {
-    if group == words {
-        []
-    } else {
-        cons(
-            draw_column_route_data_to_bottom(column_dout_global(group, mux), wmask_bot, we_rect),
-            column_dout_ports_exact(group + 1, words, mux, wmask_bot, we_rect)
-        )
-    }
+    [for g in range_full(group, words, 1) { draw_column_route_data_to_bottom(column_dout_global(g, mux), wmask_bot, we_rect) }]
 }
 
 fn column_wmask_ports_exact(bit: Int, bits: Int, mux: Int, gran: Int, unit_w: Float, wmask_bot: Float, wmask_y: Float) -> [Rect] {
-    if bit == bits {
-        []
-    } else {
-        cons(
-            draw_column_route_wmask_to_bottom(wmask_placed_d_port(bit, mux, unit_w, wmask_y), column_din_global(bit * gran, mux), wmask_bot),
-            column_wmask_ports_exact(bit + 1, bits, mux, gran, unit_w, wmask_bot, wmask_y)
-        )
-    }
+    [for b in range_full(bit, bits, 1) {
+        draw_column_route_wmask_to_bottom(wmask_placed_d_port(b, mux, unit_w, wmask_y), column_din_global(b * gran, mux), wmask_bot)
+    }]
 }
 
 // The write-mask decoder's M1 power rails in column-peripheral coordinates.
@@ -385,41 +366,30 @@ fn column_m1_power_rails(p: ColParams, vdd: Bool) -> [Rect] {
 // M1 bitline landing pads on the top edge of the column row. Columns
 // alternate in orientation, so the pads swap sides on odd columns.
 fn column_bitline_pads(idx: Int, cols: Int, p: ColParams, right: Bool) -> [Rect] {
-    if idx == cols {
-        []
-    } else {
-        let mux = p.mux.mux_ratio;
-        let even = (idx % mux) % 2 == 0;
+    let mux = p.mux.mux_ratio;
+    let top = column_outline_top(p);
+    [for i in range_full(idx, cols, 1) {
+        let even = (i % mux) % 2 == 0;
         let offset = if even == right { 715. } else { 345. };
-        let x = lib::columns::util::bit_x(idx, mux) + offset;
-        let top = column_outline_top(p);
-        cons(lib::columns::util::cbox(x, top - 140., x + 140., top), column_bitline_pads(idx + 1, cols, p, right))
-    }
+        let x = lib::columns::util::bit_x(i, mux) + offset;
+        lib::columns::util::cbox(x, top - 140., x + 140., top)
+    }]
 }
 
 fn column_data_var_ports_exact(group: Int, words: Int, mux: Int, dout: Bool) -> [Rect] {
-    if group == words {
-        []
-    } else {
-        cons(
-            if dout { column_dout_global(group, mux) } else { column_din_global(group, mux) },
-            column_data_var_ports_exact(group + 1, words, mux, dout)
-        )
-    }
+    [for g in range_full(group, words, 1) { if dout { column_dout_global(g, mux) } else { column_din_global(g, mux) } }]
 }
 
 // Full-width M2 select rails of the column muxes: complements below the
 // mux devices, true selects above them.
 fn column_select_rails(bit: Int, p: ColParams, rw: Float, complement: Bool) -> [Rect] {
-    if bit == p.mux.mux_ratio {
-        []
-    } else {
-        let my = column_mux_tap_y(p);
-        let sw = p.mux.sel_width as Float;
-        let pitch = sw + lib::columns::util::fmax(sw / 4., 140.);
-        let y0 = if complement { my - pitch * bit as Float - sw } else { my + lib::columns::mux::tgm_params_nmos_bbox(p.mux).y1 + pitch * bit as Float };
-        cons(lib::columns::util::cbox(0., y0, rw, y0 + sw), column_select_rails(bit + 1, p, rw, complement))
-    }
+    let my = column_mux_tap_y(p);
+    let sw = p.mux.sel_width as Float;
+    let pitch = sw + max_float(sw / 4., 140.);
+    [for b in range_full(bit, p.mux.mux_ratio, 1) {
+        let y0 = if complement { my - pitch * b as Float - sw } else { my + lib::columns::mux::tgm_params_nmos_bbox(p.mux).y1 + pitch * b as Float };
+        lib::columns::util::cbox(0., y0, rw, y0 + sw)
+    }]
 }
 
 fn draw_column_y_shapes(bit: Int, tile: Int, ff: Int, p: DecoderParams, unit_w: Float, wmask_y: Float) -> Rect {
@@ -433,7 +403,7 @@ fn draw_column_y_shapes(bit: Int, tile: Int, ff: Int, p: DecoderParams, unit_w: 
 
 fn draw_column_write_en_group(bit: Int, group: Int, gran: Int, words: Int, p: ColParams, we_i_m1: Rect, we_ib_m1: Rect) -> Rect {
     let col_idx = bit * gran + group;
-    if lib::columns::util::bor(group == gran, col_idx >= words) {
+    if (group == gran || col_idx >= words) {
         crect(x0=0., y0=0., x1=0., y1=0.)
     } else {
         let we_in = column_we_global(col_idx, p, false);
@@ -540,9 +510,7 @@ fn draw_column_cent_latch_power_straps(rw: Float, vdd_power: Bool) -> [Rect] {
     }
 }
 
-fn concat_rects(a: [Rect], b: [Rect]) -> [Rect] {
-    if a == [] { b } else { cons(head(a), concat_rects(tail(a), b)) }
-}
+fn concat_rects(a: [Rect], b: [Rect]) -> [Rect] { std::concat(a, b) }
 
 // Full-width M2 supply rails of the column row, from bottom-up blocks.
 fn draw_row_m2_straps(rw: Float, p: ColParams, vdd_power: Bool) -> [Rect] {

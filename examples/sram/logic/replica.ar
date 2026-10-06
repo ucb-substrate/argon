@@ -106,7 +106,7 @@ fn draw_mos_power(port: Rect, power: Rect, enabled: Bool) -> Rect {
 }
 
 fn clamped_power_span(port: Rect) -> (Float, Float) {
-    let height = lib::columns::util::fmin(lib::columns::util::fmax(lib::columns::util::rect_h(port), 320.), 3600.);
+    let height = min_float(max_float(lib::columns::util::rect_h(port), 320.), 3600.);
     lib::columns::util::center_span_gridded(lib::columns::util::rect_cy_i(port), height)
 }
 
@@ -136,7 +136,7 @@ cell column_mos(gate_width: Int, drain_n_width: Int, drain_p_width: Int, include
     if include_drain_p { draw_positive_vertical_jog(drain_p.2, drain_p.1); } else { crect(x0=0., y0=0., x1=0., y1=0.); };
 
     let nsdm_top = drain_n_y + 125.;
-    if lib::columns::util::bor(include_gate, include_drain_n) {
+    if (include_gate || include_drain_n) {
         lib::columns::util::draw_box("nsdm.drawing", lib::columns::util::cbox(0., -125., 1200., nsdm_top));
     } else { crect(x0=0., y0=0., x1=0., y1=0.); };
     if include_drain_p {
@@ -213,7 +213,7 @@ cell replica_column_mos(p: ReplicaColumnParams) {
 
 // Each unit's bitline port, from the first unit's.
 fn unit_bitlines(bl: Rect, unit: Int, units: Int) -> [Rect] {
-    if unit == units { [] } else { cons(lib::columns::util::rect_translate(bl, unit as Float * 1200. + (unit / 8) as Float * 1300., 0.), unit_bitlines(bl, unit + 1, units)) }
+    [for u in range_full(unit, units, 1) { lib::columns::util::rect_translate(bl, u as Float * 1200. + (u / 8) as Float * 1300., 0.) }]
 }
 
 // Metal-only load used to make the replica bitline see the same first-order
@@ -225,9 +225,7 @@ fn routing_track(p: ReplicaRoutingParams, track: Int) -> Rect {
     lib::columns::util::cbox(x0, 0., x0 + width as Float, p.m1_height as Float)
 }
 
-fn routing_tracks(p: ReplicaRoutingParams, track: Int) -> [Rect] {
-    if track == p.tracks { [] } else { cons(routing_track(p, track), routing_tracks(p, track + 1)) }
-}
+fn routing_tracks(p: ReplicaRoutingParams, track: Int) -> [Rect] { [for t in range_full(track, p.tracks, 1) { routing_track(p, t) }] }
 
 cell replica_metal_routing(p: ReplicaRoutingParams) {
     let bl = routing_tracks(p, 0);
@@ -239,7 +237,7 @@ cell replica_metal_routing(p: ReplicaRoutingParams) {
         let m1 = lib::columns::util::cbox(x0, 0., x0 + width as Float, p.m1_height as Float);
         lib::columns::util::draw_box("met1.drawing", m1);
         lib::columns::util::draw_box("met1.pin", m1);
-        if lib::columns::util::band(m0.x1 > m1.x0, m1.x1 > m0.x0) {
+        if (m0.x1 > m1.x0 && m1.x1 > m0.x0) {
             lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", m0, m1, 0, 0, true);
         } else { crect(x0=0., y0=0., x1=0., y1=0.); };
     }

@@ -230,6 +230,14 @@ pub fn argon_log_path() -> Option<PathBuf> {
     argon_state_dir().map(|directory| directory.join(LOG_FILE))
 }
 
+/// The progress message shown for the whole compilation of `identity`.
+fn compilation_message(identity: &CompileIdentity) -> String {
+    identity.cell.as_deref().map_or_else(
+        || "Compiling workspace".to_owned(),
+        |cell| format!("Compiling {cell}"),
+    )
+}
+
 fn read_config() -> std::result::Result<ArgonConfig, String> {
     let Some(path) = argon_config_path() else {
         return Ok(ArgonConfig::default());
@@ -543,7 +551,7 @@ impl<'a> SpanRanger<'a> {
         let encoding = self.encoding;
         let document = self
             .documents
-            .entry(span.path.clone())
+            .entry(span.path.to_path_buf())
             .or_insert_with(|| {
                 let module = ast.values().find(|module| module.path == span.path)?;
                 Some(Document::new(&module.source_text, 0, encoding))
@@ -571,7 +579,7 @@ fn diagnostics(
             CompileOutput::FatalParseErrors => {
                 vec![(
                     Span {
-                        path: root_dir.join("lib.ar"),
+                        path: root_dir.join("lib.ar").into(),
                         span: cfgrammar::Span::new(0, 0),
                     },
                     "fatal parse errors encountered, unable to compile".to_string(),
@@ -586,7 +594,7 @@ fn diagnostics(
                 .map(|e| {
                     (
                         e.span.clone().unwrap_or_else(|| Span {
-                            path: root_dir.join("lib.ar"),
+                            path: root_dir.join("lib.ar").into(),
                             span: cfgrammar::Span::new(0, 0),
                         }),
                         format!("{}", e.kind),
@@ -602,7 +610,7 @@ fn diagnostics(
         if dropped > 0 {
             errs.push((
                 Span {
-                    path: root_dir.join("lib.ar"),
+                    path: root_dir.join("lib.ar").into(),
                     span: cfgrammar::Span::new(0, 0),
                 },
                 format!(
@@ -725,14 +733,10 @@ impl State {
             .editor_client
             .create_work_done_progress(token.clone())
             .await;
-        let message = identity.cell.as_deref().map_or_else(
-            || "Compiling workspace".to_owned(),
-            |cell| format!("Compiling {cell}"),
-        );
         let editor_progress = self
             .editor_client
             .progress(token, "Argon compilation")
-            .with_message(message)
+            .with_message(compilation_message(identity))
             .begin()
             .await;
         CompilationActivity {
@@ -1226,7 +1230,8 @@ impl Backend {
                     snapshot = &mut compilation => break snapshot?,
                     _ = heartbeat.tick() => {
                         activity.editor_progress.report(format!(
-                            "Evaluating layout ({:.0}s elapsed)",
+                            "{} ({:.0}s elapsed)",
+                            compilation_message(&identity),
                             pipeline_started.elapsed().as_secs_f64(),
                         )).await;
                     }
@@ -1984,7 +1989,7 @@ impl Backend {
         let mut preview_source = ast.text.to_string();
         preview_source.insert_str(insertion.offset, &insertion.edit.new_text);
         let mut preview_module =
-            match parse::parse_source_text(preview_source, scope_span.path.clone()) {
+            match parse::parse_source_text(preview_source, scope_span.path.to_path_buf()) {
                 Ok(ast) => ast,
                 Err(error) => {
                     self.state

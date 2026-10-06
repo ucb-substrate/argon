@@ -74,8 +74,8 @@ pub(crate) fn dot(a: &SparseVec, b: &SparseVec) -> f64 {
         .sum()
 }
 
-impl From<&Vec<(f64, Var)>> for SparseVec {
-    fn from(value: &Vec<(f64, Var)>) -> Self {
+impl From<&[(f64, Var)]> for SparseVec {
+    fn from(value: &[(f64, Var)]) -> Self {
         let mut coefficients = IndexMap::new();
         for (coefficient, variable) in value {
             *coefficients.entry(*variable).or_default() += coefficient;
@@ -86,7 +86,7 @@ impl From<&Vec<(f64, Var)>> for SparseVec {
 
 impl From<&LinearExpr> for SparseVec {
     fn from(value: &LinearExpr) -> Self {
-        Self::from(&value.coeffs)
+        Self::from(&value.coeffs[..])
     }
 }
 
@@ -144,7 +144,10 @@ impl SseSpace {
             SseBasis::Nullspace(vectors) => (SseSpaceKind::Nullspace, vectors),
             SseBasis::Rowspace(vectors) => (SseSpaceKind::Rowspace, vectors),
         };
-        let vectors = vectors.iter().map(SparseVec::from).collect::<Vec<_>>();
+        let vectors = vectors
+            .iter()
+            .map(|vector| SparseVec::from(&vector[..]))
+            .collect::<Vec<_>>();
         let mut vectors_by_var = HashMap::<Var, Vec<usize>>::new();
         for (index, vector) in vectors.iter().enumerate() {
             for var in vector.keys() {
@@ -351,7 +354,7 @@ mod tests {
         // This is the coefficient form of
         // `(rect.x0 + rect.x1 + rect.x0 + rect.x1) / 4.`.
         let coordinate = LinearExpr {
-            coeffs: vec![(0.25, x0), (0.25, x1), (0.25, x0), (0.25, x1)],
+            coeffs: vec![(0.25, x0), (0.25, x1), (0.25, x0), (0.25, x1)].into(),
             constant: 0.,
         };
         let coordinate = SparseVec::from(&coordinate);
@@ -418,11 +421,11 @@ mod tests {
         let y0 = solver.new_var();
         let y1 = solver.new_var();
         solver.constrain_eq0(LinearExpr {
-            coeffs: vec![(1., x1), (-1., x0)],
+            coeffs: vec![(1., x1), (-1., x0)].into(),
             constant: -4.,
         });
         solver.constrain_eq0(LinearExpr {
-            coeffs: vec![(1., y1), (-1., y0)],
+            coeffs: vec![(1., y1), (-1., y0)].into(),
             constant: -7.,
         });
         solver.solve();
@@ -446,7 +449,7 @@ mod tests {
         let x0 = solver.new_var();
         let x1 = solver.new_var();
         solver.constrain_eq0(LinearExpr {
-            coeffs: vec![(1., x1), (-1., x0)],
+            coeffs: vec![(1., x1), (-1., x0)].into(),
             constant: -4.,
         });
         solver.solve();
@@ -462,7 +465,7 @@ mod tests {
         let x0 = solver.new_var();
         let x1 = solver.new_var();
         solver.constrain_eq0(LinearExpr {
-            coeffs: vec![(1., x1), (-1., x0)],
+            coeffs: vec![(1., x1), (-1., x0)].into(),
             constant: -4.,
         });
         solver.solve();
@@ -485,7 +488,7 @@ mod tests {
         let a = solver.new_var();
         let b = solver.new_var();
         solver.constrain_eq0(LinearExpr {
-            coeffs: vec![(1., a), (-1., b)],
+            coeffs: vec![(1., a), (-1., b)].into(),
             constant: 0.,
         });
         solver.solve();
@@ -504,11 +507,11 @@ mod tests {
         let x0 = solver.new_var();
         let x1 = solver.new_var();
         solver.constrain_eq0(LinearExpr {
-            coeffs: vec![(1., x0)],
+            coeffs: vec![(1., x0)].into(),
             constant: -1.,
         });
         solver.constrain_eq0(LinearExpr {
-            coeffs: vec![(1., x1)],
+            coeffs: vec![(1., x1)].into(),
             constant: -5.,
         });
         solver.solve();
@@ -579,7 +582,7 @@ mod tests {
         let x1 = solver.new_var();
         // Fallback `x1 - 100` pins x1 = 100; a drag moved x1 by +2.5.
         let constraint = LinearExpr {
-            coeffs: vec![(1., x1)],
+            coeffs: vec![(1., x1)].into(),
             constant: -100.,
         };
         let dv = SparseVec([(x1, 2.5)].into_iter().collect());
@@ -596,7 +599,7 @@ mod tests {
         // Fallback on x0; the drag moved only x1, so x0's initial condition is
         // untouched.
         let constraint = LinearExpr {
-            coeffs: vec![(1., x0)],
+            coeffs: vec![(1., x0)].into(),
             constant: 0.,
         };
         let dv = SparseVec([(x1, 5.)].into_iter().collect());

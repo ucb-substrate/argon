@@ -63,7 +63,7 @@ pub fn remap_span_after_value_edits(span: &Span, edits: &[ValueEdit]) -> Span {
 fn apply_value_edits(text: &str, path: &Path, edits: &[ValueEdit]) -> String {
     let mut edits = edits
         .iter()
-        .filter(|edit| edit.span.path == path)
+        .filter(|edit| *edit.span.path == *path)
         .collect::<Vec<_>>();
     edits.sort_by_key(|edit| std::cmp::Reverse(edit.span.span.start()));
     let mut text = text.to_owned();
@@ -116,7 +116,7 @@ impl DragEditHistory {
             };
         }
         for (path, text) in texts {
-            if batch.iter().any(|edit| &edit.span.path == path) {
+            if batch.iter().any(|edit| *edit.span.path == **path) {
                 self.texts
                     .insert(path.clone(), apply_value_edits(text, path, &batch));
             }
@@ -668,7 +668,7 @@ impl State {
                                 compiled
                                     .ast
                                     .values()
-                                    .find(|ast| ast.path == path)
+                                    .find(|ast| *ast.path == *path)
                                     .map(|ast| ast.source_text.to_string())
                             })
                     };
@@ -887,7 +887,8 @@ impl LangServer for State {
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         };
-        let ast = match argonc::parse::parse_source_text(source_text, scope_span.path.clone()) {
+        let ast = match argonc::parse::parse_source_text(source_text, scope_span.path.to_path_buf())
+        {
             Ok(ast) => ast,
             Err(error) => {
                 self.report_message(MessageType::ERROR, error.to_string())
@@ -1198,11 +1199,11 @@ impl LangServer for State {
         let mut history = self.drag_edits.lock().await;
         let paths = edits
             .iter()
-            .map(|edit| edit.span.path.clone())
+            .map(|edit| edit.span.path.to_path_buf())
             .chain(
                 initial_conditions
                     .iter()
-                    .map(|initial_condition| initial_condition.call_span.path.clone()),
+                    .map(|initial_condition| initial_condition.call_span.path.to_path_buf()),
             )
             .collect::<HashSet<_>>();
         let placed = match base_revision {
@@ -1236,7 +1237,7 @@ impl LangServer for State {
                 if !workspace_ast.values().any(|ast| ast.path == span.path) {
                     return Some(NOT_IN_WORKSPACE_MESSAGE);
                 }
-                (span.span.end() > texts.get(&span.path).map_or(0, String::len))
+                (span.span.end() > texts.get(&*span.path).map_or(0, String::len))
                     .then_some(READ_ONLY_GENERATED_SOURCE_MESSAGE)
             });
         if let Some(error) = source_error {
@@ -1255,18 +1256,19 @@ impl LangServer for State {
             value,
         } in initial_conditions
         {
-            if !asts.contains_key(&call_span.path) {
-                let parsed = texts.get(&call_span.path).and_then(|text| {
-                    argonc::parse::parse_source_text(text.clone(), call_span.path.clone()).ok()
+            if !asts.contains_key(&*call_span.path) {
+                let parsed = texts.get(&*call_span.path).and_then(|text| {
+                    argonc::parse::parse_source_text(text.clone(), call_span.path.to_path_buf())
+                        .ok()
                 });
                 let Some(ast) = parsed else {
                     self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
                         .await;
                     return None;
                 };
-                asts.insert(call_span.path.clone(), ast);
+                asts.insert(call_span.path.to_path_buf(), ast);
             }
-            let Some(call) = asts[&call_span.path].span2call.get(&call_span) else {
+            let Some(call) = asts[&*call_span.path].span2call.get(&call_span) else {
                 continue;
             };
             if let Some(kwarg) = call
@@ -1296,7 +1298,7 @@ impl LangServer for State {
         }
 
         for (call_span, values) in missing {
-            if let Some(text) = texts.get(&call_span.path)
+            if let Some(text) = texts.get(&*call_span.path)
                 && let Some(edit) = missing_initial_condition_edit(text, &call_span, values)
             {
                 edits.push(edit);
@@ -1323,7 +1325,7 @@ impl LangServer for State {
         // back-to-front without invalidating each other's offsets.
         let mut pending: HashMap<Uri, Vec<(usize, TextEdit)>> = HashMap::new();
         for ValueEdit { span, value } in &edits {
-            if let Some(text) = texts.get(&span.path)
+            if let Some(text) = texts.get(&*span.path)
                 && let Some(uri) = Uri::from_file_path(&span.path)
             {
                 let doc = self.document(text.as_str());
@@ -1559,7 +1561,7 @@ cell top() { let a = inst(leaf(), x=0., y=0.); }
             let start = text.find(kwarg).unwrap() + kwarg.len();
             let len = text[start..].find([',', ')']).unwrap();
             Span {
-                path: path.clone(),
+                path: path.clone().into(),
                 span: cfgrammar::Span::new(start, start + len),
             }
         };
@@ -1695,7 +1697,7 @@ cell top() { let m = inst(mid(), x=0., y=0.); }
         let source_scope = compiled
             .ast
             .values()
-            .find(|ast| ast.path == source_path)
+            .find(|ast| *ast.path == *source_path)
             .and_then(|ast| ast.span2scope.keys().next())
             .cloned()
             .expect("source cell should have a scope");
@@ -1704,7 +1706,7 @@ cell top() { let m = inst(mid(), x=0., y=0.); }
         let imported_scope = compiled
             .ast
             .values()
-            .find(|ast| ast.path == source_path)
+            .find(|ast| *ast.path == *source_path)
             .and_then(|ast| {
                 ast.span2scope
                     .keys()
@@ -1794,7 +1796,7 @@ cell top() { let m = inst(mid(), x=0., y=0.); }
         fn insert(source: &str, call: &str, values: &[(&str, &str)]) -> String {
             let start = source.find(call).unwrap();
             let call_span = argonc::ast::Span {
-                path: std::path::PathBuf::from("/virtual/lib.ar"),
+                path: std::path::Path::new("/virtual/lib.ar").into(),
                 span: cfgrammar::Span::new(start, start + call.len()),
             };
             let edit = missing_initial_condition_edit(
@@ -1808,7 +1810,7 @@ cell top() { let m = inst(mid(), x=0., y=0.); }
             .unwrap();
             let mut updated = source.to_owned();
             updated.replace_range(edit.span.span.start()..edit.span.span.end(), &edit.value);
-            parse::parse_source_text(updated.clone(), call_span.path).unwrap();
+            parse::parse_source_text(updated.clone(), call_span.path.to_path_buf()).unwrap();
             updated
         }
 

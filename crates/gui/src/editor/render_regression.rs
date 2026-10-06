@@ -1164,7 +1164,7 @@ fn early_sse_cell_preview_is_applied_as_soon_as_neovim_acknowledges_the_edit(
             Ok(Some(vec![])),
             vec![analyzer::rpc::InitialConditionEdit {
                 call_span: Span {
-                    path: source,
+                    path: source.into(),
                     span: cfgrammar::Span::new(0, original.len()),
                 },
                 name: "x1i".to_owned(),

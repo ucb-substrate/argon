@@ -147,12 +147,10 @@ fn pin_down(g: Grid, hspan: (Float, Float)) -> Rect {
     lib::columns::util::met1_port(hspan.0, bottom, hspan.1, g.y0 + 320.)
 }
 
-fn pins_down(g: Grid, l: [Rect], i: Int) -> [Rect] {
-    if l == [] { [] } else { cons(pin_down(g, lib::columns::util::rect_hspan(head(l))), pins_down(g, tail(l), i + 1)) }
-}
+fn pins_down(g: Grid, l: [Rect], i: Int) -> [Rect] { [for r in l { pin_down(g, lib::columns::util::rect_hspan(r)) }] }
 
 fn dff_pins(g: Grid, dffs: Any, i: Int, n: Int) -> [Rect] {
-    if i == n { [] } else { cons(pin_down(g, lib::columns::util::rect_hspan(lib::logic::routing::dff_pin(g, dffs, i))), dff_pins(g, dffs, i + 1, n)) }
+    [for k in range_full(i, n, 1) { pin_down(g, lib::columns::util::rect_hspan(lib::logic::routing::dff_pin(g, dffs, k))) }]
 }
 
 fn reverse<T>(l: [T]) -> [T] { reverse_onto(l, []) }

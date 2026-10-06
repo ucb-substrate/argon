@@ -47,7 +47,7 @@ fn coalesce_from(cur: (Float, Float), rest: [(Float, Float)]) -> [(Float, Float)
     if rest == [] {
         cons(cur, [])
     } else if head(rest).0 <= cur.1 {
-        coalesce_from((cur.0, lib::columns::util::fmax(cur.1, head(rest).1),), tail(rest))
+        coalesce_from((cur.0, max_float(cur.1, head(rest).1),), tail(rest))
     } else {
         cons(cur, coalesce_from(head(rest), tail(rest)))
     }

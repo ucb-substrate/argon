@@ -27,7 +27,7 @@ fn pc_gate_top_span(p: PrechargeParams) -> (Float, Float) {
 
 fn pc_outline_bottom(p: PrechargeParams) -> Float {
     let gate = pc_gate_bot_span(p);
-    lib::columns::util::fmin(0., gate.0 - (gate.1 - gate.0) / 4.)
+    min_float(0., gate.0 - (gate.1 - gate.0) / 4.)
 }
 
 fn pc_cut_bot(p: PrechargeParams) -> Float {
@@ -193,9 +193,9 @@ cell precharge_exact(p: PrechargeParams) {
     lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", lib::columns::util::rect_expand_vert(sd_2_1, -20.), r1, 0, 0, true, width);
 
     lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", lib::columns::util::cbox(width, sd_2_0.y0 + 20., width, sd_2_0.y1 - 20.), r3, 0, 0, true, width);
-    lib::columns::util::draw_clip("li1.drawing", lib::columns::util::cbox(lib::columns::util::fmin(sd_2_0.x0, width), sd_2_0.y0, lib::columns::util::fmax(sd_2_0.x1, width), sd_2_0.y1), width);
+    lib::columns::util::draw_clip("li1.drawing", lib::columns::util::cbox(min_float(sd_2_0.x0, width), sd_2_0.y0, max_float(sd_2_0.x1, width), sd_2_0.y1), width);
     lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", lib::columns::util::cbox(0., sd_1_1.y0 + 20., 0., sd_1_1.y1 - 20.), r0, 0, 0, true, width);
-    lib::columns::util::draw_clip("li1.drawing", lib::columns::util::cbox(lib::columns::util::fmin(sd_1_1.x0, 0.), sd_1_1.y0, lib::columns::util::fmax(sd_1_1.x1, 0.), sd_1_1.y1), width);
+    lib::columns::util::draw_clip("li1.drawing", lib::columns::util::cbox(min_float(sd_1_1.x0, 0.), sd_1_1.y0, max_float(sd_1_1.x1, 0.), sd_1_1.y1), width);
 
     lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", lib::columns::util::cbox(lib::columns::util::rect_cx(o0), sd_0_0.y0 + 20., lib::columns::util::rect_cx(o0), sd_0_0.y1 - 20.), lib::columns::util::rect_expand_vert(o0, -80.), 0, 0, true, width);
     lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", lib::columns::util::cbox(lib::columns::util::rect_cx(o2), sd_0_1.y0 + 20., lib::columns::util::rect_cx(o2), sd_0_1.y1 - 20.), lib::columns::util::rect_expand_vert(o2, -80.), 0, 0, true, width);
@@ -371,7 +371,7 @@ cell precharge_tap(p: PrechargeParams, both_sides: Bool, via_top: Bool) {
         crect(x0=0., y0=0., x1=0., y1=0.);
     };
     lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans((1170., 1300.,), route_span));
-    draw_precharge_side_via(p, true, lib::columns::util::bor(via_top, both_sides), tap_li);
+    draw_precharge_side_via(p, true, (via_top || both_sides), tap_li);
 
     let gate_bot = lib::columns::util::rect_from_spans((0., 1300.,), pc_gate_bot_span(p));
     let gate_top = lib::columns::util::rect_from_spans((0., 1300.,), pc_gate_top_span(p));

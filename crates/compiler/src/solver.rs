@@ -7,10 +7,11 @@ use sparse_linear_solver::{analyze as analyze_sparse_system, nullspace as sparse
 use std::collections::VecDeque;
 use std::hash::BuildHasherDefault;
 
-use fnv::FnvHasher;
+use rustc_hash::FxHasher;
+use smallvec::SmallVec;
 
-type FnvIndexMap<K, V> = IndexMap<K, V, BuildHasherDefault<FnvHasher>>;
-type FnvIndexSet<T> = IndexSet<T, BuildHasherDefault<FnvHasher>>;
+type FxIndexMap<K, V> = IndexMap<K, V, BuildHasherDefault<FxHasher>>;
+type FxIndexSet<T> = IndexSet<T, BuildHasherDefault<FxHasher>>;
 
 /// Cumulative `solve()` accounting, for attributing compile time between
 /// evaluation and the linear solver.
@@ -79,19 +80,19 @@ pub struct Solver {
     grid: f64,
     next_var: u64,
     next_constraint: ConstraintId,
-    constraints: FnvIndexMap<ConstraintId, LinearExpr>,
-    var_to_constraints: FnvIndexMap<Var, FnvIndexSet<ConstraintId>>,
+    constraints: FxIndexMap<ConstraintId, LinearExpr>,
+    var_to_constraints: FxIndexMap<Var, ConstraintSet>,
     // Solved and unsolved vars are separate to reduce overhead of many solved variables.
-    solved_vars: FnvIndexMap<Var, f64>,
-    unsolved_vars: FnvIndexSet<Var>,
-    updated_vars: FnvIndexSet<Var>,
+    solved_vars: FxIndexMap<Var, f64>,
+    unsolved_vars: FxIndexSet<Var>,
+    updated_vars: FxIndexSet<Var>,
     back_substitute_stack: Vec<ConstraintId>,
-    inconsistent_constraints: FnvIndexSet<ConstraintId>,
+    inconsistent_constraints: FxIndexSet<ConstraintId>,
     /// Variables whose solved value missed the grid, with the value the
     /// solver computed. Rounding each variable in isolation can break a
     /// constraint that couples several of them, so the diagnostic needs the
     /// number, not just the fact that a miss happened.
-    off_grid_vars: FnvIndexMap<Var, f64>,
+    off_grid_vars: FxIndexMap<Var, f64>,
     // Per-`solve()` scratch for the sparse elimination pre-pass (`eliminate_definitional`).
     // `elim_worklist` holds constraints to (re)examine for a small pivot; `substitutions`
     // records `var = expr` definitions for variables eliminated via a 2-variable
@@ -111,14 +112,14 @@ impl Default for Solver {
             grid: DEFAULT_GRID,
             next_var: 0,
             next_constraint: 0,
-            constraints: FnvIndexMap::default(),
-            var_to_constraints: FnvIndexMap::default(),
-            solved_vars: FnvIndexMap::default(),
-            unsolved_vars: FnvIndexSet::default(),
-            updated_vars: FnvIndexSet::default(),
+            constraints: FxIndexMap::default(),
+            var_to_constraints: FxIndexMap::default(),
+            solved_vars: FxIndexMap::default(),
+            unsolved_vars: FxIndexSet::default(),
+            updated_vars: FxIndexSet::default(),
             back_substitute_stack: Vec::new(),
-            inconsistent_constraints: FnvIndexSet::default(),
-            off_grid_vars: FnvIndexMap::default(),
+            inconsistent_constraints: FxIndexSet::default(),
+            off_grid_vars: FxIndexMap::default(),
             elim_worklist: VecDeque::new(),
             substitutions: Vec::new(),
             sparse_nullspace_cache: None,
@@ -163,8 +164,8 @@ impl Solver {
     /// its own label. That is what lets a caller apply several pending
     /// constraints in one round, as long as their variables carry disjoint
     /// labels.
-    pub fn unsolved_var_components(&self) -> FnvIndexMap<Var, Var> {
-        let mut labels = FnvIndexMap::with_capacity_and_hasher(
+    pub fn unsolved_var_components(&self) -> FxIndexMap<Var, Var> {
+        let mut labels = FxIndexMap::with_capacity_and_hasher(
             self.unsolved_vars.len(),
             BuildHasherDefault::default(),
         );
@@ -205,7 +206,7 @@ impl Solver {
     pub fn unsolved_component_labels(
         &self,
         expr: &LinearExpr,
-        labels: &FnvIndexMap<Var, Var>,
+        labels: &FxIndexMap<Var, Var>,
     ) -> Vec<Var> {
         expr.coeffs
             .iter()
@@ -225,7 +226,7 @@ impl Solver {
     pub fn force_solution(&mut self) {
         while !self.fully_solved() {
             let labels = self.unsolved_var_components();
-            let mut claimed = FnvIndexSet::default();
+            let mut claimed = FxIndexSet::default();
             let mut pinned = false;
             // Collected rather than cloning the `IndexSet`, which would
             // rebuild its hash table for a list this only iterates.
@@ -255,12 +256,12 @@ impl Solver {
     }
 
     #[inline]
-    pub fn inconsistent_constraints(&self) -> &FnvIndexSet<ConstraintId> {
+    pub fn inconsistent_constraints(&self) -> &FxIndexSet<ConstraintId> {
         &self.inconsistent_constraints
     }
 
     #[inline]
-    pub fn updated_vars(&self) -> &FnvIndexSet<Var> {
+    pub fn updated_vars(&self) -> &FxIndexSet<Var> {
         &self.updated_vars
     }
 
@@ -270,7 +271,7 @@ impl Solver {
     }
 
     #[inline]
-    pub fn off_grid_vars(&self) -> &FnvIndexMap<Var, f64> {
+    pub fn off_grid_vars(&self) -> &FxIndexMap<Var, f64> {
         &self.off_grid_vars
     }
 
@@ -281,7 +282,7 @@ impl Solver {
         self.grid
     }
 
-    pub fn unsolved_vars(&self) -> &FnvIndexSet<Var> {
+    pub fn unsolved_vars(&self) -> &FxIndexSet<Var> {
         &self.unsolved_vars
     }
 
@@ -343,15 +344,9 @@ impl Solver {
                 self.solve_var(var, rounded_val);
             }
             self.constraints.swap_remove(&id);
-            for constraint in self
-                .var_to_constraints
-                .get(&var)
-                .into_iter()
-                .flatten()
-                .copied()
-                .collect_vec()
-            {
-                self.back_substitute_stack.push(constraint);
+            if let Some(constraints) = self.var_to_constraints.get(&var) {
+                self.back_substitute_stack
+                    .extend(constraints.iter().copied());
             }
         }
     }
@@ -452,14 +447,9 @@ impl Solver {
     /// Re-queues every still-live constraint mentioning `var`; they may have just
     /// shrunk to a size the pre-pass can act on.
     fn requeue_neighbors(&mut self, var: Var) {
-        let neighbors: Vec<ConstraintId> = self
-            .var_to_constraints
-            .get(&var)
-            .into_iter()
-            .flatten()
-            .copied()
-            .collect();
-        self.elim_worklist.extend(neighbors);
+        if let Some(neighbors) = self.var_to_constraints.get(&var) {
+            self.elim_worklist.extend(neighbors.iter().copied());
+        }
     }
 
     /// Grounds the single variable of a 1-variable constraint (post-simplify). The
@@ -490,11 +480,11 @@ impl Solver {
         }
         // From `a*v + cw*w + constant = 0`: v = (-cw/a) * w + (-constant/a).
         let v_expr = LinearExpr {
-            coeffs: vec![(-cw / a, w)],
+            coeffs: Terms::one(-cw / a, w),
             constant: -constant / a,
         };
         self.remove_constraint(id);
-        let neighbors: Vec<ConstraintId> = self
+        let neighbors: SmallVec<[ConstraintId; 8]> = self
             .var_to_constraints
             .get(&v)
             .into_iter()
@@ -528,7 +518,7 @@ impl Solver {
                 self.assign_var(var, expr.constant);
             } else {
                 self.unsolved_vars.insert(var);
-                let mut coeffs = Vec::with_capacity(expr.coeffs.len() + 1);
+                let mut coeffs = Terms::with_capacity(expr.coeffs.len() + 1);
                 coeffs.push((1., var));
                 for (c, v) in expr.coeffs {
                     coeffs.push((-c, v));
@@ -585,7 +575,7 @@ impl Solver {
         }
         let mut output = Vec::new();
         for component in self.constraint_components() {
-            let var_indices: FnvIndexMap<Var, usize> = FnvIndexMap::from_iter(
+            let var_indices: FxIndexMap<Var, usize> = FxIndexMap::from_iter(
                 component
                     .vars
                     .iter()
@@ -678,7 +668,7 @@ impl Solver {
         Some(crate::tech::snap(self.eval_expr_exact(expr)?, self.grid))
     }
 
-    fn solve_component(&mut self, vars: &FnvIndexSet<Var>, constraints: &[ConstraintId]) {
+    fn solve_component(&mut self, vars: &FxIndexSet<Var>, constraints: &[ConstraintId]) {
         let n_vars = vars.len();
         if n_vars == 0 || constraints.is_empty() {
             return;
@@ -694,8 +684,8 @@ impl Solver {
             return;
         }
         self.sparse_nullspace_cache = None;
-        let var_indices: FnvIndexMap<Var, usize> =
-            FnvIndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
+        let var_indices: FxIndexMap<Var, usize> =
+            FxIndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
         let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
             multiunzip(constraints.iter().enumerate().flat_map(|(row, id)| {
                 self.constraints[id].coeffs.iter().map({
@@ -746,11 +736,11 @@ impl Solver {
     /// variables are uniquely determined by the CGLS particular solution.
     fn try_solve_sparse_component(
         &mut self,
-        vars: &FnvIndexSet<Var>,
+        vars: &FxIndexSet<Var>,
         constraints: &[ConstraintId],
     ) -> bool {
-        let var_indices: FnvIndexMap<Var, usize> =
-            FnvIndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
+        let var_indices: FxIndexMap<Var, usize> =
+            FxIndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
         let rows: Vec<Vec<(usize, f64)>> = constraints
             .iter()
             .map(|id| {
@@ -792,7 +782,7 @@ impl Solver {
 
     fn rowspace_component_vecs(
         &self,
-        vars: &FnvIndexSet<Var>,
+        vars: &FxIndexSet<Var>,
         constraints: &[ConstraintId],
     ) -> Vec<Vec<(f64, Var)>> {
         let n_vars = vars.len();
@@ -803,8 +793,8 @@ impl Solver {
         if !self.component_is_finite(constraints) {
             return Vec::new();
         }
-        let var_indices: FnvIndexMap<Var, usize> =
-            FnvIndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
+        let var_indices: FxIndexMap<Var, usize> =
+            FxIndexMap::from_iter(vars.iter().enumerate().map(|(i, var)| (*var, i)));
         let (i, j, val): (Vec<_>, Vec<_>, Vec<_>) =
             multiunzip(constraints.iter().enumerate().flat_map(|(row, id)| {
                 self.constraints[id].coeffs.iter().map({
@@ -841,16 +831,28 @@ impl Solver {
     }
 
     fn constraint_components(&self) -> Vec<ConstraintComponent> {
-        let mut visited_vars = FnvIndexSet::default();
-        let mut visited_constraints = FnvIndexSet::default();
+        let mut visited_vars = FxIndexSet::default();
+        let mut visited_constraints = FxIndexSet::default();
         let mut components = Vec::new();
+        let mut queue = VecDeque::new();
 
         for &root_var in &self.unsolved_vars {
             if !visited_vars.insert(root_var) {
                 continue;
             }
-            let mut queue = VecDeque::from([root_var]);
-            let mut vars = FnvIndexSet::from_iter([root_var]);
+            // A variable in no live, unvisited constraint is a component
+            // without constraints, which is not reported.
+            let starts_component = self.var_to_constraints.get(&root_var).is_some_and(|ids| {
+                ids.iter().any(|id| {
+                    self.constraints.contains_key(id) && !visited_constraints.contains(id)
+                })
+            });
+            if !starts_component {
+                continue;
+            }
+            queue.clear();
+            queue.push_back(root_var);
+            let mut vars = FxIndexSet::from_iter([root_var]);
             let mut constraints = Vec::new();
 
             while let Some(var) = queue.pop_front() {
@@ -905,6 +907,16 @@ fn substitute_var(expr: &mut LinearExpr, v: Var, v_expr: &LinearExpr) {
 /// (e.g. a chain closing onto itself collapses `x + x` to a single `2x` term, and a
 /// cancelling substitution collapses to an empty/contradiction constraint).
 fn coalesce_terms(expr: &mut LinearExpr) {
+    let distinct = expr
+        .coeffs
+        .iter()
+        .enumerate()
+        .all(|(i, (_, v))| expr.coeffs[..i].iter().all(|(_, earlier)| earlier != v));
+    if distinct {
+        expr.coeffs
+            .retain(|(c, _)| relative_ne!(*c, 0., epsilon = EPSILON));
+        return;
+    }
     let mut merged: Vec<(f64, Var)> = Vec::with_capacity(expr.coeffs.len());
     for &(c, v) in &expr.coeffs {
         if let Some(term) = merged.iter_mut().find(|(_, mv)| *mv == v) {
@@ -914,20 +926,293 @@ fn coalesce_terms(expr: &mut LinearExpr) {
         }
     }
     merged.retain(|(c, _)| relative_ne!(*c, 0., epsilon = EPSILON));
-    expr.coeffs = merged;
+    expr.coeffs = merged.into();
 }
 
 struct ConstraintComponent {
-    vars: FnvIndexSet<Var>,
+    vars: FxIndexSet<Var>,
     constraints: Vec<ConstraintId>,
 }
 
 pub type ConstraintId = u64;
 
+/// The constraints that mention one variable, in insertion order. Most
+/// variables are in a few constraints, which a short list holds without the
+/// allocations of a hash set; a longer list moves to one, keeping its order.
+#[derive(Clone, Debug)]
+enum ConstraintSet {
+    Few(SmallVec<[ConstraintId; 4]>),
+    Many(FxIndexSet<ConstraintId>),
+}
+
+impl Default for ConstraintSet {
+    fn default() -> Self {
+        ConstraintSet::Few(SmallVec::new())
+    }
+}
+
+impl ConstraintSet {
+    const FEW: usize = 16;
+
+    fn insert(&mut self, id: ConstraintId) -> bool {
+        match self {
+            ConstraintSet::Few(ids) => {
+                if ids.contains(&id) {
+                    return false;
+                }
+                if ids.len() < Self::FEW {
+                    ids.push(id);
+                } else {
+                    let mut set: FxIndexSet<ConstraintId> = ids.drain(..).collect();
+                    set.insert(id);
+                    *self = ConstraintSet::Many(set);
+                }
+                true
+            }
+            ConstraintSet::Many(set) => set.insert(id),
+        }
+    }
+
+    /// Removes `id`, moving the last constraint into its place.
+    fn swap_remove(&mut self, id: &ConstraintId) -> bool {
+        match self {
+            ConstraintSet::Few(ids) => match ids.iter().position(|other| other == id) {
+                Some(index) => {
+                    ids.swap_remove(index);
+                    true
+                }
+                None => false,
+            },
+            ConstraintSet::Many(set) => set.swap_remove(id),
+        }
+    }
+
+    fn iter(&self) -> ConstraintSetIter<'_> {
+        match self {
+            ConstraintSet::Few(ids) => Either::Left(ids.iter()),
+            ConstraintSet::Many(set) => Either::Right(set.iter()),
+        }
+    }
+}
+
+type ConstraintSetIter<'a> =
+    Either<std::slice::Iter<'a, ConstraintId>, indexmap::set::Iter<'a, ConstraintId>>;
+
+impl<'a> IntoIterator for &'a ConstraintSet {
+    type Item = &'a ConstraintId;
+    type IntoIter = ConstraintSetIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialOrd, PartialEq)]
 pub struct LinearExpr {
-    pub coeffs: Vec<(f64, Var)>,
+    pub coeffs: Terms,
     pub constant: f64,
+}
+
+/// The terms of a [`LinearExpr`], as `(coefficient, variable)` pairs. A single
+/// term is stored inline, since most expressions are one variable plus a
+/// constant.
+#[derive(Clone, Default)]
+pub struct Terms(TermsRepr);
+
+#[derive(Clone)]
+enum TermsRepr {
+    One((f64, Var)),
+    Many(Vec<(f64, Var)>),
+}
+
+impl Default for TermsRepr {
+    fn default() -> Self {
+        TermsRepr::Many(Vec::new())
+    }
+}
+
+impl Terms {
+    pub const fn new() -> Self {
+        Terms(TermsRepr::Many(Vec::new()))
+    }
+
+    pub fn one(coeff: f64, var: Var) -> Self {
+        Terms(TermsRepr::One((coeff, var)))
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        if capacity <= 1 {
+            Self::new()
+        } else {
+            Terms(TermsRepr::Many(Vec::with_capacity(capacity)))
+        }
+    }
+
+    pub fn push(&mut self, term: (f64, Var)) {
+        match &mut self.0 {
+            TermsRepr::Many(terms) if terms.capacity() == 0 => self.0 = TermsRepr::One(term),
+            TermsRepr::Many(terms) => terms.push(term),
+            TermsRepr::One(first) => {
+                let mut terms = Vec::with_capacity(4);
+                terms.push(*first);
+                terms.push(term);
+                self.0 = TermsRepr::Many(terms);
+            }
+        }
+    }
+
+    pub fn remove(&mut self, index: usize) -> (f64, Var) {
+        match &mut self.0 {
+            TermsRepr::One(term) => {
+                assert_eq!(index, 0, "term index out of bounds");
+                let term = *term;
+                self.0 = TermsRepr::Many(Vec::new());
+                term
+            }
+            TermsRepr::Many(terms) => terms.remove(index),
+        }
+    }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(&(f64, Var)) -> bool) {
+        match &mut self.0 {
+            TermsRepr::One(term) => {
+                if !keep(term) {
+                    self.0 = TermsRepr::Many(Vec::new());
+                }
+            }
+            TermsRepr::Many(terms) => terms.retain(keep),
+        }
+    }
+}
+
+impl std::ops::Deref for Terms {
+    type Target = [(f64, Var)];
+
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            TermsRepr::One(term) => std::slice::from_ref(term),
+            TermsRepr::Many(terms) => terms,
+        }
+    }
+}
+
+impl std::ops::DerefMut for Terms {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match &mut self.0 {
+            TermsRepr::One(term) => std::slice::from_mut(term),
+            TermsRepr::Many(terms) => terms,
+        }
+    }
+}
+
+impl std::fmt::Debug for Terms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl PartialEq for Terms {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl PartialOrd for Terms {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        (**self).partial_cmp(&**other)
+    }
+}
+
+impl From<Vec<(f64, Var)>> for Terms {
+    fn from(terms: Vec<(f64, Var)>) -> Self {
+        match terms[..] {
+            [term] => Terms(TermsRepr::One(term)),
+            _ => Terms(TermsRepr::Many(terms)),
+        }
+    }
+}
+
+impl Extend<(f64, Var)> for Terms {
+    fn extend<I: IntoIterator<Item = (f64, Var)>>(&mut self, iter: I) {
+        let iter = iter.into_iter();
+        if let TermsRepr::Many(terms) = &mut self.0
+            && (terms.capacity() > 0 || iter.size_hint().0 > 1)
+        {
+            terms.extend(iter);
+            return;
+        }
+        for term in iter {
+            self.push(term);
+        }
+    }
+}
+
+impl FromIterator<(f64, Var)> for Terms {
+    fn from_iter<I: IntoIterator<Item = (f64, Var)>>(iter: I) -> Self {
+        let mut terms = Terms::new();
+        terms.extend(iter);
+        terms
+    }
+}
+
+impl IntoIterator for Terms {
+    type Item = (f64, Var);
+    type IntoIter = TermsIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self.0 {
+            TermsRepr::One(term) => TermsIntoIter::One(Some(term)),
+            TermsRepr::Many(terms) => TermsIntoIter::Many(terms.into_iter()),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a Terms {
+    type Item = &'a (f64, Var);
+    type IntoIter = std::slice::Iter<'a, (f64, Var)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// The owning iterator of [`Terms`].
+pub enum TermsIntoIter {
+    One(Option<(f64, Var)>),
+    Many(std::vec::IntoIter<(f64, Var)>),
+}
+
+impl Iterator for TermsIntoIter {
+    type Item = (f64, Var);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            TermsIntoIter::One(term) => term.take(),
+            TermsIntoIter::Many(terms) => terms.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            TermsIntoIter::One(term) => {
+                let len = usize::from(term.is_some());
+                (len, Some(len))
+            }
+            TermsIntoIter::Many(terms) => terms.size_hint(),
+        }
+    }
+}
+
+impl Serialize for Terms {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.iter())
+    }
+}
+
+impl<'de> Deserialize<'de> for Terms {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<(f64, Var)>::deserialize(deserializer).map(Terms::from)
+    }
 }
 
 impl LinearExpr {
@@ -947,19 +1232,46 @@ impl LinearExpr {
     }
 
     /// Substitutes variables in `table` and removes entries with coefficient 0.
-    fn simplify(&mut self, table: &FnvIndexMap<Var, f64>) {
-        let (l, r): (Vec<f64>, Vec<_>) = self.coeffs.iter().partition_map(|a @ (coeff, var)| {
-            if relative_eq!(*coeff, 0., epsilon = EPSILON) {
-                return Either::Left(0.);
-            }
-            if let Some(s) = table.get(var) {
-                Either::Left(coeff * s)
+    fn simplify(&mut self, table: &FxIndexMap<Var, f64>) {
+        // Removed terms are summed left to right, then added to the constant.
+        let mut removed: Option<f64> = None;
+        self.coeffs.retain(|(coeff, var)| {
+            let term = if relative_eq!(*coeff, 0., epsilon = EPSILON) {
+                Some(0.)
             } else {
-                Either::Right(*a)
+                table.get(var).map(|s| coeff * s)
+            };
+            match term {
+                Some(term) => {
+                    removed = Some(removed.map_or(term, |sum| sum + term));
+                    false
+                }
+                None => true,
             }
         });
-        self.coeffs = r;
-        self.constant += l.into_iter().reduce(|a, b| a + b).unwrap_or(0.);
+        self.constant += removed.unwrap_or(0.);
+    }
+
+    /// `lhs + rhs`, without cloning either operand first.
+    pub fn sum(lhs: &LinearExpr, rhs: &LinearExpr) -> LinearExpr {
+        let mut coeffs = Terms::with_capacity(lhs.coeffs.len() + rhs.coeffs.len());
+        coeffs.extend(lhs.coeffs.iter().copied());
+        coeffs.extend(rhs.coeffs.iter().copied());
+        LinearExpr {
+            coeffs,
+            constant: lhs.constant + rhs.constant,
+        }
+    }
+
+    /// `lhs - rhs`, without cloning either operand first.
+    pub fn difference(lhs: &LinearExpr, rhs: &LinearExpr) -> LinearExpr {
+        let mut coeffs = Terms::with_capacity(lhs.coeffs.len() + rhs.coeffs.len());
+        coeffs.extend(lhs.coeffs.iter().copied());
+        coeffs.extend(rhs.coeffs.iter().map(|(c, v)| (-c, *v)));
+        LinearExpr {
+            coeffs,
+            constant: lhs.constant - rhs.constant,
+        }
     }
 }
 
@@ -986,8 +1298,15 @@ impl std::ops::Sub<f64> for LinearExpr {
 impl std::ops::Add<LinearExpr> for LinearExpr {
     type Output = Self;
     fn add(self, rhs: LinearExpr) -> Self::Output {
+        let coeffs = if self.coeffs.is_empty() {
+            rhs.coeffs
+        } else {
+            let mut coeffs = self.coeffs;
+            coeffs.extend(rhs.coeffs);
+            coeffs
+        };
         Self {
-            coeffs: self.coeffs.into_iter().chain(rhs.coeffs).collect(),
+            coeffs,
             constant: self.constant + rhs.constant,
         }
     }
@@ -996,12 +1315,15 @@ impl std::ops::Add<LinearExpr> for LinearExpr {
 impl std::ops::Sub<LinearExpr> for LinearExpr {
     type Output = Self;
     fn sub(self, rhs: LinearExpr) -> Self::Output {
+        let coeffs = if self.coeffs.is_empty() {
+            rhs.coeffs.into_iter().map(|(c, v)| (-c, v)).collect()
+        } else {
+            let mut coeffs = self.coeffs;
+            coeffs.extend(rhs.coeffs.into_iter().map(|(c, v)| (-c, v)));
+            coeffs
+        };
         Self {
-            coeffs: self
-                .coeffs
-                .into_iter()
-                .chain(rhs.coeffs.into_iter().map(|(c, v)| (-c, v)))
-                .collect(),
+            coeffs,
             constant: self.constant - rhs.constant,
         }
     }
@@ -1010,12 +1332,10 @@ impl std::ops::Sub<LinearExpr> for LinearExpr {
 impl std::ops::Sub<&LinearExpr> for LinearExpr {
     type Output = Self;
     fn sub(self, rhs: &LinearExpr) -> Self::Output {
+        let mut coeffs = self.coeffs;
+        coeffs.extend(rhs.coeffs.iter().map(|(c, v)| (-c, *v)));
         Self {
-            coeffs: self
-                .coeffs
-                .into_iter()
-                .chain(rhs.coeffs.iter().map(|(c, v)| (-c, *v)))
-                .collect(),
+            coeffs,
             constant: self.constant - rhs.constant,
         }
     }
@@ -1024,8 +1344,12 @@ impl std::ops::Sub<&LinearExpr> for LinearExpr {
 impl std::ops::Mul<f64> for LinearExpr {
     type Output = Self;
     fn mul(self, rhs: f64) -> Self::Output {
+        let mut coeffs = self.coeffs;
+        for (c, _) in coeffs.iter_mut() {
+            *c *= rhs;
+        }
         Self {
-            coeffs: self.coeffs.into_iter().map(|(c, v)| (c * rhs, v)).collect(),
+            coeffs,
             constant: self.constant * rhs,
         }
     }
@@ -1034,8 +1358,12 @@ impl std::ops::Mul<f64> for LinearExpr {
 impl std::ops::Div<f64> for LinearExpr {
     type Output = Self;
     fn div(self, rhs: f64) -> Self::Output {
+        let mut coeffs = self.coeffs;
+        for (c, _) in coeffs.iter_mut() {
+            *c /= rhs;
+        }
         Self {
-            coeffs: self.coeffs.into_iter().map(|(c, v)| (c / rhs, v)).collect(),
+            coeffs,
             constant: self.constant / rhs,
         }
     }
@@ -1044,7 +1372,7 @@ impl std::ops::Div<f64> for LinearExpr {
 impl From<Var> for LinearExpr {
     fn from(value: Var) -> Self {
         Self {
-            coeffs: vec![(1., value)],
+            coeffs: Terms::one(1., value),
             constant: 0.,
         }
     }
@@ -1053,7 +1381,7 @@ impl From<Var> for LinearExpr {
 impl From<f64> for LinearExpr {
     fn from(value: f64) -> Self {
         Self {
-            coeffs: vec![],
+            coeffs: Terms::new(),
             constant: value,
         }
     }
@@ -1105,11 +1433,11 @@ mod tests {
         let y = solver.new_var();
         let z = solver.new_var();
         solver.constrain_eq0(LinearExpr {
-            coeffs: vec![(1., x)],
+            coeffs: vec![(1., x)].into(),
             constant: -5.,
         });
         solver.constrain_eq0(LinearExpr {
-            coeffs: vec![(1., y), (-1., x)],
+            coeffs: vec![(1., y), (-1., x)].into(),
             constant: 0.,
         });
         solver.solve();
@@ -1122,7 +1450,10 @@ mod tests {
     }
 
     fn c(coeffs: Vec<(f64, Var)>, constant: f64) -> LinearExpr {
-        LinearExpr { coeffs, constant }
+        LinearExpr {
+            coeffs: coeffs.into(),
+            constant,
+        }
     }
 
     /// A consistent ring of 2-variable constraints with no 1-variable starting point

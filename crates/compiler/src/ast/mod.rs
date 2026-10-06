@@ -1,4 +1,4 @@
-use std::{fmt::Debug, path::PathBuf};
+use std::{fmt::Debug, path::Path, sync::Arc};
 
 use derive_where::derive_where;
 use indexmap::IndexMap;
@@ -14,7 +14,8 @@ pub type WorkspaceAst<T> = IndexMap<ModPath, AnnotatedAst<T>>;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
-    pub path: PathBuf,
+    /// Shared among every span of a file.
+    pub path: Arc<Path>,
     pub span: cfgrammar::Span,
 }
 
@@ -231,6 +232,8 @@ pub struct LetBinding<S, T: AstMetadata> {
 pub struct ForLoop<S, T: AstMetadata> {
     pub var: Ident<S, T>,
     pub seq: Expr<S, T>,
+    /// Elements for which this is false are skipped.
+    pub filter: Option<Box<Expr<S, T>>>,
     pub body: Scope<S, T>,
     /// Lexical order among scope-producing expressions in the enclosing scope.
     pub scope_order: u64,
@@ -283,6 +286,7 @@ pub enum BinOp {
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub enum Expr<S, T: AstMetadata> {
     If(Box<IfExpr<S, T>>),
+    ListComp(Box<ListCompExpr<S, T>>),
     Match(Box<MatchExpr<S, T>>),
     BinOp(Box<BinOpExpr<S, T>>),
     UnaryOp(Box<UnaryOpExpr<S, T>>),
@@ -302,6 +306,14 @@ pub enum Expr<S, T: AstMetadata> {
     Cast(Box<CastExpr<S, T>>),
     Tuple(TupleExpr<S, T>),
     StructLit(Box<StructLitExpr<S, T>>),
+}
+
+/// `[for var in seq { body }]`: the list of the body's values.
+#[derive_where(Debug, Clone, Serialize, Deserialize; S)]
+pub struct ListCompExpr<S, T: AstMetadata> {
+    pub for_loop: ForLoop<S, T>,
+    pub span: cfgrammar::Span,
+    pub metadata: T::ListCompExpr,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -406,6 +418,9 @@ pub struct IndexExpr<S, T: AstMetadata> {
 pub struct CallExpr<S, T: AstMetadata> {
     /// Lexical order among scope-producing expressions in the enclosing scope.
     pub scope_order: u64,
+    /// Whether the call is a `fn` body's value, so that its scope can take the
+    /// place of the caller's.
+    pub tail: bool,
     pub func: IdentPath<S, T>,
     pub args: Args<S, T>,
     pub span: cfgrammar::Span,
@@ -488,6 +503,7 @@ impl<S, T: AstMetadata> Expr<S, T> {
     pub fn span(&self) -> cfgrammar::Span {
         match self {
             Self::If(x) => x.span,
+            Self::ListComp(x) => x.span,
             Self::Match(x) => x.span,
             Self::BinOp(x) => x.span,
             Self::UnaryOp(x) => x.span,
@@ -524,6 +540,7 @@ pub trait AstMetadata {
     type ConstantDecl: Debug + Clone + Serialize + DeserializeOwned;
     type LetBinding: Debug + Clone + Serialize + DeserializeOwned;
     type ForLoop: Debug + Clone + Serialize + DeserializeOwned;
+    type ListCompExpr: Debug + Clone + Serialize + DeserializeOwned;
     type IfExpr: Debug + Clone + Serialize + DeserializeOwned;
     type MatchExpr: Debug + Clone + Serialize + DeserializeOwned;
     type BinOpExpr: Debug + Clone + Serialize + DeserializeOwned;
@@ -621,6 +638,11 @@ pub trait AstTransformer {
         seq: &Expr<Self::OutputS, Self::OutputMetadata>,
         body: &Scope<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ForLoop;
+    fn dispatch_list_comp_expr(
+        &mut self,
+        input: &ListCompExpr<Self::InputS, Self::InputMetadata>,
+        for_loop: &ForLoop<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::ListCompExpr;
     fn dispatch_if_expr(
         &mut self,
         input: &IfExpr<Self::InputS, Self::InputMetadata>,
@@ -1024,15 +1046,32 @@ pub trait AstTransformer {
     ) -> ForLoop<Self::OutputS, Self::OutputMetadata> {
         let var = self.transform_ident(&input.var);
         let seq = self.transform_expr(&input.seq);
+        let filter = input
+            .filter
+            .as_ref()
+            .map(|filter| Box::new(self.transform_expr(filter)));
         let body = self.transform_scope(&input.body);
         let metadata = self.dispatch_for_loop(input, &var, &seq, &body);
         ForLoop {
             var,
             seq,
+            filter,
             body,
             scope_order: input.scope_order,
             metadata,
             span: input.span,
+        }
+    }
+    fn transform_list_comp_expr(
+        &mut self,
+        input: &ListCompExpr<Self::InputS, Self::InputMetadata>,
+    ) -> ListCompExpr<Self::OutputS, Self::OutputMetadata> {
+        let for_loop = self.transform_for_loop(&input.for_loop);
+        let metadata = self.dispatch_list_comp_expr(input, &for_loop);
+        ListCompExpr {
+            for_loop,
+            span: input.span,
+            metadata,
         }
     }
     fn transform_if_expr(
@@ -1178,6 +1217,7 @@ pub trait AstTransformer {
         let metadata = self.dispatch_call_expr(input, &func, &args);
         CallExpr {
             scope_order: input.scope_order,
+            tail: input.tail,
             func,
             args,
             span: input.span,
@@ -1380,6 +1420,7 @@ pub trait AstTransformer {
     ) -> Expr<Self::OutputS, Self::OutputMetadata> {
         match input {
             Expr::If(if_expr) => Expr::If(Box::new(self.transform_if_expr(if_expr))),
+            Expr::ListComp(comp) => Expr::ListComp(Box::new(self.transform_list_comp_expr(comp))),
             Expr::Match(match_expr) => Expr::Match(Box::new(self.transform_match_expr(match_expr))),
             Expr::UnaryOp(unary_op_expr) => {
                 Expr::UnaryOp(Box::new(self.transform_unary_op_expr(unary_op_expr)))

@@ -26,10 +26,8 @@ cell dff_array(count: Int) {
 
 // One port per DFF, given relative to each tile's origin.
 fn dff_ports(count: Int, index: Int, dx: Float, y0: Float, w: Float, h: Float) -> [Rect] {
-    if index == count {
-        []
-    } else {
-        let x0 = dff_origin_x(index) + dx;
-        cons(lib::columns::util::cbox(x0, y0, x0 + w, y0 + h), dff_ports(count, index + 1, dx, y0, w, h))
-    }
+    [for i in range_full(index, count, 1) {
+        let x0 = dff_origin_x(i) + dx;
+        lib::columns::util::cbox(x0, y0, x0 + w, y0 + h)
+    }]
 }

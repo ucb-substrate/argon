@@ -396,7 +396,7 @@ mod tests {
             // general sparse-QR fixture rather than a specially dominant one.
             let rhs = -expected[previous] + 2. * expected[i] - 1.1 * expected[next];
             solver.constrain_eq0(LinearExpr {
-                coeffs: vec![(-1., vars[previous]), (2., vars[i]), (-1.1, vars[next])],
+                coeffs: vec![(-1., vars[previous]), (2., vars[i]), (-1.1, vars[next])].into(),
                 constant: -rhs,
             });
         }
@@ -456,7 +456,7 @@ mod tests {
         let vars: Vec<_> = (0..n).map(|_| solver.new_var()).collect();
         for i in 0..n - 2 {
             solver.constrain_eq0(LinearExpr {
-                coeffs: vec![(1., vars[i]), (-0.5, vars[i + 1]), (-0.5, vars[i + 2])],
+                coeffs: vec![(1., vars[i]), (-0.5, vars[i + 1]), (-0.5, vars[i + 2])].into(),
                 constant: 0.,
             });
         }
@@ -1700,7 +1700,7 @@ mod tests {
             "an invalid module graph must not be typed"
         );
         assert_eq!(output.errors.len(), 1);
-        assert_eq!(output.errors[0].span.path, devices_path);
+        assert_eq!(*output.errors[0].span.path, *devices_path);
         assert_eq!(
             output.errors[0].kind.to_string(),
             "cyclic module dependency: lib -> devices -> lib"
@@ -3578,7 +3578,7 @@ cell top() {
             .iter()
             .map(|error| error.span.as_ref().expect("error should point to a value"))
             .collect::<Vec<_>>();
-        assert!(spans.iter().all(|span| span.path == path));
+        assert!(spans.iter().all(|span| *span.path == *path));
         assert_eq!(
             spans
                 .iter()
@@ -5948,6 +5948,191 @@ cell top() {
             .map(|rect| rect.x1.0 - rect.x0.0)
             .collect::<Vec<_>>();
         assert_eq!(widths, [80.]);
+    }
+
+    #[test]
+    fn native_sequence_functions() {
+        let data = compile_top(
+            "cell top() {
+                 let xs = list(1, 2, 3);
+                 let empty = tail(list(1));
+                 let n = std::len(xs) + 10 * std::len(std::concat(xs, xs)) + 100 * std::sum(std::flatten(list(xs, list(4), empty)));
+                 let m = std::len(empty) + std::len(std::concat(empty, empty)) + std::sum(empty) + std::len(std::flatten(list(empty)));
+                 let flags = if std::any(list(false, true)) && std::all(list(true, true)) && !std::all(list(true, false)) && !std::any([]) && std::all([]) {
+                     1
+                 } else {
+                     0
+                 };
+                 let r = rect(\"met2\", x0=0., y0=0., x1=(n + 10000 * m + 100000 * flags) as Float, y1=1.);
+             }",
+        );
+        let widths = layout_objects(&data, data.top)
+            .into_iter()
+            .filter_map(SolvedValue::get_rect)
+            .filter(|rect| rect.layer.as_deref() == Some("met2"))
+            .map(|rect| rect.x1.0 - rect.x0.0)
+            .collect::<Vec<_>>();
+        assert_eq!(widths, [101063.]);
+    }
+
+    #[test]
+    fn list_comprehensions_map_and_filter() {
+        let data = compile_top(
+            "fn squares(n: Int) -> [Int] {
+                 [for i in std::range(n) { i * i }]
+             }
+             fn evens(l: [Int]) -> [Int] {
+                 [for x in l if x % 2 == 0 { x }]
+             }
+             cell top() {
+                 let a = squares(4);
+                 let b = evens(list(1, 2, 3, 4, 6));
+                 let c = [for x in b if x > 100 { x }];
+                 let nested = std::flatten([for i in std::range(3) { [for j in std::range(i) { 10 * i + j }] }]);
+                 let rects = [for i in std::range(3) {
+                     let w = 5. * (i + 1) as Float;
+                     rect(\"met1\", x0=0., y0=10. * i as Float, x1=w, y1=10. * i as Float + 5.)
+                 }];
+                 for r in rects if r.x1 > 5. {
+                     rect(\"met2\", x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1);
+                 }
+                 let code = std::sum(a) + 100 * std::sum(b) + 10000 * std::len(c) + 100000 * std::sum(nested) + 10000000 * std::len(rects);
+                 let out = rect(\"met3\", x0=0., y0=0., x1=5. * code as Float, y1=5.);
+             }",
+        );
+        let widths = |layer: &str| {
+            let mut widths = layout_objects(&data, data.top)
+                .into_iter()
+                .filter_map(SolvedValue::get_rect)
+                .filter(|rect| rect.layer.as_deref() == Some(layer))
+                .map(|rect| rect.x1.0 - rect.x0.0)
+                .collect::<Vec<_>>();
+            widths.sort_by(f64::total_cmp);
+            widths
+        };
+        assert_eq!(widths("met1"), [5., 10., 15.]);
+        assert_eq!(widths("met2"), [10., 15.]);
+        // 14 + 100 * 12 + 10^5 * (10 + 20 + 21) + 10^7 * 3, scaled onto the grid.
+        assert_eq!(widths("met3"), [5. * 35_101_214.]);
+    }
+
+    /// The deepest chain of execution scopes in `cell`.
+    fn max_scope_depth(cell: &crate::compile::CompiledCell) -> usize {
+        let mut deepest = 0;
+        let mut stack = vec![(cell.root, 1)];
+        while let Some((scope, depth)) = stack.pop() {
+            deepest = deepest.max(depth);
+            stack.extend(
+                cell.scopes[&scope]
+                    .children
+                    .iter()
+                    .map(|child| (*child, depth + 1)),
+            );
+        }
+        deepest
+    }
+
+    #[test]
+    fn tail_calls_keep_scopes_flat() {
+        let data = compile_top(
+            "fn count_up(n: Int, acc: Int) -> Int {
+                 if n == 0 { acc } else { count_up(n - 1, acc + 2) }
+             }
+             fn count_down(n: Int) -> Int {
+                 if n == 0 { 0 } else { 2 + count_down(n - 1) }
+             }
+             cell up() {
+                 let r = rect(\"met1\", x0=0., y0=0., x1=5. * count_up(3000, 0) as Float, y1=5.);
+             }
+             cell down() {
+                 let r = rect(\"met1\", x0=0., y0=0., x1=5. * count_down(300) as Float, y1=5.);
+             }
+             cell top() {
+                 let a = inst(up(), x=0., y=0.);
+                 let b = inst(down(), x=0., y=10.);
+             }",
+        );
+        assert_eq!(rect_widths_of(&data, "up"), [30000.]);
+        assert_eq!(rect_widths_of(&data, "down"), [3000.]);
+        let depth = |name: &str| {
+            let cell = data
+                .cells
+                .values()
+                .find(|cell| cell.name.ends_with(name))
+                .unwrap();
+            max_scope_depth(cell)
+        };
+        // Each step of the tail-recursive loop opens its scope beside the
+        // first call's; the other recursion nests a call and a branch per step.
+        assert!(depth("up") < 10, "tail calls nested {} deep", depth("up"));
+        assert!(
+            depth("down") > 600,
+            "non-tail recursion nested only {} deep",
+            depth("down")
+        );
+    }
+
+    #[test]
+    fn annotated_bindings_take_their_declared_type_in_cells() {
+        let data = compile_top(
+            "fn pair<T>(a: [T], b: [T]) -> [T] { std::concat(a, b) }
+             cell top() {
+                 let e: [Int] = [];
+                 let n = std::len(pair(e, cons(1, e))) + std::len(head(list(e)));
+                 let r = rect(\"met1\", x0=0., y0=0., x1=5. * n as Float, y1=5.);
+             }",
+        );
+        assert_eq!(rect_widths_of(&data, "top"), [5.]);
+    }
+
+    #[test]
+    fn native_min_and_max() {
+        let data = compile_top(
+            "cell top() {
+                 let a = rect(\"met1\", x0=0., y0=0., y1=5.);
+                 let w = max_float(a.x1, 10.);
+                 eq(a.x1, 15.);
+                 let r = rect(\"met2\", x0=0., y0=20., x1=w, y1=25.);
+                 let n = max_int(3, 7) + 10 * min_int(3, 7) + 100 * max_int(4, 4);
+                 let s = rect(\"met3\", x0=0., y0=30., x1=5. * n as Float, y1=35.);
+                 let m = rect(\"met4\", x0=0., y0=40., x1=std::min(std::max(5., 20.), 15.), y1=45.);
+             }",
+        );
+        let widths = |layer: &str| {
+            layout_objects(&data, data.top)
+                .into_iter()
+                .filter_map(SolvedValue::get_rect)
+                .filter(|rect| rect.layer.as_deref() == Some(layer))
+                .map(|rect| rect.x1.0 - rect.x0.0)
+                .collect::<Vec<_>>()
+        };
+        // The float maximum waits for the solver to fix `a.x1`.
+        assert_eq!(widths("met2"), [15.]);
+        assert_eq!(widths("met3"), [5. * 437.]);
+        assert_eq!(widths("met4"), [15.]);
+    }
+
+    #[test]
+    fn empty_list_fields_are_exported() {
+        let data = compile_top(
+            "cell sub() {
+                 let r = rect(\"met1\", x0=0., y0=0., x1=5., y1=5.);
+                 let none: [Rect] = [];
+                 let nested = list(list(r), []);
+             }
+             cell top() {
+                 let s = inst(sub(), x=0., y=0.);
+                 let n = std::len(s.none) + 10 * std::len(s.nested) + 100 * std::len(s.nested[0]) + 1000 * std::len(s.nested[1]);
+                 let q = rect(\"met2\", x0=0., y0=0., x1=5. * n as Float, y1=5.);
+             }",
+        );
+        let widths = layout_objects(&data, data.top)
+            .into_iter()
+            .filter_map(SolvedValue::get_rect)
+            .filter(|rect| rect.layer.as_deref() == Some("met2"))
+            .map(|rect| rect.x1.0 - rect.x0.0)
+            .collect::<Vec<_>>();
+        assert_eq!(widths, [5. * 120.]);
     }
 
     #[test]

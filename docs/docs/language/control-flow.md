@@ -5,7 +5,7 @@ description: if, match, and for.
 
 # Control flow
 
-Argon has `if`, `match` on enums, and `for` over sequences. `if` and `match` are expressions, and an `if` with no `else` is a statement.
+Argon has `if`, `match` on enums, and `for` over sequences. `if` and `match` are expressions, and an `if` with no `else` is a statement. A `for` loop in brackets is a list comprehension, an expression that builds a list.
 
 ## `if` expressions
 
@@ -100,3 +100,46 @@ for i in std::range(4) {
 ```
 
 [`std::range(stop)`](/language/std#range) yields the integers from zero up to, but not including, `stop`.
+
+An `if` after the sequence skips the elements for which it is false:
+
+```argon
+for w in widths if w >= 40. {
+    rect("met1", x0=0., y0=0., x1=w, y1=20.);
+}
+```
+
+## List comprehensions
+
+A `for` loop in brackets is an expression: its value is the list of its body's values, one per element that passes the filter.
+
+```argon
+fn pitches(n: Int) -> [Float] {
+    [for i in std::range(n) { 80. * i as Float }]
+}
+
+fn wide(widths: [Float]) -> [Float] {
+    [for w in widths if w >= 40. { w }]
+}
+```
+
+Comprehensions combine with [`std::flatten`](/language/std#flatten), [`std::sum`](/language/std#sum), [`std::any`](/language/std#any), and [`std::all`](/language/std#all) to build, filter, and fold lists without recursion:
+
+```argon
+fn count_wide(widths: [Float]) -> Int {
+    std::len([for w in widths if w >= 40. { w }])
+}
+```
+
+## Recursion and tail calls
+
+Every function call and every branch taken opens an execution scope, which the GUI's hierarchy shows. A recursive function that builds its result after the recursive call returns, like `cons(x, f(rest))` or `1 + f(rest)`, therefore nests one call and one branch per step. Prefer a comprehension or a `std` helper for that.
+
+A call whose value is the function's own value, directly or as the value of an `if`, `match`, or block that is, is a **tail call**. Its scope opens beside the caller's instead of inside it, so a loop written as tail recursion stays one level deep however many times it repeats. Its scopes are named like the first call's, with the step appended: `fn count[1]`, `fn count[2]`, and so on.
+
+```argon
+// One level deep for any n: the recursive call is the value of the `else`.
+fn count_from(items: [Int], n: Int) -> Int {
+    if items == [] { n } else { count_from(tail(items), n + 1) }
+}
+```

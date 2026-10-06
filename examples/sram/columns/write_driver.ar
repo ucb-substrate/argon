@@ -187,7 +187,7 @@ fn draw_wdrv_bitline(p: WriteDriverParams, right: Bool) -> Rect {
     lib::columns::util::draw_box("met1.pin", m1_rect);
     let via = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", m1_rect, m1_rect, 2, 2, true);
     let inv_out = wdrv_inst_dout(p, right);
-    lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_from_spans((lib::columns::util::fmin(inv_out.x0, via.0.x0), lib::columns::util::fmax(inv_out.x1, via.0.x1),), (inv_out.y0, inv_out.y1,)));
+    lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_from_spans((min_float(inv_out.x0, via.0.x0), max_float(inv_out.x1, via.0.x1),), (inv_out.y0, inv_out.y1,)));
     m1_rect
 }
 
@@ -202,7 +202,7 @@ fn draw_wdrv_en_route(p: WriteDriverParams, en_b: Bool) -> Rect {
     if en_b {
         let below_en = lib::columns::util::rect_cx_i(p0) - 460.;
         let track = wdrv_center_span(lib::columns::util::rect_cx_i(port_rect), 240.);
-        let m1_rect = lib::columns::util::rect_from_spans(track, (lib::columns::util::fmin(port_rect.y0, below_en), lib::columns::util::fmax(port_rect.y1, below_en),));
+        let m1_rect = lib::columns::util::rect_from_spans(track, (min_float(port_rect.y0, below_en), max_float(port_rect.y1, below_en),));
         lib::columns::util::draw_box("met1.drawing", m1_rect);
         lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", m1_rect, port_rect, 0, 0, true);
         let via_rect = lib::columns::util::rect_from_spans(track, wdrv_center_span(below_en, 320.));
@@ -218,7 +218,7 @@ fn draw_wdrv_en_route(p: WriteDriverParams, en_b: Bool) -> Rect {
 fn wdrv_power_span(p: WriteDriverParams, vdd_power: Bool) -> (Float, Float) {
     let p0 = if vdd_power { wdrv_inst_port(p, true, 1, 0, false) } else { wdrv_inst_port(p, false, 1, 0, false) };
     let h = lib::columns::util::rect_h(p0);
-    let stripe_h = lib::columns::util::fmin(lib::columns::util::fmax(h - 280., 800.), 3600.);
+    let stripe_h = min_float(max_float(h - 280., 800.), 3600.);
     wdrv_center_span(lib::columns::util::rect_cy_i(p0), stripe_h)
 }
 

@@ -12,8 +12,8 @@ fn grid_box(j: Int, k: Int) -> Rect {
 
 // Met1 on row k spanning columns j0 through j1.
 fn m1_h(k: Int, j0: Int, j1: Int) -> Rect {
-    let a = lib::columns::util::imin(j0, j1);
-    let b = lib::columns::util::imax(j0, j1);
+    let a = min_int(j0, j1);
+    let b = max_int(j0, j1);
     rect("met1.drawing", x0=track_x(a) - 160., y0=track_y(k) - 160., x1=track_x(b) + 160., y1=track_y(k) + 160.)
 }
 
@@ -26,8 +26,8 @@ fn via12(j: Int, k: Int) {
 }
 
 fn m2_rect(j: Int, k0: Int, k1: Int) -> Rect {
-    let a = lib::columns::util::imin(k0, k1);
-    let b = lib::columns::util::imax(k0, k1);
+    let a = min_int(k0, k1);
+    let b = max_int(k0, k1);
     rect("met2.drawing", x0=track_x(j) - 160., y0=track_y(a) - 160., x1=track_x(j) + 160., y1=track_y(b) + 160.)
 }
 
@@ -52,10 +52,10 @@ fn li1_access(pin: Rect, j: Int, k: Int) -> Rect {
     rect("mcon.drawing", x0=cx - 85., y0=cy - 85., x1=cx + 85., y1=cy + 85.);
     rect(
         "met1.drawing",
-        x0=lib::columns::util::fmin(cx - 145., track_x(j) - 160.),
-        y0=lib::columns::util::fmin(cy - 115., track_y(k) - 160.),
-        x1=lib::columns::util::fmax(cx + 145., track_x(j) + 160.),
-        y1=lib::columns::util::fmax(cy + 115., track_y(k) + 160.),
+        x0=min_float(cx - 145., track_x(j) - 160.),
+        y0=min_float(cy - 115., track_y(k) - 160.),
+        x1=max_float(cx + 145., track_x(j) + 160.),
+        y1=max_float(cy + 115., track_y(k) + 160.),
     )
 }
 
@@ -65,9 +65,9 @@ fn m1_access(pin: Rect, j: Int, k: Int) -> Rect {
     rect(
         "met1.drawing",
         x0=track_x(j) - 160.,
-        y0=lib::columns::util::fmin(pin.y0, track_y(k) - 160.),
+        y0=min_float(pin.y0, track_y(k) - 160.),
         x1=track_x(j) + 160.,
-        y1=lib::columns::util::fmax(pin.y1, track_y(k) + 160.),
+        y1=max_float(pin.y1, track_y(k) + 160.),
     )
 }
 
@@ -93,8 +93,8 @@ fn m2_pin(name: String, j: Int, k: Int) -> Rect {
 
 // Met1 on column j spanning rows k0 through k1, for short jogs between tracks.
 fn m1_v(j: Int, k0: Int, k1: Int) -> Rect {
-    let a = lib::columns::util::imin(k0, k1);
-    let b = lib::columns::util::imax(k0, k1);
+    let a = min_int(k0, k1);
+    let b = max_int(k0, k1);
     rect("met1.drawing", x0=track_x(j) - 160., y0=track_y(a) - 160., x1=track_x(j) + 160., y1=track_y(b) + 160.)
 }
 

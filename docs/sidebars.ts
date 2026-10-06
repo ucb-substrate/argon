@@ -41,6 +41,7 @@ const sidebars: SidebarsConfig = {
         'language/builtins/constraints',
         'language/builtins/hierarchy',
         'language/builtins/collections',
+        'language/builtins/math',
       ],
     },
     'language/std',

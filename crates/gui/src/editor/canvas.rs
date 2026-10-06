@@ -10230,7 +10230,7 @@ impl LayoutCanvas {
         self.pending_rectangles.push(PendingRectangle {
             id,
             scope_path: solved.selected_scope,
-            source_path: scope_span.path.clone(),
+            source_path: scope_span.path.to_path_buf(),
             name: name.clone(),
             rect,
             submitted: false,
@@ -10263,7 +10263,7 @@ impl LayoutCanvas {
             return;
         }
         let scope_span = cell.scope_span(pending.scope_path.scope).clone();
-        if scope_span.path != pending.source_path {
+        if *scope_span.path != *pending.source_path {
             return;
         }
         let client = state.lang_server_client.clone();
@@ -10340,7 +10340,7 @@ impl LayoutCanvas {
                     let address = pending.scope_path;
                     let cell = &solved.output.cells[&address.cell];
                     let scope = &cell.scopes[&address.scope];
-                    cell.scope_span(address.scope).path == pending.source_path
+                    *cell.scope_span(address.scope).path == *pending.source_path
                         && scope.bindings.iter().any(|(_, (name, object))| {
                             name == &pending.name
                                 && object
@@ -14321,7 +14321,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         let bounds = Bounds::new(Point::default(), Size::new(px(10.), px(10.)));
         SelectionHit {
             span: Span {
-                path: std::path::PathBuf::from(format!("{name}.ar")),
+                path: std::path::PathBuf::from(format!("{name}.ar")).into(),
                 span: cfgrammar::Span::new(0, 1),
             },
             outline: SelectionOutline::Rect {
@@ -14649,7 +14649,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         let rect_y1: LinearExpr = solver.new_var().into();
         let inst_x: LinearExpr = solver.new_var().into();
         let rect_span = Span {
-            path: std::path::PathBuf::from("/virtual/lib.ar"),
+            path: std::path::Path::new("/virtual/lib.ar").into(),
             span: cfgrammar::Span::new(10, 24),
         };
         let inst_span = Span {
@@ -14865,7 +14865,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
 
     #[test]
     fn selected_span_tracks_value_edits_before_and_inside_rect() {
-        let path = std::path::PathBuf::from("lib.ar");
+        let path: std::sync::Arc<std::path::Path> = std::path::Path::new("lib.ar").into();
         let selected = Span {
             path: path.clone(),
             span: cfgrammar::Span::new(10, 30),
@@ -14893,7 +14893,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
 
     #[test]
     fn pending_drag_values_track_their_compiled_source_spans() {
-        let path = std::path::PathBuf::from("lib.ar");
+        let path: std::sync::Arc<std::path::Path> = std::path::Path::new("lib.ar").into();
         let edits = [
             ValueEdit {
                 span: Span {
@@ -14929,7 +14929,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
     fn pending_drag_values_include_inserted_initial_conditions() {
         let conditions = [InitialConditionEdit {
             call_span: Span {
-                path: std::path::PathBuf::from("lib.ar"),
+                path: std::path::Path::new("lib.ar").into(),
                 span: cfgrammar::Span::new(10, 30),
             },
             name: "x0i".to_owned(),
@@ -15024,7 +15024,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         ];
 
         let selected = choose_selection_hit(hits, None, false).unwrap();
-        assert_eq!(selected.span.path, std::path::PathBuf::from("last.ar"));
+        assert_eq!(*selected.span.path, *std::path::Path::new("last.ar"));
     }
 
     #[test]
@@ -15035,7 +15035,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         ];
 
         let selected = choose_selection_hit(hits, None, false).unwrap();
-        assert_eq!(selected.span.path, std::path::PathBuf::from("old-high.ar"));
+        assert_eq!(*selected.span.path, *std::path::Path::new("old-high.ar"));
     }
 
     #[test]

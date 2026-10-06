@@ -229,6 +229,87 @@ fn count(n: Option<Int>) -> Int {
 
 </ApiItem>
 
+## `std::len` {#len}
+
+<ApiItem id="len" name="std::len" signature={'std::len<T>(items: [T]) -> Int'} summary={<>Returns the number of elements in a sequence.</>}>
+
+<ParameterTable rows={[
+  {name: 'items', type: '[T]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'Any sequence.'},
+]} />
+
+<Returns type="Int" href="/language/types/scalars#int">The element count; 0 for [].</Returns>
+
+</ApiItem>
+
+## `std::concat` {#concat}
+
+<ApiItem id="concat" name="std::concat" signature={'std::concat<T>(first: [T], second: [T]) -> [T]'} summary={<>Joins two sequences.</>}>
+
+<ParameterTable rows={[
+  {name: 'first', type: '[T]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'The leading elements.'},
+  {name: 'second', type: '[T]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'The trailing elements.'},
+]} />
+
+<Returns type="[T]" href="/language/types/collections#sequences">The elements of first, then those of second.</Returns>
+
+</ApiItem>
+
+## `std::flatten` {#flatten}
+
+<ApiItem id="flatten" name="std::flatten" signature={'std::flatten<T>(sequences: [[T]]) -> [T]'} summary={<>Joins a sequence of sequences.</>}>
+
+<ParameterTable rows={[
+  {name: 'sequences', type: '[[T]]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'The sequences to join, in order.'},
+]} />
+
+<Returns type="[T]" href="/language/types/collections#sequences">Every element of every sequence, in order.</Returns>
+
+```argon
+let wires = std::flatten([for net in nets { net.wires }]);
+```
+
+</ApiItem>
+
+## `std::sum` {#sum}
+
+<ApiItem id="sum" name="std::sum" signature={'std::sum(values: [Int]) -> Int'} summary={<>Adds up a sequence of integers.</>}>
+
+<ParameterTable rows={[
+  {name: 'values', type: '[Int]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'The integers to add.'},
+]} />
+
+<Returns type="Int" href="/language/types/scalars#int">Their sum; 0 for [].</Returns>
+
+</ApiItem>
+
+## `std::any` {#any}
+
+<ApiItem id="any" name="std::any" signature={'std::any(values: [Bool]) -> Bool'} summary={<>Whether any value is true.</>}>
+
+<ParameterTable rows={[
+  {name: 'values', type: '[Bool]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'The values to test.'},
+]} />
+
+<Returns type="Bool">true if at least one value is true; false for [].</Returns>
+
+```argon
+let blocked = std::any([for other in rails { overlaps(rail, other) }]);
+```
+
+</ApiItem>
+
+## `std::all` {#all}
+
+<ApiItem id="all" name="std::all" signature={'std::all(values: [Bool]) -> Bool'} summary={<>Whether every value is true.</>}>
+
+<ParameterTable rows={[
+  {name: 'values', type: '[Bool]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'The values to test.'},
+]} />
+
+<Returns type="Bool">true if no value is false; true for [].</Returns>
+
+</ApiItem>
+
 ## `std::range` {#range}
 
 <ApiItem id="range" name="std::range" signature={'std::range(stop: Int) -> [Int]'} summary={<>Returns the integers from 0 up to stop.</>}>

@@ -140,7 +140,7 @@ impl State {
         // its siblings, which is exactly what an inserted statement would see.
         let offset = scope.span.end();
         (offset <= index.source(&scope.path)?.len()).then_some(Anchor {
-            path: scope.path,
+            path: scope.path.to_path_buf(),
             offset,
         })
     }

@@ -19,10 +19,10 @@ fn li_m1_contact(cx: Float, cy: Float, horizontal: Bool) -> Rect {
 // point (x, y): a horizontal run at the source height, then a vertical run.
 fn m1_elbow(src: Rect, edge_x: Float, x: Float, y: Float) {
     let hw = (src.y1 - src.y0) / 2.;
-    let x0 = lib::columns::util::fmin(edge_x, x - hw);
-    let x1 = lib::columns::util::fmax(edge_x, x + hw);
+    let x0 = min_float(edge_x, x - hw);
+    let x1 = max_float(edge_x, x + hw);
     rect("met1.drawing", x0=x0, y0=src.y0, x1=x1, y1=src.y1);
-    rect("met1.drawing", x0=x - hw, y0=lib::columns::util::fmin(src.y0, y), x1=x + hw, y1=lib::columns::util::fmax(src.y1, y));
+    rect("met1.drawing", x0=x - hw, y0=min_float(src.y0, y), x1=x + hw, y1=max_float(src.y1, y));
 }
 
 // Left edge of stage `index` in an inverter chain; a tap follows every seventh stage.

@@ -172,7 +172,7 @@ fn lat_rect_with_vspan(r: Rect, span: (Float, Float)) -> Rect {
 }
 
 fn lat_span_union(a: (Float, Float), b: (Float, Float)) -> (Float, Float) {
-    (lib::columns::util::fmin(a.0, b.0), lib::columns::util::fmax(a.1, b.1),)
+    (min_float(a.0, b.0), max_float(a.1, b.1),)
 }
 
 fn lat_hspan(r: Rect) -> (Float, Float) {
@@ -292,15 +292,15 @@ cell diff_latch() {
     let sa_left = -810.;
     let sa_right = 3990.;
     let din1_li = lat_finv_inst_port(0, 0., 0.);
-    let din1_m0 = lib::columns::util::cbox(lib::columns::util::fmin(din1_li.x0, -290.), din1_li.y0, lib::columns::util::fmax(din1_li.x1, -10.), din1_li.y1);
-    let din1 = lib::columns::util::cbox(-290., lib::columns::util::fmin(din1_li.y0, 870.), -10., lib::columns::util::fmax(din1_li.y1, 870.));
+    let din1_m0 = lib::columns::util::cbox(min_float(din1_li.x0, -290.), din1_li.y0, max_float(din1_li.x1, -10.), din1_li.y1);
+    let din1 = lib::columns::util::cbox(-290., min_float(din1_li.y0, 870.), -10., max_float(din1_li.y1, 870.));
     lib::columns::util::draw_box("li1.drawing", din1_m0);
     lib::columns::util::draw_box("met1.drawing", din1);
     lib::columns::util::draw_box("met1.pin", din1);
     draw_lat_li_met1(din1_m0, din1);
     let din2_li = lat_finv_inst_port(0, 2070., 0.);
-    let din2_m0 = lib::columns::util::cbox(lib::columns::util::fmin(din2_li.x0, 3190.), din2_li.y0, lib::columns::util::fmax(din2_li.x1, 3470.), din2_li.y1);
-    let din2 = lib::columns::util::cbox(3190., lib::columns::util::fmin(din2_li.y0, 870.), 3470., lib::columns::util::fmax(din2_li.y1, 870.));
+    let din2_m0 = lib::columns::util::cbox(min_float(din2_li.x0, 3190.), din2_li.y0, max_float(din2_li.x1, 3470.), din2_li.y1);
+    let din2 = lib::columns::util::cbox(3190., min_float(din2_li.y0, 870.), 3470., max_float(din2_li.y1, 870.));
     lib::columns::util::draw_box("li1.drawing", din2_m0);
     lib::columns::util::draw_box("met1.drawing", din2);
     lib::columns::util::draw_box("met1.pin", din2);

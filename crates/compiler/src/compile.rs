@@ -17,10 +17,11 @@ use indexmap::{IndexMap, IndexSet};
 use itertools::{Either, Itertools};
 use serde::{Deserialize, Serialize};
 
-use fnv::{FnvHashMap, FnvHashSet, FnvHasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use smallvec::SmallVec;
 
-type FnvIndexMap<K, V> = IndexMap<K, V, BuildHasherDefault<FnvHasher>>;
-type FnvIndexSet<T> = IndexSet<T, BuildHasherDefault<FnvHasher>>;
+type FxIndexMap<K, V> = IndexMap<K, V, BuildHasherDefault<FxHasher>>;
+type FxIndexSet<T> = IndexSet<T, BuildHasherDefault<FxHasher>>;
 
 mod result;
 
@@ -29,6 +30,7 @@ pub use result::{
     StaticErrorCompileOutput, StaticErrorKind,
 };
 
+use crate::ast::ListCompExpr;
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
     ArithOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, EnumVariant, FieldAccessExpr, FnDecl,
@@ -114,12 +116,22 @@ pub(crate) const MAX_TEXT_LEN: usize = 512;
 /// the literals directly and must be updated alongside this constant.
 pub const RESERVED_CELL_FIELDS: [&str; 2] = ["x", "y"];
 
-pub const BUILTINS: [&str; 15] = [
+pub const BUILTINS: [&str; 25] = [
     "list",
     "cons",
     "head",
     "tail",
     "range_full",
+    "seq_len",
+    "seq_concat",
+    "seq_flatten",
+    "seq_sum",
+    "seq_any",
+    "seq_all",
+    "max_float",
+    "min_float",
+    "max_int",
+    "min_int",
     "crect",
     "rect",
     "polygon",
@@ -753,6 +765,13 @@ impl<'a> AstTransformer for ImportPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::ForLoop {
     }
 
+    fn dispatch_list_comp_expr(
+        &mut self,
+        _input: &crate::ast::ListCompExpr<Self::InputS, Self::InputMetadata>,
+        _for_loop: &crate::ast::ForLoop<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::ListCompExpr {
+    }
+
     fn dispatch_if_expr(
         &mut self,
         _input: &IfExpr<Self::InputS, Self::InputMetadata>,
@@ -1264,7 +1283,7 @@ impl StatementView {
             Some(Statement::LetBinding(typed)) => {
                 self.frame
                     .var_bindings
-                    .insert(name.clone(), (typed.metadata, typed.value.ty()));
+                    .insert(name.clone(), typed.metadata.clone());
                 self.untyped.swap_remove(name.as_str());
             }
             Some(_) => unreachable!("a `let` statement is typed as a `let`"),
@@ -1887,6 +1906,36 @@ impl std::fmt::Display for Ty {
 }
 
 impl Ty {
+    /// Whether a value of this type can name layout objects, which makes a
+    /// binding of it visible in compiled scopes. See [`Value::obj_ids`].
+    fn may_hold_objects(&self) -> bool {
+        match self {
+            Ty::Unknown
+            | Ty::Any
+            | Ty::Rect
+            | Ty::Polygon
+            | Ty::Path
+            | Ty::Inst(_)
+            | Ty::SeqNil
+            | Ty::Param(_)
+            | Ty::Infer(_) => true,
+            Ty::Seq(elem) => elem.may_hold_objects(),
+            Ty::Bool
+            | Ty::Float
+            | Ty::Int
+            | Ty::Point
+            | Ty::String
+            | Ty::Cell(_)
+            | Ty::Nil
+            | Ty::Fn(_)
+            | Ty::Enum(_)
+            | Ty::CellFn(_)
+            | Ty::Tuple(_)
+            | Ty::Struct(_)
+            | Ty::Ctor(_) => false,
+        }
+    }
+
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "Bool" => Some(Ty::Bool),
@@ -2039,6 +2088,26 @@ mod builtin_sig {
     pub(super) static TAIL: LazyLock<FnTy> = LazyLock::new(|| scheme([seq()], seq()));
     /// `list` is variadic: every element is unified with `T`.
     pub(super) static LIST: LazyLock<FnTy> = LazyLock::new(|| scheme([param()], seq()));
+    pub(super) static SEQ_LEN: LazyLock<FnTy> = LazyLock::new(|| scheme([seq()], Ty::Int));
+    pub(super) static SEQ_CONCAT: LazyLock<FnTy> = LazyLock::new(|| scheme([seq(), seq()], seq()));
+    pub(super) static SEQ_FLATTEN: LazyLock<FnTy> =
+        LazyLock::new(|| scheme([Ty::Seq(Box::new(seq()))], seq()));
+
+    fn fold(element: Ty, ret: Ty) -> FnTy {
+        FnTy {
+            params: Vec::new(),
+            sig: Signature::positional([Ty::Seq(Box::new(element))]),
+            ret,
+        }
+    }
+
+    pub(super) static SEQ_SUM: LazyLock<FnTy> = LazyLock::new(|| fold(Ty::Int, Ty::Int));
+    pub(super) static SEQ_ANY: LazyLock<FnTy> = LazyLock::new(|| fold(Ty::Bool, Ty::Bool));
+    pub(super) static SEQ_ALL: LazyLock<FnTy> = LazyLock::new(|| fold(Ty::Bool, Ty::Bool));
+    pub(super) static FLOAT_PAIR: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::Float, Ty::Float]));
+    pub(super) static INT_PAIR: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::Int, Ty::Int]));
 
     /// The coordinate keywords every rectangle constructor accepts.
     fn coordinates() -> impl Iterator<Item = (&'static str, Ty)> {
@@ -2189,11 +2258,14 @@ impl AstMetadata for VarIdTyMetadata {
     type StructDecl = Option<VarId>;
     /// The field's resolved type.
     type StructField = Ty;
-    type CellDecl = (PathBuf, VarId);
+    type CellDecl = (Arc<FsPath>, VarId);
     type ConstantDecl = ();
-    type LetBinding = VarId;
+    /// The binding's id and the type it binds: the declared type if given.
+    type LetBinding = (VarId, Ty);
     type ForLoop = VarId; // the var ID of the var Ident
-    type FnDecl = (PathBuf, VarId, Ty);
+    /// The list's type.
+    type ListCompExpr = Ty;
+    type FnDecl = (Arc<FsPath>, VarId, Ty);
     type IfExpr = Ty;
     type MatchExpr = Ty;
     type BinOpExpr = Ty;
@@ -2728,7 +2800,7 @@ impl<'a> VarIdTyPass<'a> {
             .iter()
             .filter_map(|stmt| match stmt {
                 Statement::LetBinding(binding) => {
-                    Some((binding.name.name.to_string(), binding.value.ty()))
+                    Some((binding.name.name.to_string(), binding.metadata.1.clone()))
                 }
                 _ => None,
             })
@@ -2836,7 +2908,7 @@ impl<'a> VarIdTyPass<'a> {
                 return self.no_field_on_ty(field, base_ty.clone());
             };
             return match &typing.stmts[stmt] {
-                Some(Statement::LetBinding(binding)) => subst(&binding.value.ty(), &map),
+                Some(Statement::LetBinding(binding)) => subst(&binding.metadata.1, &map),
                 Some(_) => unreachable!("`lets` indexes `let` statements"),
                 None => {
                     self.demand(def, stmt, field.span);
@@ -4091,6 +4163,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
     pub(crate) fn ty(&self) -> Ty {
         match self {
             Expr::If(if_expr) => if_expr.metadata.clone(),
+            Expr::ListComp(comp) => comp.metadata.clone(),
             Expr::Match(match_expr) => match_expr.metadata.clone(),
             Expr::BinOp(bin_op_expr) => bin_op_expr.metadata.clone(),
             Expr::Call(call_expr) => call_expr.metadata.1.clone(),
@@ -4513,6 +4586,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let metadata = self.dispatch_call_expr(input, &func, &args);
         CallExpr {
             scope_order: input.scope_order,
+            tail: input.tail,
             func,
             args,
             span: input.span,
@@ -4957,6 +5031,20 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "cons" => self.call_scheme(&builtin_sig::CONS, input.span, args),
                 "head" => self.call_scheme(&builtin_sig::HEAD, input.span, args),
                 "tail" => self.call_scheme(&builtin_sig::TAIL, input.span, args),
+                "seq_len" => self.call_scheme(&builtin_sig::SEQ_LEN, input.span, args),
+                "seq_concat" => self.call_scheme(&builtin_sig::SEQ_CONCAT, input.span, args),
+                "seq_flatten" => self.call_scheme(&builtin_sig::SEQ_FLATTEN, input.span, args),
+                "seq_sum" => self.call_scheme(&builtin_sig::SEQ_SUM, input.span, args),
+                "seq_any" => self.call_scheme(&builtin_sig::SEQ_ANY, input.span, args),
+                "seq_all" => self.call_scheme(&builtin_sig::SEQ_ALL, input.span, args),
+                "max_float" | "min_float" => {
+                    self.typecheck_args(input.span, args, &builtin_sig::FLOAT_PAIR);
+                    (None, Ty::Float)
+                }
+                "max_int" | "min_int" => {
+                    self.typecheck_args(input.span, args, &builtin_sig::INT_PAIR);
+                    (None, Ty::Int)
+                }
                 "list" => {
                     self.typecheck_kwargs(&args.kwargs, &builtin_sig::LIST.sig.kwargs);
                     if args.posargs.is_empty() {
@@ -5175,7 +5263,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             }
             None => value.ty(),
         };
-        self.alloc(&name.name, ty)
+        (self.alloc(&name.name, ty.clone()), ty)
     }
 
     fn transform_for_loop(
@@ -5208,12 +5296,18 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         };
         self.enter_scope(&input.body);
         let var_id = self.alloc(&input.var.name, elem_ty);
+        let filter = input.filter.as_ref().map(|filter| {
+            let filter = self.transform_expr(filter);
+            self.assert_eq_ty(filter.span(), &filter.ty(), &Ty::Bool);
+            Box::new(filter)
+        });
         let body = self.transform_scope_contents(&input.body);
         self.exit_scope(&input.body, &body);
         let metadata = var_id;
         ForLoop {
             var,
             seq,
+            filter,
             body,
             scope_order: input.scope_order,
             metadata,
@@ -5228,6 +5322,14 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         _body: &Scope<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ForLoop {
         unreachable!()
+    }
+
+    fn dispatch_list_comp_expr(
+        &mut self,
+        _input: &crate::ast::ListCompExpr<Self::InputS, Self::InputMetadata>,
+        for_loop: &crate::ast::ForLoop<Self::OutputS, Self::OutputMetadata>,
+    ) -> Ty {
+        Ty::Seq(Box::new(for_loop.body.metadata.clone()))
     }
 
     fn transform_s(&mut self, s: &Self::InputS) -> Self::OutputS {
@@ -5589,7 +5691,7 @@ impl AstTransformer for Zonker<'_> {
         _name: &Ident<Substr, VarIdTyMetadata>,
         _args: &[ArgDecl<Substr, VarIdTyMetadata>],
         _scope: &Scope<Substr, VarIdTyMetadata>,
-    ) -> (PathBuf, VarId) {
+    ) -> (Arc<FsPath>, VarId) {
         input.metadata.clone()
     }
 
@@ -5600,7 +5702,7 @@ impl AstTransformer for Zonker<'_> {
         _args: &[ArgDecl<Substr, VarIdTyMetadata>],
         _return_ty: &Option<TySpec<Substr, VarIdTyMetadata>>,
         _scope: &Scope<Substr, VarIdTyMetadata>,
-    ) -> (PathBuf, VarId, Ty) {
+    ) -> (Arc<FsPath>, VarId, Ty) {
         let (path, id, ty) = &input.metadata;
         (path.clone(), *id, self.ty(ty, input.name.span))
     }
@@ -5620,15 +5722,16 @@ impl AstTransformer for Zonker<'_> {
     ) -> LetBinding<Substr, VarIdTyMetadata> {
         // An unsolved variable in the binding's type is reported at the
         // binding, ahead of the expressions that carry it.
-        self.note_unsolved(&input.value.ty(), input.name.span);
+        self.note_unsolved(&input.metadata.1, input.name.span);
         let name = self.transform_ident(&input.name);
         let ty = input.ty.as_ref().map(|ty| self.transform_ty_spec(ty));
         let value = self.transform_expr(&input.value);
+        let bound = self.ty(&input.metadata.1, input.name.span);
         LetBinding {
             name,
             ty,
             value,
-            metadata: input.metadata,
+            metadata: (input.metadata.0, bound),
             span: input.span,
         }
     }
@@ -5638,8 +5741,8 @@ impl AstTransformer for Zonker<'_> {
         input: &LetBinding<Substr, VarIdTyMetadata>,
         _name: &Ident<Substr, VarIdTyMetadata>,
         _value: &Expr<Substr, VarIdTyMetadata>,
-    ) -> VarId {
-        input.metadata
+    ) -> (VarId, Ty) {
+        input.metadata.clone()
     }
 
     fn dispatch_for_loop(
@@ -5658,6 +5761,14 @@ impl AstTransformer for Zonker<'_> {
         _cond: &Expr<Substr, VarIdTyMetadata>,
         _then: &Scope<Substr, VarIdTyMetadata>,
         _else_: &Option<Scope<Substr, VarIdTyMetadata>>,
+    ) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
+    fn dispatch_list_comp_expr(
+        &mut self,
+        input: &ListCompExpr<Substr, VarIdTyMetadata>,
+        _for_loop: &ForLoop<Substr, VarIdTyMetadata>,
     ) -> Ty {
         self.ty(&input.metadata, input.span)
     }
@@ -6287,13 +6398,19 @@ pub(crate) struct DynLoc {
 
 /// Values waiting on one value, in the order they started waiting.
 ///
+/// The fewest values created between two collections of a cell's values.
+const MIN_COLLECT_VALUES: ValueId = 1 << 20;
+
+/// The most finished deferred-value boxes kept for reuse.
+const MAX_SPARE_EVALS: usize = 1 << 16;
+
 /// Almost every value has one or two waiters, which a short list holds
 /// without the hash table a set would allocate.
 #[derive(Clone, Debug, Default)]
 struct Waiters {
-    list: Vec<ValueId>,
+    list: SmallVec<[ValueId; 2]>,
     /// Membership index, built once the list is long enough to need one.
-    index: Option<FnvHashSet<ValueId>>,
+    index: Option<Box<FxHashSet<ValueId>>>,
 }
 
 impl Waiters {
@@ -6307,9 +6424,13 @@ impl Waiters {
         if new {
             self.list.push(value);
             if self.index.is_none() && self.list.len() > Self::INDEX_AFTER {
-                self.index = Some(self.list.iter().copied().collect());
+                self.index = Some(Box::new(self.list.iter().copied().collect()));
             }
         }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.list.is_empty()
     }
 }
 
@@ -6323,7 +6444,7 @@ struct Worklist {
     stack: Vec<ValueId>,
     base: ValueId,
     queued: Vec<u64>,
-    queued_older: FnvHashSet<ValueId>,
+    queued_older: FxHashSet<ValueId>,
 }
 
 impl Worklist {
@@ -6384,13 +6505,142 @@ impl Extend<ValueId> for Worklist {
     }
 }
 
+/// Shrinks `map` once it is mostly empty, so that a table sized for an
+/// earlier peak does not hold its memory until evaluation ends.
+fn shrink_if_sparse<K: Eq + std::hash::Hash, V>(map: &mut FxHashMap<K, V>) {
+    if map.capacity() > 1024 && map.len() * 8 < map.capacity() {
+        map.shrink_to(map.len() * 2);
+    }
+}
+
+/// A set of value IDs within one range, one bit each.
+struct ValueMarks {
+    start: ValueId,
+    end: ValueId,
+    words: Vec<u64>,
+}
+
+impl ValueMarks {
+    fn new(start: ValueId, end: ValueId) -> Self {
+        Self {
+            start,
+            end,
+            words: vec![0; (end - start).div_ceil(64) as usize],
+        }
+    }
+
+    fn insert(&mut self, id: ValueId) {
+        if (self.start..self.end).contains(&id) {
+            let bit = id - self.start;
+            self.words[(bit / 64) as usize] |= 1 << (bit % 64);
+        }
+    }
+
+    fn contains(&self, id: ValueId) -> bool {
+        (self.start..self.end).contains(&id) && {
+            let bit = id - self.start;
+            self.words[(bit / 64) as usize] & (1 << (bit % 64)) != 0
+        }
+    }
+}
+
+/// A set of value IDs as one bit per ID. IDs are never reused, so a member
+/// stays correct after its value is reclaimed.
+#[derive(Default)]
+struct ValueBits(Vec<u64>);
+
+impl ValueBits {
+    fn insert(&mut self, id: ValueId) {
+        let word = (id / 64) as usize;
+        if word >= self.0.len() {
+            self.0.resize(word + 1, 0);
+        }
+        self.0[word] |= 1 << (id % 64);
+    }
+
+    fn contains(&self, id: ValueId) -> bool {
+        self.0
+            .get((id / 64) as usize)
+            .is_some_and(|word| word & (1 << (id % 64)) != 0)
+    }
+}
+
+/// One value per parameter of a call; calls rarely take more than a few.
+type CallArgs<T> = SmallVec<[T; 4]>;
+
+/// Names bound in one frame. Most frames bind a few parameters, which a short
+/// list holds without allocating; a frame binding more moves to a hash table.
+#[derive(Clone)]
+enum FrameBindings {
+    Few(SmallVec<[(VarId, ValueId); FrameBindings::FEW]>),
+    Many(FxHashMap<VarId, ValueId>),
+}
+
+impl Default for FrameBindings {
+    fn default() -> Self {
+        FrameBindings::Few(SmallVec::new())
+    }
+}
+
+impl FrameBindings {
+    const FEW: usize = 6;
+
+    fn get(&self, var: &VarId) -> Option<&ValueId> {
+        match self {
+            FrameBindings::Few(list) => list.iter().find(|(v, _)| v == var).map(|(_, value)| value),
+            FrameBindings::Many(map) => map.get(var),
+        }
+    }
+
+    fn for_each_value(&self, mut f: impl FnMut(ValueId)) {
+        match self {
+            FrameBindings::Few(list) => list.iter().for_each(|(_, value)| f(*value)),
+            FrameBindings::Many(map) => map.values().for_each(|value| f(*value)),
+        }
+    }
+
+    /// Binds `var`, returning the value it was bound to before.
+    fn insert(&mut self, var: VarId, value: ValueId) -> Option<ValueId> {
+        match self {
+            FrameBindings::Few(list) => {
+                if let Some((_, old)) = list.iter_mut().find(|(v, _)| *v == var) {
+                    return Some(std::mem::replace(old, value));
+                }
+                if list.len() < Self::FEW {
+                    list.push((var, value));
+                } else {
+                    let mut map: FxHashMap<VarId, ValueId> = list.drain(..).collect();
+                    map.insert(var, value);
+                    *self = FrameBindings::Many(map);
+                }
+                None
+            }
+            FrameBindings::Many(map) => map.insert(var, value),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Frame {
-    bindings: FnvHashMap<VarId, ValueId>,
+    bindings: FrameBindings,
     parent: Option<FrameId>,
     /// One active visitor or deferred evaluator, plus one reference from each
     /// live child frame. Frames are reclaimed when the count reaches zero.
     users: u32,
+    /// Where a `fn` call's scope sits; `None` for every other frame.
+    call: Option<CallSite>,
+}
+
+/// The placement of a `fn` call's scope. A tail call's scope goes beside its
+/// caller's, so a chain of tail calls is one level deep however long it is.
+#[derive(Debug, Clone, Copy)]
+struct CallSite {
+    /// The scope the chain's first call was made in.
+    parent: ScopeId,
+    /// The scope order of the chain's first call.
+    order: u64,
+    /// The call's position in the chain; 0 for the first.
+    step: u64,
 }
 
 /// Dense, chunked storage for evaluator values.
@@ -6403,11 +6653,19 @@ type ValueChunk<'a> = Box<[Option<DeferValue<'a>>]>;
 
 struct ValueStore<'a> {
     chunks: Vec<Option<ValueChunk<'a>>>,
+    /// Values of chunks that collection released, which had few live values.
+    sparse: FxHashMap<ValueId, DeferValue<'a>>,
+    /// Indices of the released chunks, whose values are found in `sparse`.
+    sparse_chunks: ValueBits,
 }
 
 impl<'a> ValueStore<'a> {
     fn new(initial: impl IntoIterator<Item = (ValueId, DeferValue<'a>)>) -> Self {
-        let mut store = Self { chunks: Vec::new() };
+        let mut store = Self {
+            chunks: Vec::new(),
+            sparse: FxHashMap::default(),
+            sparse_chunks: ValueBits::default(),
+        };
         for (id, value) in initial {
             store.insert(id, value);
         }
@@ -6437,15 +6695,37 @@ impl<'a> ValueStore<'a> {
         &mut values[id % VALUE_CHUNK_LEN]
     }
 
+    fn is_sparse(&self, id: ValueId) -> bool {
+        self.sparse_chunks.contains(id / VALUE_CHUNK_LEN as u64)
+    }
+
     fn get(&self, id: &ValueId) -> Option<&DeferValue<'a>> {
-        self.slot(*id)?.as_ref()
+        match self.slot(*id) {
+            Some(slot) => slot.as_ref(),
+            None if self.is_sparse(*id) => self.sparse.get(id),
+            None => None,
+        }
     }
 
     fn insert(&mut self, id: ValueId, value: DeferValue<'a>) -> Option<DeferValue<'a>> {
+        if self.is_sparse(id) {
+            return self.sparse.insert(id, value);
+        }
         self.slot_mut(id).replace(value)
     }
 
+    fn get_mut(&mut self, id: &ValueId) -> Option<&mut DeferValue<'a>> {
+        if self.is_sparse(*id) {
+            return self.sparse.get_mut(id);
+        }
+        let id = usize::try_from(*id).ok()?;
+        self.chunks.get_mut(id / VALUE_CHUNK_LEN)?.as_mut()?[id % VALUE_CHUNK_LEN].as_mut()
+    }
+
     fn remove(&mut self, id: &ValueId) -> Option<DeferValue<'a>> {
+        if self.is_sparse(*id) {
+            return self.sparse.remove(id);
+        }
         let id = usize::try_from(*id).ok()?;
         self.chunks.get_mut(id / VALUE_CHUNK_LEN)?.as_mut()?[id % VALUE_CHUNK_LEN].take()
     }
@@ -6459,7 +6739,91 @@ impl<'a> ValueStore<'a> {
             .iter()
             .flatten()
             .map(|chunk| chunk.iter().filter(|value| value.is_some()).count())
-            .sum()
+            .sum::<usize>()
+            + self.sparse.len()
+    }
+
+    /// Calls `f` with every value in `start..end`.
+    fn for_each_in(
+        &self,
+        start: ValueId,
+        end: ValueId,
+        mut f: impl FnMut(ValueId, &DeferValue<'a>),
+    ) {
+        let (first, last) = (
+            start as usize / VALUE_CHUNK_LEN,
+            end as usize / VALUE_CHUNK_LEN,
+        );
+        for (index, chunk) in self.chunks.iter().enumerate().take(last + 1).skip(first) {
+            let Some(chunk) = chunk else {
+                continue;
+            };
+            for (offset, value) in chunk.iter().enumerate() {
+                let id = (index * VALUE_CHUNK_LEN + offset) as ValueId;
+                if let Some(value) = value
+                    && (start..end).contains(&id)
+                {
+                    f(id, value);
+                }
+            }
+        }
+        for (id, value) in &self.sparse {
+            if (start..end).contains(id) {
+                f(*id, value);
+            }
+        }
+    }
+
+    /// Drops the values in `start..end` that `live` does not contain, then
+    /// releases each finished chunk that is left with few values, moving those
+    /// to `sparse`. Returns how many values in the range remain.
+    fn sweep(&mut self, start: ValueId, end: ValueId, live: &ValueMarks) -> usize {
+        let mut remaining = 0;
+        let (first, last) = (
+            start as usize / VALUE_CHUNK_LEN,
+            end as usize / VALUE_CHUNK_LEN,
+        );
+        for index in first..=last.min(self.chunks.len().saturating_sub(1)) {
+            let Some(chunk) = self.chunks[index].as_mut() else {
+                continue;
+            };
+            let mut kept = 0;
+            for (offset, value) in chunk.iter_mut().enumerate() {
+                let id = (index * VALUE_CHUNK_LEN + offset) as ValueId;
+                if value.is_none() {
+                    continue;
+                }
+                if (start..end).contains(&id) {
+                    if !live.contains(id) {
+                        *value = None;
+                        continue;
+                    }
+                    remaining += 1;
+                }
+                kept += 1;
+            }
+            // The chunk new values are still being placed in stays as it is.
+            if (index + 1) * VALUE_CHUNK_LEN > end as usize || kept > VALUE_CHUNK_LEN / 16 {
+                continue;
+            }
+            let chunk = self.chunks[index].take().expect("checked above");
+            for (offset, value) in chunk.into_vec().into_iter().enumerate() {
+                if let Some(value) = value {
+                    self.sparse
+                        .insert((index * VALUE_CHUNK_LEN + offset) as ValueId, value);
+                }
+            }
+            self.sparse_chunks.insert(index as u64);
+        }
+        self.sparse.retain(|id, _| {
+            let dead = (start..end).contains(id) && !live.contains(*id);
+            if !dead && (start..end).contains(id) {
+                remaining += 1;
+            }
+            !dead
+        });
+        shrink_if_sparse(&mut self.sparse);
+        remaining
     }
 
     /// Remove a monotonic allocation range and release every completely
@@ -6467,6 +6831,10 @@ impl<'a> ValueStore<'a> {
     fn remove_range(&mut self, start: ValueId, end: ValueId, preserve: &HashSet<ValueId>) {
         if start >= end {
             return;
+        }
+        if !self.sparse.is_empty() {
+            self.sparse
+                .retain(|id, _| !(start..end).contains(id) || preserve.contains(id));
         }
         let start = usize::try_from(start).expect("value ID does not fit usize");
         let end = usize::try_from(end).expect("value ID does not fit usize");
@@ -6553,6 +6921,9 @@ enum ScopeSiteKind {
     Default,
     /// A function call; `index` is the callee declaration's address.
     Call,
+    /// A call in tail position; `index` packs its chain's first scope order
+    /// and its step in the chain.
+    TailCall,
     Block,
     Then,
     Else,
@@ -6579,15 +6950,10 @@ impl ScopeSite {
 /// emitted objects, or dynamic children.  A normal `Vec` costs three words in
 /// every one of those records even though it allocates nothing.  Keeping the
 /// allocation behind an option preserves the complete scope tree and its
-/// ordering while making the overwhelmingly common empty case one word.
+/// ordering while making the overwhelmingly common empty case one word. The
+/// first element is stored in that allocation too.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-// The extra indirection is intentional: `Option<Vec<T>>` remains three words,
-// while scope records need the empty representation to be one word.
-#[expect(
-    clippy::box_collection,
-    reason = "the box makes an empty scope vector one word instead of three"
-)]
-pub struct SparseVec<T>(Option<Box<Vec<T>>>);
+pub struct SparseVec<T>(Option<Box<SmallVec<[T; 1]>>>);
 
 impl<T> Default for SparseVec<T> {
     fn default() -> Self {
@@ -6598,7 +6964,7 @@ impl<T> Default for SparseVec<T> {
 impl<T> SparseVec<T> {
     pub fn push(&mut self, value: T) {
         self.0
-            .get_or_insert_with(|| Box::new(Vec::new()))
+            .get_or_insert_with(|| Box::new(SmallVec::new()))
             .push(value);
     }
 
@@ -6626,7 +6992,10 @@ impl<T> SparseVec<T> {
     }
 
     fn as_slice(&self) -> &[T] {
-        self.0.as_deref().map(Vec::as_slice).unwrap_or_default()
+        self.0
+            .as_deref()
+            .map(SmallVec::as_slice)
+            .unwrap_or_default()
     }
 }
 
@@ -6635,7 +7004,7 @@ impl<T> From<Vec<T>> for SparseVec<T> {
         if values.is_empty() {
             Self::default()
         } else {
-            Self(Some(Box::new(values)))
+            Self(Some(Box::new(SmallVec::from_vec(values))))
         }
     }
 }
@@ -6665,7 +7034,7 @@ impl<'a, T> IntoIterator for &'a SparseVec<T> {
 
 impl<T> IntoIterator for SparseVec<T> {
     type Item = T;
-    type IntoIter = std::vec::IntoIter<T>;
+    type IntoIter = smallvec::IntoIter<[T; 1]>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.map(|values| *values).unwrap_or_default().into_iter()
@@ -6720,15 +7089,17 @@ struct CellState {
     solve_iters: u64,
     solver: Solver,
     fields: IndexMap<String, ValueId>,
+    /// The values of every exec scope binding.
+    bound_values: Vec<ValueId>,
     emit: Vec<Emit>,
     object_emit: Vec<ObjectEmit>,
-    objects: FnvIndexMap<ObjectId, Object>,
+    objects: FxIndexMap<ObjectId, Object>,
     deferred: Worklist,
     root_scope: ScopeId,
-    scopes: FnvIndexMap<ScopeId, ExecScope>,
-    scope_metadata: FnvIndexSet<ScopeMetadata>,
+    scopes: FxIndexMap<ScopeId, ExecScope>,
+    scope_metadata: FxIndexSet<ScopeMetadata>,
     /// The label interned for each scope site seen in this cell.
-    scope_site_metadata: FnvHashMap<ScopeSite, ScopeMetadataId>,
+    scope_site_metadata: FxHashMap<ScopeSite, ScopeMetadataId>,
     fallback_constraints: BinaryHeap<FallbackConstraint>,
     fallback_constraints_used: Vec<UsedFallback>,
     /// Values the *compiler* defaults when nothing else determines them, as
@@ -6746,9 +7117,9 @@ struct CellState {
     compiler_defaults: VecDeque<(LinearExpr, Span)>,
     sse_basis: SseBasis,
     unsolved_vars: Option<IndexSet<Var>>,
-    constraint_span_map: FnvIndexMap<ConstraintId, Span>,
-    var_span_map: FnvIndexMap<Var, Span>,
-    var_dependents: FnvIndexMap<Var, FnvIndexSet<ValueId>>,
+    constraint_span_map: FxIndexMap<ConstraintId, Span>,
+    var_span_map: FxIndexMap<Var, Span>,
+    var_dependents: FxIndexMap<Var, FxIndexSet<ValueId>>,
     /// Objects built by reading a shape out of a placed instance.
     ///
     /// A proxy is a view of geometry the instance's `SREF` already draws, so
@@ -6756,7 +7127,7 @@ struct CellState {
     /// explicit request to flatten that one shape into the parent as well;
     /// [`mark_emitted_proxies_as_layout`] uses this set to tell the
     /// two apart once the emission list has been resolved to object IDs.
-    proxy_objects: FnvIndexSet<ObjectId>,
+    proxy_objects: FxIndexSet<ObjectId>,
 }
 
 impl CellState {
@@ -6781,14 +7152,26 @@ struct ExecPass<'a> {
     defs: &'a TypeDefs,
     tech: Technology,
     gds_imports: HashMap<VarId, (String, PathBuf)>,
-    cell_states: FnvIndexMap<CellId, CellState>,
+    cell_states: FxIndexMap<CellId, CellState>,
     // These execution tables have integer keys and no observable iteration
-    // order. FNV avoids SipHash's cryptographic overhead in the evaluator's
+    // order. FxHash avoids SipHash's cryptographic overhead in the evaluator's
     // hottest lookups, while ordered maps remain in the compiled output where
     // source order is part of the result.
     values: ValueStore<'a>,
-    value_dependents: FnvHashMap<ValueId, Waiters>,
-    frames: FnvHashMap<FrameId, Frame>,
+    /// Boxes of finished deferred values, reused for new ones.
+    #[expect(clippy::vec_box, reason = "the boxes become deferred values")]
+    spare_evals: Vec<Box<PartialEval<'a>>>,
+    /// The value ID at which to collect the current cell's values next.
+    collect_at: ValueId,
+    /// Waiters of values that are not pending: values being evaluated and
+    /// ready values the solver can revisit. Pending values hold their own.
+    value_dependents: FxHashMap<ValueId, Waiters>,
+    /// Values that have waited on a solver variable. A solver update can queue
+    /// one of these again after it is ready, so its waiters are kept.
+    revisitable: ValueBits,
+    /// Values that have ever had an entry in `value_dependents`.
+    listed: ValueBits,
+    frames: FxHashMap<FrameId, Frame>,
     nil_value: ValueId,
     seq_nil_value: ValueId,
     true_value: ValueId,
@@ -6858,8 +7241,8 @@ struct ExecPass<'a> {
 /// which one the author meant.
 fn mark_emitted_proxies_as_layout(
     cell: &mut CompiledCell,
-    proxies: &FnvIndexSet<ObjectId>,
-    emitted: &FnvIndexSet<ObjectId>,
+    proxies: &FxIndexSet<ObjectId>,
+    emitted: &FxIndexSet<ObjectId>,
 ) {
     for id in proxies.intersection(emitted) {
         let Some(object) = cell.objects.get_mut(id) else {
@@ -6939,20 +7322,25 @@ impl<'a> ExecPass<'a> {
             defs: &workspace.defs,
             tech,
             gds_imports,
-            cell_states: FnvIndexMap::default(),
+            cell_states: FxIndexMap::default(),
             values: ValueStore::new([
                 (1, DeferValue::Ready(Value::Nil)),
                 (2, DeferValue::Ready(Value::Bool(true))),
                 (3, DeferValue::Ready(Value::Bool(false))),
                 (4, DeferValue::Ready(Value::SeqNil)),
             ]),
-            value_dependents: FnvHashMap::default(),
-            frames: FnvHashMap::from_iter([(
+            spare_evals: Vec::new(),
+            collect_at: MIN_COLLECT_VALUES,
+            value_dependents: FxHashMap::default(),
+            revisitable: ValueBits::default(),
+            listed: ValueBits::default(),
+            frames: FxHashMap::from_iter([(
                 5,
                 Frame {
                     bindings: Default::default(),
                     parent: None,
                     users: 1,
+                    call: None,
                 },
             )]),
             nil_value: 1,
@@ -7480,6 +7868,7 @@ impl<'a> ExecPass<'a> {
             bindings: Default::default(),
             parent: Some(self.global_frame),
             users: 1,
+            call: None,
         };
         let cell_decl = self.cell_decls[self.values[&self.lookup(self.global_frame, cell).unwrap()]
             .as_ref()
@@ -7564,12 +7953,13 @@ impl<'a> ExecPass<'a> {
                         solve_iters: 0,
                         solver: Solver::with_grid(self.tech.grid_step()),
                         fields: Default::default(),
+                        bound_values: Vec::new(),
                         emit: Vec::new(),
                         object_emit: Vec::new(),
                         deferred: Worklist::new(values_start),
-                        scopes: FnvIndexMap::from_iter([(root_scope_id, root_scope)]),
-                        scope_metadata: FnvIndexSet::from_iter([root_scope_metadata]),
-                        scope_site_metadata: FnvHashMap::default(),
+                        scopes: FxIndexMap::from_iter([(root_scope_id, root_scope)]),
+                        scope_metadata: FxIndexSet::from_iter([root_scope_metadata]),
+                        scope_site_metadata: FxHashMap::default(),
                         fallback_constraints: Default::default(),
                         fallback_constraints_used: Vec::new(),
                         compiler_defaults: VecDeque::new(),
@@ -7577,10 +7967,10 @@ impl<'a> ExecPass<'a> {
                         root_scope: root_scope_id,
                         unsolved_vars: Default::default(),
                         objects: Default::default(),
-                        constraint_span_map: FnvIndexMap::default(),
-                        var_span_map: FnvIndexMap::default(),
-                        var_dependents: FnvIndexMap::default(),
-                        proxy_objects: FnvIndexSet::default(),
+                        constraint_span_map: FxIndexMap::default(),
+                        var_span_map: FxIndexMap::default(),
+                        var_dependents: FxIndexMap::default(),
+                        proxy_objects: FxIndexSet::default(),
                     }
                 )
                 .is_none()
@@ -7616,27 +8006,32 @@ impl<'a> ExecPass<'a> {
                         .get_mut(&fid)
                         .unwrap()
                         .bindings
-                        .insert(binding.metadata, value);
+                        .insert(binding.metadata.0, value);
                     self.cell_states
                         .get_mut(&cell_id)
                         .unwrap()
                         .fields
                         .insert(binding.name.name.to_string(), value);
-                    self.cell_state_mut(loc.cell)
-                        .scopes
-                        .get_mut(&loc.scope)
-                        .unwrap()
-                        .bindings
-                        .push((loc.seq_num, (binding.name.name.clone(), value)));
+                    if binding.metadata.1.may_hold_objects() {
+                        let state = self.cell_state_mut(loc.cell);
+                        state
+                            .scopes
+                            .get_mut(&loc.scope)
+                            .unwrap()
+                            .bindings
+                            .push((loc.seq_num, (binding.name.name.clone(), value)));
+                        state.bound_values.push(value);
+                    }
                     seq_num = seq_num.next();
                 }
                 Statement::Expr { value, .. } => {
                     self.visit_expr(loc, value);
                 }
                 Statement::ForLoop(f) => {
-                    self.eval_for_loop(loc, f);
+                    self.eval_for_loop(loc, f, false);
                 }
             }
+            self.maybe_collect(cell_id, values_start);
         }
         self.release_frame(fid);
 
@@ -7650,6 +8045,7 @@ impl<'a> ExecPass<'a> {
                 state.deferred.pop()
             } {
                 progress |= self.eval_partial(cell_id, vid)?;
+                self.maybe_collect(cell_id, values_start);
             }
 
             let state = self.cell_state_mut(cell_id);
@@ -7670,9 +8066,9 @@ impl<'a> ExecPass<'a> {
             state.solver.solve();
             progress = !state.solver.updated_vars().is_empty() || progress;
             let update_var_dependents = |state: &mut CellState| {
-                for var in state.solver.updated_vars().clone() {
-                    if let Some(deps) = state.var_dependents.get(&var) {
-                        for dep in deps.clone() {
+                for var in state.solver.updated_vars() {
+                    if let Some(deps) = state.var_dependents.get(var) {
+                        for &dep in deps {
                             state.deferred.insert(dep);
                         }
                     }
@@ -7767,8 +8163,10 @@ impl<'a> ExecPass<'a> {
         // `emit` constructs the compiled scope/object arenas; otherwise their
         // memory overlaps the complete output and defines the process peak.
         if self.partial_cells.is_empty() {
-            self.frames = FnvHashMap::default();
-            self.value_dependents = FnvHashMap::default();
+            self.frames = FxHashMap::default();
+            self.value_dependents = FxHashMap::default();
+            self.revisitable = ValueBits::default();
+            self.listed = ValueBits::default();
         }
 
         // `emit` has no way to report a diagnostic, so the two invariants it
@@ -8060,10 +8458,10 @@ impl<'a> ExecPass<'a> {
             };
             let root = ScopeId::semantic(None, &root_name);
             let span = Span {
-                path: path.to_path_buf(),
+                path: Arc::from(path),
                 span: cfgrammar::Span::new(0, 0),
             };
-            let mut objects = FnvIndexMap::default();
+            let mut objects = FxIndexMap::default();
             let mut emit = Vec::new();
             let mut named_objects: IndexMap<String, Vec<ObjectId>> = IndexMap::new();
             for (element_index, element) in structure.elements.into_iter().enumerate() {
@@ -8184,7 +8582,7 @@ impl<'a> ExecPass<'a> {
                 .enumerate()
                 .map(|(index, (name, value))| (SeqNum(index as u64), (name.clone(), value.clone())))
                 .collect();
-            let scopes = FnvIndexMap::from_iter([(
+            let scopes = FxIndexMap::from_iter([(
                 root,
                 CompiledScope {
                     static_parent: None,
@@ -8451,7 +8849,7 @@ impl<'a> ExecPass<'a> {
 
         let mut ccell = CompiledCell {
             name: state.name.clone(),
-            scopes: FnvIndexMap::with_capacity_and_hasher(state.scopes.len(), Default::default()),
+            scopes: FxIndexMap::with_capacity_and_hasher(state.scopes.len(), Default::default()),
             scope_metadata: state.scope_metadata.iter().cloned().collect(),
             root: state.root_scope,
             fields: IndexMap::new(),
@@ -8464,7 +8862,7 @@ impl<'a> ExecPass<'a> {
                 .iter()
                 .copied()
                 .collect(),
-            objects: FnvIndexMap::default(),
+            objects: FxIndexMap::default(),
         };
         for (id, scope) in state.scopes.iter() {
             add_scope(&mut ccell, state, *id, scope);
@@ -8474,7 +8872,7 @@ impl<'a> ExecPass<'a> {
             ccell.objects.insert(*id, emit_obj(obj));
         }
 
-        let mut emitted = FnvIndexSet::default();
+        let mut emitted = FxIndexSet::default();
         for emit in state.emit.iter() {
             // A poisoned value reported its own diagnostic and never became an
             // object. Skipping it is what lets the rest of the cell reach the
@@ -8564,6 +8962,7 @@ impl<'a> ExecPass<'a> {
                 self.value_dependents.remove(&id);
             }
         }
+        shrink_if_sparse(&mut self.value_dependents);
     }
 
     /// The ready `Value::Cell` for `cell`, created on first use.
@@ -8596,6 +8995,57 @@ impl<'a> ExecPass<'a> {
         frame.users = frame.users.checked_add(1).expect("too many frame users");
     }
 
+    /// Collects the values of `cell_id` once enough have been created since
+    /// the last collection.
+    fn maybe_collect(&mut self, cell_id: CellId, start: ValueId) {
+        if self.next_value_id >= self.collect_at {
+            self.collect_values(cell_id, start);
+        }
+    }
+
+    /// Drops the ready values of `cell_id`, those from `start` on, that no
+    /// computation can read again.
+    ///
+    /// Pending values stay, with every value they hold, as do values bound in
+    /// a live frame or a scope, emitted, named by a field, or naming a cell.
+    /// A ready value refers to no other value but its instance's cell, which
+    /// is kept through the cell's objects.
+    fn collect_values(&mut self, cell_id: CellId, start: ValueId) {
+        let end = self.next_value_id;
+        let mut live = ValueMarks::new(start, end);
+        self.values.for_each_in(start, end, |id, value| {
+            if let Defer::Deferred(eval) = value {
+                live.insert(id);
+                eval.state.for_each_value(&mut |input| live.insert(input));
+            }
+        });
+        for frame in self.frames.values() {
+            frame.bindings.for_each_value(|value| live.insert(value));
+        }
+        let state = self.cell_state(cell_id);
+        for &value in state
+            .bound_values
+            .iter()
+            .chain(state.fields.values())
+            .chain(state.emit.iter().map(|emit| &emit.value))
+            .chain(
+                state
+                    .objects
+                    .values()
+                    .filter_map(|object| Some(&object.get_inst()?.cell)),
+            )
+            .chain(self.cell_values.values())
+        {
+            live.insert(value);
+        }
+        let remaining = self.values.sweep(start, end, &live);
+        let values = &self.values;
+        self.value_dependents
+            .retain(|id, _| !(start..end).contains(id) || values.contains_key(id));
+        shrink_if_sparse(&mut self.value_dependents);
+        self.collect_at = self.next_value_id + MIN_COLLECT_VALUES.max(2 * remaining as u64);
+    }
+
     fn release_frame(&mut self, mut id: FrameId) {
         loop {
             if id == self.global_frame {
@@ -8610,6 +9060,7 @@ impl<'a> ExecPass<'a> {
                 frame.parent
             };
             self.frames.remove(&id);
+            shrink_if_sparse(&mut self.frames);
             let Some(parent) = parent else {
                 return;
             };
@@ -8725,11 +9176,22 @@ impl<'a> ExecPass<'a> {
         }
     }
 
-    fn eval_for_loop(&mut self, loc: DynLoc, f: &'a ForLoop<Substr, VarIdTyMetadata>) {
+    fn eval_for_loop(
+        &mut self,
+        loc: DynLoc,
+        f: &'a ForLoop<Substr, VarIdTyMetadata>,
+        collect: bool,
+    ) -> ValueId {
         let seq = self.visit_expr(loc, &f.seq);
         self.new_deferred_value(loc, |_| {
-            PartialEvalState::ForLoop(Box::new(PartialForLoop { for_loop: f, seq }))
-        });
+            PartialEvalState::ForLoop(PartialForLoop {
+                for_loop: f,
+                seq,
+                collect,
+                items: None,
+                ready: 0,
+            })
+        })
     }
 
     fn eval_stmt(&mut self, loc: DynLoc, stmt: &'a Statement<Substr, VarIdTyMetadata>) {
@@ -8740,19 +9202,23 @@ impl<'a> ExecPass<'a> {
                     .get_mut(&loc.frame)
                     .unwrap()
                     .bindings
-                    .insert(binding.metadata, value);
-                self.cell_state_mut(loc.cell)
-                    .scopes
-                    .get_mut(&loc.scope)
-                    .unwrap()
-                    .bindings
-                    .push((loc.seq_num, (binding.name.name.clone(), value)));
+                    .insert(binding.metadata.0, value);
+                if binding.metadata.1.may_hold_objects() {
+                    let state = self.cell_state_mut(loc.cell);
+                    state
+                        .scopes
+                        .get_mut(&loc.scope)
+                        .unwrap()
+                        .bindings
+                        .push((loc.seq_num, (binding.name.name.clone(), value)));
+                    state.bound_values.push(value);
+                }
             }
             Statement::Expr { value, .. } => {
                 self.visit_expr(loc, value);
             }
             Statement::ForLoop(f) => {
-                self.eval_for_loop(loc, f);
+                self.eval_for_loop(loc, f, false);
             }
         }
     }
@@ -8860,7 +9326,7 @@ impl<'a> ExecPass<'a> {
     }
 
     /// Creates an empty frame whose parent is the global frame.
-    fn new_call_frame(&mut self) -> FrameId {
+    fn new_call_frame(&mut self, call: Option<CallSite>) -> FrameId {
         let fid = self.frame_id();
         self.insert_frame(
             fid,
@@ -8868,9 +9334,21 @@ impl<'a> ExecPass<'a> {
                 bindings: Default::default(),
                 parent: Some(self.global_frame),
                 users: 1,
+                call,
             },
         );
         fid
+    }
+
+    /// The call site of the `fn` call whose body `frame` belongs to.
+    fn enclosing_call(&self, mut frame: FrameId) -> Option<CallSite> {
+        loop {
+            let f = &self.frames[&frame];
+            if let Some(call) = f.call {
+                return Some(call);
+            }
+            frame = f.parent?;
+        }
     }
 
     /// Evaluates a call's explicit arguments in the caller's context: one slot
@@ -8880,7 +9358,7 @@ impl<'a> ExecPass<'a> {
         loc: DynLoc,
         call: &'a CallExpr<Substr, VarIdTyMetadata>,
         params: &'a [ArgDecl<Substr, VarIdTyMetadata>],
-    ) -> Vec<Option<ValueId>> {
+    ) -> CallArgs<Option<ValueId>> {
         params
             .iter()
             .enumerate()
@@ -8909,10 +9387,10 @@ impl<'a> ExecPass<'a> {
         &mut self,
         loc: DynLoc,
         call_order: u64,
-        path: &FsPath,
+        path: &Arc<FsPath>,
         params: &'a [ArgDecl<Substr, VarIdTyMetadata>],
-        explicit: Vec<Option<ValueId>>,
-    ) -> Vec<ValueId> {
+        explicit: CallArgs<Option<ValueId>>,
+    ) -> CallArgs<ValueId> {
         params
             .iter()
             .zip(explicit)
@@ -8927,7 +9405,7 @@ impl<'a> ExecPass<'a> {
                                 (
                                     format!("{call_order} default {}", param.name.name),
                                     Span {
-                                        path: path.to_path_buf(),
+                                        path: path.clone(),
                                         span: default.span(),
                                     },
                                 )
@@ -8962,9 +9440,19 @@ impl<'a> ExecPass<'a> {
         let vid = self.value_id();
         self.retain_frame(loc.frame);
         self.cell_state_mut(loc.cell).deferred.insert(vid);
-        let state = state(self);
-        self.values
-            .insert(vid, Defer::Deferred(Box::new(PartialEval { state, loc })));
+        let eval = PartialEval {
+            state: state(self),
+            loc,
+            waiters: Waiters::default(),
+        };
+        let eval = match self.spare_evals.pop() {
+            Some(mut spare) => {
+                *spare = eval;
+                spare
+            }
+            None => Box::new(eval),
+        };
+        self.values.insert(vid, Defer::Deferred(eval));
         vid
     }
 
@@ -8991,6 +9479,7 @@ impl<'a> ExecPass<'a> {
                     .expect("no var ID assigned to a name being read");
                 self.lookup(loc.frame, var_id).unwrap()
             }
+            Expr::ListComp(comp) => self.eval_for_loop(loc, &comp.for_loop, true),
             Expr::Emit(e) => {
                 let value = self.visit_expr(loc, &e.value);
                 let span = self.span(&loc, e.span);
@@ -9004,7 +9493,7 @@ impl<'a> ExecPass<'a> {
             Expr::Call(c) => {
                 if BUILTINS.contains(&c.func.path.last().unwrap().name.as_str()) {
                     self.new_deferred_value(loc, |this| {
-                        PartialEvalState::Call(Box::new(PartialCallExpr {
+                        PartialEvalState::Call(PartialCallExpr {
                             expr: c,
                             state: CallExprState {
                                 posargs: c
@@ -9020,7 +9509,7 @@ impl<'a> ExecPass<'a> {
                                     .map(|arg| this.visit_expr(loc, &arg.value))
                                     .collect(),
                             },
-                        }))
+                        })
                     })
                 } else {
                     let callee = self
@@ -9035,30 +9524,53 @@ impl<'a> ExecPass<'a> {
                         ValueRef::Fn(val) => {
                             let val = self.fn_decls[val.0 as usize];
                             let explicit = self.explicit_args(loc, c, &val.args);
-                            let scope = self.create_exec_scope(
-                                loc.cell,
-                                loc.scope,
-                                None,
+                            let caller = if c.tail {
+                                self.enclosing_call(loc.frame)
+                            } else {
+                                None
+                            };
+                            let call = match caller {
+                                Some(caller) => CallSite {
+                                    step: caller.step + 1,
+                                    ..caller
+                                },
+                                None => CallSite {
+                                    parent: loc.scope,
+                                    order: c.scope_order,
+                                    step: 0,
+                                },
+                            };
+                            let site = if call.step == 0 {
                                 ScopeSite::new(
                                     ScopeSiteKind::Call,
                                     c,
                                     std::ptr::from_ref(val) as u64,
-                                ),
-                                |_| {
+                                )
+                            } else {
+                                ScopeSite::new(
+                                    ScopeSiteKind::TailCall,
+                                    c,
+                                    (call.order << 32) | call.step,
+                                )
+                            };
+                            let scope =
+                                self.create_exec_scope(loc.cell, call.parent, None, site, |_| {
+                                    let path =
+                                        c.func.path.iter().map(|ident| &ident.name).join("::");
+                                    let name = if call.step == 0 {
+                                        format!("{} fn {path}", call.order)
+                                    } else {
+                                        format!("{} fn {path}[{}]", call.order, call.step)
+                                    };
                                     (
-                                        format!(
-                                            "{} fn {}",
-                                            c.scope_order,
-                                            c.func.path.iter().map(|ident| &ident.name).join("::")
-                                        ),
+                                        name,
                                         Span {
                                             path: val.metadata.0.clone(),
                                             span: val.scope.span,
                                         },
                                     )
-                                },
-                            );
-                            let fid = self.new_call_frame();
+                                });
+                            let fid = self.new_call_frame(Some(call));
                             // A `fn` body is inlined here and now, unlike an
                             // `if`/`match` branch, so a recursive call that is
                             // not inside one descends natively with no
@@ -9097,23 +9609,25 @@ impl<'a> ExecPass<'a> {
                         ValueRef::CellFn(val) => {
                             let val = self.cell_decls[val.0 as usize];
                             let explicit = self.explicit_args(loc, c, &val.args);
-                            let fid = self.new_call_frame();
+                            let fid = self.new_call_frame(None);
                             let callee_loc = DynLoc { frame: fid, ..loc };
-                            let posargs = self.bind_args(
-                                callee_loc,
-                                c.scope_order,
-                                &val.metadata.0,
-                                &val.args,
-                                explicit,
-                            );
+                            let posargs = self
+                                .bind_args(
+                                    callee_loc,
+                                    c.scope_order,
+                                    &val.metadata.0,
+                                    &val.args,
+                                    explicit,
+                                )
+                                .into_vec();
                             let value = self.new_deferred_value(loc, |_| {
-                                PartialEvalState::Call(Box::new(PartialCallExpr {
+                                PartialEvalState::Call(PartialCallExpr {
                                     expr: c,
                                     state: CallExprState {
                                         posargs,
                                         kwargs: Vec::new(),
                                     },
-                                }))
+                                })
                             });
                             self.release_frame(fid);
                             value
@@ -9146,18 +9660,18 @@ impl<'a> ExecPass<'a> {
             Expr::If(if_expr) => {
                 let cond = self.visit_expr(loc, &if_expr.cond);
                 self.new_deferred_value(loc, |_| {
-                    PartialEvalState::If(Box::new(PartialIfExpr {
+                    PartialEvalState::If(PartialIfExpr {
                         expr: if_expr,
                         state: IfExprState::Cond(cond),
-                    }))
+                    })
                 })
             }
             Expr::Match(match_expr) => self.new_deferred_value(loc, |this| {
                 let scrutinee = this.visit_expr(loc, &match_expr.scrutinee);
-                PartialEvalState::Match(Box::new(PartialMatchExpr {
+                PartialEvalState::Match(PartialMatchExpr {
                     expr: match_expr,
                     state: MatchExprState::Scrutinee(scrutinee),
-                }))
+                })
             }),
             Expr::Scope(s) => {
                 let scope = self.create_exec_scope_at_loc(
@@ -9169,25 +9683,25 @@ impl<'a> ExecPass<'a> {
             }
             Expr::FieldAccess(f) => self.new_deferred_value(loc, |this| {
                 let base = this.visit_expr(loc, &f.base);
-                PartialEvalState::FieldAccess(Box::new(PartialFieldAccessExpr {
+                PartialEvalState::FieldAccess(PartialFieldAccessExpr {
                     expr: f,
                     state: FieldAccessExprState { base },
-                }))
+                })
             }),
             Expr::IndexFieldAccess(f) => self.new_deferred_value(loc, |this| {
                 let base = this.visit_expr(loc, &f.base);
-                PartialEvalState::IndexFieldAccess(Box::new(PartialIndexFieldAccessExpr {
+                PartialEvalState::IndexFieldAccess(PartialIndexFieldAccessExpr {
                     expr: f,
                     state: IndexFieldAccessExprState { base },
-                }))
+                })
             }),
             Expr::Index(i) => self.new_deferred_value(loc, |this| {
                 let base = this.visit_expr(loc, &i.base);
                 let index = this.visit_expr(loc, &i.index);
-                PartialEvalState::Index(Box::new(PartialIndexExpr {
+                PartialEvalState::Index(PartialIndexExpr {
                     expr: i,
                     state: IndexExprState { base, index },
-                }))
+                })
             }),
             Expr::BinOp(b) => match b.op {
                 BinOp::Arith(op) => self.new_deferred_value(loc, |this| {
@@ -9203,21 +9717,21 @@ impl<'a> ExecPass<'a> {
                 BinOp::Cmp(op) => self.new_deferred_value(loc, |this| {
                     let left = this.visit_expr(loc, &b.left);
                     let right = this.visit_expr(loc, &b.right);
-                    PartialEvalState::Comparison(Box::new(PartialComparison {
+                    PartialEvalState::Comparison(PartialComparison {
                         op,
                         expr: b,
                         left,
                         right,
-                    }))
+                    })
                 }),
                 BinOp::Bool(op) => {
                     let left = self.visit_expr(loc, &b.left);
                     self.new_deferred_value(loc, |_| {
-                        PartialEvalState::BoolOp(Box::new(PartialBoolOp {
+                        PartialEvalState::BoolOp(PartialBoolOp {
                             op,
                             expr: b,
                             state: BoolOpState::Left(left),
-                        }))
+                        })
                     })
                 }
             },
@@ -9231,13 +9745,13 @@ impl<'a> ExecPass<'a> {
             }),
             Expr::Cast(cast) => self.new_deferred_value(loc, |this| {
                 let value = this.visit_expr(loc, &cast.value);
-                PartialEvalState::Cast(Box::new(PartialCastExpr {
+                PartialEvalState::Cast(PartialCastExpr {
                     expr: cast,
                     state: PartialCastState {
                         value,
                         ty: cast.metadata.clone(),
                     },
-                }))
+                })
             }),
             Expr::Tuple(tuple) => self.new_deferred_value(loc, |this| {
                 PartialEvalState::Tuple(PartialTupleExpr {
@@ -9262,40 +9776,61 @@ impl<'a> ExecPass<'a> {
                         .map(|field| this.visit_expr(loc, &field.value))
                         .collect();
                     let base = lit.base.as_ref().map(|base| this.visit_expr(loc, base));
-                    PartialEvalState::StructLit(Box::new(PartialStructLit {
+                    PartialEvalState::StructLit(PartialStructLit {
                         expr: lit,
                         ty,
                         fields,
                         base,
-                    }))
+                    })
                 })
             }
         }
     }
 
     fn add_value_dependent(&mut self, vid: ValueId, dependent: ValueId) {
-        self.value_dependents
-            .entry(vid)
-            .or_default()
-            .insert(dependent);
+        match self.values.get_mut(&vid) {
+            Some(Defer::Deferred(eval)) => eval.waiters.insert(dependent),
+            // A ready value is never scheduled again unless the solver
+            // revisits it, so waiting on one would only leave a list behind.
+            Some(Defer::Ready(_)) if !self.revisitable.contains(vid) => {}
+            _ => {
+                self.listed.insert(vid);
+                self.value_dependents
+                    .entry(vid)
+                    .or_default()
+                    .insert(dependent);
+            }
+        }
     }
 
     /// Schedules a value's waiters in `cell_id`, in their insertion order.
     ///
-    /// Solver updates can deliberately revisit a ready value. Its existing
-    /// dependents must be scheduled again on that revisit, so these sets are
-    /// retained until the enclosing cell has completely settled.
+    /// Waiters are dropped once scheduled, except those of a value the solver
+    /// can queue again (see `revisitable`), which are scheduled on every visit.
     fn schedule_dependents(&mut self, cell_id: CellId, vid: ValueId) {
-        if let Some(dependents) = self.value_dependents.get(&vid) {
+        if !self.listed.contains(vid) {
+            return;
+        }
+        if self.revisitable.contains(vid) {
+            if let Some(dependents) = self.value_dependents.get(&vid) {
+                self.cell_states
+                    .get_mut(&cell_id)
+                    .expect("no cell state found for cell ID")
+                    .deferred
+                    .extend(dependents.list.iter().copied());
+            }
+        } else if let Some(dependents) = self.value_dependents.remove(&vid) {
             self.cell_states
                 .get_mut(&cell_id)
                 .expect("no cell state found for cell ID")
                 .deferred
-                .extend(dependents.list.iter().copied());
+                .extend(dependents.list);
+            shrink_if_sparse(&mut self.value_dependents);
         }
     }
 
     fn add_var_dependent(&mut self, cell_id: CellId, var: Var, dependent: ValueId) {
+        self.revisitable.insert(dependent);
         self.cell_state_mut(cell_id)
             .var_dependents
             .entry(var)
@@ -9610,18 +10145,16 @@ impl<'a> ExecPass<'a> {
         )
     }
 
-    /// Marks `vid` as poisoned, having already reported the diagnostic for it,
-    /// and re-queues whatever was waiting on it.
+    /// Marks `vid` as poisoned, having already reported the diagnostic for it.
+    /// [`Self::eval_partial`] then re-queues whatever was waiting on it.
     ///
     /// Returns `Ok(true)`: poisoning is progress. The alternative -- reporting
     /// and returning `Err(())` -- unwinds out of `execute_cell` entirely, which
     /// suppressed every other diagnostic in the cell and left
     /// `ExecErrorCompileOutput::output` as `None`, so the GUI reported the cell
     /// as failing to open over a single bad field read.
-    fn poison(&mut self, cell_id: CellId, vid: ValueId, frame: FrameId) -> Result<bool, ()> {
+    fn poison(&mut self, vid: ValueId) -> Result<bool, ()> {
         self.values.insert(vid, Defer::Ready(Value::Poison));
-        self.schedule_dependents(cell_id, vid);
-        self.release_frame(frame);
         Ok(true)
     }
 
@@ -9631,15 +10164,53 @@ impl<'a> ExecPass<'a> {
         let Some(value) = self.values.remove(&vid) else {
             return Ok(false);
         };
-        let mut vref = match value {
+        let mut eval = match value {
             ready @ Defer::Ready(_) => {
                 self.values.insert(vid, ready);
                 self.schedule_dependents(cell_id, vid);
                 return Ok(true);
             }
-            Defer::Deferred(v) => v,
+            Defer::Deferred(eval) => eval,
         };
-        let value_frame = vref.loc.frame;
+        let waiters = std::mem::take(&mut eval.waiters);
+        let DynLoc {
+            cell: cell_id,
+            frame,
+            ..
+        } = eval.loc;
+        let progress = self.eval_deferred(vid, &mut eval)?;
+        if !self.values.contains_key(&vid) {
+            eval.waiters = waiters;
+            self.values.insert(vid, Defer::Deferred(eval));
+            return Ok(progress);
+        }
+        // Waiters that arrived during the evaluation are in `value_dependents`
+        // and come after the ones the value held.
+        if self.revisitable.contains(vid) {
+            if !waiters.is_empty() {
+                let later = self.value_dependents.remove(&vid).unwrap_or_default();
+                let mut all = waiters;
+                for waiter in later.list {
+                    all.insert(waiter);
+                }
+                self.listed.insert(vid);
+                self.value_dependents.insert(vid, all);
+            }
+        } else {
+            self.cell_state_mut(cell_id).deferred.extend(waiters.list);
+        }
+        self.schedule_dependents(cell_id, vid);
+        self.release_frame(frame);
+        if self.spare_evals.len() < MAX_SPARE_EVALS {
+            self.spare_evals.push(eval);
+        }
+        Ok(progress)
+    }
+
+    /// Advances the deferred value `vid` as far as its inputs allow, either
+    /// leaving it out of the value table to be put back as still pending or
+    /// inserting its result.
+    fn eval_deferred(&mut self, vid: ValueId, vref: &mut PartialEval<'a>) -> Result<bool, ()> {
         let cell_id = vref.loc.cell;
         // Poison propagates here rather than at each read: a value built from
         // one whose diagnostic was already reported would otherwise raise a
@@ -9649,7 +10220,7 @@ impl<'a> ExecPass<'a> {
             .state
             .any_input(|input| matches!(self.values.get(&input), Some(Defer::Ready(Value::Poison))))
         {
-            return self.poison(cell_id, vid, vref.loc.frame);
+            return self.poison(vid);
         }
         let state = self.cell_states.get_mut(&cell_id).unwrap();
         let progress = match &mut vref.state {
@@ -9677,7 +10248,7 @@ impl<'a> ExecPass<'a> {
                             match self.typed_string(arg_vid, vid, cell_id, &span) {
                                 Typed::Ready(layer) => Some(Some(layer)),
                                 Typed::Pending => None,
-                                Typed::Invalid => return self.poison(cell_id, vid, vref.loc.frame),
+                                Typed::Invalid => return self.poison(vid),
                             }
                         }
                     };
@@ -9749,18 +10320,18 @@ impl<'a> ExecPass<'a> {
                                 "w" => {
                                     self.values.insert(
                                         lhs,
-                                        Defer::Ready(Value::Linear(
-                                            rect.x1.clone() - rect.x0.clone(),
-                                        )),
+                                        Defer::Ready(Value::Linear(LinearExpr::difference(
+                                            &rect.x1, &rect.x0,
+                                        ))),
                                     );
                                     (2, None)
                                 }
                                 "h" => {
                                     self.values.insert(
                                         lhs,
-                                        Defer::Ready(Value::Linear(
-                                            rect.y1.clone() - rect.y0.clone(),
-                                        )),
+                                        Defer::Ready(Value::Linear(LinearExpr::difference(
+                                            &rect.y1, &rect.y0,
+                                        ))),
                                     );
                                     (1, None)
                                 }
@@ -9801,10 +10372,9 @@ impl<'a> ExecPass<'a> {
                         {
                             Typed::Ready(layer) => layer,
                             Typed::Pending => {
-                                self.values.insert(vid, Defer::Deferred(vref.clone()));
                                 return Ok(false);
                             }
-                            Typed::Invalid => return self.poison(cell_id, vid, vref.loc.frame),
+                            Typed::Invalid => return self.poison(vid),
                         };
                         let points: Vec<(LinearExpr, LinearExpr)> = match point_spec {
                             Value::Int(count) => {
@@ -9814,7 +10384,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidPolygon,
                                     });
-                                    return self.poison(cell_id, vid, vref.loc.frame);
+                                    return self.poison(vid);
                                 };
                                 if count < 3 {
                                     self.errors.push(ExecError {
@@ -9822,7 +10392,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidPolygon,
                                     });
-                                    return self.poison(cell_id, vid, vref.loc.frame);
+                                    return self.poison(vid);
                                 }
                                 if count > MAX_SHAPE_POINTS {
                                     self.errors.push(ExecError {
@@ -9833,7 +10403,7 @@ impl<'a> ExecPass<'a> {
                                             limit: MAX_SHAPE_POINTS,
                                         },
                                     });
-                                    return self.poison(cell_id, vid, vref.loc.frame);
+                                    return self.poison(vid);
                                 }
                                 let state = self.cell_state_mut(cell_id);
                                 (0..count)
@@ -9851,7 +10421,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                         };
                         if points.len() < 3 {
@@ -9860,7 +10430,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidPolygon,
                             });
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         }
                         for kwarg in &c.expr.args.kwargs {
                             let coordinate = polygon_coordinate(kwarg.name.name.as_str())
@@ -9871,7 +10441,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::IndexOutOfBounds,
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                         }
 
@@ -9951,10 +10521,9 @@ impl<'a> ExecPass<'a> {
                         ) {
                             Typed::Ready(layer) => layer,
                             Typed::Pending => {
-                                self.values.insert(vid, Defer::Deferred(vref.clone()));
                                 return Ok(false);
                             }
-                            Typed::Invalid => return self.poison(cell_id, vid, vref.loc.frame),
+                            Typed::Invalid => return self.poison(vid),
                         };
                         let point_spec = &self.values[&c.state.posargs[1]];
                         let count = match point_spec.as_ref().unwrap_ready().as_ref() {
@@ -9965,7 +10534,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                         };
                         let Some(count) = count.filter(|count| *count >= 2) else {
@@ -9974,7 +10543,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidPath,
                             });
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         };
                         if count > MAX_SHAPE_POINTS {
                             self.errors.push(ExecError {
@@ -9985,7 +10554,7 @@ impl<'a> ExecPass<'a> {
                                     limit: MAX_SHAPE_POINTS,
                                 },
                             });
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         }
                         for kwarg in &c.expr.args.kwargs {
                             let name = kwarg.name.name.as_str();
@@ -9997,7 +10566,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::IndexOutOfBounds,
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                         }
 
@@ -10163,7 +10732,7 @@ impl<'a> ExecPass<'a> {
                             args[3].get_linear().cloned(),
                         ) else {
                             self.invalid_type(cell_id, &span);
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         };
                         let id = object_id(&mut self.next_id);
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
@@ -10232,7 +10801,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                         };
                         if let Some(r) = r {
@@ -10310,9 +10879,9 @@ impl<'a> ExecPass<'a> {
                         let (Some(vl), Some(vr)) = (vl.get_linear(), vr.get_linear()) else {
                             let span = self.span(&vref.loc, c.expr.span);
                             self.invalid_type(cell_id, &span);
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         };
-                        let expr = vl.clone() - vr.clone();
+                        let expr = LinearExpr::difference(vl, vr);
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
                         let constraint = state.solver.constrain_eq0(expr);
 
@@ -10356,7 +10925,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                         };
                         self.values
@@ -10415,7 +10984,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::ZeroRangeStep,
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                             let mut seq = Seq::new();
                             let mut i = *start;
@@ -10430,7 +10999,7 @@ impl<'a> ExecPass<'a> {
                                             limit: MAX_SEQ_LEN,
                                         },
                                     });
-                                    return self.poison(cell_id, vid, vref.loc.frame);
+                                    return self.poison(vid);
                                 }
                                 seq.push_back(Value::Int(i));
                                 // A wrapping `i` would reverse the comparison
@@ -10451,7 +11020,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         }
                     } else {
                         self.add_value_dependent(c.state.posargs[0], vid);
@@ -10470,7 +11039,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::HeadEmptyList,
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                             Value::Seq(s) => {
                                 if let Some(s) = s.front() {
@@ -10482,7 +11051,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::HeadEmptyList,
                                     });
-                                    return self.poison(cell_id, vid, vref.loc.frame);
+                                    return self.poison(vid);
                                 }
                             }
                             _ => {
@@ -10492,13 +11061,107 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                         };
                         self.values.insert(vid, Defer::Ready(val));
                         true
                     } else {
                         self.add_value_dependent(c.state.posargs[0], vid);
+                        false
+                    }
+                }
+                "max_float" | "min_float" | "max_int" | "min_int" => {
+                    let name = c.expr.func.path.last().unwrap().name.as_str();
+                    let (a, b) = (c.state.posargs[0], c.state.posargs[1]);
+                    match (&self.values[&a], &self.values[&b]) {
+                        (Defer::Ready(va), Defer::Ready(vb)) => {
+                            let (va, vb) = (va.clone(), vb.clone());
+                            // The second value when the first is less; the
+                            // first for `max` and the second for `min` on ties.
+                            let less = match (&va, &vb) {
+                                (Value::Int(x), Value::Int(y)) => Some(x < y),
+                                (Value::Linear(x), Value::Linear(y)) => {
+                                    let state = self.cell_state(cell_id);
+                                    match (state.solver.eval_expr(x), state.solver.eval_expr(y)) {
+                                        (Some(x), Some(y)) => match x.partial_cmp(&y) {
+                                            Some(ord) => Some(ord.is_lt()),
+                                            None => {
+                                                let span = self.span(&vref.loc, c.expr.span);
+                                                self.invalid_type(cell_id, &span);
+                                                return self.poison(vid);
+                                            }
+                                        },
+                                        _ => None,
+                                    }
+                                }
+                                _ => {
+                                    let span = self.span(&vref.loc, c.expr.span);
+                                    self.invalid_type(cell_id, &span);
+                                    return self.poison(vid);
+                                }
+                            };
+                            match less {
+                                Some(less) => {
+                                    let max = name.starts_with("max");
+                                    let value = if less == max { vb } else { va };
+                                    self.values.insert(vid, Defer::Ready(value));
+                                    true
+                                }
+                                None => {
+                                    // Both are floats, waiting on the solver.
+                                    let (Value::Linear(x), Value::Linear(y)) = (&va, &vb) else {
+                                        unreachable!()
+                                    };
+                                    for (_, var) in x.coeffs.iter().chain(y.coeffs.iter()) {
+                                        self.add_var_dependent(cell_id, *var, vid);
+                                    }
+                                    false
+                                }
+                            }
+                        }
+                        (Defer::Ready(_), _) => {
+                            self.add_value_dependent(b, vid);
+                            false
+                        }
+                        _ => {
+                            self.add_value_dependent(a, vid);
+                            false
+                        }
+                    }
+                }
+                "seq_len" | "seq_concat" | "seq_flatten" | "seq_sum" | "seq_any" | "seq_all" => {
+                    let unready: CallArgs<ValueId> = c
+                        .state
+                        .posargs
+                        .iter()
+                        .copied()
+                        .filter(|arg| !self.values[arg].is_ready())
+                        .collect();
+                    if unready.is_empty() {
+                        let args: Vec<&Value> = c
+                            .state
+                            .posargs
+                            .iter()
+                            .map(|arg| self.values[arg].as_ref().unwrap_ready())
+                            .collect();
+                        let Some(val) =
+                            seq_builtin(c.expr.func.path.last().unwrap().name.as_str(), &args)
+                        else {
+                            let span = self.span(&vref.loc, c.expr.span);
+                            self.errors.push(ExecError {
+                                span: Some(span),
+                                cell: cell_id,
+                                kind: ExecErrorKind::InvalidType,
+                            });
+                            return self.poison(vid);
+                        };
+                        self.values.insert(vid, Defer::Ready(val));
+                        true
+                    } else {
+                        for arg in unready {
+                            self.add_value_dependent(arg, vid);
+                        }
                         false
                     }
                 }
@@ -10512,7 +11175,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::TailEmptyList,
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                             Value::Seq(s) => {
                                 if !s.is_empty() {
@@ -10529,7 +11192,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::TailEmptyList,
                                     });
-                                    return self.poison(cell_id, vid, vref.loc.frame);
+                                    return self.poison(vid);
                                 }
                             }
                             _ => {
@@ -10539,7 +11202,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                         };
                         self.values.insert(vid, Defer::Ready(val));
@@ -10570,7 +11233,7 @@ impl<'a> ExecPass<'a> {
                             .collect::<Option<Vec<_>>>();
                         let (Some(horiz), Some(linears)) = (horiz, linears) else {
                             self.invalid_type(cell_id, &span);
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         };
                         // Positional order is (p, n, value, coord, pstop, nstop).
                         let [p, n, value, coord, pstop, nstop] =
@@ -10648,11 +11311,11 @@ impl<'a> ExecPass<'a> {
                     };
                     let refl = match read_bool(self, reflect_arg) {
                         Ok(value) => value,
-                        Err(()) => return self.poison(cell_id, vid, vref.loc.frame),
+                        Err(()) => return self.poison(vid),
                     };
                     let construction = match read_bool(self, construction_arg) {
                         Ok(value) => value,
-                        Err(()) => return self.poison(cell_id, vid, vref.loc.frame),
+                        Err(()) => return self.poison(vid),
                     };
                     let angle = match angle_arg {
                         None => None,
@@ -10679,7 +11342,7 @@ impl<'a> ExecPass<'a> {
                                     pending = true;
                                     None
                                 }
-                                Typed::Invalid => return self.poison(cell_id, vid, vref.loc.frame),
+                                Typed::Invalid => return self.poison(vid),
                             }
                         }
                     };
@@ -10764,7 +11427,7 @@ impl<'a> ExecPass<'a> {
                                     Ok(None) => unready.push(*arg_vid),
                                     // The diagnostic is already recorded, here
                                     // or when the argument was poisoned.
-                                    Err(()) => return self.poison(cell_id, vid, vref.loc.frame),
+                                    Err(()) => return self.poison(vid),
                                 }
                             }
                             _ => unready.push(*arg_vid),
@@ -10798,8 +11461,8 @@ impl<'a> ExecPass<'a> {
                     match (vl, vr) {
                         (Value::Linear(vl), Value::Linear(vr)) => {
                             let res = match arith.op {
-                                ArithOp::Add => Some(vl.clone() + vr.clone()),
-                                ArithOp::Sub => Some(vl.clone() - vr.clone()),
+                                ArithOp::Add => Some(LinearExpr::sum(vl, vr)),
+                                ArithOp::Sub => Some(LinearExpr::difference(vl, vr)),
                                 ArithOp::Mul => {
                                     let res = match (
                                         state.solver.eval_expr_exact(vl),
@@ -10838,7 +11501,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return self.poison(cell_id, vid, vref.loc.frame);
+                                    return self.poison(vid);
                                 }
                             };
                             if let Some(res) = res {
@@ -10855,7 +11518,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::NonFiniteValue,
                                     });
-                                    return self.poison(cell_id, vid, vref.loc.frame);
+                                    return self.poison(vid);
                                 }
                                 self.values
                                     .insert(vid, DeferValue::Ready(Value::Linear(res)));
@@ -10883,7 +11546,7 @@ impl<'a> ExecPass<'a> {
                                         .to_owned(),
                                     ),
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                             let res = match arith.op {
                                 ArithOp::Add => vl.checked_add(*vr),
@@ -10908,7 +11571,7 @@ impl<'a> ExecPass<'a> {
                                         .to_owned(),
                                     ),
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             };
                             self.values.insert(vid, DeferValue::Ready(Value::Int(res)));
                             true
@@ -10920,7 +11583,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         }
                     }
                 } else {
@@ -10949,7 +11612,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return self.poison(cell_id, vid, vref.loc.frame);
+                                    return self.poison(vid);
                                 }
                             };
                             self.values
@@ -10962,7 +11625,7 @@ impl<'a> ExecPass<'a> {
                                 UnaryOp::Neg => {
                                     let span = self.span(&vref.loc, unary_op.expr.span);
                                     self.invalid_type(cell_id, &span);
-                                    return self.poison(cell_id, vid, vref.loc.frame);
+                                    return self.poison(vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
@@ -10979,7 +11642,7 @@ impl<'a> ExecPass<'a> {
                                             cell: cell_id,
                                             kind: ExecErrorKind::IntegerOverflow("-".to_owned()),
                                         });
-                                        return self.poison(cell_id, vid, vref.loc.frame);
+                                        return self.poison(vid);
                                     };
                                     res
                                 }
@@ -10990,7 +11653,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return self.poison(cell_id, vid, vref.loc.frame);
+                                    return self.poison(vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(Value::Int(res)));
@@ -11003,7 +11666,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         }
                     }
                 } else {
@@ -11103,7 +11766,7 @@ impl<'a> ExecPass<'a> {
                         let Some(value) = val.get_enum().cloned() else {
                             let span = self.span(&vref.loc, match_.expr.scrutinee.span());
                             self.invalid_type(cell_id, &span);
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         };
                         let arm =
                             match_.expr.arms.iter().find(|arm| {
@@ -11112,7 +11775,7 @@ impl<'a> ExecPass<'a> {
                         let Some(arm) = arm else {
                             let span = self.span(&vref.loc, match_.expr.scrutinee.span());
                             self.invalid_type(cell_id, &span);
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         };
                         // The pattern's bindings live in a frame of their own
                         // under the arm's enclosing frame.
@@ -11120,6 +11783,7 @@ impl<'a> ExecPass<'a> {
                             bindings: Default::default(),
                             parent: Some(vref.loc.frame),
                             users: 1,
+                            call: None,
                         };
                         self.bind_pattern(&arm.pattern, scrutinee, &Value::Enum(value), &mut frame);
                         let fid = self.frame_id();
@@ -11157,7 +11821,7 @@ impl<'a> ExecPass<'a> {
                         let Some(left_val) = val.get_bool().copied() else {
                             let span = self.span(&vref.loc, bool_op.expr.left.span());
                             self.invalid_type(cell_id, &span);
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         };
                         // Whether or not this expression should short-circuit.
                         let decided = match bool_op.op {
@@ -11185,7 +11849,7 @@ impl<'a> ExecPass<'a> {
                         let Some(res) = val.get_bool().copied() else {
                             let span = self.span(&vref.loc, bool_op.expr.right.span());
                             self.invalid_type(cell_id, &span);
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         };
                         self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
                         true
@@ -11229,7 +11893,6 @@ impl<'a> ExecPass<'a> {
                                 {
                                     self.add_var_dependent(cell_id, var, vid);
                                 }
-                                self.values.insert(vid, Defer::Deferred(vref.clone()));
                                 return Ok(false);
                             };
                             match op {
@@ -11253,7 +11916,7 @@ impl<'a> ExecPass<'a> {
                     let Some(res) = res else {
                         let span = self.span(&vref.loc, cmp.expr.span);
                         self.invalid_type(cell_id, &span);
-                        return self.poison(cell_id, vid, vref.loc.frame);
+                        return self.poison(vid);
                     };
                     self.values.insert(vid, DeferValue::Ready(Value::Bool(res)));
                     true
@@ -11272,8 +11935,8 @@ impl<'a> ExecPass<'a> {
                                 "x1" => Value::Linear(rect.x1.clone()),
                                 "y0" => Value::Linear(rect.y0.clone()),
                                 "y1" => Value::Linear(rect.y1.clone()),
-                                "w" => Value::Linear(rect.x1.clone() - rect.x0.clone()),
-                                "h" => Value::Linear(rect.y1.clone() - rect.y0.clone()),
+                                "w" => Value::Linear(LinearExpr::difference(&rect.x1, &rect.x0)),
+                                "h" => Value::Linear(LinearExpr::difference(&rect.y1, &rect.y0)),
                                 "layer" => {
                                     let Some(layer) = rect.layer.clone() else {
                                         // A construction rect has no layer.
@@ -11292,7 +11955,7 @@ impl<'a> ExecPass<'a> {
                                                 field: "layer".to_string(),
                                             },
                                         });
-                                        return self.poison(cell_id, vid, vref.loc.frame);
+                                        return self.poison(vid);
                                     };
                                     Value::String(layer)
                                 }
@@ -11303,7 +11966,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return self.poison(cell_id, vid, vref.loc.frame);
+                                    return self.poison(vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
@@ -11335,7 +11998,7 @@ impl<'a> ExecPass<'a> {
                                             cell: cell_id,
                                             kind: ExecErrorKind::IndexOutOfBounds,
                                         });
-                                        return self.poison(cell_id, vid, vref.loc.frame);
+                                        return self.poison(vid);
                                     };
                                     Value::Linear(match coordinate.axis {
                                         PolygonAxis::X => point.0.clone(),
@@ -11350,7 +12013,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return self.poison(cell_id, vid, vref.loc.frame);
+                                    return self.poison(vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
@@ -11384,7 +12047,7 @@ impl<'a> ExecPass<'a> {
                                             cell: cell_id,
                                             kind: ExecErrorKind::IndexOutOfBounds,
                                         });
-                                        return self.poison(cell_id, vid, vref.loc.frame);
+                                        return self.poison(vid);
                                     };
                                     Value::Linear(match coordinate.axis {
                                         PolygonAxis::X => point.0.clone(),
@@ -11399,7 +12062,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return self.poison(cell_id, vid, vref.loc.frame);
+                                    return self.poison(vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
@@ -11417,7 +12080,7 @@ impl<'a> ExecPass<'a> {
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidType,
                                     });
-                                    return self.poison(cell_id, vid, vref.loc.frame);
+                                    return self.poison(vid);
                                 }
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
@@ -11430,7 +12093,7 @@ impl<'a> ExecPass<'a> {
                             let Some(val) = value.fields.get(field).cloned() else {
                                 let span = self.span(&vref.loc, field_access_expr.expr.span);
                                 self.invalid_type(cell_id, &span);
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             };
                             self.values.insert(vid, DeferValue::Ready(val));
                             true
@@ -11448,7 +12111,7 @@ impl<'a> ExecPass<'a> {
                                             let span =
                                                 self.span(&vref.loc, field_access_expr.expr.span);
                                             self.invalid_type(cell_id, &span);
-                                            return self.poison(cell_id, vid, vref.loc.frame);
+                                            return self.poison(vid);
                                         };
                                         // When a cell is ready, it must have been fully
                                         // solved/compiled, and therefore it will be in the
@@ -11469,7 +12132,7 @@ impl<'a> ExecPass<'a> {
                                                         cell: cell.name.clone(),
                                                     },
                                                 });
-                                                return self.poison(cell_id, vid, vref.loc.frame);
+                                                return self.poison(vid);
                                             };
                                         let cell_values = &self.cell_values;
                                         let obj_id = &mut self.next_id;
@@ -11644,7 +12307,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         }
                     }
                 } else {
@@ -11669,7 +12332,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                         }
                         _ => {
@@ -11679,7 +12342,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         }
                     }
                 } else {
@@ -11703,7 +12366,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::IndexOutOfBounds,
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                         } else {
                             let span = self.span(&vref.loc, index_expr.expr.index.span());
@@ -11712,7 +12375,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         }
                     } else {
                         let span = self.span(&vref.loc, index_expr.expr.base.span());
@@ -11721,7 +12384,7 @@ impl<'a> ExecPass<'a> {
                             cell: cell_id,
                             kind: ExecErrorKind::InvalidType,
                         });
-                        return self.poison(cell_id, vid, vref.loc.frame);
+                        return self.poison(vid);
                     }
                 } else {
                     self.add_value_dependent(index_expr.state.base, vid);
@@ -11739,9 +12402,9 @@ impl<'a> ExecPass<'a> {
                     let (Some(lhs), Some(rhs)) = (vl.get_linear(), vr.get_linear()) else {
                         let span = c.span.clone();
                         self.invalid_type(cell_id, &span);
-                        return self.poison(cell_id, vid, vref.loc.frame);
+                        return self.poison(vid);
                     };
-                    let expr = lhs.clone() - rhs.clone();
+                    let expr = LinearExpr::difference(lhs, rhs);
                     let state = self.cell_states.get_mut(&cell_id).unwrap();
                     if c.fallback {
                         state.fallback_constraints.push(FallbackConstraint {
@@ -11782,7 +12445,7 @@ impl<'a> ExecPass<'a> {
                                     cell: cell_id,
                                     kind: ExecErrorKind::NonFiniteValue,
                                 });
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                             let res = state
                                 .solver
@@ -11803,7 +12466,7 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidCast,
                             });
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         }
                     };
                     if let Some(value) = value {
@@ -11861,7 +12524,7 @@ impl<'a> ExecPass<'a> {
                                 let base = lit.expr.base.as_ref().expect("base was evaluated");
                                 let span = self.span(&vref.loc, base.span());
                                 self.invalid_type(cell_id, &span);
-                                return self.poison(cell_id, vid, vref.loc.frame);
+                                return self.poison(vid);
                             }
                         },
                     };
@@ -11871,7 +12534,7 @@ impl<'a> ExecPass<'a> {
                     let Some(def) = self.defs.get(&lit.ty.def).and_then(AdtDef::as_struct) else {
                         let span = self.span(&vref.loc, lit.expr.span);
                         self.invalid_type(cell_id, &span);
-                        return self.poison(cell_id, vid, vref.loc.frame);
+                        return self.poison(vid);
                     };
                     let fields = def
                         .fields
@@ -11894,7 +12557,7 @@ impl<'a> ExecPass<'a> {
                     let Some(fields) = fields else {
                         let span = self.span(&vref.loc, lit.expr.span);
                         self.invalid_type(cell_id, &span);
-                        return self.poison(cell_id, vid, vref.loc.frame);
+                        return self.poison(vid);
                     };
                     self.values.insert(
                         vid,
@@ -11932,6 +12595,81 @@ impl<'a> ExecPass<'a> {
                     true
                 }
             }
+            PartialEvalState::ForLoop(f) if f.items.is_some() => {
+                let items = f.items.as_ref().unwrap();
+                // Items are waited on one at a time, in order, so that a long
+                // comprehension is not rescanned as each item finishes.
+                while let Some(item) = items.get(f.ready) {
+                    match &self.values[item] {
+                        Defer::Ready(Value::Poison) => return self.poison(vid),
+                        Defer::Ready(_) => f.ready += 1,
+                        Defer::Deferred(_) => break,
+                    }
+                }
+                if f.ready == items.len() {
+                    let mut seq = Seq::new();
+                    for item in items {
+                        let value = self.values[item].as_ref().unwrap_ready().clone();
+                        if f.for_loop.filter.is_some() {
+                            if let Value::Seq(kept) = value {
+                                seq.append((*kept).clone());
+                            }
+                        } else {
+                            seq.push_back(value);
+                        }
+                    }
+                    let value = if seq.is_empty() {
+                        Value::SeqNil
+                    } else {
+                        Value::Seq(Arc::new(seq))
+                    };
+                    self.values.insert(vid, Defer::Ready(value));
+                    true
+                } else {
+                    self.add_value_dependent(items[f.ready], vid);
+                    false
+                }
+            }
+            PartialEvalState::ForItem(item) => match item.state {
+                ForItemState::Filter(cond) => {
+                    if let Defer::Ready(val) = &self.values[&cond] {
+                        let Value::Bool(keep) = *val else {
+                            let span =
+                                self.span(&vref.loc, item.for_loop.filter.as_ref().unwrap().span());
+                            self.invalid_type(cell_id, &span);
+                            return self.poison(vid);
+                        };
+                        if keep {
+                            let body = self.visit_scope_expr_inner(
+                                cell_id,
+                                vref.loc.frame,
+                                item.scope,
+                                &item.for_loop.body,
+                            );
+                            item.state = ForItemState::Body(body);
+                            self.cell_state_mut(cell_id).deferred.insert(vid);
+                        } else {
+                            self.values.insert(vid, Defer::Ready(Value::SeqNil));
+                        }
+                        true
+                    } else {
+                        self.add_value_dependent(cond, vid);
+                        false
+                    }
+                }
+                ForItemState::Body(body) => {
+                    if let Defer::Ready(val) = &self.values[&body] {
+                        let mut kept = Seq::new();
+                        kept.push_back(val.clone());
+                        self.values
+                            .insert(vid, Defer::Ready(Value::Seq(Arc::new(kept))));
+                        true
+                    } else {
+                        self.add_value_dependent(body, vid);
+                        false
+                    }
+                }
+            },
             PartialEvalState::ForLoop(f) => {
                 if let Defer::Ready(val) = &self.values[&f.seq] {
                     let seq = match val.as_ref() {
@@ -11945,14 +12683,16 @@ impl<'a> ExecPass<'a> {
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidType,
                             });
-                            return self.poison(cell_id, vid, vref.loc.frame);
+                            return self.poison(vid);
                         }
                     };
+                    let mut items = Vec::with_capacity(seq.len());
                     for (i, elem) in seq.iter().enumerate() {
                         let mut frame = Frame {
                             bindings: Default::default(),
                             parent: Some(vref.loc.frame),
                             users: 1,
+                            call: None,
                         };
 
                         let elem_vid = self.value_id();
@@ -11976,10 +12716,39 @@ impl<'a> ExecPass<'a> {
                         );
                         let fid = self.frame_id();
                         self.insert_frame(fid, frame);
-                        self.visit_scope_expr_inner(vref.loc.cell, fid, scope, &f.for_loop.body);
+                        let item = match &f.for_loop.filter {
+                            Some(filter) => {
+                                let item_loc = DynLoc {
+                                    cell: vref.loc.cell,
+                                    frame: fid,
+                                    scope,
+                                    seq_num: SeqNum::new(),
+                                };
+                                let cond = self.visit_expr(item_loc, filter);
+                                self.new_deferred_value(item_loc, |_| {
+                                    PartialEvalState::ForItem(PartialForItem {
+                                        for_loop,
+                                        scope,
+                                        state: ForItemState::Filter(cond),
+                                    })
+                                })
+                            }
+                            None => self.visit_scope_expr_inner(
+                                vref.loc.cell,
+                                fid,
+                                scope,
+                                &f.for_loop.body,
+                            ),
+                        };
+                        items.push(item);
                         self.release_frame(fid);
                     }
-                    self.values.insert(vid, Defer::Ready(Value::Nil));
+                    if f.collect {
+                        f.items = Some(items);
+                        self.cell_state_mut(cell_id).deferred.insert(vid);
+                    } else {
+                        self.values.insert(vid, Defer::Ready(Value::Nil));
+                    }
                     true
                 } else {
                     self.add_value_dependent(f.seq, vid);
@@ -11988,13 +12757,6 @@ impl<'a> ExecPass<'a> {
             }
         };
 
-        if !self.values.contains_key(&vid) {
-            self.values.insert(vid, Defer::Deferred(vref));
-        }
-        if self.values[&vid].is_ready() {
-            self.schedule_dependents(cell_id, vid);
-            self.release_frame(value_frame);
-        }
         Ok(progress)
     }
 
@@ -12202,6 +12964,7 @@ impl Value {
             Value::Seq(s) => Some(Arrayed::Array(
                 s.iter().map(|v| v.obj_ids()).collect::<Option<Vec<_>>>()?,
             )),
+            Value::SeqNil => Some(Arrayed::Array(Vec::new())),
             _ => None,
         }
     }
@@ -12253,6 +13016,59 @@ fn pattern_matches(pattern: &Pattern<Substr, VarIdTyMetadata>, value: &Value) ->
 
 /// Structural equality of two values, or `None` for a pair the evaluator
 /// cannot compare.
+/// The elements of a sequence value, or `None` for any other value.
+fn seq_elements(value: &Value) -> Option<std::borrow::Cow<'_, Seq>> {
+    match value {
+        Value::SeqNil => Some(std::borrow::Cow::Owned(Seq::new())),
+        Value::Seq(s) => Some(std::borrow::Cow::Borrowed(s)),
+        _ => None,
+    }
+}
+
+/// Evaluates a native sequence builtin on ready arguments, or returns `None`
+/// when an argument has the wrong runtime type.
+fn seq_builtin(name: &str, args: &[&Value]) -> Option<Value> {
+    let seq = |s: Seq| {
+        if s.is_empty() {
+            Value::SeqNil
+        } else {
+            Value::Seq(Arc::new(s))
+        }
+    };
+    Some(match name {
+        "seq_len" => Value::Int(seq_elements(args[0])?.len() as i64),
+        "seq_concat" => {
+            let mut out = seq_elements(args[0])?.into_owned();
+            out.append(seq_elements(args[1])?.into_owned());
+            seq(out)
+        }
+        "seq_flatten" => {
+            let mut out = Seq::new();
+            for part in seq_elements(args[0])?.iter() {
+                out.append(seq_elements(part)?.into_owned());
+            }
+            seq(out)
+        }
+        "seq_sum" => {
+            let mut total: i64 = 0;
+            for v in seq_elements(args[0])?.iter() {
+                total = total.wrapping_add(*v.get_int()?);
+            }
+            Value::Int(total)
+        }
+        "seq_any" | "seq_all" => {
+            let all = name == "seq_all";
+            let mut result = all;
+            for v in seq_elements(args[0])?.iter() {
+                let b = *v.get_bool()?;
+                if all { result &= b } else { result |= b }
+            }
+            Value::Bool(result)
+        }
+        _ => return None,
+    })
+}
+
 fn values_equal(left: &Value, right: &Value) -> Option<bool> {
     match (left, right) {
         (Value::Int(l), Value::Int(r)) => Some(l == r),
@@ -12436,12 +13252,12 @@ pub struct CompiledCell {
     /// Carried as structured data so consumers -- the GDS exporter above all
     /// -- do not have to recover it by scraping a human-readable scope name.
     pub name: String,
-    pub scopes: FnvIndexMap<ScopeId, CompiledScope>,
+    pub scopes: FxIndexMap<ScopeId, CompiledScope>,
     scope_metadata: Vec<ScopeMetadata>,
     pub root: ScopeId,
     pub fields: IndexMap<String, Arrayed<ObjectId>>,
     pub sse_basis: SseBasis,
-    pub objects: FnvIndexMap<ObjectId, SolvedValue>,
+    pub objects: FxIndexMap<ObjectId, SolvedValue>,
     pub fallback_constraints_used: Vec<UsedFallback>,
     pub unsolved_vars: IndexSet<Var>,
     pub inconsistent_constraints: IndexSet<ConstraintId>,
@@ -12608,7 +13424,7 @@ impl CompiledCell {
         for fallback in &self.fallback_constraints_used {
             paths.insert(&fallback.span.path);
         }
-        paths.into_iter().cloned().collect()
+        paths.into_iter().map(|path| path.to_path_buf()).collect()
     }
 
     pub fn scope_name(&self, scope: ScopeId) -> &str {
@@ -12985,29 +13801,84 @@ type DeferValue<'a> = Defer<Value, Box<PartialEval<'a>>>;
 struct PartialEval<'a> {
     state: PartialEvalState<'a>,
     loc: DynLoc,
+    /// Values to schedule once this one is ready.
+    waiters: Waiters,
 }
 
 #[derive(Debug, Clone)]
 enum PartialEvalState<'a> {
-    If(Box<PartialIfExpr<'a>>),
-    Match(Box<PartialMatchExpr<'a>>),
+    If(PartialIfExpr<'a>),
+    Match(PartialMatchExpr<'a>),
     Arith(PartialArith<'a>),
-    Comparison(Box<PartialComparison<'a>>),
-    BoolOp(Box<PartialBoolOp<'a>>),
+    Comparison(PartialComparison<'a>),
+    BoolOp(PartialBoolOp<'a>),
     UnaryOp(PartialUnaryOp<'a>),
-    Call(Box<PartialCallExpr<'a>>),
-    FieldAccess(Box<PartialFieldAccessExpr<'a>>),
-    IndexFieldAccess(Box<PartialIndexFieldAccessExpr<'a>>),
-    Index(Box<PartialIndexExpr<'a>>),
+    Call(PartialCallExpr<'a>),
+    FieldAccess(PartialFieldAccessExpr<'a>),
+    IndexFieldAccess(PartialIndexFieldAccessExpr<'a>),
+    Index(PartialIndexExpr<'a>),
     Constraint(PartialConstraint),
-    Cast(Box<PartialCastExpr<'a>>),
+    Cast(PartialCastExpr<'a>),
     Tuple(PartialTupleExpr),
-    StructLit(Box<PartialStructLit<'a>>),
-    ForLoop(Box<PartialForLoop<'a>>),
+    StructLit(PartialStructLit<'a>),
+    ForLoop(PartialForLoop<'a>),
+    ForItem(PartialForItem<'a>),
     Ctor(PartialCtor),
 }
 
 impl PartialEvalState<'_> {
+    /// Calls `f` with every value this state holds, including inputs it has
+    /// not read yet.
+    fn for_each_value(&self, f: &mut impl FnMut(ValueId)) {
+        match self {
+            Self::If(e) => match e.state {
+                IfExprState::Cond(v) | IfExprState::Then(v) | IfExprState::Else(v) => f(v),
+            },
+            Self::Match(e) => match e.state {
+                MatchExprState::Scrutinee(v) | MatchExprState::Value(v) => f(v),
+            },
+            Self::Arith(e) => {
+                f(e.left);
+                f(e.right);
+            }
+            Self::Comparison(e) => {
+                f(e.left);
+                f(e.right);
+            }
+            Self::BoolOp(e) => match e.state {
+                BoolOpState::Left(v) | BoolOpState::Right(v) => f(v),
+            },
+            Self::UnaryOp(e) => f(e.operand),
+            Self::Call(e) => e
+                .state
+                .posargs
+                .iter()
+                .chain(&e.state.kwargs)
+                .for_each(|v| f(*v)),
+            Self::FieldAccess(e) => f(e.state.base),
+            Self::IndexFieldAccess(e) => f(e.state.base),
+            Self::Index(e) => {
+                f(e.state.base);
+                f(e.state.index);
+            }
+            Self::Constraint(c) => {
+                f(c.lhs);
+                f(c.rhs);
+            }
+            Self::Cast(e) => f(e.state.value),
+            Self::Tuple(e) => e.items.iter().for_each(|v| f(*v)),
+            Self::StructLit(e) => e.fields.iter().copied().chain(e.base).for_each(f),
+            Self::ForLoop(l) => {
+                f(l.seq);
+                l.items.iter().flatten().for_each(|v| f(*v));
+            }
+            Self::ForItem(item) => match item.state {
+                ForItemState::Filter(v) | ForItemState::Body(v) => f(v),
+            },
+            Self::Ctor(c) => c.args.iter().for_each(|v| f(*v)),
+        }
+    }
+
     /// Whether `f` holds for any value this state reads to make its next step.
     ///
     /// `If` and `Match` hold only the branch evaluation has reached, so an
@@ -13041,7 +13912,14 @@ impl PartialEvalState<'_> {
             Self::Cast(e) => f(e.state.value),
             Self::Tuple(e) => e.items.iter().any(|input| f(*input)),
             Self::StructLit(e) => e.fields.iter().copied().chain(e.base).any(f),
-            Self::ForLoop(for_loop) => f(for_loop.seq),
+            // Items before `ready` were checked as they became ready.
+            Self::ForLoop(for_loop) => match &for_loop.items {
+                Some(items) => items.get(for_loop.ready).is_some_and(|input| f(*input)),
+                None => f(for_loop.seq),
+            },
+            Self::ForItem(item) => match item.state {
+                ForItemState::Filter(v) | ForItemState::Body(v) => f(v),
+            },
             Self::Ctor(c) => c.args.iter().any(|input| f(*input)),
         }
     }
@@ -13192,6 +14070,28 @@ struct PartialStructLit<'a> {
 struct PartialForLoop<'a> {
     for_loop: &'a ForLoop<Substr, VarIdTyMetadata>,
     seq: ValueId,
+    /// Whether the loop is a list comprehension, whose value is the list.
+    collect: bool,
+    /// A comprehension's iteration values once it has run: each body's value,
+    /// or with a filter, a list of zero or one.
+    items: Option<Vec<ValueId>>,
+    /// How many leading `items` are known to be ready.
+    ready: usize,
+}
+
+/// One iteration of a filtered loop, which runs its body only if the filter
+/// holds.
+#[derive(Debug, Clone)]
+struct PartialForItem<'a> {
+    for_loop: &'a ForLoop<Substr, VarIdTyMetadata>,
+    scope: ScopeId,
+    state: ForItemState,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ForItemState {
+    Filter(ValueId),
+    Body(ValueId),
 }
 
 #[derive(Debug, Clone)]

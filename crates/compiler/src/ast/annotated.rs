@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, path::PathBuf};
+use std::{marker::PhantomData, path::Path, sync::Arc};
 
 use arcstr::{ArcStr, Substr};
 use derive_where::derive_where;
@@ -26,14 +26,15 @@ pub struct AnnotatedAst<T: AstMetadata> {
     /// that has to tell "nothing here" from "nothing readable here" reads this.
     pub parsed: bool,
     pub ast: Ast<Substr, T>,
-    pub path: PathBuf,
+    pub path: Arc<Path>,
     pub span2scope: IndexMap<Span, Scope<Substr, T>>,
     // TODO: merge span2 IndexMaps
     pub span2call: IndexMap<Span, CallExpr<Substr, T>>,
 }
 
 impl<T: AstMetadata> AnnotatedAst<T> {
-    pub fn new<S>(text: ArcStr, ast: &Ast<S, T>, path: PathBuf) -> Self {
+    pub fn new<S>(text: ArcStr, ast: &Ast<S, T>, path: impl Into<Arc<Path>>) -> Self {
+        let path: Arc<Path> = path.into();
         let mut pass = AstAnnotationPass {
             text,
             path: path.clone(),
@@ -101,7 +102,7 @@ impl<T: AstMetadata> AnnotatedAst<T> {
 
 struct AstAnnotationPass<S, T: AstMetadata> {
     text: ArcStr,
-    path: PathBuf,
+    path: Arc<Path>,
     span2scope: IndexMap<Span, Scope<Substr, T>>,
     span2call: IndexMap<Span, CallExpr<Substr, T>>,
     phantom: PhantomData<S>,
@@ -221,6 +222,14 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         _seq: &super::Expr<Self::OutputS, Self::OutputMetadata>,
         _body: &super::Scope<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::ForLoop {
+        input.metadata.clone()
+    }
+
+    fn dispatch_list_comp_expr(
+        &mut self,
+        input: &super::ListCompExpr<Self::InputS, Self::InputMetadata>,
+        _for_loop: &super::ForLoop<Self::OutputS, Self::OutputMetadata>,
+    ) -> <Self::OutputMetadata as AstMetadata>::ListCompExpr {
         input.metadata.clone()
     }
 
@@ -398,6 +407,7 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         let metadata = self.dispatch_call_expr(input, &func, &args);
         let o = CallExpr {
             scope_order: input.scope_order,
+            tail: input.tail,
             func,
             args,
             span: input.span,

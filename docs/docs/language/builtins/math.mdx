@@ -1,0 +1,65 @@
+---
+title: Math built-ins
+description: Minimum and maximum of two numbers.
+sidebar_label: Math
+---
+
+import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReference';
+
+# Math built-ins
+
+These pick one of two numbers without opening a scope, so they suit inner loops. [`std::max`](/language/std#max) and [`std::min`](/language/std#min) wrap the `Float` versions.
+
+## `max_float`
+
+<ApiItem id="max-float" name="max_float" signature={'max_float(a: Float, b: Float) -> Float'} summary={<>Returns the larger of two floats.</>}>
+
+<ParameterTable rows={[
+  {name: 'a', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required, positional', description: 'Returned when the two are equal.'},
+  {name: 'b', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required, positional', description: 'Returned when it is larger.'},
+]} />
+
+<Returns type="Float" href="/language/types/scalars#float">b if a is less than b, otherwise a.</Returns>
+
+Like a comparison, it compares values snapped to the manufacturing grid, and waits until the solver has fixed both.
+
+</ApiItem>
+
+## `min_float`
+
+<ApiItem id="min-float" name="min_float" signature={'min_float(a: Float, b: Float) -> Float'} summary={<>Returns the smaller of two floats.</>}>
+
+<ParameterTable rows={[
+  {name: 'a', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required, positional', description: 'Returned when it is smaller.'},
+  {name: 'b', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required, positional', description: 'Returned when the two are equal.'},
+]} />
+
+<Returns type="Float" href="/language/types/scalars#float">a if a is less than b, otherwise b.</Returns>
+
+</ApiItem>
+
+## `max_int`
+
+<ApiItem id="max-int" name="max_int" signature={'max_int(a: Int, b: Int) -> Int'} summary={<>Returns the larger of two integers.</>}>
+
+<ParameterTable rows={[
+  {name: 'a', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required, positional', description: 'First value.'},
+  {name: 'b', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required, positional', description: 'Second value.'},
+]} />
+
+<Returns type="Int" href="/language/types/scalars#int">The larger value.</Returns>
+
+</ApiItem>
+
+## `min_int`
+
+<ApiItem id="min-int" name="min_int" signature={'min_int(a: Int, b: Int) -> Int'} summary={<>Returns the smaller of two integers.</>}>
+
+<ParameterTable rows={[
+  {name: 'a', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required, positional', description: 'First value.'},
+  {name: 'b', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required, positional', description: 'Second value.'},
+]} />
+
+<Returns type="Int" href="/language/types/scalars#int">The smaller value.</Returns>
+
+</ApiItem>

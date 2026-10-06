@@ -87,3 +87,7 @@ Fails at run time if the sequence is empty.
 For the common case of counting from zero, use [`std::range(stop)`](/language/std#range).
 
 </ApiItem>
+
+## Sequence helpers
+
+`seq_len`, `seq_concat`, `seq_flatten`, `seq_sum`, `seq_any`, and `seq_all` back [`std::len`](/language/std#len), [`std::concat`](/language/std#concat), [`std::flatten`](/language/std#flatten), [`std::sum`](/language/std#sum), [`std::any`](/language/std#any), and [`std::all`](/language/std#all), which take the same arguments. Each runs in one step, however long its input.

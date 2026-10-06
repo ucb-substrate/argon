@@ -56,7 +56,7 @@ fn li1_jumper(src: Rect, dst: Rect) {
 
 // Fails unless v >= lo.
 fn at_least(v: Int, lo: Int) {
-    eq(lib::columns::util::imax(v, lo) as Float, v as Float);
+    eq(max_int(v, lo) as Float, v as Float);
 }
 
 // The replica-timed control logic, with pins on its left and right edges.
@@ -199,10 +199,7 @@ cell control_logic_replica_v2(p: ControlLogicParams) {
     // from their own positions and step past columns that other nets cross
     // there. Met2 columns 0, 1, and 13 through 15 stay empty; the SRAM runs
     // supply feeders across the block there.
-    let right = lib::columns::util::fmax(
-        lib::columns::util::fmax(inv_rbl_x + 1440. + t, wl_ctl_x + lib::logic::control::blocks::sr_latch_w() + t),
-        lib::columns::util::fmax(wrdrven_ctl_x + lib::logic::control::blocks::sr_latch_w() + t, pc_b_buf_x + 10560. + t),
-    );
+    let right = max_float(max_float(inv_rbl_x + 1440. + t, wl_ctl_x + lib::logic::control::blocks::sr_latch_w() + t), max_float(wrdrven_ctl_x + lib::logic::control::blocks::sr_latch_w() + t, pc_b_buf_x + 10560. + t));
     let rh = lib::logic::control::blocks::row_h();
     let vdd_rails = list(rail_rect(0., right), rail_rect(y2 + rh, right), rail_rect(y4 + rh, right));
     let vss_rails = list(rail_rect(y0, right), rail_rect(y2, right), rail_rect(y4, right));
@@ -288,7 +285,7 @@ cell control_logic_replica_v2(p: ControlLogicParams) {
     li1_access(inv_rbl.out, 162, -2);
     m2_v(162, -2, 6);
     let rbl_b_j = free_col(pin_col_right(mux_wlen_rst.a0), 1, list(83, 101, 146, 162));
-    m1_h(6, lib::columns::util::imin(71, rbl_b_j), lib::columns::util::imax(162, rbl_b_j));
+    m1_h(6, min_int(71, rbl_b_j), max_int(162, rbl_b_j));
     m2_v(71, 6, -18);
     li1_access(nand_wlendb_web.a, 71, -18);
     m2_v(rbl_b_j, 6, -11);

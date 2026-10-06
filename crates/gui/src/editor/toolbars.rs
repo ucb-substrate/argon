@@ -1271,6 +1271,8 @@ impl HierarchySideBar {
         }
     }
 
+    /// Appends the rows of `scope` and, where expanded, everything beneath it:
+    /// each scope, then the cells it instantiates, then its child scopes.
     fn collect_scope_rows(
         solved_cell: &CompileOutputState,
         expanded_scopes: &IndexSet<ScopePath>,
@@ -1280,50 +1282,41 @@ impl HierarchySideBar {
         count: usize,
         depth: usize,
     ) {
-        let scope_state = &solved_cell.state[&scope];
-        let expanded = expanded_scopes.contains(&scope);
-        if scope_state.name.to_lowercase().contains(filter) {
-            rows.push(HierarchyRow {
-                scope,
-                count,
-                depth,
-            });
-        }
-        let scope_info = &solved_cell.output.cells[&scope.cell].scopes[&scope.scope];
-        let mut cells = IndexMap::new();
-        for (obj, _) in scope_info.emit.iter() {
-            let elt = &solved_cell.output.cells[&scope.cell].objects[obj];
-            if let SolvedValue::Instance(inst) = elt {
-                *cells.entry(inst.cell).or_insert(0) += 1;
-            }
-        }
-
-        if expanded {
-            for (cell, count) in cells {
-                let scope = solved_cell.output.cells[&cell].root;
-                Self::collect_scope_rows(
-                    solved_cell,
-                    expanded_scopes,
-                    filter,
-                    rows,
-                    ScopeAddress { scope, cell },
+        let mut stack = vec![(scope, count, depth)];
+        while let Some((scope, count, depth)) = stack.pop() {
+            let scope_state = &solved_cell.state[&scope];
+            if scope_state.name.to_lowercase().contains(filter) {
+                rows.push(HierarchyRow {
+                    scope,
                     count,
-                    depth + 1,
-                );
+                    depth,
+                });
             }
-            for child_scope in scope_info.children.clone() {
-                Self::collect_scope_rows(
-                    solved_cell,
-                    expanded_scopes,
-                    filter,
-                    rows,
-                    ScopeAddress {
-                        scope: child_scope,
-                        cell: scope.cell,
-                    },
-                    1,
-                    depth + 1,
-                );
+            if !expanded_scopes.contains(&scope) {
+                continue;
+            }
+            let scope_info = &solved_cell.output.cells[&scope.cell].scopes[&scope.scope];
+            let mut cells = IndexMap::new();
+            for (obj, _) in scope_info.emit.iter() {
+                let elt = &solved_cell.output.cells[&scope.cell].objects[obj];
+                if let SolvedValue::Instance(inst) = elt {
+                    *cells.entry(inst.cell).or_insert(0) += 1;
+                }
+            }
+            // Pushed last-first, so they come off the stack in order.
+            for child_scope in scope_info.children.iter().rev() {
+                let child = ScopeAddress {
+                    scope: *child_scope,
+                    cell: scope.cell,
+                };
+                stack.push((child, 1, depth + 1));
+            }
+            for (cell, count) in cells.into_iter().rev() {
+                let child = ScopeAddress {
+                    scope: solved_cell.output.cells[&cell].root,
+                    cell,
+                };
+                stack.push((child, count, depth + 1));
             }
         }
     }

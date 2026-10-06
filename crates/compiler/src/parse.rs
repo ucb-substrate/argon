@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail};
 use arcstr::{ArcStr, Substr};
@@ -46,6 +47,7 @@ impl AstMetadata for ParseMetadata {
     type ConstantDecl = ();
     type LetBinding = ();
     type ForLoop = ();
+    type ListCompExpr = ();
     type IfExpr = ();
     type MatchExpr = ();
     type BinOpExpr = ();
@@ -162,7 +164,7 @@ impl ParseOutput {
                     .iter()
                     .map(|err| StaticError {
                         span: Span {
-                            path: path.clone(),
+                            path: Arc::from(path.as_path()),
                             span: err.span,
                         },
                         kind: err.kind.clone(),
@@ -171,7 +173,7 @@ impl ParseOutput {
                         if self.asts.get(mod_path)?.1.is_some() {
                             Some(StaticError {
                                 span: Span {
-                                    path: path.clone(),
+                                    path: Arc::from(path.as_path()),
                                     span: *span,
                                 },
                                 kind: StaticErrorKind::InvalidMod {
@@ -186,7 +188,7 @@ impl ParseOutput {
             .chain(self.asts.values().filter_map(|(ast, error)| {
                 let has_parse_diagnostics = self
                     .errs
-                    .get(&ast.path)
+                    .get(&*ast.path)
                     .is_some_and(|(diagnostics, _)| !diagnostics.is_empty());
                 (!has_parse_diagnostics)
                     .then_some(error.as_ref())
@@ -379,7 +381,7 @@ fn add_gds_imports(output: &mut ParseOutput, imports: impl IntoIterator<Item = (
     }
     for (module, (imports, import_path, import_count)) in modules {
         if let Some((existing, _)) = output.asts.get(&module) {
-            let source_path = existing.path.clone();
+            let source_path = existing.path.to_path_buf();
             let source = ArcStr::from(format!("{}\n{imports}", existing.text));
             let (mut result, diagnostics) = parse_source(source, source_path.clone());
             if result.1.is_none() {
@@ -424,7 +426,7 @@ pub struct CellInvocation {
     /// Offset within the root module's backing text of the generated cell.
     generated_offset: usize,
     /// Root module path, which the two offsets above index.
-    path: PathBuf,
+    path: Arc<Path>,
 }
 
 impl CellInvocation {
@@ -455,7 +457,7 @@ impl CellInvocation {
         let start = onto_source(span.span.start());
         let end = onto_source(span.span.end()).max(start);
         Some(Span {
-            path: PathBuf::from(CELL_PATH),
+            path: Path::new(CELL_PATH).into(),
             span: cfgrammar::Span::new(start, end),
         })
     }
@@ -546,7 +548,7 @@ impl EntryCell {
         let generated_offset = existing.text.len() + 1;
         Ok(Self {
             text: ArcStr::from(format!("{}\n{generated}", existing.text)),
-            path: existing.path.clone(),
+            path: existing.path.to_path_buf(),
             source_text: existing.source_text.clone(),
             generated_declarations: existing.generated_declarations,
             invocation: CellInvocation {

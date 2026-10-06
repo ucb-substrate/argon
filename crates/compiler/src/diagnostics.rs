@@ -2,6 +2,7 @@ use std::{
     fs,
     io::{self, IsTerminal, Write},
     path::PathBuf,
+    sync::Arc,
 };
 
 use serde::{Deserialize, Serialize};
@@ -60,7 +61,7 @@ impl Diagnostic {
         Self {
             level,
             message: message.into(),
-            path: Some(span.path.clone()),
+            path: Some(span.path.to_path_buf()),
             start: Some(span.span.start()),
             end: Some(span.span.end()),
             source: None,
@@ -79,11 +80,11 @@ pub fn remap_invocation(diagnostics: &mut Vec<Diagnostic>, invocation: &CellInvo
             continue;
         };
         let span = Span {
-            path: path.clone(),
+            path: Arc::from(path.as_path()),
             span: cfgrammar::Span::new(start, end),
         };
         if let Some(remapped) = invocation.remap(&span) {
-            diagnostic.path = Some(remapped.path);
+            diagnostic.path = Some(remapped.path.to_path_buf());
             diagnostic.start = Some(remapped.span.start());
             diagnostic.end = Some(remapped.span.end());
             diagnostic.source = Some(invocation.source.clone());
@@ -165,7 +166,7 @@ pub fn condense_spanned(errors: &mut Vec<(Span, String)>) -> usize {
             .iter()
             .map(|(span, message)| {
                 seen.insert((
-                    span.path.as_path(),
+                    &*span.path,
                     span.span.start(),
                     span.span.end(),
                     message.as_str(),
@@ -352,8 +353,6 @@ fn source_location(source: &str, start: usize, end: usize) -> (usize, usize, Opt
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use crate::{
         ast::Span,
         parse::{STD_PATH, STD_SOURCE},
@@ -369,7 +368,7 @@ mod tests {
             Level::Error,
             message,
             &Span {
-                path: PathBuf::from("/virtual/lib.ar"),
+                path: std::path::Path::new("/virtual/lib.ar").into(),
                 span: cfgrammar::Span::new(start, start + 1),
             },
         )
@@ -430,7 +429,7 @@ mod tests {
                 Level::Error,
                 "long line",
                 &Span {
-                    path: PathBuf::from("/virtual/lib.ar"),
+                    path: std::path::Path::new("/virtual/lib.ar").into(),
                     span: cfgrammar::Span::new(caret, caret + 1),
                 },
             )
@@ -471,7 +470,7 @@ mod tests {
                 Level::Error,
                 "wide span",
                 &Span {
-                    path: PathBuf::from("/virtual/lib.ar"),
+                    path: std::path::Path::new("/virtual/lib.ar").into(),
                     span: cfgrammar::Span::new(0, 5_000),
                 },
             )
@@ -512,7 +511,7 @@ mod tests {
             Level::Error,
             "test standard-library diagnostic",
             &Span {
-                path: PathBuf::from(STD_PATH),
+                path: std::path::Path::new(STD_PATH).into(),
                 span: cfgrammar::Span::new(start, start + needle.len()),
             },
         );

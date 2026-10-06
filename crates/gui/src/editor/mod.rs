@@ -1239,7 +1239,7 @@ mod tests {
     #[test]
     fn compilation_error_message_does_not_embed_individual_diagnostics() {
         let span = Span {
-            path: PathBuf::from("lib.ar"),
+            path: PathBuf::from("lib.ar").into(),
             span: cfgrammar::Span::new(0, 1),
         };
         let output = CompileOutput::StaticErrors(StaticErrorCompileOutput {
@@ -1341,5 +1341,72 @@ mod tests {
                 layer.name
             );
         }
+    }
+
+    #[test]
+    fn prepares_deeply_nested_scopes_from_a_small_stack() {
+        // GPUI's background executor, which runs the GUI's RPC handlers, gives
+        // its threads 512 KiB of stack. Each level of this recursion nests a
+        // call scope and a branch scope.
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("lib.ar");
+        std::fs::write(
+            &source,
+            r#"
+fn nest(n: Int) -> Rect {
+    if n == 0 {
+        rect("met1", x0=0., y0=0., x1=1., y1=1.)
+    } else {
+        let r = nest(n - 1);
+        r
+    }
+}
+cell top() { let r = nest(3000); }
+"#,
+        )
+        .unwrap();
+        let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+        ));
+        let ast = argonc::parse::parse_workspace_with_config(&config).ast();
+        let output = argonc::compile::compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+            },
+            &config,
+        )
+        .unwrap_valid();
+        let top = &output.cells[&output.top];
+        let mut deepest = 0;
+        let mut stack = vec![(top.root, 1)];
+        while let Some((scope, depth)) = stack.pop() {
+            deepest = deepest.max(depth);
+            stack.extend(
+                top.scopes[&scope]
+                    .children
+                    .iter()
+                    .map(|child| (*child, depth + 1)),
+            );
+        }
+        assert!(deepest > 5000, "scopes nest only {deepest} deep");
+        let snapshot = super::CompilationSnapshot {
+            revision: 0,
+            output: CompileOutput::Valid(output),
+        };
+        let context = super::CompilationPreparationContext {
+            layers: Default::default(),
+            selected_scope: None,
+            scope_state: None,
+            previous: None,
+        };
+        let prepared = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || super::prepare_compilation_snapshot(snapshot, context))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(prepared.prepared_output.is_some());
     }
 }

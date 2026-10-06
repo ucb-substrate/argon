@@ -969,7 +969,7 @@ impl State {
         let highlights = index
             .references_at(&path, offset, true)
             .into_iter()
-            .filter(|span| span.path == path)
+            .filter(|span| *span.path == *path)
             .filter_map(|span| {
                 Some(DocumentHighlight {
                     range: view.location(span.span)?.range,

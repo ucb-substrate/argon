@@ -35,12 +35,15 @@ fn join(a: Power, b: Power) -> Power {
     }
 }
 
-fn join_rects(l: [[Rect]]) -> [Rect] {
-    if l == [] { [] } else { lib::logic::routing::concat(head(l), join_rects(tail(l))) }
-}
+fn join_rects(l: [[Rect]]) -> [Rect] { std::flatten(l) }
 
 fn join_all(l: [Power]) -> Power {
-    if l == [] { none() } else { join(head(l), join_all(tail(l))) }
+    Power {
+        m1: std::flatten([for p in l { p.m1 }]),
+        m2: std::flatten([for p in l { p.m2 }]),
+        m1_targets: std::flatten([for p in l { p.m1_targets }]),
+        m2_targets: std::flatten([for p in l { p.m2_targets }]),
+    }
 }
 
 fn cbox(x0: Float, y0: Float, x1: Float, y1: Float) -> Rect { lib::columns::util::cbox(x0, y0, x1, y1) }
@@ -100,72 +103,88 @@ fn feed_m1_to_edge(g: Grid, source: Rect, supply: Int, top: Bool) -> Power {
 }
 
 fn feed_all_m2(g: Grid, rails: [Rect], supply: Int, right: Bool) -> Power {
-    if rails == [] { none() } else { join(feed_m2_to_side(g, head(rails), supply, right), feed_all_m2(g, tail(rails), supply, right)) }
+    join_all([for r in rails { feed_m2_to_side(g, r, supply, right) }])
 }
 
 // Rails run to the left bank, longest feeder first. A rail that an earlier
 // feeder of its supply already crosses needs no feeder of its own.
-fn feed_left(g: Grid, sources: [Rect], supply: Int) -> Power { feed_left_sorted(g, sort_by_right(sources), supply, []) }
-
-fn insert_by_right(r: Rect, sorted: [Rect]) -> [Rect] {
-    if sorted == [] { list(r) } else if r.x1 >= head(sorted).x1 { cons(r, sorted) } else { cons(head(sorted), insert_by_right(r, tail(sorted))) }
+fn feed_left(g: Grid, sources: [Rect], supply: Int) -> Power {
+    join_all([for s in reverse_onto(left_feeds(sort_by_right(sources), []), []) { feed_m2_to_side(g, s, supply, false) }])
 }
 
-fn sort_by_right(l: [Rect]) -> [Rect] {
-    if l == [] { [] } else { insert_by_right(head(l), sort_by_right(tail(l))) }
-}
+fn overlaps_any_v(r: Rect, l: [Rect]) -> Bool { std::any([for o in l { lib::logic::routing::overlaps_v(r, o) }]) }
 
-fn overlaps_any_v(r: Rect, l: [Rect]) -> Bool {
-    if l == [] { false } else if lib::logic::routing::overlaps_v(r, head(l)) { true } else { overlaps_any_v(r, tail(l)) }
-}
-
-fn feed_left_sorted(g: Grid, sources: [Rect], supply: Int, drawn: [Rect]) -> Power {
+fn left_feeds(sources: [Rect], drawn: [Rect]) -> [Rect] {
     if sources == [] {
-        none()
+        drawn
+    } else if overlaps_any_v(head(sources), drawn) {
+        left_feeds(tail(sources), drawn)
     } else {
-        let s = head(sources);
-        if overlaps_any_v(s, drawn) {
-            feed_left_sorted(g, tail(sources), supply, drawn)
-        } else {
-            join(feed_m2_to_side(g, s, supply, false), feed_left_sorted(g, tail(sources), supply, cons(s, drawn)))
-        }
+        left_feeds(tail(sources), cons(head(sources), drawn))
     }
 }
 
 fn feed_all_m1(g: Grid, rails: [Rect], supply: Int, top: Bool) -> Power {
-    if rails == [] { none() } else { join(feed_m1_to_edge(g, head(rails), supply, top), feed_all_m1(g, tail(rails), supply, top)) }
+    join_all([for r in rails { feed_m1_to_edge(g, r, supply, top) }])
 }
 
 // Rails sorted bottom up, with rails less than 400 nm apart merged so that
 // their bank vias do not crowd.
-fn insert_rail(r: Rect, sorted: [Rect]) -> [Rect] {
-    if sorted == [] { list(r) } else if r.y0 <= head(sorted).y0 { cons(r, sorted) } else { cons(head(sorted), insert_rail(r, tail(sorted))) }
-}
+fn sort_rails(l: [Rect]) -> [Rect] { sorted_rails(l, false) }
 
-fn sort_rails(l: [Rect]) -> [Rect] {
-    if l == [] { [] } else { insert_rail(head(l), sort_rails(tail(l))) }
-}
+fn sort_by_right(l: [Rect]) -> [Rect] { sorted_rails(l, true) }
 
-fn merge_sorted(l: [Rect]) -> [Rect] {
-    if l == [] {
-        []
-    } else if tail(l) == [] {
+// Rails sorted bottom up, or rightmost right edge first. Equal rails keep
+// their order.
+fn sorted_rails(l: [Rect], by_right: Bool) -> [Rect] {
+    let n = std::len(l);
+    if n <= 1 {
         l
     } else {
-        let a = head(l);
-        let b = head(tail(l));
-        if b.y0 - a.y1 < 400. {
-            merge_sorted(cons(lib::columns::util::rect_union(a, b), tail(tail(l))))
-        } else {
-            cons(a, merge_sorted(tail(l)))
-        }
+        let half = n / 2;
+        let first = sorted_rails([for i in range_full(0, half, 1) { l[i] }], by_right);
+        let second = sorted_rails([for i in range_full(half, n, 1) { l[i] }], by_right);
+        merge_rails(first, second, [], by_right)
+    }
+}
+
+fn rail_before(a: Rect, b: Rect, by_right: Bool) -> Bool { if by_right { a.x1 >= b.x1 } else { a.y0 <= b.y0 } }
+
+// The sorted lists `a` and `b` merged after `out`, which is newest first.
+fn merge_rails(a: [Rect], b: [Rect], out: [Rect], by_right: Bool) -> [Rect] {
+    if a == [] {
+        reverse_onto(out, b)
+    } else if b == [] {
+        reverse_onto(out, a)
+    } else if rail_before(head(a), head(b), by_right) {
+        merge_rails(tail(a), b, cons(head(a), out), by_right)
+    } else {
+        merge_rails(a, tail(b), cons(head(b), out), by_right)
+    }
+}
+
+fn reverse_onto<T>(l: [T], acc: [T]) -> [T] {
+    if l == [] { acc } else { reverse_onto(tail(l), cons(head(l), acc)) }
+}
+
+fn merge_sorted(l: [Rect]) -> [Rect] { reverse_onto(merge_close(l, []), []) }
+
+// Rails of `l` added to `done`, newest first, each merged into the one before
+// it when they are closer than 400 nm.
+fn merge_close(l: [Rect], done: [Rect]) -> [Rect] {
+    if l == [] {
+        done
+    } else if done == [] {
+        merge_close(tail(l), list(head(l)))
+    } else if head(l).y0 - head(done).y1 < 400. {
+        merge_close(tail(l), cons(lib::columns::util::rect_union(head(done), head(l)), tail(done)))
+    } else {
+        merge_close(tail(l), cons(head(l), done))
     }
 }
 
 // Rails leaving a block's right edge at x, as zero-width stubs there.
-fn edge_stubs(rails: [Rect], x: Float) -> [Rect] {
-    if rails == [] { [] } else { cons(from_spans((x, x,), vspan(head(rails))), edge_stubs(tail(rails), x)) }
-}
+fn edge_stubs(rails: [Rect], x: Float) -> [Rect] { [for r in rails { from_spans((x, x,), vspan(r)) }] }
 
 fn feed_right_edge(g: Grid, rails: [Rect], x: Float, supply: Int) -> Power {
     feed_all_m2(g, edge_stubs(merge_sorted(sort_rails(rails)), x), supply, true)
@@ -173,29 +192,24 @@ fn feed_right_edge(g: Grid, rails: [Rect], x: Float, supply: Int) -> Power {
 
 // Rails in a block's own coordinates, placed like the block.
 fn place(l: [Rect], orientation: Int, at: (Float, Float)) -> [Rect] {
-    if l == [] { [] } else { cons(lib::logic::floorplan::moved(lib::logic::floorplan::oriented(head(l), orientation), at), place(tail(l), orientation, at)) }
+    [for r in l { lib::logic::floorplan::moved(lib::logic::floorplan::oriented(r, orientation), at) }]
 }
 
 // M2 stripes ending at a block's top edge, continued just above it and
 // carried up to the top bank on M1.
 fn feed_stripes_up(g: Grid, stripes: [Rect], supply: Int) -> Power {
-    if stripes == [] {
-        none()
-    } else {
-        let s = head(stripes);
+    join_all([for s in stripes {
         let stub = m2(from_spans(hspan(s), (s.y1, s.y1 + 700.,)));
         let piece = from_spans(hspan(s), (s.y1 + 100., s.y1 + 700.,));
         let up = feed_m1_to_edge(g, piece, supply, true);
         let via = power_via(piece, stub);
-        join_all(list(Power { m1: [], m2: list(stub, via), m1_targets: [], m2_targets: [] }, up, feed_stripes_up(g, tail(stripes), supply)))
-    }
+        join(Power { m1: [], m2: list(stub, via), m1_targets: [], m2_targets: [] }, up)
+    }])
 }
 
 // M1 rails at a block's right edge, brought up to M2 inside the edge and run
 // to the right bank.
-fn m1_rail_pieces(rails: [Rect], x: Float) -> [Rect] {
-    if rails == [] { [] } else { cons(from_spans((x - 800., x,), vspan(head(rails))), m1_rail_pieces(tail(rails), x)) }
-}
+fn m1_rail_pieces(rails: [Rect], x: Float) -> [Rect] { [for r in rails { from_spans((x - 800., x,), vspan(r)) }] }
 
 fn feed_m1_rails_right(g: Grid, rails: [Rect], x: Float, supply: Int) -> Power {
     let pieces = m1_rail_pieces(rails, x);
@@ -209,19 +223,17 @@ fn feed_m1_rails_right(g: Grid, rails: [Rect], x: Float, supply: Int) -> Power {
 // A stacked block's rails, which run its full height, joined by an M2 bar of
 // each supply: VDD above the block and VSS below it. M2 stripes reach their
 // bar directly; M1 rails reach it on their corridor strip and via onto it.
-fn bar_span(l: [Rect]) -> (Float, Float) {
-    if tail(l) == [] { hspan(head(l)) } else { span_union(hspan(head(l)), bar_span(tail(l))) }
+fn bar_span(l: [Rect]) -> (Float, Float) { bar_span_from(tail(l), hspan(head(l))) }
+
+fn bar_span_from(l: [Rect], span: (Float, Float)) -> (Float, Float) {
+    if l == [] { span } else { bar_span_from(tail(l), span_union(span, hspan(head(l)))) }
 }
 
 fn rails_reach(l: [Rect], to: Float, on_m1: Bool, supply: Int) -> [Rect] {
-    if l == [] {
-        []
-    } else {
-        let r = head(l);
+    [for r in l {
         let h = if on_m1 { strip(r, supply) } else { hspan(r) };
-        let piece = if to > r.y1 { from_spans(h, (r.y1, to,)) } else { from_spans(h, (to, r.y0,)) };
-        cons(piece, rails_reach(tail(l), to, on_m1, supply))
-    }
+        if to > r.y1 { from_spans(h, (r.y1, to,)) } else { from_spans(h, (to, r.y0,)) }
+    }]
 }
 
 fn draw_block_bars(m1_vdd: [Rect], m1_vss: [Rect], m2_vdd: [Rect], m2_vss: [Rect]) -> Power {
@@ -279,12 +291,10 @@ fn control_feeder(f: SramFloorplan, control: Any, supply: Int) -> Rect {
 // Whether a feeder from the left bank to r would cross the replica array.
 fn crosses_rbl(f: SramFloorplan, r: Rect) -> Bool {
     let b = f.boxes.rbl;
-    lib::columns::util::band(lib::columns::util::band(r.y0 < b.y1 + 400., b.y0 - 400. < r.y1), b.x1 < r.x0)
+    ((r.y0 < b.y1 + 400. && b.y0 - 400. < r.y1) && b.x1 < r.x0)
 }
 
-fn rbl_clear(f: SramFloorplan, l: [Rect]) -> [Rect] {
-    if l == [] { [] } else if crosses_rbl(f, head(l)) { rbl_clear(f, tail(l)) } else { cons(head(l), rbl_clear(f, tail(l))) }
-}
+fn rbl_clear(f: SramFloorplan, l: [Rect]) -> [Rect] { [for r in l if !crosses_rbl(f, r) { r }] }
 
 // A control feeder whose row the replica array blocks passes under the array:
 // M2 to an M1 track right of the array, M1 down past its bottom, and M2 on to
@@ -365,18 +375,12 @@ fn jog(above: Rect, below: Rect, supply: Int, level: (Float, Float)) -> [Rect] {
     )
 }
 
-fn clear_of(a: [Rect], b: [Rect]) -> Bool {
-    if a == [] { true } else { lib::columns::util::band(clear_of_one(head(a), b), clear_of(tail(a), b)) }
-}
+fn clear_of(a: [Rect], b: [Rect]) -> Bool { std::all([for r in a { clear_of_one(r, b) }]) }
 
 fn clear_of_one(r: Rect, l: [Rect]) -> Bool {
-    if l == [] {
-        true
-    } else {
-        let o = head(l);
-        let apart = lib::columns::util::bor(lib::columns::util::bor(o.x0 >= r.x1 + 300., r.x0 >= o.x1 + 300.), lib::columns::util::bor(o.y0 >= r.y1 + 300., r.y0 >= o.y1 + 300.));
-        lib::columns::util::band(apart, clear_of_one(r, tail(l)))
-    }
+    std::all([for o in l {
+        ((o.x0 >= r.x1 + 300. || r.x0 >= o.x1 + 300.) || (o.y0 >= r.y1 + 300. || r.y0 >= o.y1 + 300.))
+    }])
 }
 
 // Jogs for both supplies across one gap, with the two jog levels ordered so
@@ -396,9 +400,7 @@ fn gap_jogs(above_vdd: Rect, above_vss: Rect, below_vdd: Rect, below_vss: Rect) 
     }
 }
 
-fn corridor_targets(l: [Rect], supply: Int) -> [Target] {
-    if l == [] { [] } else { cons(Target { rect: head(l), supply: supply, skip: -1 }, corridor_targets(tail(l), supply)) }
-}
+fn corridor_targets(l: [Rect], supply: Int) -> [Target] { [for r in l { Target { rect: r, supply: supply, skip: -1 } }] }
 
 // M2 tracks between the control logic's replica routes and the row decoder.
 fn band_tracks(g: Grid, f: SramFloorplan, control: Any) -> (Int, Int) {
@@ -406,18 +408,13 @@ fn band_tracks(g: Grid, f: SramFloorplan, control: Any) -> (Int, Int) {
 }
 
 fn band_straps(g: Grid, j: Int, last: Int, vdd_x1: Float, vss_x1: Float, vdd: Rect, vss: Rect) -> Power {
-    if j > last {
-        none()
-    } else {
-        let supply = j % 2;
+    join_all([for k in range_full(j, last + 1, 1) {
+        let supply = k % 2;
         let corridor = if supply == 0 { vdd } else { vss };
-        let strap = m2(from_spans((m1_track(g, 0).0, if supply == 0 { vdd_x1 } else { vss_x1 },), m2_track(g, j)));
+        let strap = m2(from_spans((m1_track(g, 0).0, if supply == 0 { vdd_x1 } else { vss_x1 },), m2_track(g, k)));
         let via = power_via(from_spans(hspan(corridor), vspan(strap)), strap);
-        join(
-            Power { m1: [], m2: list(strap, via), m1_targets: [], m2_targets: list(Target { rect: strap, supply: supply, skip: -1 }) },
-            band_straps(g, j + 1, last, vdd_x1, vss_x1, vdd, vss),
-        )
-    }
+        Power { m1: [], m2: list(strap, via), m1_targets: [], m2_targets: list(Target { rect: strap, supply: supply, skip: -1 }) }
+    }])
 }
 
 fn feed_buffer_stack(g: Grid, f: SramFloorplan, control: Any, pc_b: Any, sense: Any, col_dec: Any, write: Any) -> Power {
@@ -563,87 +560,69 @@ fn stripe_lo(o: Float, s: Int) -> Float { o + 680. * (16 * s) as Float - 160. - 
 fn stripe_hi(o: Float, s: Int) -> Float { o + 680. * (16 * s + 15) as Float + 160. + 300. }
 
 fn crosses(r: Rect, lo: Float, hi: Float, vertical: Bool) -> Bool {
-    if vertical { lib::columns::util::band(r.x0 < hi, r.x1 > lo) } else { lib::columns::util::band(r.y0 < hi, r.y1 > lo) }
+    if vertical { (r.x0 < hi && r.x1 > lo) } else { (r.y0 < hi && r.y1 > lo) }
 }
 
 fn filter_range(l: [Rect], i0: Int, i1: Int, lo: Float, hi: Float, vertical: Bool) -> [Rect] {
-    if i1 - i0 <= 0 {
-        []
-    } else if i1 - i0 == 1 {
-        if crosses(l[i0], lo, hi, vertical) { list(l[i0]) } else { [] }
-    } else {
-        let mid = (i0 + i1) / 2;
-        lib::logic::routing::concat(filter_range(l, i0, mid, lo, hi, vertical), filter_range(l, mid, i1, lo, hi, vertical))
-    }
+    [for k in range_full(i0, i1, 1) if crosses(l[k], lo, hi, vertical) { l[k] }]
 }
 
-fn count<T>(l: [T]) -> Int { if l == [] { 0 } else { 1 + count(tail(l)) } }
+fn count<T>(l: [T]) -> Int { std::len(l) }
 
 fn filter_targets(l: [Target], i0: Int, i1: Int, lo: Float, hi: Float, vertical: Bool) -> [Target] {
-    if i1 - i0 <= 0 {
-        []
-    } else if i1 - i0 == 1 {
-        if crosses(l[i0].rect, lo, hi, vertical) { list(l[i0]) } else { [] }
-    } else {
-        let mid = (i0 + i1) / 2;
-        lib::logic::routing::concat(filter_targets(l, i0, mid, lo, hi, vertical), filter_targets(l, mid, i1, lo, hi, vertical))
-    }
+    [for k in range_full(i0, i1, 1) if crosses(l[k].rect, lo, hi, vertical) { l[k] }]
 }
 
 fn target_stripes(l: [Target], n: Int, o: Float, s: Int, ns: Int, vertical: Bool) -> [[Target]] {
-    if s == ns { [] } else { cons(filter_targets(l, 0, n, stripe_lo(o, s), stripe_hi(o, s), vertical), target_stripes(l, n, o, s + 1, ns, vertical)) }
+    [for k in range_full(s, ns, 1) { filter_targets(l, 0, n, stripe_lo(o, k), stripe_hi(o, k), vertical) }]
 }
 
 fn stripes(l: [Rect], n: Int, o: Float, s: Int, ns: Int, vertical: Bool) -> [[Rect]] {
-    if s == ns { [] } else { cons(filter_range(l, 0, n, stripe_lo(o, s), stripe_hi(o, s), vertical), stripes(l, n, o, s + 1, ns, vertical)) }
+    [for k in range_full(s, ns, 1) { filter_range(l, 0, n, stripe_lo(o, k), stripe_hi(o, k), vertical) }]
 }
 
 // Crossing-track intervals blocked on one track.
 fn blocked(l: [Rect], center: Float, o: Float, n: Int, vertical: Bool) -> [(Int, Int)] {
-    if l == [] {
-        []
-    } else {
-        let r = head(l);
-        let rest = blocked(tail(l), center, o, n, vertical);
-        let lo = center - 160. - 300.;
-        let hi = center + 160. + 300.;
-        if crosses(r, lo, hi, vertical) {
-            let a = if vertical { r.y0 } else { r.x0 };
-            let b = if vertical { r.y1 } else { r.x1 };
-            let j0 = lib::columns::util::imax(fdiv((a - o) as Int - 640, 680) + 1, 0);
-            let j1 = lib::columns::util::imin(cdiv((b - o) as Int + 640, 680) - 1, n - 1);
-            if j0 <= j1 { cons((j0, j1,), rest) } else { rest }
-        } else {
-            rest
-        }
-    }
+    let lo = center - 160. - 300.;
+    let hi = center + 160. + 300.;
+    std::flatten([for r in l if crosses(r, lo, hi, vertical) {
+        let a = if vertical { r.y0 } else { r.x0 };
+        let b = if vertical { r.y1 } else { r.x1 };
+        let j0 = max_int(fdiv((a - o) as Int - 640, 680) + 1, 0);
+        let j1 = min_int(cdiv((b - o) as Int + 640, 680) - 1, n - 1);
+        if j0 <= j1 { list((j0, j1,)) } else { [] }
+    }])
+}
+
+fn max_from(l: [Int], best: Int) -> Int {
+    if l == [] { best } else { max_from(tail(l), max_int(head(l), best)) }
 }
 
 fn cover_end(ivs: [(Int, Int)], cur: Int) -> Int {
-    if ivs == [] { -1 } else {
-        let iv = head(ivs);
-        let rest = cover_end(tail(ivs), cur);
-        if lib::columns::util::band(iv.0 <= cur, cur <= iv.1) { lib::columns::util::imax(iv.1, rest) } else { rest }
-    }
+    max_from([for iv in ivs if (iv.0 <= cur && cur <= iv.1) { iv.1 }], -1)
 }
 
 fn next_start(ivs: [(Int, Int)], cur: Int, best: Int) -> Int {
     if ivs == [] { best } else {
         let lo = head(ivs).0;
-        next_start(tail(ivs), cur, if lib::columns::util::band(lo > cur, lo < best) { lo } else { best })
+        next_start(tail(ivs), cur, if (lo > cur && lo < best) { lo } else { best })
     }
 }
 
-fn runs_from(ivs: [(Int, Int)], t: Int, cur: Int, last: Int) -> [Run] {
+fn runs_from(ivs: [(Int, Int)], t: Int, cur: Int, last: Int) -> [Run] { reverse_onto(runs_onto(ivs, t, cur, last, []), []) }
+
+// The free runs of track `t` from crossing track `cur` to `last`, added to
+// `out` newest first.
+fn runs_onto(ivs: [(Int, Int)], t: Int, cur: Int, last: Int, out: [Run]) -> [Run] {
     if cur > last {
-        []
+        out
     } else {
         let covered = cover_end(ivs, cur);
         if covered >= cur {
-            runs_from(ivs, t, covered + 1, last)
+            runs_onto(ivs, t, covered + 1, last, out)
         } else {
             let stop = next_start(ivs, cur, last + 1);
-            cons(Run { t: t, a: cur, b: stop - 1 }, runs_from(ivs, t, stop, last))
+            runs_onto(ivs, t, stop, last, cons(Run { t: t, a: cur, b: stop - 1 }, out))
         }
     }
 }
@@ -651,36 +630,27 @@ fn runs_from(ivs: [(Int, Int)], t: Int, cur: Int, last: Int) -> [Run] {
 // Runs on tracks t through t1 - 1, one list per track, from crossing track
 // `first` to `last`.
 fn track_runs(st: [[Rect]], t: Int, t1: Int, track_o: Float, cross_o: Float, first: Int, last: Int, n_cross: Int, vertical: Bool) -> [[Run]] {
-    if t == t1 {
-        []
-    } else {
-        let center = track_o + 680. * t as Float;
-        let ivs = blocked(st[t / 16], center, cross_o, n_cross, vertical);
-        cons(runs_from(ivs, t, first, last), track_runs(st, t + 1, t1, track_o, cross_o, first, last, n_cross, vertical))
-    }
+    [for k in range_full(t, t1, 1) {
+        let center = track_o + 680. * k as Float;
+        let ivs = blocked(st[k / 16], center, cross_o, n_cross, vertical);
+        runs_from(ivs, k, first, last)
+    }]
 }
 
 fn empty_runs(t: Int, t1: Int) -> [[Run]] {
     if t == t1 { [] } else { cons([], empty_runs(t + 1, t1)) }
 }
 
-fn bank_runs(t: Int, t1: Int, a: Int, b: Int) -> [[Run]] {
-    if t == t1 { [] } else { cons(list(Run { t: t, a: a, b: b }), bank_runs(t + 1, t1, a, b)) }
-}
+fn bank_runs(t: Int, t1: Int, a: Int, b: Int) -> [[Run]] { [for k in range_full(t, t1, 1) { list(Run { t: k, a: a, b: b }) }] }
 
 fn concat_runs(a: [[Run]], b: [[Run]]) -> [[Run]] { lib::logic::routing::concat(a, b) }
 
 // Whether a run on the other layer's track `t` covers crossing point `c`.
-fn covers(runs: [Run], c: Int) -> Bool {
-    if runs == [] { false } else { lib::columns::util::bor(lib::columns::util::band(head(runs).a <= c, c <= head(runs).b), covers(tail(runs), c)) }
-}
+fn covers(runs: [Run], c: Int) -> Bool { std::any([for r in runs { (r.a <= c && c <= r.b) }]) }
 
 // Like-supply crossings of run r with the other layer's runs.
 fn crossing_count(r: Run, other: [[Run]], j: Int) -> Int {
-    if j > r.b { 0 } else {
-        let here = if covers(other[j], r.t) { 1 } else { 0 };
-        here + crossing_count(r, other, j + 2)
-    }
+    std::len([for k in range_full(j, r.b + 1, 2) if covers(other[k], r.t) { k }])
 }
 
 fn first_crossing(r: Run) -> Int { r.a + (r.a + r.t) % 2 }
@@ -711,14 +681,14 @@ fn hits_target(g: Grid, r: Run, t: Target, vertical: Bool) -> Bool {
     let track = if vertical { m1_track(g, r.t) } else { m2_track(g, r.t) };
     let span = layer_span(g, r, vertical);
     let rect = t.rect;
-    let along = if vertical { lib::columns::util::band(span.0 <= rect.y0, rect.y1 <= span.1) } else { lib::columns::util::band(span.0 <= rect.x0, rect.x1 <= span.1) };
-    let across = if vertical { lib::columns::util::band(rect.x0 <= track.0, track.1 <= rect.x1) } else { lib::columns::util::band(rect.y0 <= track.0, track.1 <= rect.y1) };
+    let along = if vertical { (span.0 <= rect.y0 && rect.y1 <= span.1) } else { (span.0 <= rect.x0 && rect.x1 <= span.1) };
+    let across = if vertical { (rect.x0 <= track.0 && track.1 <= rect.x1) } else { (rect.y0 <= track.0 && track.1 <= rect.y1) };
     let tall = if vertical { rect.y1 - rect.y0 >= 260. } else { rect.x1 - rect.x0 >= 260. };
-    lib::columns::util::band(lib::columns::util::band(along, across), lib::columns::util::band(tall, lib::columns::util::band(t.supply == r.t % 2, t.skip != r.t)))
+    ((along && across) && (tall && (t.supply == r.t % 2 && t.skip != r.t)))
 }
 
 fn target_hits(g: Grid, r: Run, targets: [Target], vertical: Bool) -> Int {
-    if targets == [] { 0 } else { (if hits_target(g, r, head(targets), vertical) { 1 } else { 0 }) + target_hits(g, r, tail(targets), vertical) }
+    std::len([for t in targets if hits_target(g, r, t, vertical) { t }])
 }
 
 fn draw_target_vias(g: Grid, r: Run, targets: [Target], vertical: Bool) -> Rect {

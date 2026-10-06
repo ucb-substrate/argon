@@ -23,8 +23,9 @@ use arcstr::ArcStr;
 
 use crate::{
     ast::{
-        ArgDecl, CellDecl, Decl, EnumDecl, Expr, FnDecl, GenericArgs, Ident, IdentPath, ModPath,
-        Pattern, Scope, Statement, StructDecl, TyParam, TySpec, TySpecKind, UseDecl, WorkspaceAst,
+        ArgDecl, CellDecl, Decl, EnumDecl, Expr, FnDecl, ForLoop, GenericArgs, Ident, IdentPath,
+        ModPath, Pattern, Scope, Statement, StructDecl, TyParam, TySpec, TySpecKind, UseDecl,
+        WorkspaceAst,
     },
     compile::{
         AdtDef, BUILTINS, RESERVED_CELL_FIELDS, Ty, TyParamTy, TypeDefs, TypedWorkspace, VarId,
@@ -249,7 +250,7 @@ impl NavIndex {
     pub fn coverage(ast: &WorkspaceAst<VarIdTyMetadata>) -> HashSet<&Path> {
         ast.values()
             .filter(|module| indexes_source(module))
-            .map(|module| module.path.as_path())
+            .map(|module| &*module.path)
             .collect()
     }
 
@@ -694,14 +695,14 @@ impl NavIndex {
                 let DefLocation::Source(selection) = &definition.location else {
                     return None;
                 };
-                (selection.path == file).then(|| OutlineSymbol {
+                (*selection.path == *file).then(|| OutlineSymbol {
                     name: definition.name.clone(),
                     detail: definition.detail.clone(),
                     kind: definition.kind,
                     range: definition
                         .full_span
                         .as_ref()
-                        .filter(|span| span.path == file)
+                        .filter(|span| *span.path == *file)
                         .map_or(selection.span, |span| span.span),
                     selection_range: selection.span,
                 })
@@ -798,6 +799,48 @@ fn builtin_signature(name: &str) -> Option<SignatureInfo> {
         "range_full" => signature(
             "fn range_full(start: Int, stop: Int, step: Int) -> [Int]",
             &["start: Int", "stop: Int", "step: Int"],
+            &[],
+        ),
+        "seq_len" => signature("fn seq_len(sequence: [T]) -> Int", &["sequence: [T]"], &[]),
+        "seq_concat" => signature(
+            "fn seq_concat(first: [T], second: [T]) -> [T]",
+            &["first: [T]", "second: [T]"],
+            &[],
+        ),
+        "seq_flatten" => signature(
+            "fn seq_flatten(sequences: [[T]]) -> [T]",
+            &["sequences: [[T]]"],
+            &[],
+        ),
+        "seq_sum" => signature("fn seq_sum(values: [Int]) -> Int", &["values: [Int]"], &[]),
+        "seq_any" => signature(
+            "fn seq_any(values: [Bool]) -> Bool",
+            &["values: [Bool]"],
+            &[],
+        ),
+        "seq_all" => signature(
+            "fn seq_all(values: [Bool]) -> Bool",
+            &["values: [Bool]"],
+            &[],
+        ),
+        "max_float" => signature(
+            "fn max_float(a: Float, b: Float) -> Float",
+            &["a: Float", "b: Float"],
+            &[],
+        ),
+        "min_float" => signature(
+            "fn min_float(a: Float, b: Float) -> Float",
+            &["a: Float", "b: Float"],
+            &[],
+        ),
+        "max_int" => signature(
+            "fn max_int(a: Int, b: Int) -> Int",
+            &["a: Int", "b: Int"],
+            &[],
+        ),
+        "min_int" => signature(
+            "fn min_int(a: Int, b: Int) -> Int",
+            &["a: Int", "b: Int"],
             &[],
         ),
         "crect" => {
@@ -940,7 +983,7 @@ struct Builder<'a> {
     params: HashMap<VarId, HashMap<String, VarId>>,
     /// Module currently being walked.
     current: &'a ModPath,
-    path: &'a Path,
+    path: Arc<Path>,
     /// Length of the file's editor-visible source. Generated declarations are
     /// appended past this point.
     visible: usize,
@@ -998,7 +1041,7 @@ impl<'a> Builder<'a> {
             cell_fields: HashMap::new(),
             params: HashMap::new(),
             current: const { &Vec::new() },
-            path: Path::new(""),
+            path: Path::new("").into(),
             visible: 0,
             index: NavIndex {
                 type_defs: workspace.defs.clone(),
@@ -1075,14 +1118,14 @@ impl<'a> Builder<'a> {
             if indexes_source(ast) {
                 self.index
                     .file_modules
-                    .insert(ast.path.clone(), module.clone());
+                    .insert(ast.path.to_path_buf(), module.clone());
             }
             self.index.defs.insert(
                 DefKey::Module(module.clone()),
                 Definition {
                     kind: SymbolKind::Module,
                     name: module.last().cloned().unwrap_or_default(),
-                    location: DefLocation::File(ast.path.clone()),
+                    location: DefLocation::File(ast.path.to_path_buf()),
                     detail: module
                         .last()
                         .map_or_else(|| "workspace root".to_owned(), |name| format!("mod {name}")),
@@ -1137,12 +1180,14 @@ impl<'a> Builder<'a> {
                             .collect::<Vec<_>>();
                         let fields = bindings
                             .iter()
-                            .map(|binding| (binding.name.name.to_string(), binding.metadata))
+                            .map(|binding| (binding.name.name.to_string(), binding.metadata.0))
                             .collect();
                         self.cell_fields.insert(decl.metadata.1, fields);
                         let field_types = bindings
                             .iter()
-                            .map(|binding| (binding.name.name.to_string(), binding.value.ty()))
+                            .map(|binding| {
+                                (binding.name.name.to_string(), binding.metadata.1.clone())
+                            })
                             .collect();
                         self.index
                             .cell_field_types
@@ -1211,12 +1256,12 @@ impl<'a> Builder<'a> {
                 continue;
             }
             self.current = module;
-            self.path = &ast.path;
+            self.path = ast.path.clone();
             self.visible = ast.source_text.len();
             if indexes_source(ast) {
                 self.index
                     .sources
-                    .insert(ast.path.clone(), ast.source_text.clone());
+                    .insert(ast.path.to_path_buf(), ast.source_text.clone());
             }
             for decl in &ast.ast.decls {
                 self.decl(decl);
@@ -1239,7 +1284,7 @@ impl<'a> Builder<'a> {
 
     fn span(&self, span: cfgrammar::Span) -> crate::ast::Span {
         crate::ast::Span {
-            path: self.path.to_path_buf(),
+            path: self.path.clone(),
             span,
         }
     }
@@ -1821,8 +1866,8 @@ impl<'a> Builder<'a> {
                 Statement::LetBinding(binding) => {
                     // The initializer is evaluated before the name is bound.
                     self.expr(&binding.value);
-                    let key = DefKey::Var(binding.metadata);
-                    let ty = binding.value.ty();
+                    let key = DefKey::Var(binding.metadata.0);
+                    let ty = binding.metadata.1.clone();
                     if let Some(spec) = &binding.ty {
                         self.ty_spec(spec, &ty);
                     }
@@ -1848,41 +1893,52 @@ impl<'a> Builder<'a> {
                             available_after: binding.span.end(),
                         });
                 }
-                Statement::ForLoop(loop_) => {
-                    self.expr(&loop_.seq);
-                    let key = DefKey::Var(loop_.metadata);
-                    let ty = match loop_.seq.ty() {
-                        Ty::Seq(element) => *element,
-                        _ => Ty::Unknown,
-                    };
-                    self.define(
-                        key.clone(),
-                        SymbolKind::LoopVar,
-                        &loop_.var,
-                        DefinitionInfo {
-                            detail: format!("loop variable {}: {ty}", loop_.var.name),
-                            ty: Some(ty),
-                            signature: None,
-                            full_span: Some(loop_.span),
-                        },
-                    );
-                    self.index
-                        .scope_bindings
-                        .entry(self.path.to_path_buf())
-                        .or_default()
-                        .push(ScopeBinding {
-                            name: loop_.var.name.to_string(),
-                            key,
-                            scope: loop_.body.span,
-                            available_after: loop_.body.span.start(),
-                        });
-                    self.scope(&loop_.body);
-                }
+                Statement::ForLoop(loop_) => self.for_loop(loop_),
             }
         }
         if let Some(tail) = &scope.tail {
             self.expr(tail);
         }
+    }
+
+    fn for_loop(&mut self, loop_: &'a ForLoop<arcstr::Substr, VarIdTyMetadata>) {
+        self.expr(&loop_.seq);
+        let key = DefKey::Var(loop_.metadata);
+        let ty = match loop_.seq.ty() {
+            Ty::Seq(element) => *element,
+            _ => Ty::Unknown,
+        };
+        self.define(
+            key.clone(),
+            SymbolKind::LoopVar,
+            &loop_.var,
+            DefinitionInfo {
+                detail: format!("loop variable {}: {ty}", loop_.var.name),
+                ty: Some(ty),
+                signature: None,
+                full_span: Some(loop_.span),
+            },
+        );
+        // The variable is in scope from the filter through the body.
+        let start = loop_
+            .filter
+            .as_ref()
+            .map_or(loop_.body.span.start(), |filter| filter.span().start());
+        let scope = cfgrammar::Span::new(start, loop_.body.span.end());
+        self.index
+            .scope_bindings
+            .entry(self.path.to_path_buf())
+            .or_default()
+            .push(ScopeBinding {
+                name: loop_.var.name.to_string(),
+                key,
+                scope,
+                available_after: start,
+            });
+        if let Some(filter) = &loop_.filter {
+            self.expr(filter);
+        }
+        self.scope(&loop_.body);
     }
 
     // ---------------------------------------------------------- expressions
@@ -1951,6 +2007,7 @@ impl<'a> Builder<'a> {
                     self.expr(&arm.expr);
                 }
             }
+            Expr::ListComp(comp) => self.for_loop(&comp.for_loop),
             Expr::If(if_) => {
                 self.expr(&if_.cond);
                 self.scope(&if_.then);
@@ -2473,7 +2530,7 @@ fn width(s: Shape) -> Float {
         let DefLocation::Source(span) = &definition.location else {
             panic!("expected a source location, got {:?}", definition.location);
         };
-        assert_eq!(span.path, Path::new(STD_PATH));
+        assert_eq!(*span.path, *Path::new(STD_PATH));
         assert_eq!(&STD_SOURCE[span.span.start()..span.span.end()], "Some");
         assert_eq!(definition.detail, "Option::Some(T)");
     }
@@ -2646,7 +2703,7 @@ cell top() {
         let DefLocation::Source(span) = &definition.location else {
             panic!("expected a source location, got {:?}", definition.location);
         };
-        assert_eq!(span.path, Path::new("/virtual/origin.ar"));
+        assert_eq!(*span.path, *Path::new("/virtual/origin.ar"));
     }
 
     /// A module made up entirely of GDS imports is recorded against the binary
@@ -2761,7 +2818,7 @@ cell top() {
         let DefLocation::Source(span) = &definition.location else {
             panic!("expected a source location, got {:?}", definition.location);
         };
-        assert_eq!(span.path, Path::new(STD_PATH));
+        assert_eq!(*span.path, *Path::new(STD_PATH));
         assert_eq!(
             &STD_SOURCE[span.span.start()..span.span.end()],
             "max",
@@ -3026,7 +3083,7 @@ cell top() {
             let index = NavIndex::build(&typed);
             let visible: IndexMap<&Path, usize> = typed
                 .values()
-                .map(|module| (module.path.as_path(), module.source_text.len()))
+                .map(|module| (&*module.path, module.source_text.len()))
                 .collect();
 
             for (path, entries) in &index.refs {
@@ -3054,7 +3111,7 @@ cell top() {
                             path.display()
                         );
                         let location = crate::ast::Span {
-                            path: path.clone(),
+                            path: Arc::from(path.as_path()),
                             span: *span,
                         };
                         assert!(

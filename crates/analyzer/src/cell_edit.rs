@@ -90,7 +90,7 @@ pub(crate) fn new_cell_edit(
     validate_cell_name(name)?;
     let (module_path, module) = workspace
         .iter()
-        .find(|(_, module)| module.path == source_path)
+        .find(|(_, module)| *module.path == *source_path)
         .ok_or_else(|| "The active buffer is not part of this Argon workspace".to_owned())?;
     ensure_name_is_available(workspace, module_path, name)?;
 
@@ -226,7 +226,7 @@ fn add_edit(
     }
     let module = workspace
         .values()
-        .find(|module| module.path == path)
+        .find(|module| *module.path == *path)
         .ok_or_else(|| "A cell reference is outside the current workspace".to_owned())?;
     if span.end() > module.source_text.len() {
         return Err("Imported GDS cells and generated declarations are read-only".to_owned());

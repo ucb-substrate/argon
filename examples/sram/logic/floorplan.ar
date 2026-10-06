@@ -289,19 +289,16 @@ fn periphery_widths(p: SramLayoutParams) -> PeripheryWidths {
     let col_dec_wh = col_dec_w * col_dec_h;
     let addr_width = p.address_dff_count - 2;
     let total0 = col_dec_wh + rect_area_i(pc_b) + rect_area_i(sense_en) + rect_area_i(write_en);
-    let available0 = lib::columns::util::imax(
-        lib::columns::util::imax(rect_h_i(cols) - rect_h_i(dffs) - 5500 - 1400 * addr_width, rect_h_i(rbl)),
-        rect_w_i(control),
-    ) - 4 * 6000;
-    let col_dec_alloc = lib::columns::util::imax(available0 * col_dec_wh / total0, col_dec_w);
+    let available0 = max_int(max_int(rect_h_i(cols) - rect_h_i(dffs) - 5500 - 1400 * addr_width, rect_h_i(rbl)), rect_w_i(control)) - 4 * 6000;
+    let col_dec_alloc = max_int(available0 * col_dec_wh / total0, col_dec_w);
     let available = available0 - col_dec_alloc;
     let total = total0 - col_dec_wh;
     let match_row = col_dec_wh / rect_h_i(row_dec);
-    let col_dec_max = if match_row < 2 * col_dec_alloc { lib::columns::util::imax(match_row, col_dec_alloc) } else { col_dec_alloc };
+    let col_dec_max = if match_row < 2 * col_dec_alloc { max_int(match_row, col_dec_alloc) } else { col_dec_alloc };
     PeripheryWidths {
         col_decoder: col_dec_max,
-        pc_b_buffer: lib::columns::util::imax(available * rect_area_i(pc_b) / total, 6000),
-        sense_en_buffer: lib::columns::util::imax(available * rect_area_i(sense_en) / total, 6000),
-        write_driver_en_buffer: lib::columns::util::imax(available * rect_area_i(write_en) / total, 6000),
+        pc_b_buffer: max_int(available * rect_area_i(pc_b) / total, 6000),
+        sense_en_buffer: max_int(available * rect_area_i(sense_en) / total, 6000),
+        write_driver_en_buffer: max_int(available * rect_area_i(write_en) / total, 6000),
     }
 }

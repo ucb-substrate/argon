@@ -66,173 +66,233 @@ impl PreparedHierarchy {
     }
 }
 
+/// Where a scope's preparation has reached. A scope waits on each child that
+/// is not yet prepared, so children finish first, in the order they are met.
+enum GeometryPhase {
+    Start,
+    /// Revisiting an unchanged cell's scope: its children must be prepared
+    /// before its cached bounds can be trusted.
+    CheckEmits(usize),
+    CheckChildren(usize),
+    Emits(usize),
+    Children(usize),
+}
+
+struct GeometryFrame {
+    address: ScopeAddress,
+    phase: GeometryPhase,
+    bbox: Option<Arc<Rect<f64>>>,
+    children: smallvec::SmallVec<[ScopeAddress; 2]>,
+}
+
+/// Prepares the bounds of `root` and every scope beneath it, recording the
+/// layers they use in first-use order.
 fn prepare_geometry(
     output: &CompiledData,
-    address: ScopeAddress,
+    root: ScopeAddress,
     scopes: &mut HashMap<ScopeAddress, Arc<PreparedScope>>,
     layers: &mut indexmap::IndexSet<String>,
     previous: Option<&CompileOutputState>,
     reusable: &HashSet<CellId>,
 ) {
-    if scopes.contains_key(&address) {
-        return;
-    }
-    let cell = &output.cells[&address.cell];
-    let source_scope = &cell.scopes[&address.scope];
-    if reusable.contains(&address.cell)
-        && let Some(cached) = previous
+    let frame = |address| GeometryFrame {
+        address,
+        phase: GeometryPhase::Start,
+        bbox: None,
+        children: smallvec::SmallVec::new(),
+    };
+    let instance_root = |cell: CellId| ScopeAddress {
+        cell,
+        scope: output.cells[&cell].root,
+    };
+    let mut stack = vec![frame(root)];
+    while let Some(mut top) = stack.pop() {
+        let address = top.address;
+        let cell = &output.cells[&address.cell];
+        let source_scope = &cell.scopes[&address.scope];
+        let cached = previous
             .and_then(|old| old.state.get(&address))
-            .map(|scope| &scope.prepared)
-    {
-        // A content-derived cell and its whole instantiated closure are
-        // immutable. The old geometry is already prepared; walking its
-        // millions of execution scopes just to rediscover that costs more
-        // than recompiling a small parent edit.
-        scopes.insert(address, cached.clone());
-        return;
-    }
-    if let Some(old) = previous
-        && let Some(cached) = old
-            .state
-            .get(&address)
-            .map(|scope| &scope.prepared)
-            .filter(|_| {
-                old.output
-                    .cells
-                    .get(&address.cell)
-                    .is_some_and(|old| Arc::ptr_eq(old, cell))
-            })
-    {
-        // An immutable parent's bounds can still change if a referenced
-        // child changed. Walk dependencies in emit order both to validate them
-        // and to preserve the renderer's first-use layer ordering.
-        for (object, _) in &source_scope.emit {
-            match &cell.objects[object] {
-                SolvedValue::Rect(rect) => {
-                    if let Some(layer) = &rect.layer {
-                        layers.insert(layer.clone());
+            .map(|scope| &scope.prepared);
+        match top.phase {
+            GeometryPhase::Start => {
+                if scopes.contains_key(&address) {
+                    continue;
+                }
+                if reusable.contains(&address.cell)
+                    && let Some(cached) = cached
+                {
+                    // A content-derived cell and its whole instantiated closure are
+                    // immutable. The old geometry is already prepared; walking its
+                    // millions of execution scopes just to rediscover that costs more
+                    // than recompiling a small parent edit.
+                    scopes.insert(address, cached.clone());
+                    continue;
+                }
+                let unchanged = cached.is_some()
+                    && previous.is_some_and(|old| {
+                        old.output
+                            .cells
+                            .get(&address.cell)
+                            .is_some_and(|old| Arc::ptr_eq(old, cell))
+                    });
+                // An immutable parent's bounds can still change if a referenced
+                // child changed. Walk dependencies in emit order both to validate them
+                // and to preserve the renderer's first-use layer ordering.
+                top.phase = if unchanged {
+                    GeometryPhase::CheckEmits(0)
+                } else {
+                    GeometryPhase::Emits(0)
+                };
+                stack.push(top);
+            }
+            GeometryPhase::CheckEmits(index) => {
+                let Some((object, _)) = source_scope.emit.iter().as_slice().get(index) else {
+                    top.phase = GeometryPhase::CheckChildren(0);
+                    stack.push(top);
+                    continue;
+                };
+                top.phase = GeometryPhase::CheckEmits(index + 1);
+                let child = match &cell.objects[object] {
+                    SolvedValue::Instance(instance) => Some(instance_root(instance.cell)),
+                    value => {
+                        if let Some(layer) = object_layer(value) {
+                            layers.insert(layer.to_owned());
+                        }
+                        None
+                    }
+                };
+                stack.push(top);
+                if let Some(child) = child {
+                    stack.push(frame(child));
+                }
+            }
+            GeometryPhase::CheckChildren(index) => {
+                if let Some(child) = source_scope.children.iter().as_slice().get(index) {
+                    top.phase = GeometryPhase::CheckChildren(index + 1);
+                    stack.push(top);
+                    stack.push(frame(ScopeAddress {
+                        cell: address.cell,
+                        scope: *child,
+                    }));
+                    continue;
+                }
+                let old = previous.unwrap();
+                let cached = cached.unwrap();
+                if cached.children.iter().all(|child| {
+                    old.state
+                        .get(child)
+                        .is_some_and(|old| Arc::ptr_eq(&old.prepared, &scopes[child]))
+                }) {
+                    scopes.insert(address, cached.clone());
+                } else {
+                    top.phase = GeometryPhase::Emits(0);
+                    stack.push(top);
+                }
+            }
+            GeometryPhase::Emits(index) => {
+                let Some((object, _)) = source_scope.emit.iter().as_slice().get(index) else {
+                    top.phase = GeometryPhase::Children(0);
+                    stack.push(top);
+                    continue;
+                };
+                match &cell.objects[object] {
+                    SolvedValue::Instance(instance) => {
+                        let child = instance_root(instance.cell);
+                        let Some(prepared) = scopes.get(&child) else {
+                            // Come back to this instance once its cell is ready.
+                            stack.push(top);
+                            stack.push(frame(child));
+                            continue;
+                        };
+                        top.children.push(child);
+                        top.bbox = shared_bbox_union(
+                            top.bbox,
+                            prepared
+                                .bbox
+                                .as_ref()
+                                .map(|rect| Arc::new(instance_bbox(instance, rect))),
+                        );
+                    }
+                    value => {
+                        top.bbox = shared_bbox_union(top.bbox, object_bbox(value).map(Arc::new));
+                        if let Some(layer) = object_layer(value) {
+                            layers.insert(layer.to_owned());
+                        }
                     }
                 }
-                SolvedValue::Polygon(polygon) => {
-                    layers.insert(polygon.layer.clone());
-                }
-                SolvedValue::Path(path) => {
-                    layers.insert(path.layer.clone());
-                }
-                SolvedValue::Text(text) => {
-                    layers.insert(text.layer.clone());
-                }
-                SolvedValue::Instance(instance) => prepare_geometry(
-                    output,
-                    ScopeAddress {
-                        cell: instance.cell,
-                        scope: output.cells[&instance.cell].root,
-                    },
-                    scopes,
-                    layers,
-                    previous,
-                    reusable,
-                ),
-                SolvedValue::Dimension(_) => {}
+                top.phase = GeometryPhase::Emits(index + 1);
+                stack.push(top);
             }
-        }
-        for child in &source_scope.children {
-            prepare_geometry(
-                output,
-                ScopeAddress {
+            GeometryPhase::Children(index) => {
+                let Some(child) = source_scope.children.iter().as_slice().get(index) else {
+                    scopes.insert(
+                        address,
+                        Arc::new(PreparedScope {
+                            name: cell.scope_name_shared(address.scope),
+                            bbox: top.bbox,
+                            children: top.children,
+                        }),
+                    );
+                    continue;
+                };
+                let child = ScopeAddress {
                     cell: address.cell,
                     scope: *child,
-                },
-                scopes,
-                layers,
-                previous,
-                reusable,
-            );
-        }
-        if cached.children.iter().all(|child| {
-            old.state
-                .get(child)
-                .is_some_and(|old| Arc::ptr_eq(&old.prepared, &scopes[child]))
-        }) {
-            scopes.insert(address, cached.clone());
-            return;
-        }
-    }
-    let scope = source_scope;
-    let mut bbox = None;
-    let mut children = smallvec::SmallVec::new();
-    for (object, _) in &scope.emit {
-        match &cell.objects[object] {
-            SolvedValue::Rect(rect) => {
-                bbox = shared_bbox_union(bbox, Some(Arc::new(rect.to_float())));
-                if let Some(layer) = &rect.layer {
-                    layers.insert(layer.clone());
-                }
-            }
-            SolvedValue::Polygon(polygon) => {
-                bbox = shared_bbox_union(bbox, polygon.bbox().map(Arc::new));
-                layers.insert(polygon.layer.clone());
-            }
-            SolvedValue::Path(path) => {
-                bbox = shared_bbox_union(bbox, path.bbox().map(Arc::new));
-                layers.insert(path.layer.clone());
-            }
-            SolvedValue::Text(text) => {
-                bbox = shared_bbox_union(bbox, bbox_text_union(None, text).map(Arc::new));
-                layers.insert(text.layer.clone());
-            }
-            SolvedValue::Dimension(dimension) => {
-                bbox = shared_bbox_union(bbox, bbox_dim_union(None, dimension).map(Arc::new));
-            }
-            SolvedValue::Instance(instance) => {
-                let child = ScopeAddress {
-                    cell: instance.cell,
-                    scope: output.cells[&instance.cell].root,
                 };
-                prepare_geometry(output, child, scopes, layers, previous, reusable);
-                children.push(child);
-                bbox = shared_bbox_union(
-                    bbox,
-                    scopes[&child].bbox.as_ref().map(|rect| {
-                        let mut matrix = TransformationMatrix::identity();
-                        if instance.reflect {
-                            matrix = matrix.reflect_vert();
-                        }
-                        matrix = matrix.rotate(instance.angle);
-                        let p0 = ifmatvec(matrix, (rect.x0, rect.y0));
-                        let p1 = ifmatvec(matrix, (rect.x1, rect.y1));
-                        Arc::new(Rect {
-                            layer: None,
-                            x0: p0.0.min(p1.0) + instance.x,
-                            y0: p0.1.min(p1.1) + instance.y,
-                            x1: p0.0.max(p1.0) + instance.x,
-                            y1: p0.1.max(p1.1) + instance.y,
-                            id: instance.id,
-                            construction: true,
-                            span: rect.span.clone(),
-                        })
-                    }),
-                );
+                let Some(prepared) = scopes.get(&child) else {
+                    stack.push(top);
+                    stack.push(frame(child));
+                    continue;
+                };
+                top.children.push(child);
+                top.bbox = shared_bbox_union(top.bbox, prepared.bbox.clone());
+                top.phase = GeometryPhase::Children(index + 1);
+                stack.push(top);
             }
         }
     }
-    for child in &scope.children {
-        let child = ScopeAddress {
-            cell: address.cell,
-            scope: *child,
-        };
-        prepare_geometry(output, child, scopes, layers, previous, reusable);
-        children.push(child);
-        bbox = shared_bbox_union(bbox, scopes[&child].bbox.clone());
+}
+
+fn object_layer(value: &SolvedValue) -> Option<&str> {
+    match value {
+        SolvedValue::Rect(rect) => rect.layer.as_deref(),
+        SolvedValue::Polygon(polygon) => Some(&polygon.layer),
+        SolvedValue::Path(path) => Some(&path.layer),
+        SolvedValue::Text(text) => Some(&text.layer),
+        SolvedValue::Dimension(_) | SolvedValue::Instance(_) => None,
     }
-    scopes.insert(
-        address,
-        Arc::new(PreparedScope {
-            name: cell.scope_name_shared(address.scope),
-            bbox,
-            children,
-        }),
-    );
+}
+
+fn object_bbox(value: &SolvedValue) -> Option<Rect<f64>> {
+    match value {
+        SolvedValue::Rect(rect) => Some(rect.to_float()),
+        SolvedValue::Polygon(polygon) => polygon.bbox(),
+        SolvedValue::Path(path) => path.bbox(),
+        SolvedValue::Text(text) => bbox_text_union(None, text),
+        SolvedValue::Dimension(dimension) => bbox_dim_union(None, dimension),
+        SolvedValue::Instance(_) => None,
+    }
+}
+
+/// The bounds of an instance whose cell's bounds are `rect`.
+fn instance_bbox(instance: &argonc::compile::SolvedInstance, rect: &Rect<f64>) -> Rect<f64> {
+    let mut matrix = TransformationMatrix::identity();
+    if instance.reflect {
+        matrix = matrix.reflect_vert();
+    }
+    matrix = matrix.rotate(instance.angle);
+    let p0 = ifmatvec(matrix, (rect.x0, rect.y0));
+    let p1 = ifmatvec(matrix, (rect.x1, rect.y1));
+    Rect {
+        layer: None,
+        x0: p0.0.min(p1.0) + instance.x,
+        y0: p0.1.min(p1.1) + instance.y,
+        x1: p0.0.max(p1.0) + instance.x,
+        y1: p0.1.max(p1.1) + instance.y,
+        id: instance.id,
+        construction: true,
+        span: rect.span.clone(),
+    }
 }
 
 fn shared_bbox_union(
@@ -248,56 +308,63 @@ fn shared_bbox_union(
     }
 }
 
+/// Records every scope under `root` with its parent and visibility. A scope
+/// reached along several paths keeps the first, walking the last child first.
 fn prepare_paths(
-    address: ScopeAddress,
-    parent: Option<ScopeAddress>,
-    path: &mut Vec<String>,
+    root: ScopeAddress,
     hidden_paths: &HashSet<Vec<String>>,
     scopes: &HashMap<ScopeAddress, Arc<PreparedScope>>,
     state: &mut ProcessScopeState,
 ) {
-    let scope = &scopes[&address];
-    if state.state.contains_key(&address) {
-        return;
+    let mut path: Vec<String> = Vec::new();
+    let mut stack = vec![(root, None, 0)];
+    while let Some((address, parent, depth)) = stack.pop() {
+        if state.state.contains_key(&address) {
+            continue;
+        }
+        let scope = &scopes[&address];
+        path.truncate(depth);
+        path.push(scope.name.to_string());
+        state.state.insert(
+            address,
+            ScopeState {
+                parent,
+                visible: !hidden_paths.contains(&path),
+                prepared: Arc::clone(scope),
+            },
+        );
+        stack.extend(
+            scope
+                .children
+                .iter()
+                .map(|child| (*child, Some(address), depth + 1)),
+        );
     }
-    path.push(scope.name.to_string());
-    state.state.insert(
-        address,
-        ScopeState {
-            parent,
-            visible: !hidden_paths.contains(path),
-            prepared: Arc::clone(scope),
-        },
-    );
-    for child in scope.children.iter().rev() {
-        prepare_paths(*child, Some(address), path, hidden_paths, scopes, state);
-    }
-    path.pop();
 }
 
 /// Populate the overwhelmingly common all-visible hierarchy without building
 /// and allocating a displayed-name path for every execution scope. Name paths
 /// are needed only to remap the small set of user-hidden scopes across edits.
 fn prepare_visible_paths(
-    address: ScopeAddress,
-    parent: Option<ScopeAddress>,
+    root: ScopeAddress,
     scopes: &HashMap<ScopeAddress, Arc<PreparedScope>>,
     state: &mut ProcessScopeState,
 ) {
-    if state.state.contains_key(&address) {
-        return;
-    }
-    let scope = &scopes[&address];
-    state.state.insert(
-        address,
-        ScopeState {
-            parent,
-            visible: true,
-            prepared: Arc::clone(scope),
-        },
-    );
-    for child in scope.children.iter().rev() {
-        prepare_visible_paths(*child, Some(address), scopes, state);
+    let mut stack = vec![(root, None)];
+    while let Some((address, parent)) = stack.pop() {
+        if state.state.contains_key(&address) {
+            continue;
+        }
+        let scope = &scopes[&address];
+        state.state.insert(
+            address,
+            ScopeState {
+                parent,
+                visible: true,
+                prepared: Arc::clone(scope),
+            },
+        );
+        stack.extend(scope.children.iter().map(|child| (*child, Some(address))));
     }
 }
 
@@ -390,42 +457,46 @@ fn reuse_paths(
 /// A reused cell is safe to keep as an opaque prepared subtree only when its
 /// own data and every referenced cell are the same immutable allocations.
 fn reusable_cells(output: &CompiledData, old: &CompileOutputState) -> HashSet<CellId> {
-    fn check(
-        id: CellId,
-        output: &CompiledData,
-        old: &CompileOutputState,
-        memo: &mut HashMap<CellId, bool>,
-    ) -> bool {
-        if let Some(reusable) = memo.get(&id) {
-            return *reusable;
-        }
-        let Some(cell) = output.cells.get(&id) else {
-            return false;
-        };
-        if !old
-            .output
-            .cells
-            .get(&id)
-            .is_some_and(|before| Arc::ptr_eq(before, cell))
-        {
-            memo.insert(id, false);
-            return false;
-        }
-        // Cached parents can retain their allocation while a referenced
-        // child is replaced (notably in generated and test hierarchies). The
-        // parent bbox and render index are reusable only if its closure is.
-        memo.insert(id, false);
-        let reusable = cell.objects.values().all(|value| match value {
-            SolvedValue::Instance(instance) => check(instance.cell, output, old, memo),
-            _ => true,
-        });
-        memo.insert(id, reusable);
-        reusable
-    }
-
-    let mut memo = HashMap::new();
+    let same = |id: &CellId| {
+        output.cells.get(id).is_some_and(|cell| {
+            old.output
+                .cells
+                .get(id)
+                .is_some_and(|before| Arc::ptr_eq(before, cell))
+        })
+    };
+    // Cached parents can retain their allocation while a referenced
+    // child is replaced (notably in generated and test hierarchies). The
+    // parent bbox and render index are reusable only if its closure is.
+    let mut memo: HashMap<CellId, bool> = HashMap::new();
     for id in output.cells.keys() {
-        check(*id, output, old, &mut memo);
+        // A cell is decided after every cell it instantiates.
+        let mut stack = vec![(*id, false)];
+        while let Some((id, children_done)) = stack.pop() {
+            if children_done {
+                let reusable = output.cells[&id].objects.values().all(|value| match value {
+                    SolvedValue::Instance(instance) => memo.get(&instance.cell) == Some(&true),
+                    _ => true,
+                });
+                memo.insert(id, reusable);
+                continue;
+            }
+            if memo.contains_key(&id) {
+                continue;
+            }
+            if !same(&id) {
+                memo.insert(id, false);
+                continue;
+            }
+            stack.push((id, true));
+            for value in output.cells[&id].objects.values() {
+                if let SolvedValue::Instance(instance) = value
+                    && !memo.contains_key(&instance.cell)
+                {
+                    stack.push((instance.cell, false));
+                }
+            }
+        }
     }
     memo.into_iter()
         .filter_map(|(id, reusable)| reusable.then_some(id))
@@ -470,16 +541,12 @@ fn reuse_unchanged_paths(
             }
         }
     }
-    fn visit(
-        address: ScopeAddress,
-        parent: Option<ScopeAddress>,
-        scopes: &HashMap<ScopeAddress, Arc<PreparedScope>>,
-        state: &mut imbl::HashMap<ScopePath, ScopeState>,
-        reusable: &HashSet<CellId>,
-        seen: &mut HashSet<ScopeAddress>,
-    ) -> bool {
+    let state = &mut state.state;
+    let mut seen = HashSet::new();
+    let mut stack = vec![(root, None)];
+    while let Some((address, parent)) = stack.pop() {
         if !seen.insert(address) {
-            return true;
+            continue;
         }
         let Some(prepared) = scopes.get(&address) else {
             return false;
@@ -497,7 +564,7 @@ fn reuse_unchanged_paths(
                     },
                 );
             }
-            return true;
+            continue;
         }
         state.insert(
             address,
@@ -507,20 +574,14 @@ fn reuse_unchanged_paths(
                 prepared: Arc::clone(prepared),
             },
         );
-        prepared
-            .children
-            .iter()
-            .rev()
-            .all(|child| visit(*child, Some(address), scopes, state, reusable, seen))
+        stack.extend(
+            prepared
+                .children
+                .iter()
+                .map(|child| (*child, Some(address))),
+        );
     }
-    visit(
-        root,
-        None,
-        scopes,
-        &mut state.state,
-        reusable,
-        &mut HashSet::new(),
-    )
+    true
 }
 
 fn changed_cell_layers(output: &CompiledData, reusable: &HashSet<CellId>) -> HashSet<String> {
@@ -646,10 +707,10 @@ pub(super) fn prepare(
     } else {
         let hidden_paths = hidden_paths(old);
         if hidden_paths.is_empty() {
-            prepare_visible_paths(root, None, &scopes, state);
+            prepare_visible_paths(root, &scopes, state);
             true
         } else {
-            prepare_paths(root, None, &mut Vec::new(), &hidden_paths, &scopes, state);
+            prepare_paths(root, &hidden_paths, &scopes, state);
             state.state.values().all(|scope| scope.visible)
         }
     };

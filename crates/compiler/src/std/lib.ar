@@ -1,17 +1,9 @@
 fn max(x0: Float, x1: Float) -> Float {
-  if x0 < x1 {
-    x1
-  } else {
-    x0
-  }
+  max_float(x0, x1)
 }
 
 fn min(x0: Float, x1: Float) -> Float {
-  if x0 < x1 {
-    x0
-  } else {
-    x1
-  }
+  min_float(x0, x1)
 }
 
 fn intersection(rect1: Rect, rect2: Rect) -> Rect {
@@ -163,6 +155,33 @@ fn last<T>(items: [T]) -> T {
     } else {
         last(tail(items))
     }
+}
+
+// The sequence helpers below are native builtins, so each runs in one step
+// however long its input.
+
+fn len<T>(items: [T]) -> Int {
+    seq_len(items)
+}
+
+fn concat<T>(first: [T], second: [T]) -> [T] {
+    seq_concat(first, second)
+}
+
+fn flatten<T>(sequences: [[T]]) -> [T] {
+    seq_flatten(sequences)
+}
+
+fn sum(values: [Int]) -> Int {
+    seq_sum(values)
+}
+
+fn any(values: [Bool]) -> Bool {
+    seq_any(values)
+}
+
+fn all(values: [Bool]) -> Bool {
+    seq_all(values)
 }
 
 // `range_full` is a native builtin (see the `"range_full"` arms in compile.rs):
