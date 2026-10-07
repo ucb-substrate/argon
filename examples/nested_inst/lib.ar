@@ -1,3 +1,5 @@
+use std::layout::{dimension, inst, rect};
+
 cell bot() {
     pub let met1 = rect("met1", x0=0., y0=0., x1=100., y1=100.);
     pub let met2 = rect("met1", x0=100., y0=0., x1=200., y1=100.);

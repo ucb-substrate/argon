@@ -1,3 +1,5 @@
+use std::layout::rect;
+
 fn emit_shapes(n: Int) {
     // Recursively emit `n` independent, fully-constrained rectangles.
     // Each rectangle introduces 4 solver variables that are pinned directly

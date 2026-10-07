@@ -1322,7 +1322,8 @@ mod tests {
     fn rebasing_moves_spans_onto_identical_text() {
         use crate::fingerprint::{ItemIndex, SpanRebase};
 
-        let source = "cell leaf() {\n    \
+        let source = "use std::layout::{inst, rect};\n\
+                      cell leaf() {\n    \
                       let r = rect(\"met1\", x0i = 1., y0i = 2., x1i = 30., y1i = 40.);\n}\n\
                       cell top() {\n    let i = inst(leaf(), x = 0., y = 0.);\n}\n";
         let (_dir, config) = scratch_workspace(source);
@@ -1396,7 +1397,8 @@ mod tests {
     /// however many times the compile instantiates it.
     #[test]
     fn reuse_reports_a_cells_diagnostics_once() {
-        let source = "cell child() {\n    let r = rect(\"met1\", x0i = 1., y0i = 2., x1i = 30., y1i = 40.);\n}\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell child() {\n    let r = rect(\"met1\", x0i = 1., y0i = 2., x1i = 30., y1i = 40.);\n}\n\
                       cell parent() {\n    for i in std::range(3) {\n        inst(child(), x = 0., y = 0.);\n    }\n}\n";
         let (_dir, config) = scratch_workspace(source);
         let root = config.root_lib().to_path_buf();
@@ -1436,7 +1438,8 @@ mod tests {
     /// would: children before the cells that instantiate them.
     #[test]
     fn reinstated_cells_keep_a_fresh_compiles_order() {
-        let source = "cell b() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell b() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell a() { inst(b(), x = 0., y = 0.); inst(b(), x = 2., y = 0.); }\n\
                       cell r() { inst(a(), x = 0., y = 0.); inst(b(), x = 0., y = 10.); }\n";
         let (_dir, config) = scratch_workspace(source);
@@ -1472,7 +1475,8 @@ mod tests {
     fn an_edit_that_moves_nothing_needs_no_rebase() {
         use crate::fingerprint::{ItemIndex, SpanRebase};
 
-        let source = "cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell top() { let i = inst(leaf(), x = 0., y = 0.); }\n";
         let (_dir, config) = scratch_workspace(source);
         let root = config.root_lib().to_path_buf();
@@ -1501,7 +1505,8 @@ mod tests {
     /// one revision is still recognisable in the next.
     #[test]
     fn moving_a_declaration_preserves_its_cell_id() {
-        let source = "cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell top() { let i = inst(leaf(), x = 0., y = 0.); }\n";
         let (_dir, config) = scratch_workspace(source);
         let root = config.root_lib().to_path_buf();
@@ -1551,7 +1556,8 @@ mod tests {
     /// `ExecPass::source_cell_id`.
     #[test]
     fn source_cells_are_named_by_content() {
-        let source = "cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell top() { let i = inst(leaf(), x = 0., y = 0.); }\n";
         let (_dir, config) = scratch_workspace(source);
         let tech =
@@ -1576,7 +1582,8 @@ mod tests {
     /// change what they compile to.
     #[test]
     fn editing_a_parent_reuses_unchanged_children() {
-        let source = "cell child_a() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell child_a() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell child_b() { let r = rect(\"met1\", x0 = 2., y0 = 0., x1 = 3., y1 = 1.); }\n\
                       cell parent() {\n    let a = inst(child_a(), x = 0., y = 0.);\n    \
                       let b = inst(child_b(), x = 10., y = 0.);\n}\n";
@@ -1613,7 +1620,8 @@ mod tests {
     /// instantiates, so that its parent can still place it.
     #[test]
     fn reusing_a_cell_reinstates_the_cells_its_fields_hold() {
-        let source = "cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell holder() { pub let c = leaf(); }\n\
                       cell parent() {\n    let h = inst(holder(), x = 0., y = 0.);\n    \
                       let l = inst(h.c, x = 10., y = 0.);\n}\n";
@@ -1646,7 +1654,8 @@ mod tests {
     /// through `Any` reports the same error whether or not the cell is reused.
     #[test]
     fn a_reused_cell_still_reports_its_private_fields() {
-        let source = "fn width(i: Any) -> Any { i.secret.w }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      fn width(i: Any) -> Any { i.secret.w }\n\
                       cell pad() { let secret = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell parent() {\n    let p = inst(pad(), x = 0., y = 0.);\n    \
                       let r = rect(\"met2\", x0 = 0., y0 = 0., w = width(p), h = 1.);\n}\n";
@@ -1680,7 +1689,8 @@ mod tests {
     /// A child that actually changed must be re-executed, and only it.
     #[test]
     fn changing_a_child_re_executes_only_that_child() {
-        let source = "cell child_a() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell child_a() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell child_b() { let r = rect(\"met1\", x0 = 2., y0 = 0., x1 = 3., y1 = 1.); }\n\
                       cell parent() {\n    let a = inst(child_a(), x = 0., y = 0.);\n    \
                       let b = inst(child_b(), x = 10., y = 0.);\n}\n";
@@ -1719,7 +1729,8 @@ mod tests {
     /// cache rather than in isolation.
     #[test]
     fn reuse_after_a_shift_keeps_spans_pointing_at_the_same_text() {
-        let source = "cell child() {\n    \
+        let source = "use std::layout::{inst, rect};\n\
+                      cell child() {\n    \
                       let r = rect(\"met1\", x0i = 1., y0i = 2., x1i = 30., y1i = 40.);\n}\n\
                       cell parent() {\n    let i = inst(child(), x = 0., y = 0.);\n}\n";
         let (_dir, config) = scratch_workspace(source);
@@ -1761,7 +1772,8 @@ mod tests {
     /// reusing the import must not change the compiled geometry.
     #[test]
     fn editing_source_reuses_the_imported_gds() {
-        let source = "cell top() {\n    let i = inst(child(), x = 0., y = 0.);\n}\n";
+        let source =
+            "use std::layout::inst;\ncell top() {\n    let i = inst(child(), x = 0., y = 0.);\n}\n";
         let (_dir, config, _gds) = scratch_gds_workspace(source);
         let root = config.root_lib().to_path_buf();
         let cell = vec!["top".to_owned()];
@@ -1773,7 +1785,8 @@ mod tests {
         assert_eq!(session.stats().gds_cache.hits, 0);
 
         // What the GUI writes when someone draws a rectangle beside it.
-        let edited = "cell top() {\n    let i = inst(child(), x = 0., y = 0.);\n    \
+        let edited = "use std::layout::{inst, rect};\n\
+                      cell top() {\n    let i = inst(child(), x = 0., y = 0.);\n    \
                       rect(\"met1\", x0i = 0., y0i = 0., x1i = 5., y1i = 5.);\n}\n";
         session.set_source_text(root.clone(), edited);
         let second = session.compile_cell(&config, &cell, Vec::new());
@@ -1803,7 +1816,8 @@ mod tests {
     fn a_same_length_gds_rewrite_is_still_detected() {
         use ::gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
 
-        let source = "cell top() {\n    let i = inst(child(), x = 0., y = 0.);\n}\n";
+        let source =
+            "use std::layout::inst;\ncell top() {\n    let i = inst(child(), x = 0., y = 0.);\n}\n";
         let (_dir, config, gds) = scratch_gds_workspace(source);
         let root = config.root_lib().to_path_buf();
         let cell = vec!["top".to_owned()];
@@ -1851,7 +1865,8 @@ mod tests {
     fn rewriting_the_gds_file_retires_the_import() {
         use ::gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
 
-        let source = "cell top() {\n    let i = inst(child(), x = 0., y = 0.);\n}\n";
+        let source =
+            "use std::layout::inst;\ncell top() {\n    let i = inst(child(), x = 0., y = 0.);\n}\n";
         let (_dir, config, gds) = scratch_gds_workspace(source);
         let root = config.root_lib().to_path_buf();
         let cell = vec!["top".to_owned()];

@@ -28,6 +28,8 @@ A struct groups values under named fields, written `Size { w: 100., h: 50. }` an
 | [`Any`](/language/types/scalars#any) | — | A value of any type |
 | [`()`](/language/types/scalars#unit) | `()` | The unit value and type |
 
+The layout examples call `rect`, `polygon`, `path`, and `inst` from [`std::layout`](/language/std-layout), imported with `use std::layout::{inst, path, polygon, rect};`.
+
 ## Numeric literals
 
 The decimal point is what makes a literal a float:

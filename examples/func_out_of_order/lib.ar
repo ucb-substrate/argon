@@ -1,3 +1,5 @@
+use std::layout::rect;
+
 fn triple(x: Float) -> Float {
     x + double(x)
 }

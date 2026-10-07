@@ -54,7 +54,7 @@ end
 if vim.env.ARGON_TEST_MODE == 'roundtrip' then
   wait_for('GUI source edit', function()
     return table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
-      :find('let gui_rect = rect(', 1, true) ~= nil
+      :find('let gui_rect = std::layout::rect(', 1, true) ~= nil
   end)
   wait_for('GUI edit to recompile', function()
     return vim.uv.fs_stat(vim.env.ARGON_TEST_GUI_EDIT_ACK) ~= nil
@@ -71,7 +71,7 @@ if vim.env.ARGON_TEST_MODE == 'roundtrip' then
   end
   assert(closing_line, 'could not find cell closing brace')
   vim.api.nvim_buf_set_lines(bufnr, closing_line - 1, closing_line - 1, false, {
-    '    let editor_rect = rect("met1", x0i = 20., y0i = 20., x1i = 30., y1i = 30.)!;',
+    '    let editor_rect = std::layout::rect("met1", x0i = 20., y0i = 20., x1i = 30., y1i = 30.)!;',
   })
   vim.cmd('write')
 elseif vim.env.ARGON_TEST_MODE == 'startup_errors' then
@@ -179,18 +179,21 @@ elseif vim.env.ARGON_TEST_MODE == 'navigation' then
 
   local completion_labels = completion_labels_at(params.position)
   assert(completion_labels.width, 'completion should contain the visible local width')
-  assert(completion_labels.rect, 'completion should contain builtin functions')
+  assert(completion_labels.eq, 'completion should contain builtin functions')
+  assert(completion_labels.rect, 'completion should contain imported functions')
+  assert(not completion_labels.crect, 'completion should exclude functions that are not imported')
   assert(not completion_labels.cell, 'expressions should exclude declaration keywords')
   assert(not completion_labels.Float, 'expressions should exclude type names')
   assert(not completion_labels.let, 'nested expressions should exclude statement keywords')
 
-  local declaration_labels = completion_labels_at({ line = 0, character = #'cell t' })
+  -- Line 0 imports `rect`, so the first cell is declared on line 1.
+  local declaration_labels = completion_labels_at({ line = 1, character = #'cell t' })
   assert(
     vim.tbl_isempty(declaration_labels),
     'a cell declaration name should not offer existing symbols: ' .. vim.inspect(declaration_labels)
   )
 
-  local top_level_labels = completion_labels_at({ line = 0, character = #'ce' })
+  local top_level_labels = completion_labels_at({ line = 1, character = #'ce' })
   assert(top_level_labels.cell, 'top-level completion should contain the cell keyword')
   assert(not top_level_labels.rect, 'top-level completion should exclude functions')
 
@@ -209,10 +212,10 @@ elseif vim.env.ARGON_TEST_MODE == 'navigation' then
       .. tostring(#highlights.result)
   )
 
-  local rect_column = assert(lines[3]:find('rect(', 1, true)) - 1 + #'rect('
+  local rect_column = assert(lines[4]:find('rect(', 1, true)) - 1 + #'rect('
   local signature = client:request_sync('textDocument/signatureHelp', {
     textDocument = vim.lsp.util.make_text_document_params(bufnr),
-    position = { line = 2, character = rect_column },
+    position = { line = 3, character = rect_column },
   }, 10000, bufnr)
   assert(signature and not signature.err and signature.result, 'signature-help request failed')
   assert(
@@ -340,6 +343,13 @@ elseif vim.env.ARGON_TEST_MODE == 'navigation' then
       .. ' got '
       .. tostring(shifted.range.start.line)
   )
+elseif vim.env.ARGON_TEST_MODE == 'generated' then
+  -- The Rust test drives the GUI drawing requests, then has the edited buffer
+  -- saved so it can compile the file itself.
+  wait_for('generated edits to compile', function()
+    return vim.uv.fs_stat(vim.env.ARGON_TEST_GUI_EDIT_ACK) ~= nil
+  end)
+  vim.cmd('write')
 elseif vim.env.ARGON_TEST_MODE == 'rpc_errors' then
   -- The Rust test drives the analyzer RPC directly and acknowledges the
   -- mirrored GUI error after observing it.

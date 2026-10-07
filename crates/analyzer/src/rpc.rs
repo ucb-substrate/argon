@@ -333,7 +333,7 @@ fn polygon_expression(polygon: &PolygonParams) -> String {
         .collect::<Vec<_>>()
         .join("\n        ");
     format!(
-        "polygon({:?}, {},\n        {}\n    )",
+        "std::layout::polygon({:?}, {},\n        {}\n    )",
         polygon.layer,
         polygon.points.len(),
         coordinates
@@ -349,7 +349,7 @@ fn path_expression(path: &PathParams) -> String {
         .collect::<Vec<_>>()
         .join("\n        ");
     format!(
-        "path({:?}, {},\n        widthi = {:?},\n        {}\n    )",
+        "std::layout::path({:?}, {},\n        widthi = {:?},\n        {}\n    )",
         path.layer,
         path.points.len(),
         path.width,
@@ -430,7 +430,7 @@ fn missing_initial_condition_edit(
 }
 
 fn instance_placement_expression(invocation: &str, x: f64, y: f64) -> String {
-    format!("inst({invocation}, xi={x:?}, yi={y:?})")
+    format!("std::layout::inst({invocation}, xi={x:?}, yi={y:?})")
 }
 
 impl State {
@@ -612,7 +612,7 @@ impl LangServer for State {
         let document = self.document(&ast.source_text);
         let grid = self.technology_grid().await;
         let expression = format!(
-            "rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})",
+            "std::layout::rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})",
             rect.layer
                 .as_ref()
                 .map(|layer| format!("\"{layer}\", "))
@@ -808,7 +808,7 @@ impl LangServer for State {
         let scope = ast.span2scope.get(&scope_span)?;
         let document = self.document(&ast.source_text);
         let expression = format!(
-            "dimension({}, {}, {}, {}, {}, {}, {})",
+            "std::layout::dimension({}, {}, {}, {}, {}, {}, {})",
             params.p,
             params.n,
             params.value,
@@ -1097,6 +1097,7 @@ mod tests {
         std::fs::write(
             &source,
             r#"
+use std::layout::{inst, rect};
 cell leaf() { let r = rect("met1", x0=0., y0=0., x1=10., y1=5.); }
 cell top() { let a = inst(leaf(), x=0., y=0.); }
 "#,
@@ -1238,37 +1239,74 @@ cell top() { let a = inst(leaf(), x=0., y=0.); }
         assert!(editor_buffers_are_current(&source_state, &compiled));
     }
 
+    /// Inserts `statement` into the body of `top`, in a module with no `use`
+    /// declarations, the way the drawing requests do, and asserts that the
+    /// result type-checks.
+    fn assert_compiles_without_imports(statement: &str) {
+        let path = PathBuf::from("/virtual/lib.ar");
+        let source = "cell child(w: Float) {}\ncell top() {\n}\n";
+        let ast = parse::parse_source_text(source, path.clone()).unwrap();
+        let body = source.rfind('{').unwrap();
+        let scope = ast
+            .span2scope
+            .values()
+            .find(|scope| scope.span.start() == body)
+            .expect("the body of top should be indexed");
+        let insertion = insert_statement(
+            &Document::new(source, 0, PositionEncoding::Utf8),
+            scope.span,
+            None,
+            statement,
+            0..0,
+        );
+        let mut edited = source.to_owned();
+        edited.insert_str(insertion.offset, &insertion.edit.new_text);
+        let root = parse::parse_source_text(edited.clone(), path).unwrap();
+        let (_, errors) = argonc::compile::static_compile(&parse::with_std(root)).unwrap();
+        assert!(errors.errors.is_empty(), "{edited}\n{:?}", errors.errors);
+    }
+
     #[test]
     fn placed_instances_use_initial_conditions() {
+        let expression = instance_placement_expression("child(10.)", 12.5, -4.0);
         assert_eq!(
-            instance_placement_expression("child(10.)", 12.5, -4.0),
-            "inst(child(10.), xi=12.5, yi=-4.0)"
+            expression,
+            "std::layout::inst(child(10.), xi=12.5, yi=-4.0)"
         );
+        assert_compiles_without_imports(&format!("pub let inst0 = {expression};"));
     }
 
     #[test]
     fn drawn_polygons_use_numbered_initial_conditions() {
+        let expression = polygon_expression(&PolygonParams {
+            layer: "met1".to_owned(),
+            points: vec![(0., 1.), (20.5, 1.), (10., 30.)],
+            constraints: vec![],
+        });
         assert_eq!(
-            polygon_expression(&PolygonParams {
-                layer: "met1".to_owned(),
-                points: vec![(0., 1.), (20.5, 1.), (10., 30.)],
-                constraints: vec![],
-            }),
-            "polygon(\"met1\", 3,\n        x0i = 0.0, y0i = 1.0,\n        x1i = 20.5, y1i = 1.0,\n        x2i = 10.0, y2i = 30.0,\n    )"
+            expression,
+            "std::layout::polygon(\"met1\", 3,\n        x0i = 0.0, y0i = 1.0,\n        x1i = 20.5, y1i = 1.0,\n        x2i = 10.0, y2i = 30.0,\n    )"
         );
+        let constraints =
+            segment_constraint_statements("polygon0", &[DrawSegmentConstraint::Horizontal(1)]);
+        assert_compiles_without_imports(&format!("pub let polygon0 = {expression}!;{constraints}"));
     }
 
     #[test]
     fn drawn_paths_use_numbered_initial_conditions() {
+        let expression = path_expression(&PathParams {
+            layer: "met1".to_owned(),
+            width: 20.,
+            points: vec![(0., 1.), (20.5, 1.), (10., 30.)],
+            constraints: vec![],
+        });
         assert_eq!(
-            path_expression(&PathParams {
-                layer: "met1".to_owned(),
-                width: 20.,
-                points: vec![(0., 1.), (20.5, 1.), (10., 30.)],
-                constraints: vec![],
-            }),
-            "path(\"met1\", 3,\n        widthi = 20.0,\n        x0i = 0.0, y0i = 1.0,\n        x1i = 20.5, y1i = 1.0,\n        x2i = 10.0, y2i = 30.0,\n    )"
+            expression,
+            "std::layout::path(\"met1\", 3,\n        widthi = 20.0,\n        x0i = 0.0, y0i = 1.0,\n        x1i = 20.5, y1i = 1.0,\n        x2i = 10.0, y2i = 30.0,\n    )"
         );
+        let constraints =
+            segment_constraint_statements("path0", &[DrawSegmentConstraint::Vertical(2)]);
+        assert_compiles_without_imports(&format!("pub let path0 = {expression}!;{constraints}"));
     }
 
     #[test]

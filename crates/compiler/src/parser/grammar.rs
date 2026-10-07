@@ -506,15 +506,12 @@ impl<'a> Parser<'a> {
         while !self.at(TokenKind::Eof) {
             let mark = self.ntok;
             self.record_completion_site(CompletionSite::TopLevel);
-            match self.parse_decl() {
-                Some(decl) => decls.push(decl),
-                None => {
-                    self.error_at(
-                        self.span(self.cur),
-                        format!("expected a declaration, found {}", self.cur.kind.describe()),
-                    );
-                    self.recover_to_decl();
-                }
+            if !self.parse_decl(&mut decls) {
+                self.error_at(
+                    self.span(self.cur),
+                    format!("expected a declaration, found {}", self.cur.kind.describe()),
+                );
+                self.recover_to_decl();
             }
             if self.ntok == mark {
                 self.bump();
@@ -576,7 +573,9 @@ impl<'a> Parser<'a> {
     // Declarations
     // ------------------------------------------------------------------
 
-    fn parse_decl(&mut self) -> Option<Decl<&'a str, Md>> {
+    /// Parses one declaration into `decls`, or returns `false` if the cursor
+    /// is not at one. A grouped `use` adds one declaration per item.
+    fn parse_decl(&mut self, decls: &mut Vec<Decl<&'a str, Md>>) -> bool {
         use TokenKind::*;
         while self.at(KwPub) {
             self.error_at(
@@ -585,16 +584,21 @@ impl<'a> Parser<'a> {
             );
             self.bump();
         }
-        Some(match self.cur.kind {
+        let decl = match self.cur.kind {
             KwEnum => Decl::Enum(self.parse_enum_decl()),
             KwStruct => Decl::Struct(self.parse_struct_decl()),
             KwCell => Decl::Cell(self.parse_cell_decl()),
             KwFn => Decl::Fn(self.parse_fn_decl()),
             KwConst => Decl::Constant(self.parse_const_decl()),
             KwMod => Decl::Mod(self.parse_mod_decl()),
-            KwUse => Decl::Use(self.parse_use_decl()),
-            _ => return None,
-        })
+            KwUse => {
+                decls.extend(self.parse_use_decl().into_iter().map(Decl::Use));
+                return true;
+            }
+            _ => return false,
+        };
+        decls.push(decl);
+        true
     }
 
     /// `enumDecl : ENUM ident genericParams? LBRACE enumVariants RBRACE`
@@ -708,34 +712,79 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `useDecl : USE identPath (AS ident)? SEMI`
-    fn parse_use_decl(&mut self) -> UseDecl<&'a str, Md> {
+    /// `useDecl : USE identPath (AS ident)? SEMI
+    ///          | USE identPath PATHSEP LBRACE useItem (COMMA useItem)* COMMA? RBRACE SEMI`
+    ///
+    /// A group desugars into one declaration per item. Each shares the
+    /// prefix idents and spans only its own `useItem`.
+    fn parse_use_decl(&mut self) -> Vec<UseDecl<&'a str, Md>> {
         let lo = self.cur.start;
         self.expect(TokenKind::KwUse);
         let path = self.parse_ident_path(CompletionSite::ImportPath);
-        if path.path.len() < 2 {
-            self.error_at(
-                path.span,
-                "a use path must name an item in a module".to_string(),
-            );
-        }
         if let Some(args) = &path.generic_args {
             self.error_at(
                 args.span,
                 "a use path cannot take type arguments".to_string(),
             );
         }
-        self.record_completion_site(CompletionSite::Keyword("as"));
-        let alias = if self.eat(TokenKind::KwAs) {
-            Some(self.ident(CompletionSite::NewIdentifier))
-        } else {
-            None
-        };
+        if self.at(TokenKind::PathSep) && self.nxt.kind == TokenKind::LBrace {
+            self.bump();
+            let group_lo = self.cur.start;
+            self.expect(TokenKind::LBrace);
+            let items = self.separated_list(TokenKind::RBrace, CompletionSite::ImportPath, |p| {
+                p.parse_use_item()
+            });
+            self.expect(TokenKind::RBrace);
+            if items.is_empty() {
+                self.error_at(
+                    self.finish_span(group_lo),
+                    "a use group must name at least one item".to_string(),
+                );
+            }
+            self.expect(TokenKind::Semi);
+            return items
+                .into_iter()
+                .map(|(item, alias, span)| {
+                    let mut item_path = path.path.clone();
+                    item_path.push(item);
+                    UseDecl {
+                        path: item_path,
+                        alias,
+                        span,
+                    }
+                })
+                .collect();
+        }
+        if path.path.len() < 2 {
+            self.error_at(
+                path.span,
+                "a use path must name an item in a module".to_string(),
+            );
+        }
+        let alias = self.parse_use_alias();
         self.expect(TokenKind::Semi);
-        UseDecl {
+        vec![UseDecl {
             path: path.path,
             alias,
             span: self.finish_span(lo),
+        }]
+    }
+
+    /// `useItem : ident (AS ident)?`, with the span it covers.
+    fn parse_use_item(&mut self) -> (Ident<&'a str, Md>, Option<Ident<&'a str, Md>>, Span) {
+        let lo = self.cur.start;
+        let item = self.ident(CompletionSite::ImportPath);
+        let alias = self.parse_use_alias();
+        (item, alias, self.finish_span(lo))
+    }
+
+    /// `(AS ident)?` after an imported item.
+    fn parse_use_alias(&mut self) -> Option<Ident<&'a str, Md>> {
+        self.record_completion_site(CompletionSite::Keyword("as"));
+        if self.eat(TokenKind::KwAs) {
+            Some(self.ident(CompletionSite::NewIdentifier))
+        } else {
+            None
         }
     }
 
@@ -1747,6 +1796,10 @@ impl<'a> Parser<'a> {
         let mut path = vec![self.ident(completion_site)];
         let mut generic_args: Option<GenericArgs<&'a str, Md>> = None;
         while self.at(TokenKind::PathSep) {
+            // `use prefix::{..}` ends the path before its group.
+            if completion_site == CompletionSite::ImportPath && self.nxt.kind == TokenKind::LBrace {
+                break;
+            }
             if self.nxt.kind == TokenKind::Lt {
                 self.bump();
                 let args_lo = self.cur.start;

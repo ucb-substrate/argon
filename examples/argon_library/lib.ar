@@ -1,6 +1,8 @@
 mod utils;
 mod nested;
 
+use std::layout::rect;
+
 cell test() {
     rect("met1", x0=0., y0=0., x1=nested::nested::test(), y1=lib::utils::test());
 }

@@ -1,3 +1,5 @@
+use std::layout::{inst, rect};
+
 fn make_list(base: Float) -> [Rect] {
     cons(
         rect("met1", x0=base, y0=0., w=100., h=100.),

@@ -1,3 +1,5 @@
+use std::layout::rect;
+
 cell top() {
     if true {
         let true_rect = rect("met1", x0=0., y0=0., x1=100., y1=100.);

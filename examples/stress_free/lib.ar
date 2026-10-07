@@ -1,3 +1,5 @@
+use std::layout::crect;
+
 fn emit_free(n: Int) {
     // Emit `n` rectangles whose edges are coupled to each other but anchored
     // to nothing. Each contributes a two-variable constraint in x and another

@@ -1,3 +1,5 @@
+use std::layout::rect;
+
 fn make_tuple() -> (Int, Int) {
     (3, 5)
 }

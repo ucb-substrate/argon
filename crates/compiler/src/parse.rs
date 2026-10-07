@@ -21,6 +21,40 @@ pub type WorkspaceParseAst = WorkspaceAst<ParseMetadata>;
 pub const STD_PATH: &str = "<argon-std>/lib.ar";
 /// Source text embedded into the compiler for the Argon standard library.
 pub const STD_SOURCE: &str = include_str!("std/lib.ar");
+/// Virtual path of the embedded `std::layout` module.
+pub const STD_LAYOUT_PATH: &str = "<argon-std>/layout.ar";
+/// Source text of the embedded `std::layout` module.
+pub const STD_LAYOUT_SOURCE: &str = include_str!("std/layout.ar");
+
+/// One module of the embedded standard library.
+pub struct StdModule {
+    /// The module's path, such as `["std", "layout"]`.
+    pub module: &'static [&'static str],
+    /// The virtual path its diagnostics and definitions point at.
+    pub path: &'static str,
+    pub source: &'static str,
+}
+
+impl StdModule {
+    pub fn mod_path(&self) -> ModPath {
+        self.module.iter().map(|name| name.to_string()).collect()
+    }
+}
+
+/// The modules of the standard library, in the order they are typed. A module
+/// may refer only to the modules before it.
+pub const STD_MODULES: [StdModule; 2] = [
+    StdModule {
+        module: &["std"],
+        path: STD_PATH,
+        source: STD_SOURCE,
+    },
+    StdModule {
+        module: &["std", "layout"],
+        path: STD_LAYOUT_PATH,
+        source: STD_LAYOUT_SOURCE,
+    },
+];
 /// Virtual path used for diagnostics originating in a cell invocation supplied
 /// by a compiler entry point rather than by a source file.
 pub const CELL_PATH: &str = "<argon-cell>";
@@ -31,7 +65,29 @@ pub const CELL_PATH: &str = "<argon-cell>";
 /// source file by path — diagnostic rendering, an editor jumping to a
 /// definition — has to go through here rather than the filesystem.
 pub fn virtual_source(path: &Path) -> Option<&'static str> {
-    (path == Path::new(STD_PATH)).then_some(STD_SOURCE)
+    STD_MODULES
+        .iter()
+        .find(|module| path == Path::new(module.path))
+        .map(|module| module.source)
+}
+
+/// Parses every module of the standard library, keyed by module path.
+pub fn parse_std() -> WorkspaceParseAst {
+    STD_MODULES
+        .iter()
+        .map(|module| {
+            let ast = parse_source_text(module.source, PathBuf::from(module.path))
+                .expect("the standard library parses");
+            (module.mod_path(), ast)
+        })
+        .collect()
+}
+
+/// A workspace of `root` and the standard library.
+pub fn with_std(root: AnnotatedParseAst) -> WorkspaceParseAst {
+    let mut ast = WorkspaceParseAst::from([(ModPath::new(), root)]);
+    ast.extend(parse_std());
+    ast
 }
 
 impl AstMetadata for ParseMetadata {
@@ -340,11 +396,13 @@ pub fn parse_workspace_with_config_sources_and_cache(
         None,
     );
     add_gds_imports(&mut output, config.gds_imports.iter().cloned());
-    let std_path = PathBuf::from(STD_PATH);
-    let (std_ast, std_diagnostics) = parse_source(ArcStr::from(STD_SOURCE), std_path.clone());
-    // TODO: fix std library overwriting user-defined std mods.
-    output.asts.insert(vec!["std".to_string()], std_ast);
-    output.errs.insert(std_path, (std_diagnostics, Vec::new()));
+    for module in &STD_MODULES {
+        let path = PathBuf::from(module.path);
+        let (ast, diagnostics) = parse_source(ArcStr::from(module.source), path.clone());
+        // TODO: fix std library overwriting user-defined std mods.
+        output.asts.insert(module.mod_path(), ast);
+        output.errs.insert(path, (diagnostics, Vec::new()));
+    }
     output
 }
 

@@ -94,6 +94,8 @@ Generates a standalone HTML reference for the library, one page per module, with
 ```argon title="lib.ar"
 //! Standard cells for this library.
 
+use std::layout::rect;
+
 /// Draws a square on the requested layer.
 ///
 /// # Arguments

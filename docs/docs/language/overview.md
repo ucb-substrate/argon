@@ -9,11 +9,15 @@ sidebar_label: Overview
 Argon is a statically typed language for describing integrated-circuit layout. The syntax and type system are modeled on Rust. What's different is that geometric values, such as the edges of a rectangle, are variables in a linear constraint system rather than fixed numbers.
 
 ```argon
-cell via_array(cols: Int, pitch: Float) {
-    let cut = rect("via", w=20., h=20.);
+use std::layout::{inst, rect};
 
+cell via(size: Float) {
+    rect("via1", x0=0., y0=0., w=size, h=size);
+}
+
+cell via_array(cols: Int, pitch: Float) {
     for i in std::range(cols) {
-        inst(cut, x=(i as Float) * pitch, y=0.);
+        inst(via(20.), x=(i as Float) * pitch, y=0.);
     }
 }
 ```
@@ -22,9 +26,9 @@ cell via_array(cols: Int, pitch: Float) {
 
 - A **cell** is a layout definition you can call.
 - A **function** computes a value, or emits geometry and constraints into the scope that calls it.
-- Geometry constructors create rectangles, polygons, paths, and text.
+- Geometry constructors from [`std::layout`](/language/std-layout) create rectangles, polygons, paths, and text.
 - [`Float`](/language/types/scalars#float) values, including geometry, can be related with equality constraints.
-- Calling a cell produces a cell value; [`inst`](/language/builtins/hierarchy#inst) places it in the hierarchy.
+- Calling a cell produces a cell value; [`inst`](/language/std-layout#inst) places it in the hierarchy.
 - Modules and manifests organize source, dependencies, technology data, and GDS imports.
 
 ## Syntax

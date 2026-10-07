@@ -1,3 +1,5 @@
+use std::layout::rect;
+
 fn emit_fallbacks(n: Int) {
     // Emit `n` rectangles in the shape the GUI actually writes: every
     // coordinate is an *initial condition* (`x0i`, `y0i`) rather than a hard

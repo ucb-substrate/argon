@@ -7,6 +7,12 @@ description: Rectangles, polygons, paths, and text.
 
 Geometry constructors take positional arguments first, then keyword arguments. The coordinates they expose are solver variables, not plain numbers, so you can constrain them after the fact.
 
+The constructors are in the [`std::layout`](/language/std-layout) module. The examples on this page assume a module that imports them:
+
+```argon
+use std::layout::{crect, path, polygon, rect, text};
+```
+
 ## Rectangles
 
 ```argon
@@ -14,13 +20,13 @@ let metal = rect("met1", x0=0., y0=0., w=200., h=100.);
 let bounds = crect(x0=0., y0=0., x1=400., y1=300.);
 ```
 
-[`rect`](/language/builtins/geometry#rect) draws a rectangle on a layer. [`crect`](/language/builtins/geometry#crect) makes a construction rectangle, which isn't exported and needs no layer.
+[`rect`](/language/std-layout#rect) draws a rectangle on a layer. [`crect`](/language/std-layout#crect) makes a construction rectangle, which isn't exported and needs no layer.
 
 Both have `x0`, `y0`, `x1`, `y1`, `w`, and `h`; see [`Rect`](/language/types/rect) for how they relate.
 
 ## Polygons
 
-[`polygon`](/language/builtins/geometry#polygon) takes a layer and a vertex count. Set or constrain each coordinate individually:
+[`polygon`](/language/std-layout#polygon) takes a layer and a vertex count. Set or constrain each coordinate individually:
 
 ```argon
 let outline = polygon(
@@ -47,7 +53,7 @@ let route = path(
 );
 ```
 
-See [`Path`](/language/types/path) and the [`path` constructor](/language/builtins/geometry#path).
+See [`Path`](/language/types/path) and the [`path` constructor](/language/std-layout#path).
 
 ## Text
 
@@ -55,4 +61,4 @@ See [`Path`](/language/types/path) and the [`path` constructor](/language/builti
 text("VDD", "text.label", 40., 80.);
 ```
 
-[`text`](/language/builtins/geometry#text) places a label on a text layer.
+[`text`](/language/std-layout#text) places a label on a text layer.
