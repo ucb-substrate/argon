@@ -367,7 +367,7 @@ impl Builder<'_> {
                 out.insert(ctor.def);
                 self.tys(&ctor.args, out);
             }
-            Ty::Cell(cell) | Ty::Inst(cell) => {
+            Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => {
                 if let Some(def) = cell.def {
                     out.insert(def);
                 }
@@ -406,6 +406,7 @@ impl Builder<'_> {
             | Ty::Path
             | Ty::Point
             | Ty::String
+            | Ty::Signal
             | Ty::Nil => {}
         }
     }
@@ -1079,6 +1080,15 @@ fn untouched<T>(v: T) -> T { v }
                 &format!("use std::layout::{{polygon as shape}};{body}"),
             ),
             Vec::<String>::new()
+        );
+        // The two `inst` natives share a name but not a module.
+        let body = "\ncell child() {}\n\ncell top() {\n    let i = place(child());\n}\n";
+        assert_eq!(
+            changed(
+                &format!("use std::layout::inst as place;{body}"),
+                &format!("use std::schematic::inst as place;{body}"),
+            ),
+            ["top"]
         );
     }
 

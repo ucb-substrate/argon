@@ -22,7 +22,8 @@ The layout functions, such as `rect`, `crect`, `polygon`, `path`, `text`, `inst`
 | --- | --- |
 | Scalars | [`Float`](/language/types/scalars#float), [`Int`](/language/types/scalars#int), [`Bool`](/language/types/scalars#bool), [`String`](/language/types/scalars#string), [`Any`](/language/types/scalars#any), [`()`](/language/types/scalars#unit) |
 | Geometry | [`Rect`](/language/types/rect), [`Polygon`](/language/types/polygon), [`Path`](/language/types/path), [`Point`](/language/types/point) |
-| Hierarchy | [`Cell`](/language/types/instance#cell-values), [`Inst`](/language/types/instance#instance-values) |
+| Hierarchy | [`Cell`](/language/types/instance#cell-values), [`Inst`](/language/types/instance#instance-values), [`SchematicInst`](/language/types/instance#schematic-instances) |
+| Schematic | [`Signal`](/language/std-schematic#signal), imported from `std::schematic` |
 | Collections | [`[T]`](/language/types/collections#sequences), [`(A, B)`](/language/types/collections#tuples) |
 
 ## Signature notation

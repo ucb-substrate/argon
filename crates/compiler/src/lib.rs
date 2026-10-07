@@ -123,8 +123,9 @@ mod tests {
 
     use crate::{
         compile::{
-            CellId, CompiledData, ExecErrorKind, MAX_TEXT_LEN, RESERVED_CELL_FIELDS,
-            RectInitialCondition, SolvedValue, StaticErrorKind, static_compile,
+            CellId, CompiledCell, CompiledData, DetachedReason, DeviceKind, Element, ExecErrorKind,
+            MAX_TEXT_LEN, NetIdx, ParamValue, RESERVED_CELL_FIELDS, RectInitialCondition,
+            Schematic, SolvedValue, StaticErrorKind, static_compile,
         },
         parse::{parse_source_text, parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
@@ -7242,6 +7243,954 @@ cell top() {
         // outline's height is the box's.
         assert_eq!(top_rect_sizes(&data), [(400., 20.)]);
         assert_eq!(rect_widths_of(&data, "shape_rect"), [100., 300.]);
+    }
+
+    // ---------------------------------------------------------------------
+    // Schematic entry.
+    // ---------------------------------------------------------------------
+
+    const SCHEMATIC_INVERTER: &str = "use std::schematic::{DeviceKind, Signal};
+use std::schematic::{device, connect};
+use std::schematic::inst as sinst;
+
+cell mos(nfet: Bool, w: Float, nf: Int) {
+    pub let d = Signal();
+    pub let g = Signal();
+    pub let s = Signal();
+    pub let b = Signal();
+
+    let model = if nfet {
+        \"sky130_fd_pr__nfet_01v8\"
+    } else {
+        \"sky130_fd_pr__pfet_01v8\"
+    };
+
+    device(DeviceKind::Subckt, [d, g, s, b], model, l=0.15, w=w, nf=nf);
+}
+
+cell inv(pw: Float, nw: Float, nf: Int) {
+    pub let a = Signal();
+    pub let out = Signal();
+    pub let vdd = Signal();
+    pub let vss = Signal();
+
+    let nmos = sinst(mos(true, nw, nf));
+    let pmos = sinst(mos(false, pw, nf));
+    connect(a, nmos.g);
+    connect(a, pmos.g);
+    connect(out, nmos.d);
+    connect(out, pmos.d);
+    connect(vdd, pmos.s);
+    connect(vdd, pmos.b);
+    connect(vss, nmos.s);
+    connect(vss, nmos.b);
+}
+";
+
+    /// The imports every schematic test source starts with.
+    const SCHEMATIC_PRELUDE: &str = "use std::schematic::{DeviceKind, Signal, connect, device};\n\
+                                     use std::schematic::inst as sinst;\n\
+                                     cell r() { pub let a = Signal(); pub let b = Signal(); }\n";
+
+    /// `top` of `body` after the schematic imports and a two-port cell `r`.
+    fn compile_schematic(body: &str) -> CompiledData {
+        compile_top(&format!("{SCHEMATIC_PRELUDE}{body}"))
+    }
+
+    /// The execution errors of `top` in `body`, after the schematic imports.
+    fn run_schematic(body: &str) -> Vec<ExecErrorKind> {
+        run_source(&format!("{SCHEMATIC_PRELUDE}{body}"))
+    }
+
+    /// The static errors of `body`, after the schematic imports.
+    fn schematic_static_errors(body: &str) -> Vec<StaticErrorKind> {
+        static_errors_of(&format!("{SCHEMATIC_PRELUDE}{body}"))
+    }
+
+    /// The compiled cell named `name`.
+    fn cell_named<'d>(data: &'d CompiledData, name: &str) -> &'d CompiledCell {
+        data.cells
+            .values()
+            .find(|cell| cell.name == name)
+            .unwrap_or_else(|| panic!("no cell named `{name}`"))
+    }
+
+    fn top_schematic(data: &CompiledData) -> &Schematic {
+        &data.cells[&data.top].schematic
+    }
+
+    fn port_names(schematic: &Schematic) -> Vec<&str> {
+        (0..schematic.ports.len())
+            .map(|port| schematic.port_name(port))
+            .collect()
+    }
+
+    fn net_names(schematic: &Schematic) -> Vec<&str> {
+        schematic.nets.iter().map(|net| net.name.as_str()).collect()
+    }
+
+    /// The names of `nets` in `schematic`.
+    fn names_of<'s>(schematic: &'s Schematic, nets: &[NetIdx]) -> Vec<&'s str> {
+        nets.iter()
+            .map(|net| schematic.nets[*net as usize].name.as_str())
+            .collect()
+    }
+
+    fn instance_names(schematic: &Schematic) -> Vec<&str> {
+        schematic
+            .instances
+            .iter()
+            .map(|instance| instance.name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn the_inverter_connects_two_transistors() {
+        let data = compile_source(
+            SCHEMATIC_INVERTER,
+            "inv",
+            vec![CellArg::Float(2.), CellArg::Float(1.), CellArg::Int(2)],
+        );
+        let CompileOutput::Valid(data) = data else {
+            panic!("{data:#?}");
+        };
+        let inv = top_schematic(&data);
+        assert_eq!(port_names(inv), ["a", "out", "vdd", "vss"]);
+        assert_eq!(net_names(inv), ["a", "out", "vdd", "vss"]);
+        assert_eq!(instance_names(inv), ["Xnmos", "Xpmos"]);
+        assert_eq!(
+            names_of(inv, &inv.instances[0].terminals),
+            ["out", "a", "vss", "vss"]
+        );
+        assert_eq!(
+            names_of(inv, &inv.instances[1].terminals),
+            ["out", "a", "vdd", "vdd"]
+        );
+        assert!(inv.devices.is_empty());
+        assert_eq!(inv.elements, [Element::Instance(0), Element::Instance(1)]);
+
+        for (instance, model, w) in [
+            (&inv.instances[0], "sky130_fd_pr__nfet_01v8", 1.),
+            (&inv.instances[1], "sky130_fd_pr__pfet_01v8", 2.),
+        ] {
+            let mos = &data.cells[&instance.cell].schematic;
+            assert_eq!(port_names(mos), ["d", "g", "s", "b"]);
+            assert!(mos.instances.is_empty());
+            let [device] = mos.devices.as_slice() else {
+                panic!("one device: {:?}", mos.devices);
+            };
+            assert_eq!(device.name, "X0");
+            assert_eq!(device.kind, DeviceKind::Subckt);
+            assert_eq!(names_of(mos, &device.terminals), ["d", "g", "s", "b"]);
+            assert_eq!(device.model.as_deref(), Some(model));
+            assert_eq!(device.value, None);
+            assert_eq!(
+                device.params,
+                [
+                    ("l".to_owned(), ParamValue::Float(0.15)),
+                    ("w".to_owned(), ParamValue::Float(w)),
+                    ("nf".to_owned(), ParamValue::Int(2)),
+                ]
+            );
+        }
+        assert_ne!(inv.instances[0].cell, inv.instances[1].cell);
+    }
+
+    #[test]
+    fn signal_is_reached_by_import_or_by_its_full_path() {
+        compile_top(
+            "cell top() {\n\
+                 let s = std::schematic::Signal();\n\
+                 std::schematic::connect(s, std::schematic::Signal());\n\
+             }",
+        );
+        compile_top(
+            "use std::schematic::Signal;\n\
+             fn same(s: Signal) -> Signal { s }\n\
+             cell top() { let s: Signal = same(Signal()); }",
+        );
+        let errors = static_errors_of("cell top() { let s = Signal(); }");
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [StaticErrorKind::UndeclaredVar { name }] if name == "Signal"
+            ),
+            "{errors:?}"
+        );
+        let errors = static_errors_of("fn f(s: Signal) {}");
+        assert!(
+            !errors.is_empty()
+                && errors
+                    .iter()
+                    .all(|error| matches!(error, StaticErrorKind::UnknownType)),
+            "{errors:?}"
+        );
+    }
+
+    /// Only the `std::layout` natives were ever bare builtins, so only they
+    /// say where they moved.
+    #[test]
+    fn bare_schematic_natives_are_undeclared() {
+        for name in ["connect", "device"] {
+            let errors = static_errors_of(&format!("cell top() {{ {name}(); }}"));
+            assert!(
+                matches!(
+                    errors.as_slice(),
+                    [StaticErrorKind::UndeclaredVar { name: found }] if found == name
+                ),
+                "{name}: {errors:?}"
+            );
+        }
+        let errors = static_errors_of("cell top() { inst(); }");
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [StaticErrorKind::MovedItem { path, .. }] if path == "std::layout::inst"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn each_inst_import_resolves_to_its_own_native() {
+        let child = "cell child() {\n\
+                         pub let s = std::schematic::Signal();\n\
+                         let r = std::layout::rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                     }\n";
+        let layout = compile_top(&format!(
+            "use std::layout::inst;\n{child}cell top() {{ let i = inst(child(), x=0., y=0.); }}"
+        ));
+        assert!(top_schematic(&layout).instances.is_empty());
+        assert!(
+            layout.cells[&layout.top]
+                .objects
+                .values()
+                .any(|object| matches!(object, SolvedValue::Instance(_)))
+        );
+
+        let schematic = compile_top(&format!(
+            "use std::schematic::inst;\n{child}cell top() {{ let i = inst(child()); }}"
+        ));
+        assert_eq!(instance_names(top_schematic(&schematic)), ["Xi"]);
+        assert!(
+            !schematic.cells[&schematic.top]
+                .objects
+                .values()
+                .any(|object| matches!(object, SolvedValue::Instance(_)))
+        );
+
+        let both = compile_top(&format!(
+            "use std::layout::inst;\nuse std::schematic::inst as sinst;\n{child}\
+             cell top() {{ let l = inst(child(), x=0., y=0.); let s = sinst(child()); }}"
+        ));
+        assert_eq!(instance_names(top_schematic(&both)), ["Xs"]);
+        let errors = static_errors_of(&format!(
+            "use std::layout::inst;\nuse std::schematic::inst;\n{child}cell top() {{}}"
+        ));
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::DuplicateNameDeclaration)),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn schematic_natives_may_only_be_called() {
+        let errors = schematic_static_errors(
+            "cell top() {\n\
+                 let f = connect;\n\
+                 let g = std::schematic::Signal;\n\
+             }",
+        );
+        let names = errors
+            .iter()
+            .filter_map(|error| match error {
+                StaticErrorKind::NativeNotCallable { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["connect", "Signal"], "{errors:?}");
+    }
+
+    #[test]
+    fn device_parameters_are_numbers_or_strings() {
+        let errors = schematic_static_errors(
+            "cell top() {\n\
+                 let a = Signal();\n\
+                 let b = Signal();\n\
+                 device(DeviceKind::Res, [a, b], \"\", value=1., ok=1, fine=\"x\", bad=true);\n\
+                 device(DeviceKind::Res, [a, b], \"\", value=1., value=2.);\n\
+                 device(DeviceKind::Res, [a, b], \"\", w=1., W=2.);\n\
+                 device(DeviceKind::Res, [a, b], 3);\n\
+             }",
+        );
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [
+                    StaticErrorKind::InvalidDeviceParamType { name, found },
+                    StaticErrorKind::DuplicateKwArg,
+                    StaticErrorKind::DuplicateKwArg,
+                    StaticErrorKind::IncorrectTy { .. },
+                ] if name == "bad" && found == "Bool"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    /// The `(param, ty, found, via)` of each `SignalCellParam` in `errors`.
+    fn signal_params(errors: &[StaticErrorKind]) -> Vec<(&str, &str, &str, Option<&str>)> {
+        errors
+            .iter()
+            .filter_map(|error| match error {
+                StaticErrorKind::SignalCellParam {
+                    param,
+                    ty,
+                    found,
+                    via,
+                    ..
+                } => Some((param.as_str(), ty.as_str(), found.as_str(), via.as_deref())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cell_parameters_cannot_hold_signals() {
+        let errors = schematic_static_errors(
+            "struct Pin { w: Float, net: Signal }\n\
+             struct Outer { pin: Pin }\n\
+             struct Top { outer: Outer }\n\
+             struct Wrap<T> { value: T }\n\
+             enum Conn { Open, Net(Signal) }\n\
+             enum Named { Open, Net { width: Float, net: Signal } }\n\
+             cell c1(p: Signal) {}\n\
+             cell c2(p: [Signal]) {}\n\
+             cell c3(p: (Float, Signal)) {}\n\
+             cell c4(p: Option<Signal>) {}\n\
+             cell c5(p: Pin) {}\n\
+             cell c6(p: Top) {}\n\
+             cell c7(p: Conn) {}\n\
+             cell c8(p: Named) {}\n\
+             cell c9(p: Wrap<Signal>) {}\n\
+             cell top() {}",
+        );
+        assert_eq!(
+            signal_params(&errors),
+            [
+                ("p", "Signal", "Signal", None),
+                ("p", "[Signal]", "Signal", Some("[Signal][]")),
+                ("p", "(Float, Signal)", "Signal", Some("(Float, Signal).1")),
+                (
+                    "p",
+                    "std::Option<Signal>",
+                    "Signal",
+                    Some("std::Option<Signal>::Some.0")
+                ),
+                ("p", "Pin", "Signal", Some("Pin.net")),
+                ("p", "Top", "Signal", Some("Top.outer.pin.net")),
+                ("p", "Conn", "Signal", Some("Conn::Net.0")),
+                ("p", "Named", "Signal", Some("Named::Net.net")),
+                ("p", "Wrap<Signal>", "Signal", Some("Wrap<Signal>.value")),
+            ],
+            "{errors:?}"
+        );
+        assert_eq!(errors.len(), 9, "{errors:?}");
+        assert_eq!(
+            errors[4].to_string(),
+            "parameter `p` of cell `c5` has type `Pin`, which holds a `Signal` at `Pin.net`; \
+             cells cannot take signals or schematic instances"
+        );
+        assert_eq!(
+            errors[0].to_string(),
+            "parameter `p` of cell `c1` has type `Signal`; cells cannot take signals or \
+             schematic instances"
+        );
+    }
+
+    #[test]
+    fn types_without_signals_are_valid_cell_parameters() {
+        let errors = schematic_static_errors(
+            "struct Size { w: Float, h: Float }\n\
+             struct Wrap<T> { value: T }\n\
+             enum Mode { Fast, Slow(Int) }\n\
+             struct Node { width: Float, next: Option<Node> }\n\
+             cell c(a: Size, b: Wrap<Float>, c: Mode, d: Option<Node>, e: [Size], f: Any) {}\n\
+             cell top() {}",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// Recursive and polymorphically recursive types are walked once per
+    /// definition, without losing a signal behind a type argument.
+    #[test]
+    fn recursive_types_are_checked_without_looping() {
+        let errors = schematic_static_errors(
+            "struct Node { next: Option<Node>, net: Signal }\n\
+             struct Plain { next: Option<Plain>, width: Float }\n\
+             struct W<T> { inner: Option<W<(T, Int)>> }\n\
+             cell c1(n: Node) {}\n\
+             cell c2(n: Plain) {}\n\
+             cell c3(w: W<Int>) {}\n\
+             cell c4(w: W<Signal>) {}\n\
+             cell top() {}",
+        );
+        assert_eq!(
+            signal_params(&errors),
+            [
+                ("n", "Node", "Signal", Some("Node.net")),
+                (
+                    "w",
+                    "W<Signal>",
+                    "Signal",
+                    Some("W<Signal>.inner::Some.0.0")
+                ),
+            ],
+            "{errors:?}"
+        );
+        assert_eq!(errors.len(), 2, "{errors:?}");
+    }
+
+    #[test]
+    fn a_generic_cell_rejects_a_signal_type_argument_at_the_call() {
+        let errors = schematic_static_errors(
+            "cell c<T>(x: T) {}\n\
+             cell top() {\n\
+                 let fine = c(1.);\n\
+                 let bad = c(Signal());\n\
+             }",
+        );
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [StaticErrorKind::SignalCellParam { param, ty, type_param: true, .. }]
+                    if param == "T" && ty == "Signal"
+            ),
+            "{errors:?}"
+        );
+        assert_eq!(
+            errors[0].to_string(),
+            "type parameter `T` of cell `c` is `Signal`; cells cannot take signals or \
+             schematic instances"
+        );
+    }
+
+    #[test]
+    fn a_signal_passed_through_any_is_rejected_at_execution() {
+        let errors = run_schematic(
+            "cell c(x: Any) {}\n\
+             cell top() { let k = c(Signal()); }",
+        );
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ExecErrorKind::SignalCellArgument { kind }] if kind == "signal"
+            ),
+            "{errors:?}"
+        );
+        let errors = run_schematic(
+            "cell c(x: Any) {}\n\
+             cell top() { let k = c([sinst(r())]); }",
+        );
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ExecErrorKind::SignalCellArgument { kind }] if kind == "schematic instance"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn signals_and_schematic_instances_have_no_operators() {
+        let errors = schematic_static_errors(
+            "cell top() {\n\
+                 let a = Signal();\n\
+                 let same = a == Signal();\n\
+                 a!;\n\
+                 let i = sinst(r());\n\
+                 i!;\n\
+                 let b = std::layout::bbox(i);\n\
+                 let px = i.x;\n\
+             }",
+        );
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [
+                    StaticErrorKind::ComparisonInvalidType,
+                    StaticErrorKind::ComparisonInvalidType,
+                    StaticErrorKind::CannotEmit(signal),
+                    StaticErrorKind::CannotEmit(instance),
+                    StaticErrorKind::IncorrectTyCategory { .. },
+                    StaticErrorKind::NoFieldOnTy { field, .. },
+                ] if signal == "Signal" && instance == "SchematicInst(r)" && field == "x"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn private_fields_are_private_through_a_schematic_instance() {
+        let errors = schematic_static_errors(
+            "cell secret() { let s = Signal(); }\n\
+             cell top() { let i = sinst(secret()); let s = i.s; }",
+        );
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [StaticErrorKind::PrivateField { field, cell }] if field == "s" && cell == "secret"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn ports_are_the_local_signals_public_fields_hold() {
+        let data = compile_schematic(
+            "struct Pin { w: Float, net: Signal }\n\
+             cell top() {\n\
+                 pub let a = Signal();\n\
+                 pub let bus = [Signal(), Signal()];\n\
+                 pub let pair = (Signal(), 1.);\n\
+                 pub let pin = Pin { w: 1., net: Signal() };\n\
+                 pub let some = Some(Signal());\n\
+                 pub let none: Option<Signal> = None;\n\
+                 let hidden = Signal();\n\
+                 pub let m = sinst(r());\n\
+                 pub let alias = m.a;\n\
+             }",
+        );
+        let schematic = top_schematic(&data);
+        assert_eq!(
+            port_names(schematic),
+            ["a", "bus_0", "bus_1", "pair_0", "pin_net", "some_0"]
+        );
+        // `alias` is a terminal of `m`, so it names a net without being a port.
+        assert_eq!(
+            net_names(schematic),
+            [
+                "a", "bus_0", "bus_1", "pair_0", "pin_net", "some_0", "hidden", "alias", "m_b"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_port_is_a_net_named_by_its_shortest_path() {
+        let data = compile_schematic(
+            "struct Pin { w: Float, net: Signal }\n\
+             cell top() {\n\
+                 pub let a = Signal();\n\
+                 pub let b = Signal();\n\
+                 connect(a, b);\n\
+                 pub let data = [Signal(), Signal()];\n\
+                 pub let clk = data[1];\n\
+                 pub let long_name = Signal();\n\
+                 pub let s = long_name;\n\
+                 pub let a_b_c = Signal();\n\
+                 pub let p = Pin { w: 1., net: a_b_c };\n\
+                 pub let x1 = Signal();\n\
+                 pub let y1 = x1;\n\
+             }",
+        );
+        // `b` ties with `a` and loses on walk order; `clk` has fewer
+        // delimiters than `data_1`; `s` has fewer characters than
+        // `long_name`; `a_b_c` is one segment, so it beats `p_net`.
+        assert_eq!(
+            port_names(top_schematic(&data)),
+            ["a", "data_0", "clk", "s", "a_b_c", "x1"]
+        );
+    }
+
+    #[test]
+    fn internal_nets_prefer_local_paths_then_terminals_then_names() {
+        let data = compile_schematic(
+            "fn pair() -> Signal {\n\
+                 let long = Signal();\n\
+                 let s = Signal();\n\
+                 connect(long, s);\n\
+                 s\n\
+             }\n\
+             cell top() {\n\
+                 let data = [Signal(), Signal()];\n\
+                 let clk = data[1];\n\
+                 let bus = [Signal()];\n\
+                 let m = sinst(r());\n\
+                 connect(bus[0], m.a);\n\
+                 let longer = sinst(r());\n\
+                 connect(m.b, longer.b);\n\
+                 pair();\n\
+             }",
+        );
+        assert_eq!(
+            net_names(top_schematic(&data)),
+            ["data_0", "clk", "bus_0", "m_b", "longer_a", "s"]
+        );
+    }
+
+    #[test]
+    fn unconnected_terminals_are_floating_nets() {
+        let data = compile_schematic("cell top() { let nmos = sinst(r()); }");
+        let schematic = top_schematic(&data);
+        assert_eq!(net_names(schematic), ["nmos_a", "nmos_b"]);
+        assert_eq!(
+            names_of(schematic, &schematic.instances[0].terminals),
+            ["nmos_a", "nmos_b"]
+        );
+    }
+
+    #[test]
+    fn instances_are_named_by_their_bindings() {
+        let data = compile_schematic(
+            "cell top() {\n\
+                 let single = sinst(r());\n\
+                 let row = [sinst(r()), sinst(r())];\n\
+                 sinst(r());\n\
+                 for i in std::range(2) {\n\
+                     let looped = sinst(r());\n\
+                 }\n\
+             }",
+        );
+        let schematic = top_schematic(&data);
+        assert_eq!(
+            instance_names(schematic),
+            [
+                "Xsingle",
+                "Xrow_0",
+                "Xrow_1",
+                "Xinst3",
+                "Xlooped",
+                "Xlooped_1"
+            ]
+        );
+        assert_eq!(
+            net_names(schematic)[8..],
+            ["looped_a", "looped_b", "looped_1_a", "looped_1_b"]
+        );
+    }
+
+    #[test]
+    fn names_are_unique_regardless_of_case() {
+        let data = compile_schematic(
+            "cell top() {\n\
+                 pub let A = Signal();\n\
+                 pub let a = Signal();\n\
+                 let a_1 = Signal();\n\
+                 let inv = sinst(r());\n\
+                 let INV = sinst(r());\n\
+             }",
+        );
+        let schematic = top_schematic(&data);
+        assert_eq!(port_names(schematic), ["A", "a_1"]);
+        assert_eq!(&net_names(schematic)[..3], ["A", "a_1", "a_1_1"]);
+        assert_eq!(instance_names(schematic), ["Xinv", "XINV_1"]);
+    }
+
+    /// A child's schematic instance reads through to the parent's nets on the
+    /// child's ports, and is detached on its internal nets.
+    #[test]
+    fn nested_terminals_map_ports_and_detach_internal_nets() {
+        let child = "cell x() {\n\
+                         pub let p = Signal();\n\
+                         let hidden = Signal();\n\
+                         pub let m = sinst(r());\n\
+                         connect(p, m.a);\n\
+                         connect(hidden, m.b);\n\
+                     }\n";
+        let data = compile_schematic(&format!(
+            "{child}cell top() {{\n\
+                 let xi = sinst(x());\n\
+                 let net = Signal();\n\
+                 connect(net, xi.m.a);\n\
+                 let held = xi.m.b;\n\
+             }}"
+        ));
+        let schematic = top_schematic(&data);
+        let x = cell_named(&data, "x");
+        assert_eq!(port_names(&x.schematic), ["p"]);
+        assert_eq!(
+            names_of(schematic, &schematic.instances[0].terminals),
+            ["net"]
+        );
+
+        let errors = run_schematic(&format!(
+            "{child}cell top() {{\n\
+                 let xi = sinst(x());\n\
+                 connect(Signal(), xi.m.b);\n\
+             }}"
+        ));
+        let [ExecErrorKind::DetachedValue(detached)] = errors.as_slice() else {
+            panic!("{errors:?}");
+        };
+        assert_eq!(detached.reason, DetachedReason::InternalNet);
+        assert_eq!(detached.field, "m.b");
+        assert_eq!(detached.cell, "x");
+        assert_eq!(
+            errors[0].to_string(),
+            "`m.b` is internal to `x`'s schematic; connect it to a `pub let ... = Signal()` \
+             in `x` to export it"
+        );
+    }
+
+    /// The `DetachedValue` errors of `errors` as `(reason, cell, field)`.
+    fn detached_reads(errors: &[ExecErrorKind]) -> Vec<(DetachedReason, &str, &str)> {
+        errors
+            .iter()
+            .filter_map(|error| match error {
+                ExecErrorKind::DetachedValue(detached) => Some((
+                    detached.reason,
+                    detached.cell.as_str(),
+                    detached.field.as_str(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_detached_value_is_an_error_only_when_used() {
+        let cells = "cell g() {\n\
+                         pub let r = std::layout::rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                         pub let s = Signal();\n\
+                     }\n\
+                     cell holder() {\n\
+                         let gi = sinst(g());\n\
+                         pub let r = gi.r;\n\
+                     }\n";
+        let held = run_schematic(&format!(
+            "{cells}cell top() {{\n\
+                 let li = std::layout::inst(g(), x=0., y=0.);\n\
+                 let si = sinst(g());\n\
+                 let signal = li.s;\n\
+                 let rect = si.r;\n\
+                 let both = (signal, rect.x0 < 1.);\n\
+             }}"
+        ));
+        assert_eq!(
+            detached_reads(&held),
+            [(DetachedReason::ThroughSchematicInstance, "g", "r")],
+            "only `rect.x0` uses a detached value: {held:?}"
+        );
+
+        let used = run_schematic(&format!(
+            "{cells}cell top() {{\n\
+                 let li = std::layout::inst(g(), x=0., y=0.);\n\
+                 let si = sinst(g());\n\
+                 connect(Signal(), li.s);\n\
+                 let x0 = si.r.x0;\n\
+                 si.r!;\n\
+                 let h = sinst(holder());\n\
+                 let w = h.r.w;\n\
+                 let hl = std::layout::inst(holder(), x=0., y=0.);\n\
+                 let v = hl.r.w;\n\
+             }}"
+        ));
+        // Reported in evaluation order.
+        let mut reads = detached_reads(&used);
+        reads.sort_by_key(|(reason, _, _)| *reason != DetachedReason::ThroughLayoutInstance);
+        assert_eq!(
+            reads,
+            [
+                (DetachedReason::ThroughLayoutInstance, "g", "s"),
+                (DetachedReason::ThroughSchematicInstance, "g", "r"),
+                (DetachedReason::ThroughSchematicInstance, "g", "r"),
+                (DetachedReason::ThroughSchematicInstance, "g", "r"),
+                (DetachedReason::ThroughSchematicInstance, "g", "r"),
+            ],
+            "{used:?}"
+        );
+        assert_eq!(used.len(), 5, "{used:?}");
+    }
+
+    /// Runs one `device` call on the given terminals and returns its errors.
+    fn device_errors(call: &str) -> Vec<ExecErrorKind> {
+        run_schematic(&format!(
+            "cell top() {{\n\
+                 let t = [Signal(), Signal(), Signal(), Signal(), Signal()];\n\
+                 {call};\n\
+             }}"
+        ))
+    }
+
+    #[test]
+    fn devices_are_checked_against_their_kind() {
+        for valid in [
+            "device(DeviceKind::Mos, [t[0], t[1], t[2], t[3]], \"nch\", w=1.)",
+            "device(DeviceKind::Res, [t[0], t[1]], \"\", value=1000.)",
+            "device(DeviceKind::Res, [t[0], t[1]], \"\", VALUE=1000.)",
+            "device(DeviceKind::Res, [t[0], t[1]], \"rpoly\", w=1.)",
+            "device(DeviceKind::Cap, [t[0], t[1]], \"\", value=1)",
+            "device(DeviceKind::Cap, [t[0], t[1]], \"cmim\", value=\"1p\")",
+            "device(DeviceKind::Diode, [t[0], t[1]], \"dio\")",
+            "device(DeviceKind::Bjt, [t[0], t[1], t[2]], \"npn\")",
+            "device(DeviceKind::Bjt, [t[0], t[1], t[2], t[3]], \"npn\")",
+            "device(DeviceKind::Subckt, [t[0]], \"sub\")",
+            "device(DeviceKind::Subckt, t, \"sub\")",
+        ] {
+            let errors = device_errors(valid);
+            assert!(errors.is_empty(), "{valid}: {errors:?}");
+        }
+        for (invalid, kind, reason) in [
+            (
+                "device(DeviceKind::Mos, [t[0], t[1], t[2]], \"nch\")",
+                "Mos",
+                "expects 4 terminals (d, g, s, b), found 3",
+            ),
+            (
+                "device(DeviceKind::Mos, [t[0], t[1], t[2], t[3]], \"\")",
+                "Mos",
+                "requires a model",
+            ),
+            (
+                "device(DeviceKind::Mos, [t[0], t[1], t[2], t[3]], \"nch\", value=1.)",
+                "Mos",
+                "does not take a `value`",
+            ),
+            (
+                "device(DeviceKind::Mos, [t[0], t[1], t[2], t[3]], \"nch\", Value=1.)",
+                "Mos",
+                "does not take a `value`",
+            ),
+            (
+                "device(DeviceKind::Res, [t[0]], \"\", value=1.)",
+                "Res",
+                "expects 2 terminals, found 1",
+            ),
+            (
+                "device(DeviceKind::Res, [t[0], t[1]], \"\")",
+                "Res",
+                "requires a model or a `value`",
+            ),
+            (
+                "device(DeviceKind::Cap, [t[0], t[1], t[2]], \"cmim\")",
+                "Cap",
+                "expects 2 terminals, found 3",
+            ),
+            (
+                "device(DeviceKind::Diode, [t[0], t[1]], \"\")",
+                "Diode",
+                "requires a model",
+            ),
+            (
+                "device(DeviceKind::Diode, [t[0]], \"dio\")",
+                "Diode",
+                "expects 2 terminals (anode, cathode), found 1",
+            ),
+            (
+                "device(DeviceKind::Bjt, [t[0], t[1]], \"npn\")",
+                "Bjt",
+                "expects 3 or 4 terminals (c, b, e[, substrate]), found 2",
+            ),
+            (
+                "device(DeviceKind::Bjt, [t[0], t[1], t[2]], \"npn\", value=1.)",
+                "Bjt",
+                "does not take a `value`",
+            ),
+            (
+                "device(DeviceKind::Subckt, [], \"sub\")",
+                "Subckt",
+                "expects at least 1 terminal, found 0",
+            ),
+            (
+                "device(DeviceKind::Subckt, [t[0]], \"\")",
+                "Subckt",
+                "requires a model",
+            ),
+        ] {
+            let errors = device_errors(invalid);
+            assert!(
+                matches!(
+                    errors.as_slice(),
+                    [ExecErrorKind::InvalidDevice { kind: k, reason: r }] if k == kind && r == reason
+                ),
+                "{invalid}: {errors:?}"
+            );
+        }
+        let errors = device_errors("device(DeviceKind::Subckt, [t[0]], \"my model\")");
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ExecErrorKind::InvalidDeviceModel { model }] if model == "my model"
+            ),
+            "{errors:?}"
+        );
+        let errors = device_errors("device(DeviceKind::Subckt, [t[0]], \"sub\", w=1. / 0.)");
+        assert!(
+            matches!(errors.as_slice(), [ExecErrorKind::NonFiniteValue]),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_device_parameter_may_wait_for_the_solver() {
+        let data = compile_schematic(
+            "cell top() {\n\
+                 let a = Signal();\n\
+                 let w = float();\n\
+                 device(DeviceKind::Res, [a, Signal()], \"rpoly\", w=w, l=2.);\n\
+                 device(DeviceKind::Res, [a, Signal()], \"\", value=3.);\n\
+                 eq(w * 2., 5.);\n\
+             }",
+        );
+        let schematic = top_schematic(&data);
+        let [first, second] = schematic.devices.as_slice() else {
+            panic!("{:?}", schematic.devices);
+        };
+        assert_eq!((first.name.as_str(), second.name.as_str()), ("R0", "R1"));
+        assert_eq!(
+            first.params,
+            [
+                ("w".to_owned(), ParamValue::Float(2.5)),
+                ("l".to_owned(), ParamValue::Float(2.)),
+            ]
+        );
+        assert_eq!(second.value, Some(ParamValue::Float(3.)));
+        assert_eq!(second.model, None);
+    }
+
+    /// One cell value placed in both views executes once.
+    #[test]
+    fn one_cell_value_feeds_both_views() {
+        let data = compile_schematic(
+            "cell both() {\n\
+                 pub let s = Signal();\n\
+                 let r = std::layout::rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+             }\n\
+             cell top() {\n\
+                 let c = both();\n\
+                 let l = std::layout::inst(c, x=0., y=0.);\n\
+                 let s = sinst(c);\n\
+             }",
+        );
+        let both = data
+            .cells
+            .iter()
+            .filter(|(_, cell)| cell.name == "both")
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        assert_eq!(both.len(), 1);
+        let top = &data.cells[&data.top];
+        assert!(top.objects.values().any(|object| matches!(
+            object,
+            SolvedValue::Instance(instance) if instance.cell == both[0]
+        )));
+        assert_eq!(top.schematic.instances[0].cell, both[0]);
+    }
+
+    #[test]
+    fn the_digest_covers_the_schematic() {
+        let digest = |body: &str| compile_schematic(body).geometry_digest();
+        let base = "cell top() { let a = Signal(); let m = sinst(r()); connect(a, m.a); }";
+        assert_eq!(digest(base), digest(base));
+        assert_ne!(
+            digest(base),
+            digest("cell top() { let a = Signal(); let m = sinst(r()); connect(a, m.b); }")
+        );
+        assert_ne!(
+            digest("cell top() { device(DeviceKind::Res, [Signal(), Signal()], \"\", value=1.); }"),
+            digest("cell top() { device(DeviceKind::Res, [Signal(), Signal()], \"\", value=2.); }")
+        );
     }
 }
 pub mod cli;

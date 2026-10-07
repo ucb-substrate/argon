@@ -55,6 +55,7 @@ A group imports several items from one module: `use utils::{default_spacing, pad
 | --- | --- |
 | [`std`](/language/std) | `max`, `min`, `Option`, and sequence helpers |
 | [`std::layout`](/language/std-layout) | Geometry constructors, `inst`, `bbox`, `dimension`, and rectangle helpers |
+| [`std::schematic`](/language/std-schematic) | `Signal`, `connect`, `device`, `inst`, and `DeviceKind` |
 
 Call a standard library item by its full path, such as `std::max(a, b)` or `std::layout::rect("met1")`, or import it with `use`. `Option`, `Some`, and `None` are in scope in every module without an import.
 
