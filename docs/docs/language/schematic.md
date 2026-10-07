@@ -132,8 +132,11 @@ A resistor or capacitor needs a model, a `value`, or both. The model is a name w
 
 ```argon
 device(DeviceKind::Res, [a, b], "", value=1000.);
+device(DeviceKind::Cap, [a, b], "", value=1e-12);
 device(DeviceKind::Mos, [d, g, s, b], "nch", w=2., l=0.15);
 ```
+
+Values far from 1, such as a capacitance in farads, are easiest to write with an exponent: `1e-12`, `4.7e-15`.
 
 ## Schematic instances
 

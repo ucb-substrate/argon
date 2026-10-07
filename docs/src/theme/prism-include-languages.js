@@ -32,7 +32,7 @@ export default function prismIncludeLanguages(PrismObject) {
     boolean: /\b(?:true|false)\b/,
     'class-name': /\b[A-Z][A-Za-z0-9_]*\b/,
     function: /\b[a-z_][a-z0-9_]*(?=\s*\()/,
-    number: /\b\d[\d_]*(?:\.\d*)?(?:e[+-]?\d+)?/i,
+    number: /\b\d+(?:\.(?![\w.])|(?:\.\d+)?(?:e[+-]?\d+)?)/i,
     operator: /->|=>|::|&&|\|\||[+\-*\/%<>=!]=?/,
     punctuation: /[{}[\]();,.:?]/,
   };

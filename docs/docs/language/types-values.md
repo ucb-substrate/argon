@@ -34,12 +34,16 @@ The layout examples call `rect`, `polygon`, `path`, and `inst` from [`std::layou
 
 ## Numeric literals
 
-The decimal point is what makes a literal a float:
+A decimal point or an exponent makes a literal a float:
 
 ```argon
-let count = 50;     // Int
-let distance = 50.; // Float
+let count = 50;       // Int
+let distance = 50.;   // Float
+let cap = 1e-12;      // Float
+let width = 2.5e3;    // Float
 ```
+
+An exponent is `e` or `E`, an optional sign, and digits, written with no spaces: `1e-12`, `2.5e3`, `1.0E+6`. Write at least one digit after the decimal point before an exponent, since `1.e3` reads the field `e3` of `1`.
 
 Geometry and constraints use `Float`. Counts and indices use `Int`.
 
