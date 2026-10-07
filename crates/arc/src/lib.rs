@@ -615,6 +615,12 @@ fn width(s: Shape) -> Float {
     }
 
     #[test]
+    fn exponent_literals_round_trip() {
+        let source = "cell top() {\n    let c = 1.0E+6;\n    let d = 1e-12;\n}\n";
+        assert_eq!(format_source(source), source);
+    }
+
+    #[test]
     fn formatting_check_does_not_write_files() {
         let directory = tempfile::tempdir().unwrap();
         let source_path = directory.path().join("lib.ar");

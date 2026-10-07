@@ -31,6 +31,8 @@ pub enum TokenKind {
     // Names & literals.
     Ident,
     IntLit,
+    /// Digits with an exponent, such as `1e-12` or the `5e3` of `1.5e3`.
+    ExpLit,
     /// `"..."` — the span includes both quotes; the parser trims them.
     StrLit,
 
@@ -99,6 +101,7 @@ impl TokenKind {
             KwFalse => "'false'",
             Ident => "identifier",
             IntLit => "integer literal",
+            ExpLit => "float literal",
             StrLit => "string literal",
             PathSep => "'::'",
             FatArrow => "'=>'",

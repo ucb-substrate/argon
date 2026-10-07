@@ -919,6 +919,7 @@ mod tests {
                 .join("::"),
             Expr::BoolLiteral(b) => b.value.to_string(),
             Expr::IntLiteral(i) => i.value.to_string(),
+            Expr::FloatLiteral(f) => format!("{:?}", f.value),
             other => panic!(
                 "shape() does not render this expression kind (span {:?})",
                 other.span()
@@ -1014,6 +1015,82 @@ mod tests {
     }
 
     #[test]
+    fn exponents_lex_with_their_digits() {
+        use super::lexer::Lexer;
+        use super::token::TokenKind::{Dot, Eof, ExpLit, Ident, IntLit, Minus, Plus};
+
+        // An exponent joins the digits it follows. An `e` without exponent
+        // digits starts an identifier, and a `.` is always its own token.
+        for (src, expected) in [
+            ("1e3", &[(ExpLit, "1e3")][..]),
+            ("1E3", &[(ExpLit, "1E3")]),
+            ("1e-12", &[(ExpLit, "1e-12")]),
+            ("10E+6", &[(ExpLit, "10E+6")]),
+            ("2.5e3", &[(IntLit, "2"), (Dot, "."), (ExpLit, "5e3")]),
+            ("1.0E+6", &[(IntLit, "1"), (Dot, "."), (ExpLit, "0E+6")]),
+            ("1.e3", &[(IntLit, "1"), (Dot, "."), (Ident, "e3")]),
+            ("2em", &[(IntLit, "2"), (Ident, "em")]),
+            ("1e", &[(IntLit, "1"), (Ident, "e")]),
+            ("1e+", &[(IntLit, "1"), (Ident, "e"), (Plus, "+")]),
+            (
+                "1e-x",
+                &[(IntLit, "1"), (Ident, "e"), (Minus, "-"), (Ident, "x")],
+            ),
+            ("1e 3", &[(IntLit, "1"), (Ident, "e"), (IntLit, "3")]),
+            (
+                "t.0.1",
+                &[
+                    (Ident, "t"),
+                    (Dot, "."),
+                    (IntLit, "0"),
+                    (Dot, "."),
+                    (IntLit, "1"),
+                ],
+            ),
+        ] {
+            let mut lexer = Lexer::new(src, 0);
+            let mut tokens = Vec::new();
+            loop {
+                let token = lexer.next_token();
+                if token.kind == Eof {
+                    break;
+                }
+                tokens.push((token.kind, &src[token.start as usize..token.end as usize]));
+            }
+            assert_eq!(tokens, expected, "lexing `{src}`");
+        }
+    }
+
+    #[test]
+    fn exponent_literals_are_floats() {
+        for (expr, expected) in [
+            ("1e3", "1000.0"),
+            ("1E3", "1000.0"),
+            ("1e-12", "1e-12"),
+            ("2.5e3", "2500.0"),
+            ("1.0E+6", "1000000.0"),
+            ("1.5e+3", "1500.0"),
+            ("-1e-12", "(-1e-12)"),
+            ("2e3 * x", "(2000.0 * x)"),
+            // `1.e3` is field `e3` of `1`, as `1.foo` is, and tuple indices
+            // stay separate accesses.
+            ("1.e3", "(1.e3)"),
+            ("t.0.1", "((t.0).1)"),
+        ] {
+            assert_eq!(expr_shape(expr), expected, "parsing `{expr}`");
+        }
+
+        // A tuple index can't carry an exponent.
+        let errors = parse("cell c() { let x = t.1e3; }").expect_err("not a tuple index");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message == "expected field name or index, found float literal"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
     fn unparsable_numeric_literals_are_reported() {
         // These used to silently evaluate to 0, compiling to wrong geometry.
         for (body, message) in [
@@ -1022,6 +1099,12 @@ mod tests {
                 "invalid integer literal `99999999999999999999`",
             ),
             ("let x = 1 . 5;", "invalid float literal `1 . 5`"),
+            ("let x = 1. 5e3;", "invalid float literal `1. 5e3`"),
+            ("let x = 1e400;", "float literal `1e400` is out of range"),
+            (
+                "let x = 1.5E+999;",
+                "float literal `1.5E+999` is out of range",
+            ),
         ] {
             let errors = parse(&format!("cell c() {{ {body} }}"))
                 .expect_err("an unparsable literal should be rejected");
@@ -1131,7 +1214,7 @@ mod tests {
         // Assert the concrete AST variant *and* that each node's span re-slices
         // to exactly the source text it covers, rather than fuzzy-matching a
         // `{:#?}` dump.
-        let src = "cell c() {\n  let f = 100.;\n  let s = rect(\"met1\");\n}\n";
+        let src = "cell c() {\n  let f = 100.;\n  let s = rect(\"met1\");\n  let e = 2.5e-3;\n}\n";
         let mut parser = super::grammar::Parser::new(src, 0);
         let ast = parser.parse_root();
         assert!(parser.errors.is_empty(), "{:?}", parser.errors);
@@ -1164,6 +1247,16 @@ mod tests {
         assert_eq!(s.value, "met1");
         assert_eq!(&src[s.span.start()..s.span.end()], "\"met1\"");
         assert_eq!(call.scope_order, 0);
+
+        // `let e = 2.5e-3;` — one FloatLiteral spans the fraction and exponent.
+        let Statement::LetBinding(let_e) = &cell.scope.stmts[2] else {
+            panic!("expected a let binding, got {:?}", cell.scope.stmts[2]);
+        };
+        let Expr::FloatLiteral(e) = &let_e.value else {
+            panic!("expected a FloatLiteral, got {:?}", let_e.value);
+        };
+        assert_eq!(e.value, 2.5e-3);
+        assert_eq!(&src[e.span.start()..e.span.end()], "2.5e-3");
     }
 
     #[test]

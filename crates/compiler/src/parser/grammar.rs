@@ -1645,7 +1645,7 @@ impl<'a> Parser<'a> {
                     Expr::IdentPath(path)
                 }
             }
-            TokenKind::IntLit => self.parse_int_or_float(),
+            TokenKind::IntLit | TokenKind::ExpLit => self.parse_int_or_float(),
             TokenKind::StrLit => self.parse_string_literal(),
             TokenKind::KwTrue | TokenKind::KwFalse => {
                 let t = self.bump();
@@ -1924,11 +1924,15 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `INTLIT` optionally followed by `. INTLIT?` to form a float.
+    /// `EXPLIT`, or `INTLIT` optionally followed by `. (INTLIT | EXPLIT)?` to
+    /// form a float.
     ///
     /// See `literal_value` for a slice that does not parse.
     fn parse_int_or_float(&mut self) -> Expr<&'a str, Md> {
         let i0 = self.bump();
+        if i0.kind == TokenKind::ExpLit {
+            return self.float_literal(self.span(i0));
+        }
         // `INTLIT .` forms a float (`1.`, `1.5`) — except when the `.` is
         // immediately followed by an identifier, which is a field-access suffix
         // on the integer (`1.foo`); leave that `.` for the Pratt suffix loop so
@@ -1937,16 +1941,12 @@ impl<'a> Parser<'a> {
         // token (e.g. `1.`), still assembles a float, matching prior behavior.
         if self.at(TokenKind::Dot) && self.nxt.kind != TokenKind::Ident {
             let dot = self.bump();
-            let end = if self.at(TokenKind::IntLit) {
+            let end = if matches!(self.cur.kind, TokenKind::IntLit | TokenKind::ExpLit) {
                 self.bump().end
             } else {
                 dot.end
             };
-            let span = Span::new(i0.start as usize, end as usize);
-            Expr::FloatLiteral(FloatLiteral {
-                span,
-                value: self.literal_value(span, "float"),
-            })
+            self.float_literal(Span::new(i0.start as usize, end as usize))
         } else {
             let span = self.span(i0);
             Expr::IntLiteral(IntLiteral {
@@ -1954,6 +1954,17 @@ impl<'a> Parser<'a> {
                 value: self.literal_value(span, "integer"),
             })
         }
+    }
+
+    /// A float literal over `span`. A value too large for a `Float` is an error.
+    fn float_literal(&mut self, span: Span) -> Expr<&'a str, Md> {
+        let mut value: f64 = self.literal_value(span, "float");
+        if value.is_infinite() {
+            let slice = self.slice_span(span);
+            self.error_at(span, format!("float literal `{slice}` is out of range"));
+            value = 0.;
+        }
+        Expr::FloatLiteral(FloatLiteral { span, value })
     }
 
     /// Parses a numeric literal from its source slice.

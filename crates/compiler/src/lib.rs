@@ -8149,6 +8149,26 @@ cell inv(pw: Float, nw: Float, nf: Int) {
         assert_eq!(second.model, None);
     }
 
+    #[test]
+    fn exponent_literals_are_floats() {
+        assert!(static_errors_of("fn f() -> Float { 1e-12 + 2e3 }").is_empty());
+        assert!(matches!(
+            static_errors_of("fn f() -> Int { 1e3 }").as_slice(),
+            [StaticErrorKind::IncorrectTy { expected, found }]
+                if expected == "Int" && found == "Float"
+        ));
+        let data = compile_schematic(
+            "cell top() {\n\
+                 device(DeviceKind::Cap, [Signal(), Signal()], \"\", value=1e-12, m=2.5E+3);\n\
+             }",
+        );
+        let [cap] = top_schematic(&data).devices.as_slice() else {
+            panic!("{:?}", top_schematic(&data).devices);
+        };
+        assert_eq!(cap.value, Some(ParamValue::Float(1e-12)));
+        assert_eq!(cap.params, [("m".to_owned(), ParamValue::Float(2500.))]);
+    }
+
     /// One cell value placed in both views executes once.
     #[test]
     fn one_cell_value_feeds_both_views() {
