@@ -29,6 +29,7 @@ const sidebars: SidebarsConfig = {
     'language/control-flow',
     'language/geometry',
     'language/constraints',
+    'language/schematic',
     'language/modules-manifests',
     'language/technology',
     {
@@ -46,7 +47,7 @@ const sidebars: SidebarsConfig = {
       label: 'Standard library',
       collapsed: false,
       link: {type: 'doc', id: 'language/std'},
-      items: ['language/std-layout'],
+      items: ['language/std-layout', 'language/std-schematic'],
     },
     {
       type: 'category',

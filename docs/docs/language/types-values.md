@@ -22,13 +22,15 @@ A struct groups values under named fields, written `Size { w: 100., h: 50. }` an
 | [`Path`](/language/types/path) | `path("met1", 2)` | Paths with a width |
 | [`Point`](/language/types/point) | `shape.points[0]` | A polygon or path vertex |
 | [`Inst`](/language/types/instance) | `inst(child())` | A placed cell |
+| [`Signal`](/language/schematic#signals-and-nets) | `Signal()` | A signal of a cell's schematic |
+| [`SchematicInst`](/language/types/instance#schematic-instances) | `std::schematic::inst(child())` | A cell placed in a schematic |
 | [`[T]`](/language/types/collections#sequences) | `[Float]` | A sequence of one type |
 | [`(A, B)`](/language/types/collections#tuples) | `(3, 5)` | A fixed-size tuple of mixed types |
 | [`Option<T>`](/language/std#option) | `Some(3)`, `None` | A value that may be absent |
 | [`Any`](/language/types/scalars#any) | — | A value of any type |
 | [`()`](/language/types/scalars#unit) | `()` | The unit value and type |
 
-The layout examples call `rect`, `polygon`, `path`, and `inst` from [`std::layout`](/language/std-layout), imported with `use std::layout::{inst, path, polygon, rect};`.
+The layout examples call `rect`, `polygon`, `path`, and `inst` from [`std::layout`](/language/std-layout), imported with `use std::layout::{inst, path, polygon, rect};`. `Signal` is imported from [`std::schematic`](/language/std-schematic) like any other item, with `use std::schematic::Signal;`, and is only a type name once imported.
 
 ## Numeric literals
 

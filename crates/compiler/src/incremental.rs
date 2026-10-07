@@ -1616,6 +1616,75 @@ mod tests {
         assert_ne!(geometry(&first), geometry(&second), "the edit took effect");
     }
 
+    /// Every cell's schematic, with instances naming their cell, sorted.
+    fn schematics(output: &CompileOutput) -> Vec<String> {
+        let CompileOutput::Valid(data) = output else {
+            panic!("unexpected compile output: {output:?}");
+        };
+        let mut cells = data
+            .cells
+            .values()
+            .map(|cell| {
+                let schematic = &cell.schematic;
+                let instances = schematic
+                    .instances
+                    .iter()
+                    .map(|instance| {
+                        let child = &data.cells[&instance.cell];
+                        format!("{} {} {:?}", instance.name, child.name, instance.terminals)
+                    })
+                    .collect::<Vec<_>>();
+                format!(
+                    "{} nets={:?} ports={:?} {instances:?}",
+                    cell.name, schematic.nets, schematic.ports
+                )
+            })
+            .collect::<Vec<_>>();
+        cells.sort();
+        cells
+    }
+
+    /// A reused cell brings along the cells it places only in its schematic.
+    #[test]
+    fn reusing_a_cell_reinstates_its_schematic_children() {
+        let source = "use std::schematic::{Signal, connect};\n\
+                      use std::schematic::inst as sinst;\n\
+                      cell leaf() { pub let a = Signal(); }\n\
+                      cell child() {\n    pub let a = Signal();\n    \
+                      let l = sinst(leaf());\n    connect(a, l.a);\n}\n\
+                      cell parent() {\n    let c = sinst(child());\n    \
+                      let n = Signal();\n    connect(n, c.a);\n}\n";
+        let (_dir, config) = scratch_workspace(source);
+        let root = config.root_lib().to_path_buf();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = config.with_tech(Some(tech));
+        let cell = vec!["parent".to_owned()];
+
+        let mut session = IncrementalCompiler::new();
+        session.set_source_text(root.clone(), source);
+        let first = session.compile_cell(&config, &cell, Vec::new());
+
+        let edited = source.replace(
+            "let n = Signal();\n    connect(n,",
+            "let net = Signal();\n    connect(net,",
+        );
+        assert_ne!(edited, source);
+        session.set_source_text(root.clone(), edited.clone());
+        let second = session.compile_cell(&config, &cell, Vec::new());
+        assert!(session.stats().cell_cache.hits > 0, "`child` is reused");
+
+        let mut fresh = IncrementalCompiler::new();
+        fresh.set_source_text(root, edited);
+        let uncached = fresh.compile_cell(&config, &cell, Vec::new());
+        assert_eq!(schematics(&second), schematics(&uncached));
+        assert_ne!(
+            schematics(&first),
+            schematics(&second),
+            "the edit took effect"
+        );
+    }
+
     /// A reused cell brings along a cell it holds in a field but never
     /// instantiates, so that its parent can still place it.
     #[test]

@@ -17,11 +17,17 @@ use itertools::{Either, Itertools};
 use serde::{Deserialize, Serialize};
 
 mod result;
+mod schematic;
 
 pub use result::{
     CompileOutput, ExecError, ExecErrorCompileOutput, ExecErrorKind, StaticError,
     StaticErrorCompileOutput, StaticErrorKind,
 };
+pub use schematic::{
+    Detached, DetachedKind, DetachedReason, Device, DeviceKind, Element, Net, NetIdx, NodeId,
+    ParamValue, Schematic, SchematicInstValue, SchematicInstance, SignalRef,
+};
+use schematic::{DeviceRecord, NodeOrigin, SchInstRecord, SchematicState};
 
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
@@ -101,9 +107,9 @@ pub(crate) const MAX_TEXT_LEN: usize = 512;
 /// not shadow one.
 ///
 /// A cell's fields are its top-level `let` bindings, of which an instance
-/// reads only the `pub` ones, and `inst.x` / `inst.y` are the instance's
-/// position. The reserved-name check and the `Ty::Inst` field-access arm both
-/// read this list.
+/// reads only the `pub` ones, and `inst.x` / `inst.y` are a layout instance's
+/// position. The reserved-name check and the instance field-access arms read
+/// this list; a schematic instance has no position, so it answers neither.
 ///
 /// The evaluator's `ValueRef::Inst` field dispatch is the third site and
 /// cannot: each name maps to a different field of the instance, so it matches
@@ -138,10 +144,14 @@ pub enum Native {
     Dimension,
     LayoutInst,
     Bbox,
+    Signal,
+    Connect,
+    Device,
+    SchematicInst,
 }
 
 impl Native {
-    pub const ALL: [Native; 8] = [
+    pub const ALL: [Native; 12] = [
         Native::Rect,
         Native::Crect,
         Native::Polygon,
@@ -150,11 +160,27 @@ impl Native {
         Native::Dimension,
         Native::LayoutInst,
         Native::Bbox,
+        Native::Signal,
+        Native::Connect,
+        Native::Device,
+        Native::SchematicInst,
     ];
 
     /// The module the native is bound in.
     pub fn module(self) -> &'static [&'static str] {
-        &["std", "layout"]
+        match self {
+            Native::Rect
+            | Native::Crect
+            | Native::Polygon
+            | Native::Path
+            | Native::Text
+            | Native::Dimension
+            | Native::LayoutInst
+            | Native::Bbox => &["std", "layout"],
+            Native::Signal | Native::Connect | Native::Device | Native::SchematicInst => {
+                &["std", "schematic"]
+            }
+        }
     }
 
     /// The name the native is bound to in its module.
@@ -168,6 +194,10 @@ impl Native {
             Native::Dimension => "dimension",
             Native::LayoutInst => "inst",
             Native::Bbox => "bbox",
+            Native::Signal => "Signal",
+            Native::Connect => "connect",
+            Native::Device => "device",
+            Native::SchematicInst => "inst",
         }
     }
 
@@ -183,9 +213,12 @@ impl Native {
             .filter(move |native| native.module().iter().eq(module.iter()))
     }
 
-    /// The native bound to `name` in its module.
+    /// The `std::layout` native bound to `name`, which a bare `name` that
+    /// does not resolve is reported as having moved to.
     pub fn named(name: &str) -> Option<Native> {
-        Self::ALL.into_iter().find(|native| native.name() == name)
+        Self::ALL
+            .into_iter()
+            .find(|native| native.module() == ["std", "layout"] && native.name() == name)
     }
 }
 
@@ -1525,6 +1558,10 @@ pub enum Ty {
     String,
     Cell(Arc<CellTy>),
     Inst(Arc<CellTy>),
+    /// A cell placed with `std::schematic::inst`.
+    SchematicInst(Arc<CellTy>),
+    /// A signal of a cell's schematic, made by `std::schematic::Signal()`.
+    Signal,
     Nil,
     Fn(Box<FnTy>),
     /// A user-declared `enum`: the declaring enum and its type arguments.
@@ -1810,6 +1847,7 @@ pub(crate) fn subst(ty: &Ty, map: &HashMap<VarId, Ty>) -> Ty {
         })),
         Ty::Cell(cell) => Ty::Cell(Arc::new(cell.subst(map))),
         Ty::Inst(cell) => Ty::Inst(Arc::new(cell.subst(map))),
+        Ty::SchematicInst(cell) => Ty::SchematicInst(Arc::new(cell.subst(map))),
         Ty::Fn(f) => Ty::Fn(Box::new(FnTy {
             params: f.params.clone(),
             sig: f.sig.subst(map),
@@ -1830,6 +1868,7 @@ pub(crate) fn subst(ty: &Ty, map: &HashMap<VarId, Ty>) -> Ty {
         | Ty::Path
         | Ty::Point
         | Ty::String
+        | Ty::Signal
         | Ty::Nil
         | Ty::Infer(_)
         | Ty::Native(_) => ty.clone(),
@@ -1924,6 +1963,12 @@ impl InferCtx {
                 args: cell.args.iter().map(|arg| self.deep(arg)).collect(),
                 ..(**cell).clone()
             })),
+            Ty::SchematicInst(cell) if !cell.args.is_empty() => {
+                Ty::SchematicInst(Arc::new(CellTy {
+                    args: cell.args.iter().map(|arg| self.deep(arg)).collect(),
+                    ..(**cell).clone()
+                }))
+            }
             _ => ty,
         }
     }
@@ -1937,7 +1982,9 @@ impl InferCtx {
             Ty::Struct(s) => s.args.iter().any(|arg| self.has_unsolved(arg)),
             Ty::Enum(e) => e.args.iter().any(|arg| self.has_unsolved(arg)),
             Ty::Ctor(c) => c.args.iter().any(|arg| self.has_unsolved(arg)),
-            Ty::Cell(cell) | Ty::Inst(cell) => cell.args.iter().any(|arg| self.has_unsolved(arg)),
+            Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => {
+                cell.args.iter().any(|arg| self.has_unsolved(arg))
+            }
             _ => false,
         }
     }
@@ -1951,7 +1998,9 @@ impl InferCtx {
             Ty::Struct(s) => s.args.iter().any(|arg| self.occurs(id, arg)),
             Ty::Enum(e) => e.args.iter().any(|arg| self.occurs(id, arg)),
             Ty::Ctor(c) => c.args.iter().any(|arg| self.occurs(id, arg)),
-            Ty::Cell(cell) | Ty::Inst(cell) => cell.args.iter().any(|arg| self.occurs(id, arg)),
+            Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => {
+                cell.args.iter().any(|arg| self.occurs(id, arg))
+            }
             _ => false,
         }
     }
@@ -1981,7 +2030,7 @@ impl InferCtx {
                     self.solve_unsolved(arg, solution);
                 }
             }
-            Ty::Cell(cell) | Ty::Inst(cell) => {
+            Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => {
                 for arg in &cell.args {
                     self.solve_unsolved(arg, solution);
                 }
@@ -2048,6 +2097,8 @@ impl std::fmt::Display for Ty {
             Ty::Nil => write!(f, "()"),
             Ty::Cell(cell) => write!(f, "Cell({})", cell.name),
             Ty::Inst(cell) => write!(f, "Inst({})", cell.name),
+            Ty::SchematicInst(cell) => write!(f, "SchematicInst({})", cell.name),
+            Ty::Signal => write!(f, "Signal"),
             Ty::CellFn(cell_fn) => {
                 write!(f, "cell {}", cell_fn.cell.name)?;
                 fmt_params(f, &cell_fn.params)?;
@@ -2075,6 +2126,7 @@ impl std::fmt::Display for Ty {
             Ty::Ctor(c) => write!(f, "{}::{}", c.enum_name, c.variant),
             Ty::Param(param) => write!(f, "{}", param.name),
             Ty::Infer(_) => write!(f, "_"),
+            Ty::Native(Native::Signal) => write!(f, "Signal"),
             Ty::Native(native) => write!(f, "fn {}", native.name()),
         }
     }
@@ -2272,6 +2324,11 @@ mod builtin_sig {
             ("construction", Ty::Bool),
         ])
     });
+    pub(super) static CONNECT: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::Signal, Ty::Signal]));
+    /// Like [`INST`], the cell is checked by `assert_ty_is_cell`.
+    pub(super) static SCHEMATIC_INST: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::Any]));
     /// A builtin that takes no arguments, and the empty keyword set that
     /// builtins with variadic positional arguments check against.
     pub(super) static NONE: LazyLock<Signature> = LazyLock::new(Signature::default);
@@ -2582,8 +2639,13 @@ impl<'a> VarIdTyPass<'a> {
             .args
             .iter()
             .map(|arg| (arg, self.ty_from_spec(&arg.ty)))
-            .collect();
+            .collect::<Vec<_>>();
         self.bindings.pop();
+        let name = self.qualified_name(&input.name.name);
+        for (arg, ty) in &sig {
+            self.check_signal_param(&name, &arg.name.name, ty, arg.ty.span, false);
+        }
+        let sig = sig.into_iter().collect();
         // Generated declarations -- the signatures standing in for GDS-backed
         // cells -- sit at the front of the list. They have no declared fields
         // to trace back to, so field accesses on them fall through to the
@@ -3740,6 +3802,10 @@ impl<'a> VarIdTyPass<'a> {
                 let (def, ty_name) = match &ty {
                     Ty::Struct(s) => (s.def, s.name.clone()),
                     Ty::Enum(e) => (e.def, e.name.clone()),
+                    Ty::Native(Native::Signal) => {
+                        self.check_ty_arg_arity(name.span, "Signal", 0, args.len());
+                        return Ty::Signal;
+                    }
                     Ty::Native(_) => {
                         self.errors.push(StaticError {
                             span: self.span(name.span),
@@ -4067,7 +4133,9 @@ impl<'a> VarIdTyPass<'a> {
                 a.def == b.def && a.variant == b.variant && self.unify_all(&a.args, &b.args)
             }
             (Ty::Param(a), Ty::Param(b)) => a.id == b.id,
-            (Ty::Cell(a), Ty::Cell(b)) | (Ty::Inst(a), Ty::Inst(b)) => {
+            (Ty::Cell(a), Ty::Cell(b))
+            | (Ty::Inst(a), Ty::Inst(b))
+            | (Ty::SchematicInst(a), Ty::SchematicInst(b)) => {
                 a.def == b.def
                     && a.dynamic_fields == b.dynamic_fields
                     && self.unify_all(&a.args, &b.args)
@@ -4318,6 +4386,19 @@ impl<'a> VarIdTyPass<'a> {
                 Ty::CellFn(ty) => {
                     let map = self.instantiate(&ty.params, explicit, call_span, name);
                     self.typecheck_args(call_span, args, &ty.sig.subst(&map));
+                    // An argument still unsolved is left to the evaluator.
+                    for param in &ty.params {
+                        let arg = self.infer.deep(&map[&param.id]);
+                        if !self.infer.has_unsolved(&arg) {
+                            self.check_signal_param(
+                                &ty.cell.name,
+                                &param.name,
+                                &arg,
+                                call_span,
+                                true,
+                            );
+                        }
+                    }
                     (Some(varid), Ty::Cell(Arc::new(ty.cell.subst(&map))))
                 }
                 Ty::Ctor(ctor) => self.typecheck_ctor_call(varid, &ctor, call_span, args, explicit),
@@ -4452,7 +4533,160 @@ impl<'a> VarIdTyPass<'a> {
                     Ty::Unknown
                 }
             }
+            Native::Signal => {
+                self.typecheck_args(call_span, args, &builtin_sig::NONE);
+                Ty::Signal
+            }
+            Native::Connect => {
+                self.typecheck_args(call_span, args, &builtin_sig::CONNECT);
+                Ty::Nil
+            }
+            Native::Device => {
+                let module = vec!["std".to_owned(), "schematic".to_owned()];
+                let kind = match self.module_item(&module, "DeviceKind") {
+                    Some((_, ty @ Ty::Enum(_))) => ty,
+                    _ => Ty::Unknown,
+                };
+                let terminals = Ty::Seq(Box::new(Ty::Signal));
+                self.typecheck_posargs(call_span, &args.posargs, &[kind, terminals, Ty::String]);
+                self.typecheck_device_params(&args.kwargs);
+                Ty::Nil
+            }
+            Native::SchematicInst => {
+                self.typecheck_args(call_span, args, &builtin_sig::SCHEMATIC_INST);
+                if let Some(ty) = args.posargs.first() {
+                    self.assert_ty_is_cell(ty.span(), &ty.ty());
+                    match self.shallow(&ty.ty()) {
+                        Ty::Cell(c) => Ty::SchematicInst(c.clone()),
+                        Ty::Any => Ty::Any,
+                        _ => Ty::Unknown,
+                    }
+                } else {
+                    Ty::Unknown
+                }
+            }
         }
+    }
+
+    /// Checks the keyword arguments of `device`, which are the device's
+    /// parameters: any names, each a `Float`, `Int`, or `String`.
+    fn typecheck_device_params(&mut self, kwargs: &[KwArgValue<Substr, VarIdTyMetadata>]) {
+        let mut seen = IndexSet::new();
+        for kwarg in kwargs {
+            let name = kwarg.name.name.as_str();
+            if !seen.insert(name) {
+                self.errors.push(StaticError {
+                    span: self.span(kwarg.name.span),
+                    kind: StaticErrorKind::DuplicateKwArg,
+                });
+                continue;
+            }
+            let ty = self.shallow(&kwarg.value.ty());
+            if !(matches!(ty, Ty::Float | Ty::Int | Ty::String | Ty::Infer(_)) || ty.is_wildcard())
+            {
+                self.errors.push(StaticError {
+                    span: self.span(kwarg.value.span()),
+                    kind: StaticErrorKind::InvalidDeviceParamType {
+                        name: name.to_owned(),
+                        found: self.display(&ty),
+                    },
+                });
+            }
+        }
+    }
+
+    /// The first signal or schematic instance a value of type `ty` can hold,
+    /// with the path to it from `ty`.
+    ///
+    /// Each struct and enum definition is entered once, so recursive types
+    /// stay finite; the type arguments are walked every time, so a signal
+    /// cannot hide behind an argument of a definition already entered.
+    fn signal_path(&self, ty: &Ty, visited: &mut IndexSet<VarId>) -> Option<(Ty, String)> {
+        let prefixed = |segment: String, found: Option<(Ty, String)>| {
+            found.map(|(ty, path)| (ty, format!("{segment}{path}")))
+        };
+        match ty {
+            Ty::Signal | Ty::SchematicInst(_) => Some((ty.clone(), String::new())),
+            Ty::Seq(inner) => prefixed("[]".to_owned(), self.signal_path(inner, visited)),
+            Ty::Tuple(items) => items.iter().enumerate().find_map(|(index, item)| {
+                prefixed(format!(".{index}"), self.signal_path(item, visited))
+            }),
+            Ty::Struct(struct_ty) => {
+                if visited.insert(struct_ty.def)
+                    && let Some(def) = self.adt_def(struct_ty.def).and_then(AdtDef::as_struct)
+                {
+                    let map = param_map(&def.params, &struct_ty.args);
+                    for (name, field) in &def.fields {
+                        let found = self.signal_path(&subst(field, &map), visited);
+                        if found.is_some() {
+                            return prefixed(format!(".{name}"), found);
+                        }
+                    }
+                }
+                struct_ty
+                    .args
+                    .iter()
+                    .find_map(|arg| self.signal_path(arg, visited))
+            }
+            Ty::Enum(enum_ty) => {
+                if visited.insert(enum_ty.def)
+                    && let Some(def) = self.adt_def(enum_ty.def).and_then(AdtDef::as_enum)
+                {
+                    let map = param_map(&def.params, &enum_ty.args);
+                    for (variant, def) in &def.variants {
+                        let payload: Vec<(String, &Ty)> = match &def.payload {
+                            VariantTys::Tuple(tys) => tys
+                                .iter()
+                                .enumerate()
+                                .map(|(index, ty)| (index.to_string(), ty))
+                                .collect(),
+                            VariantTys::Struct(fields) => {
+                                fields.iter().map(|(name, ty)| (name.clone(), ty)).collect()
+                            }
+                        };
+                        for (element, ty) in payload {
+                            let found = self.signal_path(&subst(ty, &map), visited);
+                            if found.is_some() {
+                                return prefixed(format!("::{variant}.{element}"), found);
+                            }
+                        }
+                    }
+                }
+                enum_ty
+                    .args
+                    .iter()
+                    .find_map(|arg| self.signal_path(arg, visited))
+            }
+            _ => None,
+        }
+    }
+
+    /// Reports a parameter of `cell`, or a type argument of a call of it,
+    /// whose type `ty` can hold a signal or a schematic instance.
+    fn check_signal_param(
+        &mut self,
+        cell: &str,
+        param: &str,
+        ty: &Ty,
+        span: cfgrammar::Span,
+        type_param: bool,
+    ) {
+        let Some((found, path)) = self.signal_path(ty, &mut IndexSet::new()) else {
+            return;
+        };
+        let ty = self.display(ty);
+        let via = (!path.is_empty()).then(|| format!("{ty}{path}"));
+        self.errors.push(StaticError {
+            span: self.span(span),
+            kind: StaticErrorKind::SignalCellParam {
+                cell: cell.to_owned(),
+                param: param.to_owned(),
+                ty,
+                found: self.display(&found),
+                via,
+                type_param,
+            },
+        });
     }
 }
 
@@ -4488,7 +4722,9 @@ fn mentions_param(ty: &Ty, id: VarId) -> bool {
         Ty::Struct(s) => s.args.iter().any(|arg| mentions_param(arg, id)),
         Ty::Enum(e) => e.args.iter().any(|arg| mentions_param(arg, id)),
         Ty::Ctor(c) => c.args.iter().any(|arg| mentions_param(arg, id)),
-        Ty::Cell(cell) | Ty::Inst(cell) => cell.args.iter().any(|arg| mentions_param(arg, id)),
+        Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => {
+            cell.args.iter().any(|arg| mentions_param(arg, id))
+        }
         Ty::Fn(f) => {
             f.sig
                 .args
@@ -4515,6 +4751,7 @@ fn mentions_param(ty: &Ty, id: VarId) -> bool {
         | Ty::Path
         | Ty::Point
         | Ty::String
+        | Ty::Signal
         | Ty::Nil
         | Ty::Infer(_)
         | Ty::Native(_) => false,
@@ -5298,7 +5535,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "x" | "y" => Ty::Float,
                 _ => self.no_field_on_ty(field, Ty::Point),
             },
-            Ty::Inst(ref c) => {
+            // A schematic instance has no position.
+            Ty::SchematicInst(_) if RESERVED_CELL_FIELDS.contains(&field.name.as_str()) => {
+                self.no_field_on_ty(field, base_ty.clone())
+            }
+            Ty::Inst(ref c) | Ty::SchematicInst(ref c) => {
                 let ty = self.inst_field_ty(c, field, &base_ty);
                 match function_kind(&ty) {
                     Some(kind) => {
@@ -6252,7 +6493,7 @@ fn unsolved_vars(ty: &Ty, out: &mut Vec<InferId>) {
         Ty::Struct(s) => s.args.iter().for_each(|arg| unsolved_vars(arg, out)),
         Ty::Enum(e) => e.args.iter().for_each(|arg| unsolved_vars(arg, out)),
         Ty::Ctor(c) => c.args.iter().for_each(|arg| unsolved_vars(arg, out)),
-        Ty::Cell(cell) | Ty::Inst(cell) => {
+        Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => {
             cell.args.iter().for_each(|arg| unsolved_vars(arg, out));
         }
         _ => {}
@@ -6286,6 +6527,10 @@ fn erase_infer(ty: &Ty) -> Ty {
             ..(**cell).clone()
         })),
         Ty::Inst(cell) => Ty::Inst(Arc::new(CellTy {
+            args: cell.args.iter().map(erase_infer).collect(),
+            ..(**cell).clone()
+        })),
+        Ty::SchematicInst(cell) => Ty::SchematicInst(Arc::new(CellTy {
             args: cell.args.iter().map(erase_infer).collect(),
             ..(**cell).clone()
         })),
@@ -7237,6 +7482,7 @@ struct CellState {
     /// [`mark_emitted_proxies_as_layout`] uses this set to tell the
     /// two apart once the emission list has been resolved to object IDs.
     proxy_objects: IndexSet<ObjectId>,
+    schematic: SchematicState,
 }
 
 impl CellState {
@@ -8002,6 +8248,7 @@ impl<'a> ExecPass<'a> {
                         var_span_map: IndexMap::new(),
                         var_dependents: IndexMap::new(),
                         proxy_objects: IndexSet::new(),
+                        schematic: SchematicState::default(),
                     }
                 )
                 .is_none()
@@ -8173,6 +8420,20 @@ impl<'a> ExecPass<'a> {
                 })
                 .map(|inst| (inst.span.clone(), ExecErrorKind::InvalidType)),
         );
+        // A detached value has no object to emit either. Emitting one is a use,
+        // and `emit` skips it as it does a poisoned value.
+        let detached = self
+            .cell_state(cell_id)
+            .emit
+            .iter()
+            .filter_map(|emit| match self.values[&emit.value].get_ready() {
+                Some(Value::Detached(detached)) => Some((emit.span.clone(), detached.clone())),
+                _ => None,
+            })
+            .collect_vec();
+        for (span, detached) in detached {
+            self.detached_value(cell_id, span, detached);
+        }
         // ...and `!` on an `Any` value is likewise unproven, as is `!` on a
         // sequence, which has no single element to emit.
         invalid.extend(
@@ -8183,7 +8444,13 @@ impl<'a> ExecPass<'a> {
                 // reported why. Adding `CannotEmit` on top would be the second
                 // error for one mistake, and the `Err` below would then throw
                 // away the layout the rest of the cell produced.
-                .filter(|emit| !self.is_poisoned(emit.value))
+                .filter(|emit| {
+                    !self.is_poisoned(emit.value)
+                        && !matches!(
+                            self.values[&emit.value].get_ready(),
+                            Some(Value::Detached(_))
+                        )
+                })
                 .filter(|emit| {
                     !self.values[&emit.value]
                         .get_ready()
@@ -8284,6 +8551,12 @@ impl<'a> ExecPass<'a> {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        children.extend(
+            cell.schematic
+                .instances
+                .iter()
+                .map(|instance| instance.cell),
+        );
         // A field can name a cell that nothing here instantiates.
         for field in cell.fields.values() {
             field.for_each_cell(&mut |child| children.push(child));
@@ -8571,6 +8844,7 @@ impl<'a> ExecPass<'a> {
                     fallback_constraints_used: Vec::new(),
                     unsolved_vars: IndexSet::new(),
                     inconsistent_constraints: IndexSet::new(),
+                    schematic: Schematic::default(),
                 }),
             );
         }
@@ -8821,6 +9095,7 @@ impl<'a> ExecPass<'a> {
             unsolved_vars: state.unsolved_vars.clone().unwrap_or_default(),
             inconsistent_constraints: state.solver.inconsistent_constraints().clone(),
             objects: IndexMap::new(),
+            schematic: Schematic::default(),
         };
         for (id, scope) in state.scopes.iter() {
             add_scope(&mut ccell, state, *id, scope);
@@ -8837,7 +9112,7 @@ impl<'a> ExecPass<'a> {
             // GUI instead of the whole compile returning no layout at all.
             if matches!(
                 self.values[&emit.value].as_ref().into_ready(),
-                Some(Value::Poison)
+                Some(Value::Poison | Value::Detached(_))
             ) {
                 continue;
             }
@@ -8887,18 +9162,28 @@ impl<'a> ExecPass<'a> {
             }
         }
 
-        for (name, vid) in state.fields.iter() {
-            if !state.public_fields.contains(name) {
-                ccell.private_fields.insert(name.clone());
+        let fields = state
+            .fields
+            .iter()
+            .map(|(name, vid)| {
+                let value = self.values[vid]
+                    .as_ref()
+                    .into_ready()
+                    .expect("cell fields must be ready");
+                (name.as_str(), value, state.public_fields.contains(name))
+            })
+            .collect_vec();
+        let (schematic, nets) = state.schematic.emit(cell, &fields, &self.compiled_cells);
+        ccell.schematic = schematic;
+        for (name, value, public) in fields {
+            if !public {
+                ccell.private_fields.insert(name.to_owned());
                 continue;
             }
-            let value = self.values[vid]
-                .as_ref()
-                .into_ready()
-                .expect("cell fields must be ready");
-            ccell
-                .fields
-                .insert(name.clone(), FieldValue::solve(value, &state.solver));
+            ccell.fields.insert(
+                name.to_owned(),
+                FieldValue::solve(value, &state.solver, &nets),
+            );
         }
 
         ccell
@@ -9121,6 +9406,7 @@ impl<'a> ExecPass<'a> {
             .bindings
             .insert(id, value);
         let state = self.cell_state_mut(loc.cell);
+        state.schematic.hint(value, name);
         if let Some(public) = field {
             state.fields.insert(name.to_string(), value);
             // A later binding of the same name decides its visibility.
@@ -9802,12 +10088,14 @@ impl<'a> ExecPass<'a> {
     /// to a cell and an error has been recorded.
     ///
     /// A shape is passed by value: its coordinates are resolved in this cell's
-    /// solver, and the callee receives the constants. See [`CellArg`].
+    /// solver, and the callee receives the constants. See [`CellArg`]. `span`
+    /// is the call passing the value.
     pub fn cell_arg_from_value(
         &mut self,
         cell_id: CellId,
         dependent_vid: ValueId,
         val: &Value,
+        span: &Span,
     ) -> Result<Option<CellArg>, ()> {
         Ok(match val {
             Value::Linear(v) => {
@@ -9827,7 +10115,7 @@ impl<'a> ExecPass<'a> {
                 VariantValues::Tuple(values) => {
                     let mut payload = Vec::with_capacity(values.len());
                     for v in values {
-                        match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                        match self.cell_arg_from_value(cell_id, dependent_vid, v, span)? {
                             Some(arg) => payload.push(arg),
                             None => return Ok(None),
                         }
@@ -9840,7 +10128,7 @@ impl<'a> ExecPass<'a> {
                 VariantValues::Struct(values) => {
                     let mut fields = Vec::with_capacity(values.len());
                     for (name, v) in values {
-                        match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                        match self.cell_arg_from_value(cell_id, dependent_vid, v, span)? {
                             Some(arg) => fields.push((name.clone(), arg)),
                             None => return Ok(None),
                         }
@@ -9854,7 +10142,7 @@ impl<'a> ExecPass<'a> {
             Value::Seq(s) => {
                 let mut args = Vec::with_capacity(s.len());
                 for v in s.iter() {
-                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v, span)? {
                         Some(arg) => args.push(arg),
                         None => return Ok(None),
                     }
@@ -9864,7 +10152,7 @@ impl<'a> ExecPass<'a> {
             Value::Struct(value) => {
                 let mut fields = Vec::with_capacity(value.fields.len());
                 for (name, v) in value.fields.iter() {
-                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v, span)? {
                         Some(arg) => fields.push((name.clone(), arg)),
                         None => return Ok(None),
                     }
@@ -9931,7 +10219,7 @@ impl<'a> ExecPass<'a> {
             Value::Tuple(items) => {
                 let mut args = Vec::with_capacity(items.len());
                 for v in items {
-                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v, span)? {
                         Some(arg) => args.push(arg),
                         None => return Ok(None),
                     }
@@ -9942,6 +10230,22 @@ impl<'a> ExecPass<'a> {
             // `Err` into poison of its own rather than a second diagnostic
             // naming a type the value never had.
             Value::Poison => return Err(()),
+            // A cell parameter cannot hold these, which the type checker
+            // rejects unless the value arrived as `Any`.
+            Value::Signal(_) | Value::SchematicInst(_) => {
+                self.errors.push(ExecError {
+                    span: Some(span.clone()),
+                    cell: cell_id,
+                    kind: ExecErrorKind::SignalCellArgument {
+                        kind: val.kind_name().to_owned(),
+                    },
+                });
+                return Err(());
+            }
+            Value::Detached(detached) => {
+                self.detached_value(cell_id, span.clone(), detached.clone());
+                return Err(());
+            }
             v => {
                 self.errors.push(ExecError {
                     span: None,
@@ -9979,6 +10283,226 @@ impl<'a> ExecPass<'a> {
         Ok(true)
     }
 
+    /// Reports a use of the detached value `detached` at `span`.
+    fn detached_value(&mut self, cell_id: CellId, span: Span, detached: Arc<Detached>) {
+        self.errors.push(ExecError {
+            span: Some(span),
+            cell: cell_id,
+            kind: ExecErrorKind::DetachedValue(detached),
+        });
+    }
+
+    /// Where `eval` uses its input `input`: the argument of a native call,
+    /// and otherwise the expression being evaluated.
+    fn use_span(&self, eval: &PartialEval<VarIdTyMetadata>, input: ValueId) -> Span {
+        let span = match &eval.state {
+            PartialEvalState::If(e) => e.expr.cond.span(),
+            PartialEvalState::Match(e) => e.expr.scrutinee.span(),
+            PartialEvalState::Arith(e) => e.expr.span,
+            PartialEvalState::Comparison(e) => e.expr.span,
+            PartialEvalState::BoolOp(e) => match e.state {
+                BoolOpState::Left(_) => e.expr.left.span(),
+                BoolOpState::Right(_) => e.expr.right.span(),
+            },
+            PartialEvalState::UnaryOp(e) => e.expr.span,
+            PartialEvalState::Call(e) => e.expr.span,
+            PartialEvalState::Native(e) => {
+                let call = &e.call;
+                let posargs = call
+                    .state
+                    .posargs
+                    .iter()
+                    .zip(&call.expr.args.posargs)
+                    .map(|(arg, expr)| (*arg, expr.span()));
+                let kwargs = call
+                    .state
+                    .kwargs
+                    .iter()
+                    .zip(&call.expr.args.kwargs)
+                    .map(|(arg, kwarg)| (*arg, kwarg.value.span()));
+                posargs
+                    .chain(kwargs)
+                    .find(|(arg, _)| *arg == input)
+                    .map_or(call.expr.span, |(_, span)| span)
+            }
+            PartialEvalState::FieldAccess(e) => e.expr.span,
+            PartialEvalState::IndexFieldAccess(e) => e.expr.span,
+            PartialEvalState::Index(e) => e.expr.span,
+            PartialEvalState::Constraint(c) => return c.span.clone(),
+            PartialEvalState::Cast(e) => e.expr.span,
+            PartialEvalState::ForLoop(f) => f.for_loop.seq.span(),
+            PartialEvalState::Destructure(d) => d.span,
+            PartialEvalState::StructLit(lit) => lit.expr.span,
+            // These only pass their inputs through.
+            PartialEvalState::Tuple(_) | PartialEvalState::Seq(_) | PartialEvalState::Ctor(_) => {
+                return self.cell_state(eval.loc.cell).scopes[&eval.loc.scope]
+                    .span
+                    .clone();
+            }
+        };
+        self.span(&eval.loc, span)
+    }
+
+    /// The node of `value` if it is a signal of `cell_id`.
+    fn local_node(&self, cell_id: CellId, value: &Value) -> Option<NodeId> {
+        match value {
+            Value::Signal(signal)
+                if signal.cell == cell_id
+                    && self.cell_state(cell_id).schematic.contains(signal.node) =>
+            {
+                Some(signal.node)
+            }
+            _ => None,
+        }
+    }
+
+    /// Validates a ready `device` call at `loc`, whose value is `vid`, into a
+    /// record. `Ok(None)` means a parameter waits on the solver; `Err` means a
+    /// diagnostic has been recorded.
+    fn device_record(
+        &mut self,
+        vid: ValueId,
+        loc: &DynLoc,
+        call: &PartialCallExpr<VarIdTyMetadata>,
+    ) -> Result<Option<DeviceRecord>, ()> {
+        let cell_id = loc.cell;
+        let arg = |this: &Self, index: usize| {
+            this.values[&call.state.posargs[index]]
+                .get_ready()
+                .cloned()
+                .expect("device arguments are ready")
+        };
+        let arg_span =
+            |this: &Self, index: usize| this.span(loc, call.expr.args.posargs[index].span());
+
+        let kind = match arg(self, 0) {
+            Value::Enum(value) if value.payload.is_empty() => {
+                DeviceKind::from_variant(&value.variant)
+            }
+            _ => None,
+        };
+        let Some(kind) = kind else {
+            self.invalid_type(cell_id, &arg_span(self, 0));
+            return Err(());
+        };
+
+        let Value::Seq(items) = arg(self, 1) else {
+            self.invalid_type(cell_id, &arg_span(self, 1));
+            return Err(());
+        };
+        let mut terminals = Vec::with_capacity(items.len());
+        for item in items.iter() {
+            match item {
+                Value::Detached(detached) => {
+                    self.detached_value(cell_id, arg_span(self, 1), detached.clone());
+                    return Err(());
+                }
+                item => match self.local_node(cell_id, item) {
+                    Some(node) => terminals.push(node),
+                    None => {
+                        self.invalid_type(cell_id, &arg_span(self, 1));
+                        return Err(());
+                    }
+                },
+            }
+        }
+
+        let Value::String(model) = arg(self, 2) else {
+            self.invalid_type(cell_id, &arg_span(self, 2));
+            return Err(());
+        };
+        if model.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            self.errors.push(ExecError {
+                span: Some(arg_span(self, 2)),
+                cell: cell_id,
+                kind: ExecErrorKind::InvalidDeviceModel { model },
+            });
+            return Err(());
+        }
+        let model = (!model.is_empty()).then_some(model);
+
+        let mut value = None;
+        let mut params = Vec::new();
+        let mut pending = false;
+        for (kwarg, arg) in call.expr.args.kwargs.iter().zip(&call.state.kwargs) {
+            let name = kwarg.name.name.to_string();
+            let invalid = |this: &mut Self, reason: String| {
+                this.errors.push(ExecError {
+                    span: Some(this.span(loc, kwarg.value.span())),
+                    cell: cell_id,
+                    kind: ExecErrorKind::InvalidDeviceParam {
+                        name: name.clone(),
+                        reason,
+                    },
+                });
+                Err(())
+            };
+            let param = match self.values[arg]
+                .get_ready()
+                .cloned()
+                .expect("checked ready")
+            {
+                Value::Int(i) => ParamValue::Int(i),
+                Value::String(s) if s.contains(['\n', '\r']) => {
+                    return invalid(
+                        self,
+                        "a string parameter must not contain a line break".into(),
+                    );
+                }
+                Value::String(s) => ParamValue::String(s),
+                Value::Linear(expr) => match self.cell_state(cell_id).solver.eval_expr_exact(&expr)
+                {
+                    Some(f) if f.is_finite() => ParamValue::Float(f),
+                    Some(_) => return invalid(self, "the value is not a finite number".into()),
+                    None => {
+                        for (_, var) in expr.coeffs {
+                            self.add_var_dependent(cell_id, var, vid);
+                        }
+                        pending = true;
+                        continue;
+                    }
+                },
+                other => {
+                    let found = other.kind_name();
+                    return invalid(
+                        self,
+                        format!("expected a Float, Int, or String, found {found}"),
+                    );
+                }
+            };
+            if name == "value" {
+                value = Some(param);
+            } else {
+                params.push((name, param));
+            }
+        }
+        if pending {
+            return Ok(None);
+        }
+
+        let span = self.span(loc, call.expr.span);
+        if let Err(reason) = kind.check(terminals.len(), model.is_some(), value.is_some()) {
+            self.errors.push(ExecError {
+                span: Some(span),
+                cell: cell_id,
+                kind: ExecErrorKind::InvalidDevice {
+                    kind: kind.name().to_owned(),
+                    reason,
+                },
+            });
+            return Err(());
+        }
+        Ok(Some(DeviceRecord {
+            order: vid,
+            kind,
+            terminals,
+            model,
+            value,
+            params,
+            span,
+        }))
+    }
+
     fn eval_partial(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
         let v = self.values.get(&vid);
         if v.is_none() {
@@ -10001,12 +10525,26 @@ impl<'a> ExecPass<'a> {
         // one whose diagnostic was already reported would otherwise raise a
         // second, derived error at every level of the expression tree it
         // appears in.
-        if vref
-            .state
-            .inputs()
+        let inputs = vref.state.inputs();
+        if inputs
             .iter()
             .any(|input| matches!(self.values.get(input), Some(Defer::Ready(Value::Poison))))
         {
+            return self.poison(cell_id, vid);
+        }
+        // Holding a detached value is fine; inspecting one is not.
+        let uses = if vref.state.passes_through() {
+            &[][..]
+        } else {
+            &inputs[..]
+        };
+        let detached = uses.iter().find_map(|input| match self.values.get(input) {
+            Some(Defer::Ready(Value::Detached(detached))) => Some((*input, detached.clone())),
+            _ => None,
+        });
+        if let Some((input, detached)) = detached {
+            let span = self.use_span(&vref, input);
+            self.detached_value(cell_id, span, detached);
             return self.poison(cell_id, vid);
         }
         let state = self.cell_states.get_mut(&cell_id).unwrap();
@@ -10227,10 +10765,11 @@ impl<'a> ExecPass<'a> {
                     // User functions are never deferred.
                     let mut arg_vals = Vec::with_capacity(c.state.posargs.len());
                     let mut unready = Vec::new();
+                    let span = self.span(&vref.loc, c.expr.span);
                     for arg_vid in c.state.posargs.iter() {
                         match self.values[arg_vid].clone() {
                             Defer::Ready(v) => {
-                                match self.cell_arg_from_value(cell_id, *arg_vid, &v) {
+                                match self.cell_arg_from_value(cell_id, *arg_vid, &v, &span) {
                                     Ok(Some(arg)) => arg_vals.push(arg),
                                     Ok(None) => unready.push(*arg_vid),
                                     // The diagnostic is already recorded, here
@@ -11134,6 +11673,123 @@ impl<'a> ExecPass<'a> {
                             false
                         }
                     }
+                    Native::Signal => {
+                        let node = NodeId(self.alloc_id());
+                        self.cell_state_mut(cell_id).schematic.add_node(
+                            node,
+                            NodeOrigin::Local,
+                            (vid, 0),
+                        );
+                        let signal = SignalRef {
+                            cell: cell_id,
+                            node,
+                        };
+                        self.values.insert(vid, Defer::Ready(Value::Signal(signal)));
+                        true
+                    }
+                    Native::Connect => {
+                        let args = [c.state.posargs[0], c.state.posargs[1]];
+                        let unready = args
+                            .into_iter()
+                            .filter(|arg| !self.values[arg].is_ready())
+                            .collect_vec();
+                        if !unready.is_empty() {
+                            for arg in unready {
+                                self.add_value_dependent(arg, vid);
+                            }
+                            return Ok(false);
+                        }
+                        let nodes = args.map(|arg| {
+                            let value = self.values[&arg].get_ready().expect("checked ready");
+                            self.local_node(cell_id, value)
+                        });
+                        let [Some(left), Some(right)] = nodes else {
+                            let span = self.span(&vref.loc, c.expr.span);
+                            self.invalid_type(cell_id, &span);
+                            return self.poison(cell_id, vid);
+                        };
+                        self.cell_state_mut(cell_id).schematic.connect(left, right);
+                        self.values.insert(vid, Defer::Ready(Value::Nil));
+                        true
+                    }
+                    Native::Device => {
+                        let unready = c
+                            .state
+                            .posargs
+                            .iter()
+                            .chain(&c.state.kwargs)
+                            .copied()
+                            .filter(|arg| !self.values[arg].is_ready())
+                            .collect_vec();
+                        if !unready.is_empty() {
+                            for arg in unready {
+                                self.add_value_dependent(arg, vid);
+                            }
+                            return Ok(false);
+                        }
+                        match self.device_record(vid, &vref.loc, c) {
+                            Ok(Some(record)) => {
+                                self.cell_state_mut(cell_id).schematic.add_device(record);
+                                self.values.insert(vid, Defer::Ready(Value::Nil));
+                                true
+                            }
+                            Ok(None) => false,
+                            Err(()) => return self.poison(cell_id, vid),
+                        }
+                    }
+                    Native::SchematicInst => {
+                        let arg = c.state.posargs[0];
+                        let Some(value) = self.values[&arg].get_ready() else {
+                            self.add_value_dependent(arg, vid);
+                            return Ok(false);
+                        };
+                        // A cell is compiled before its value is ready.
+                        let child = value
+                            .get_cell()
+                            .copied()
+                            .filter(|child| self.compiled_cells.contains_key(child));
+                        let span = self.span(&vref.loc, c.expr.span);
+                        let Some(child) = child else {
+                            self.invalid_type(cell_id, &span);
+                            return self.poison(cell_id, vid);
+                        };
+                        let ports = self.compiled_cells[&child].schematic.ports.len();
+                        let id = self.object_id();
+                        let nodes = (0..ports).map(|_| NodeId(self.alloc_id())).collect_vec();
+                        let schematic = &mut self.cell_state_mut(cell_id).schematic;
+                        let instance = schematic.next_instance();
+                        for (port, node) in nodes.iter().enumerate() {
+                            schematic.add_node(
+                                *node,
+                                NodeOrigin::Terminal { instance, port },
+                                (vid, port),
+                            );
+                        }
+                        schematic.add_instance(SchInstRecord {
+                            order: vid,
+                            id,
+                            cell: child,
+                            terminals: nodes.clone(),
+                            span,
+                        });
+                        let terminals = nodes
+                            .into_iter()
+                            .map(|node| {
+                                Value::Signal(SignalRef {
+                                    cell: cell_id,
+                                    node,
+                                })
+                            })
+                            .collect();
+                        let value = SchematicInstValue {
+                            id: Some(id),
+                            cell: child,
+                            terminals,
+                        };
+                        self.values
+                            .insert(vid, Defer::Ready(Value::SchematicInst(Arc::new(value))));
+                        true
+                    }
                 }
             }
             PartialEvalState::Arith(arith) => {
@@ -11782,69 +12438,35 @@ impl<'a> ExecPass<'a> {
                                         // solved/compiled, and therefore it will be in the
                                         // compiled cell map.
                                         let cell = &self.compiled_cells[&inst_cell_id];
-                                        let field_value = match cell.fields.get(field) {
-                                            // Reported when the cell was compiled.
-                                            Some(FieldValue::Poison) => {
-                                                return self.poison(cell_id, vid);
-                                            }
-                                            Some(FieldValue::Unreadable(kind)) => {
-                                                Err(ExecErrorKind::UnreadableInstanceField {
-                                                    field: field.to_string(),
-                                                    cell: cell.name.clone(),
-                                                    kind: kind.clone(),
-                                                })
-                                            }
-                                            Some(field_value) => Ok(field_value),
-                                            None if cell.private_fields.contains(field) => {
-                                                Err(ExecErrorKind::PrivateField {
-                                                    field: field.to_string(),
-                                                    cell: cell.name.clone(),
-                                                })
-                                            }
-                                            None => Err(ExecErrorKind::NoFieldOnInstance {
-                                                field: field.to_string(),
-                                                cell: cell.name.clone(),
-                                            }),
-                                        };
-                                        let field_value = match field_value {
+                                        let span =
+                                            self.span(&vref.loc, field_access_expr.expr.span);
+                                        let field_value = match instance_field(cell, field) {
                                             Ok(field_value) => field_value,
-                                            Err(kind) => {
+                                            // Reported when the cell was compiled.
+                                            Err(None) => return self.poison(cell_id, vid),
+                                            Err(Some(kind)) => {
                                                 self.errors.push(ExecError {
-                                                    span: Some(self.span(
-                                                        &vref.loc,
-                                                        field_access_expr.expr.span,
-                                                    )),
+                                                    span: Some(span),
                                                     cell: cell_id,
                                                     kind,
                                                 });
                                                 return self.poison(cell_id, vid);
                                             }
                                         };
-                                        let cell_values = &self.cell_values;
-                                        let obj_id = &mut self.next_id;
                                         let cell_state =
                                             self.cell_states.get_mut(&cell_id).unwrap();
-                                        let proxies = &mut cell_state.proxy_objects;
-                                        let objects = &mut cell_state.objects;
-                                        let mut place_object = |object| {
-                                            place_inst_object(
-                                                inst,
-                                                &cell.objects[&object],
-                                                cell_values,
-                                                obj_id,
-                                                proxies,
-                                                objects,
-                                            )
+                                        let mut reader = LayoutReader {
+                                            inst,
+                                            cell,
+                                            cell_values: &self.cell_values,
+                                            next_id: &mut self.next_id,
+                                            proxies: &mut cell_state.proxy_objects,
+                                            objects: &mut cell_state.objects,
+                                            span: &span,
                                         };
-                                        let mat = tmat(inst.angle, inst.reflect);
-                                        let mut place_point = |x, y| {
-                                            let (x, y) = ifmatvec(mat, (x, y));
-                                            Value::Point((
-                                                LinearExpr::add(x, inst.x.clone()),
-                                                LinearExpr::add(y, inst.y.clone()),
-                                            ))
-                                        };
-                                        Some(field_value.read(&mut place_object, &mut place_point))
+                                        Some(
+                                            field_value.read(&mut reader, &FieldPath::Field(field)),
+                                        )
                                     } else {
                                         None
                                     }
@@ -11857,6 +12479,36 @@ impl<'a> ExecPass<'a> {
                                 self.add_value_dependent(inst.cell, vid);
                                 false
                             }
+                        }
+                        ValueRef::SchematicInst(instance) => {
+                            let field = field_access_expr.expr.field.name.as_str();
+                            let span = self.span(&vref.loc, field_access_expr.expr.span);
+                            let Some(cell) = self.compiled_cells.get(&instance.cell) else {
+                                self.invalid_type(cell_id, &span);
+                                return self.poison(cell_id, vid);
+                            };
+                            let field_value = match instance_field(cell, field) {
+                                Ok(field_value) => field_value,
+                                // Reported when the cell was compiled.
+                                Err(None) => return self.poison(cell_id, vid),
+                                Err(Some(kind)) => {
+                                    self.errors.push(ExecError {
+                                        span: Some(span),
+                                        cell: cell_id,
+                                        kind,
+                                    });
+                                    return self.poison(cell_id, vid);
+                                }
+                            };
+                            let mut reader = SchematicReader {
+                                instance,
+                                cell,
+                                cells: &self.compiled_cells,
+                                span: &span,
+                            };
+                            let val = field_value.read(&mut reader, &FieldPath::Field(field));
+                            self.values.insert(vid, DeferValue::Ready(val));
+                            true
                         }
                         _ => {
                             let span = self.span(&vref.loc, field_access_expr.expr.span);
@@ -12444,6 +13096,14 @@ pub enum Value {
     ///
     /// `mycell_inst` is a value of type `Inst`.
     Inst(Instance),
+    /// A signal of the current cell's schematic.
+    Signal(SignalRef),
+    /// A cell placed with `std::schematic::inst`, or one read through another
+    /// schematic instance.
+    SchematicInst(Arc<SchematicInstValue>),
+    /// A placeholder read through an instance, which is an error to use. See
+    /// [`Detached`].
+    Detached(Arc<Detached>),
     Seq(Seq),
     Tuple(Vec<Value>),
     /// A struct value. Boxed like [`Value::Fn`]: a struct is rarely stored
@@ -12489,6 +13149,9 @@ impl Value {
             Self::CellFn(_) => "cell generator",
             Self::Cell(_) => "cell",
             Self::Inst(_) => "instance",
+            Self::Signal(_) => "signal",
+            Self::SchematicInst(_) => "schematic instance",
+            Self::Detached(_) => "detached value",
             Self::Seq(_) => "sequence",
             Self::Tuple(_) => "tuple",
             Self::Struct(_) => "struct",
@@ -12804,6 +13467,8 @@ pub struct CompiledCell {
     pub fallback_constraints_used: Vec<UsedFallback>,
     pub unsolved_vars: IndexSet<Var>,
     pub inconsistent_constraints: IndexSet<ConstraintId>,
+    /// The cell's schematic view; empty for a cell with no schematic content.
+    pub schematic: Schematic,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12867,6 +13532,17 @@ pub enum FieldValue {
         variant: String,
         fields: Vec<(String, FieldValue)>,
     },
+    /// A signal on a net of the cell's schematic.
+    Signal(NetIdx),
+    /// A schematic instance: one [`Self::Signal`] or [`Self::Detached`] per
+    /// port of `cell`.
+    SchematicInst {
+        cell: CellId,
+        terminals: Vec<FieldValue>,
+    },
+    /// A detached value, which reads back as itself through either kind of
+    /// instance.
+    Detached(Arc<Detached>),
     /// A field whose value was poisoned, which already reported why. Only ever
     /// a whole field.
     Poison,
@@ -12876,15 +13552,20 @@ pub enum FieldValue {
 }
 
 impl FieldValue {
-    /// The field for `value`, whose solver variables belong to `solver`.
-    fn solve(value: &Value, solver: &Solver) -> Self {
-        Self::try_solve(value, solver).unwrap_or_else(|field| field)
+    /// The field for `value`, whose solver variables belong to `solver` and
+    /// whose signals are on the nets `nets` gives their nodes.
+    fn solve(value: &Value, solver: &Solver, nets: &HashMap<NodeId, NetIdx>) -> Self {
+        Self::try_solve(value, solver, nets).unwrap_or_else(|field| field)
     }
 
     /// Like [`Self::solve`], but a part that makes the whole field
     /// [`Self::Poison`] or [`Self::Unreadable`] returns it as `Err`.
-    fn try_solve(value: &Value, solver: &Solver) -> Result<Self, Self> {
-        let solve = |value: &Value| Self::try_solve(value, solver);
+    fn try_solve(
+        value: &Value,
+        solver: &Solver,
+        nets: &HashMap<NodeId, NetIdx>,
+    ) -> Result<Self, Self> {
+        let solve = |value: &Value| Self::try_solve(value, solver, nets);
         let solve_fields = |fields: &IndexMap<String, Value>| {
             fields
                 .iter()
@@ -12921,6 +13602,19 @@ impl FieldValue {
                     fields: solve_fields(fields)?,
                 },
             },
+            Value::Signal(signal) => match nets.get(&signal.node) {
+                Some(net) => Self::Signal(*net),
+                None => return Err(Self::Poison),
+            },
+            Value::SchematicInst(instance) => Self::SchematicInst {
+                cell: instance.cell,
+                terminals: instance
+                    .terminals
+                    .iter()
+                    .map(solve)
+                    .collect::<Result<_, _>>()?,
+            },
+            Value::Detached(detached) => Self::Detached(detached.clone()),
             Value::Poison => return Err(Self::Poison),
             Value::Fn(_) | Value::CellFn(_) | Value::Ctor(_) => {
                 return Err(Self::Unreadable(value.kind_name().to_owned()));
@@ -12936,54 +13630,91 @@ impl FieldValue {
         }
     }
 
-    /// Rebuilds the field as a value, with `object` and `point` placing each
-    /// object and point.
-    fn read<F, G>(&self, object: &mut F, point: &mut G) -> Value
-    where
-        F: FnMut(ObjectId) -> Value,
-        G: FnMut(f64, f64) -> Value,
-    {
+    /// Rebuilds the field as a value through an instance, which `reader`
+    /// reads each leaf through. `path` is where the field is within the value
+    /// read.
+    fn read(&self, reader: &mut dyn FieldReader, path: &FieldPath<'_>) -> Value {
+        let tuple = |items: &[FieldValue], reader: &mut dyn FieldReader| {
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| item.read(reader, &FieldPath::Position(path, index)))
+                .collect::<Vec<_>>()
+        };
+        let named = |fields: &[(String, FieldValue)], reader: &mut dyn FieldReader| {
+            fields
+                .iter()
+                .map(|(name, field)| {
+                    let value = field.read(reader, &FieldPath::Member(path, name));
+                    (name.clone(), value)
+                })
+                .collect::<IndexMap<_, _>>()
+        };
         match self {
-            Self::Object(id) => object(*id),
+            Self::Object(id) => reader.object(*id, path),
             Self::Float(f) => Value::Linear(LinearExpr::from(*f)),
             Self::Int(i) => Value::Int(*i),
             Self::Bool(b) => Value::Bool(*b),
             Self::String(s) => Value::String(s.clone()),
-            Self::Point(x, y) => point(*x, *y),
+            Self::Point(x, y) => reader.point(*x, *y, path),
             Self::Cell(cell) => Value::Cell(*cell),
             Self::Nil => Value::Nil,
-            Self::Seq(items) => {
-                Value::Seq(items.iter().map(|item| item.read(object, point)).collect())
-            }
-            Self::Tuple(items) => {
-                Value::Tuple(items.iter().map(|item| item.read(object, point)).collect())
-            }
+            Self::Seq(items) => Value::Seq(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| item.read(reader, &FieldPath::Index(path, index)))
+                    .collect(),
+            ),
+            Self::Tuple(items) => Value::Tuple(tuple(items, reader)),
             Self::Struct { name, fields } => Value::Struct(Box::new(StructValue {
                 name: name.clone(),
-                fields: fields
-                    .iter()
-                    .map(|(name, field)| (name.clone(), field.read(object, point)))
-                    .collect(),
+                fields: named(fields, reader),
             })),
             Self::Enum { variant, payload } => Value::Enum(Arc::new(EnumValue {
                 variant: variant.clone(),
-                payload: VariantValues::Tuple(
-                    payload
-                        .iter()
-                        .map(|item| item.read(object, point))
-                        .collect(),
-                ),
+                payload: VariantValues::Tuple(tuple(payload, reader)),
             })),
             Self::StructVariant { variant, fields } => Value::Enum(Arc::new(EnumValue {
                 variant: variant.clone(),
-                payload: VariantValues::Struct(
-                    fields
-                        .iter()
-                        .map(|(name, field)| (name.clone(), field.read(object, point)))
-                        .collect(),
-                ),
+                payload: VariantValues::Struct(named(fields, reader)),
             })),
+            Self::Signal(net) => reader.signal(*net, path),
+            Self::SchematicInst { cell, terminals } => {
+                reader.schematic_inst(*cell, terminals, path)
+            }
+            Self::Detached(detached) => Value::Detached(detached.clone()),
             Self::Poison | Self::Unreadable(_) => Value::Poison,
+        }
+    }
+
+    /// Translates the spans of the detached values in this field onto another
+    /// revision of the workspace.
+    fn rebase_spans(&mut self, rebase: &SpanRebase) -> Result<(), RebaseError> {
+        match self {
+            Self::Detached(detached) => rebase.rebase(&mut Arc::make_mut(detached).span),
+            Self::Seq(items)
+            | Self::Tuple(items)
+            | Self::Enum { payload: items, .. }
+            | Self::SchematicInst {
+                terminals: items, ..
+            } => items
+                .iter_mut()
+                .try_for_each(|item| item.rebase_spans(rebase)),
+            Self::Struct { fields, .. } | Self::StructVariant { fields, .. } => fields
+                .iter_mut()
+                .try_for_each(|(_, field)| field.rebase_spans(rebase)),
+            Self::Object(_)
+            | Self::Float(_)
+            | Self::Int(_)
+            | Self::Bool(_)
+            | Self::String(_)
+            | Self::Point(..)
+            | Self::Cell(_)
+            | Self::Nil
+            | Self::Signal(_)
+            | Self::Poison
+            | Self::Unreadable(_) => Ok(()),
         }
     }
 
@@ -12991,6 +13722,7 @@ impl FieldValue {
     fn for_each_cell(&self, f: &mut impl FnMut(CellId)) {
         match self {
             Self::Cell(cell) => f(*cell),
+            Self::SchematicInst { cell, .. } => f(*cell),
             Self::Seq(items) | Self::Tuple(items) | Self::Enum { payload: items, .. } => {
                 items.iter().for_each(|item| item.for_each_cell(f))
             }
@@ -13004,9 +13736,230 @@ impl FieldValue {
             | Self::String(_)
             | Self::Point(..)
             | Self::Nil
+            | Self::Signal(_)
+            | Self::Detached(_)
             | Self::Poison
             | Self::Unreadable(_) => {}
         }
+    }
+}
+
+/// Where a value is within the field it was read from, built into a string
+/// only when a diagnostic needs it.
+#[derive(Clone, Copy)]
+enum FieldPath<'a> {
+    Field(&'a str),
+    /// An element of a sequence.
+    Index(&'a FieldPath<'a>, usize),
+    /// An element of a tuple or a tuple variant's payload.
+    Position(&'a FieldPath<'a>, usize),
+    /// A field of a struct, or a port of a schematic instance.
+    Member(&'a FieldPath<'a>, &'a str),
+}
+
+impl std::fmt::Display for FieldPath<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Field(name) => write!(f, "{name}"),
+            Self::Index(parent, index) => write!(f, "{parent}[{index}]"),
+            Self::Position(parent, index) => write!(f, "{parent}.{index}"),
+            Self::Member(parent, name) => write!(f, "{parent}.{name}"),
+        }
+    }
+}
+
+/// Reads the leaves of a field through one kind of instance, each of which
+/// reads what its view of the cell has.
+trait FieldReader {
+    fn object(&mut self, id: ObjectId, path: &FieldPath<'_>) -> Value;
+    fn point(&mut self, x: f64, y: f64, path: &FieldPath<'_>) -> Value;
+    fn signal(&mut self, net: NetIdx, path: &FieldPath<'_>) -> Value;
+    fn schematic_inst(
+        &mut self,
+        cell: CellId,
+        terminals: &[FieldValue],
+        path: &FieldPath<'_>,
+    ) -> Value;
+}
+
+/// A detached value for the field at `path` of `cell`, read at `span`.
+fn detached(
+    kind: DetachedKind,
+    reason: DetachedReason,
+    cell: &CompiledCell,
+    path: &FieldPath<'_>,
+    span: &Span,
+) -> Value {
+    Value::Detached(Arc::new(Detached {
+        kind,
+        reason,
+        cell: cell.name.clone(),
+        field: path.to_string(),
+        span: span.clone(),
+    }))
+}
+
+/// Reads a field through a layout instance, placing geometry in the parent.
+struct LayoutReader<'a> {
+    inst: &'a Instance,
+    cell: &'a CompiledCell,
+    cell_values: &'a HashMap<CellId, ValueId>,
+    next_id: &'a mut u64,
+    proxies: &'a mut IndexSet<ObjectId>,
+    objects: &'a mut IndexMap<ObjectId, Object>,
+    span: &'a Span,
+}
+
+impl FieldReader for LayoutReader<'_> {
+    fn object(&mut self, id: ObjectId, _path: &FieldPath<'_>) -> Value {
+        place_inst_object(
+            self.inst,
+            &self.cell.objects[&id],
+            self.cell_values,
+            self.next_id,
+            self.proxies,
+            self.objects,
+        )
+    }
+
+    fn point(&mut self, x: f64, y: f64, _path: &FieldPath<'_>) -> Value {
+        let (x, y) = ifmatvec(tmat(self.inst.angle, self.inst.reflect), (x, y));
+        Value::Point((
+            LinearExpr::add(x, self.inst.x.clone()),
+            LinearExpr::add(y, self.inst.y.clone()),
+        ))
+    }
+
+    fn signal(&mut self, _net: NetIdx, path: &FieldPath<'_>) -> Value {
+        detached(
+            DetachedKind::Signal,
+            DetachedReason::ThroughLayoutInstance,
+            self.cell,
+            path,
+            self.span,
+        )
+    }
+
+    fn schematic_inst(
+        &mut self,
+        _cell: CellId,
+        _terminals: &[FieldValue],
+        path: &FieldPath<'_>,
+    ) -> Value {
+        detached(
+            DetachedKind::SchematicInstance,
+            DetachedReason::ThroughLayoutInstance,
+            self.cell,
+            path,
+            self.span,
+        )
+    }
+}
+
+/// Reads a field through a schematic instance, mapping a signal on a port of
+/// the cell to the instance's terminal.
+struct SchematicReader<'a> {
+    instance: &'a SchematicInstValue,
+    cell: &'a CompiledCell,
+    cells: &'a IndexMap<CellId, Arc<CompiledCell>>,
+    span: &'a Span,
+}
+
+impl FieldReader for SchematicReader<'_> {
+    fn object(&mut self, id: ObjectId, path: &FieldPath<'_>) -> Value {
+        let kind = match self.cell.objects.get(&id) {
+            Some(SolvedValue::Instance(_)) => DetachedKind::LayoutInstance,
+            _ => DetachedKind::Geometry,
+        };
+        detached(
+            kind,
+            DetachedReason::ThroughSchematicInstance,
+            self.cell,
+            path,
+            self.span,
+        )
+    }
+
+    fn point(&mut self, _x: f64, _y: f64, path: &FieldPath<'_>) -> Value {
+        detached(
+            DetachedKind::Geometry,
+            DetachedReason::ThroughSchematicInstance,
+            self.cell,
+            path,
+            self.span,
+        )
+    }
+
+    fn signal(&mut self, net: NetIdx, path: &FieldPath<'_>) -> Value {
+        match self.cell.schematic.port_of(net) {
+            Some(port) => self
+                .instance
+                .terminals
+                .get(port)
+                .cloned()
+                .unwrap_or(Value::Poison),
+            None => detached(
+                DetachedKind::Signal,
+                DetachedReason::InternalNet,
+                self.cell,
+                path,
+                self.span,
+            ),
+        }
+    }
+
+    fn schematic_inst(
+        &mut self,
+        cell: CellId,
+        terminals: &[FieldValue],
+        path: &FieldPath<'_>,
+    ) -> Value {
+        let child = self.cells.get(&cell);
+        let terminals = terminals
+            .iter()
+            .enumerate()
+            .map(|(port, terminal)| {
+                let name = child.map_or_else(
+                    || port.to_string(),
+                    |child| child.schematic.port_name(port).to_owned(),
+                );
+                match terminal {
+                    FieldValue::Signal(net) => self.signal(*net, &FieldPath::Member(path, &name)),
+                    FieldValue::Detached(detached) => Value::Detached(detached.clone()),
+                    _ => Value::Poison,
+                }
+            })
+            .collect();
+        Value::SchematicInst(Arc::new(SchematicInstValue {
+            id: None,
+            cell,
+            terminals,
+        }))
+    }
+}
+
+/// The field `field` of `cell`, as an instance of it reads it. `Err(None)` is
+/// a poisoned field, which already reported why.
+fn instance_field<'c>(
+    cell: &'c CompiledCell,
+    field: &str,
+) -> Result<&'c FieldValue, Option<ExecErrorKind>> {
+    match cell.fields.get(field) {
+        Some(FieldValue::Poison) => Err(None),
+        Some(FieldValue::Unreadable(kind)) => Err(Some(ExecErrorKind::UnreadableInstanceField {
+            field: field.to_string(),
+            cell: cell.name.clone(),
+            kind: kind.clone(),
+        })),
+        Some(field_value) => Ok(field_value),
+        None if cell.private_fields.contains(field) => Err(Some(ExecErrorKind::PrivateField {
+            field: field.to_string(),
+            cell: cell.name.clone(),
+        })),
+        None => Err(Some(ExecErrorKind::NoFieldOnInstance {
+            field: field.to_string(),
+            cell: cell.name.clone(),
+        })),
     }
 }
 
@@ -13033,6 +13986,7 @@ impl CompiledData {
                     hasher.write_u32(fallback.span.span.start() as u32);
                     hasher.write_u32(fallback.span.span.end() as u32);
                 }
+                hash_schematic(&mut hasher, &cell.schematic, &self.cells);
                 hasher.finish()
             })
             .collect::<Vec<_>>();
@@ -13050,6 +14004,74 @@ impl CompiledData {
 fn hash_str(hasher: &mut fnv::FnvHasher, value: &str) {
     hasher.write_usize(value.len());
     hasher.write(value.as_bytes());
+}
+
+/// Hashes everything a netlist of `schematic` shows.
+fn hash_schematic(
+    hasher: &mut fnv::FnvHasher,
+    schematic: &Schematic,
+    cells: &IndexMap<CellId, Arc<CompiledCell>>,
+) {
+    let nets = |hasher: &mut fnv::FnvHasher, nets: &[NetIdx]| {
+        hasher.write_usize(nets.len());
+        for net in nets {
+            hasher.write_u32(*net);
+        }
+    };
+    let param = |hasher: &mut fnv::FnvHasher, value: &ParamValue| match value {
+        ParamValue::Float(f) => {
+            hasher.write_u8(0);
+            hasher.write_u64(f.to_bits());
+        }
+        ParamValue::Int(i) => {
+            hasher.write_u8(1);
+            hasher.write_i64(*i);
+        }
+        ParamValue::String(s) => {
+            hasher.write_u8(2);
+            hash_str(hasher, s);
+        }
+    };
+    hasher.write_usize(schematic.nets.len());
+    for net in &schematic.nets {
+        hash_str(hasher, &net.name);
+    }
+    nets(hasher, &schematic.ports);
+    for element in &schematic.elements {
+        match *element {
+            Element::Instance(index) => {
+                let instance = &schematic.instances[index];
+                hasher.write_u8(0);
+                hash_str(hasher, &instance.name);
+                // By name, because the referenced id is itself allocation-dependent.
+                hash_str(
+                    hasher,
+                    cells
+                        .get(&instance.cell)
+                        .map(|c| c.name.as_str())
+                        .unwrap_or(""),
+                );
+                nets(hasher, &instance.terminals);
+            }
+            Element::Device(index) => {
+                let device = &schematic.devices[index];
+                hasher.write_u8(1);
+                hash_str(hasher, &device.name);
+                hash_str(hasher, device.kind.name());
+                nets(hasher, &device.terminals);
+                hash_str(hasher, device.model.as_deref().unwrap_or(""));
+                hasher.write_u8(u8::from(device.value.is_some()));
+                if let Some(value) = &device.value {
+                    param(hasher, value);
+                }
+                hasher.write_usize(device.params.len());
+                for (name, value) in &device.params {
+                    hash_str(hasher, name);
+                    param(hasher, value);
+                }
+            }
+        }
+    }
 }
 
 fn hash_solved_value(
@@ -13125,14 +14147,32 @@ impl CompiledCell {
             name: _,
             scopes,
             root: _,
-            fields: _,
+            fields,
             private_fields: _,
             sse_basis: _,
             objects,
             fallback_constraints_used,
             unsolved_vars: _,
             inconsistent_constraints: _,
+            schematic,
         } = self;
+
+        for field in fields.values_mut() {
+            field.rebase_spans(rebase)?;
+        }
+        let Schematic {
+            nets: _,
+            ports: _,
+            instances,
+            devices,
+            elements: _,
+        } = schematic;
+        for SchematicInstance { span, .. } in instances.iter_mut() {
+            rebase.rebase_opt(span)?;
+        }
+        for Device { span, .. } in devices.iter_mut() {
+            rebase.rebase_opt(span)?;
+        }
 
         for scope in scopes.values_mut() {
             let CompiledScope {
@@ -13332,6 +14372,18 @@ enum PartialEvalState<T: AstMetadata> {
 }
 
 impl<T: AstMetadata> PartialEvalState<T> {
+    /// Whether this state only passes its inputs through rather than
+    /// inspecting them. Using a detached value is an error; passing it on is
+    /// not.
+    fn passes_through(&self) -> bool {
+        match self {
+            Self::Tuple(_) | Self::Seq(_) | Self::StructLit(_) | Self::Ctor(_) => true,
+            Self::If(e) => !matches!(e.state, IfExprState::Cond(_)),
+            Self::Match(e) => matches!(e.state, MatchExprState::Value(_)),
+            _ => false,
+        }
+    }
+
     /// The values this state reads to make its next step.
     ///
     /// `If` and `Match` hold only the branch evaluation has reached, so an

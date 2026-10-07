@@ -29,8 +29,9 @@ use crate::{
         VariantPayload, WorkspaceAst,
     },
     compile::{
-        AdtDef, BUILTINS, Native, RESERVED_CELL_FIELDS, Ty, TyParamTy, TypeDefs, TypedWorkspace,
-        VarId, VarIdTyMetadata, VariantTys, module_prefix, param_map, subst, typed_let_bindings,
+        AdtDef, BUILTINS, CellTy, Native, RESERVED_CELL_FIELDS, Ty, TyParamTy, TypeDefs,
+        TypedWorkspace, VarId, VarIdTyMetadata, VariantTys, module_prefix, param_map, subst,
+        typed_let_bindings,
     },
 };
 
@@ -487,11 +488,16 @@ impl NavIndex {
                 .into_iter()
                 .map(|(name, ty)| (name.to_owned(), ty))
                 .collect(),
-            Ty::Inst(cell) => {
+            Ty::Inst(cell) | Ty::SchematicInst(cell) => {
                 let map = cell.param_map();
-                RESERVED_CELL_FIELDS
-                    .into_iter()
-                    .map(|name| (name.to_owned(), Ty::Float))
+                // A schematic instance has no position.
+                let reserved = match ty {
+                    Ty::Inst(_) => RESERVED_CELL_FIELDS.as_slice(),
+                    _ => &[],
+                };
+                reserved
+                    .iter()
+                    .map(|name| (name.to_string(), Ty::Float))
                     .chain(
                         cell.def
                             .and_then(|cell| self.cell_field_types.get(&cell))
@@ -749,7 +755,7 @@ fn builtin_type(name: &str) -> Option<&'static str> {
 fn declaring_cell(ty: &Ty) -> Option<VarId> {
     match ty {
         Ty::CellFn(cell_fn) => cell_fn.cell.def,
-        Ty::Cell(cell) | Ty::Inst(cell) => cell.def,
+        Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => cell.def,
         _ => None,
     }
 }
@@ -879,6 +885,20 @@ fn native_signature(native: Native) -> SignatureInfo {
             &["value: Cell | Inst"],
             &[],
         ),
+        Native::Signal => signature("fn Signal() -> Signal", &[], &[]),
+        Native::Connect => signature(
+            "fn connect(a: Signal, b: Signal)",
+            &["a: Signal", "b: Signal"],
+            &[],
+        ),
+        Native::Device => signature(
+            "fn device(kind: DeviceKind, terminals: [Signal], model: String, *, params...)",
+            &["kind: DeviceKind", "terminals: [Signal]", "model: String"],
+            &[],
+        ),
+        Native::SchematicInst => {
+            signature("fn inst(cell: Cell) -> SchematicInst", &["cell: Cell"], &[])
+        }
     }
 }
 
@@ -988,7 +1008,9 @@ fn find_param(ty: &Ty, name: &str) -> Option<VarId> {
         Ty::Tuple(items) => items.iter().find_map(|item| find_param(item, name)),
         Ty::Struct(s) => s.args.iter().find_map(|arg| find_param(arg, name)),
         Ty::Enum(e) => e.args.iter().find_map(|arg| find_param(arg, name)),
-        Ty::Cell(cell) | Ty::Inst(cell) => cell.args.iter().find_map(|arg| find_param(arg, name)),
+        Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => {
+            cell.args.iter().find_map(|arg| find_param(arg, name))
+        }
         _ => None,
     }
 }
@@ -2295,12 +2317,8 @@ impl<'a> Builder<'a> {
 
     /// What `name` refers to when read off a value of type `base`.
     fn field_target(&self, base: &Ty, name: &str) -> Target {
-        match base {
-            // An instance's fields are the cell's top-level `let` bindings.
-            // `x` and `y` are the instance's own placement, checked first by
-            // the type pass and shadowing any binding of the same name.
-            Ty::Inst(cell) if name != "x" && name != "y" => cell
-                .def
+        let cell_field = |cell: &CellTy| {
+            cell.def
                 .and_then(|cell_id| self.cell_fields.get(&cell_id))
                 .map_or(
                     // A GDS-backed cell declares no fields to trace back to:
@@ -2313,7 +2331,15 @@ impl<'a> Builder<'a> {
                             .get(name)
                             .map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(*id)))
                     },
-                ),
+                )
+        };
+        match base {
+            // An instance's fields are the cell's top-level `let` bindings.
+            // `x` and `y` are the instance's own placement, checked first by
+            // the type pass and shadowing any binding of the same name.
+            Ty::Inst(cell) if name != "x" && name != "y" => cell_field(cell),
+            // A schematic instance has no placement.
+            Ty::SchematicInst(cell) => cell_field(cell),
             Ty::Inst(_) | Ty::Rect | Ty::Polygon | Ty::Path | Ty::Point => {
                 Target::Builtin(Builtin::Field(name.to_string()))
             }
@@ -3061,6 +3087,56 @@ cell top() {
         );
         for expected in ["rect", "crect", "inst", "bbox", "array", "intersection"] {
             assert!(layout.iter().any(|label| label == expected), "{layout:?}");
+        }
+    }
+
+    /// The schematic natives resolve, hover, and complete like the layout
+    /// ones, and a schematic instance completes its public fields only.
+    #[test]
+    fn schematic_natives_and_instances() {
+        let (source, index, _) = index(
+            r#"
+use std::schematic::{Signal, connect, device, DeviceKind};
+use std::schematic::inst as sinst;
+cell child() {
+    pub let a = Signal();
+    let hidden = Signal();
+}
+cell top() {
+    let i = sinst(child());
+    connect(i.a, Signal());
+    device(DeviceKind::Res, [i.a, Signal()], "", value=1.);
+}
+"#,
+        );
+        let hover = |needle: &str| {
+            let offset = source.find(needle).unwrap();
+            index
+                .hover_at(Path::new(ROOT), offset)
+                .unwrap_or_else(|| panic!("no hover at {needle}"))
+                .contents
+        };
+        assert_eq!(hover("connect(i"), "fn connect(a: Signal, b: Signal)");
+        assert_eq!(hover("sinst(child"), "fn inst(cell: Cell) -> SchematicInst");
+        assert_eq!(
+            hover("device(D"),
+            "fn device(kind: DeviceKind, terminals: [Signal], model: String, *, params...)"
+        );
+        let base_end = source.find("i.a,").unwrap() + 1;
+        assert_eq!(
+            labels(index.member_completions_at(Path::new(ROOT), base_end)),
+            ["a"]
+        );
+        let schematic =
+            labels(index.qualified_completions(
+                Path::new(ROOT),
+                &["std".to_owned(), "schematic".to_owned()],
+            ));
+        for expected in ["Signal", "connect", "device", "inst", "DeviceKind"] {
+            assert!(
+                schematic.iter().any(|label| label == expected),
+                "{schematic:?}"
+            );
         }
     }
 

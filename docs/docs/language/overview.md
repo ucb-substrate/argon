@@ -29,6 +29,7 @@ cell via_array(cols: Int, pitch: Float) {
 - Geometry constructors from [`std::layout`](/language/std-layout) create rectangles, polygons, paths, and text.
 - [`Float`](/language/types/scalars#float) values, including geometry, can be related with equality constraints.
 - Calling a cell produces a cell value; [`inst`](/language/std-layout#inst) places it in the hierarchy.
+- A cell can also describe a [schematic](./schematic): signals, devices, and instances placed with [`std::schematic::inst`](/language/std-schematic#inst).
 - Modules and manifests organize source, dependencies, technology data, and GDS imports.
 
 ## Syntax
@@ -49,4 +50,5 @@ fn half(value: Float) -> Float {
 - [Cells and functions](./cells-functions)
 - [Geometry](./geometry)
 - [Constraints](./constraints)
+- [Schematics](./schematic)
 - [Modules and manifests](./modules-manifests)

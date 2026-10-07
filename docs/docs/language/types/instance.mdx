@@ -15,7 +15,7 @@ Calling a cell runs its body with the given arguments and produces a cell value:
 let child = inverter(1200., 2000., 4);
 ```
 
-A cell value isn't placed anywhere until you pass it to [`std::layout::inst`](/language/std-layout#inst). Pass it to [`std::layout::bbox`](/language/std-layout#bbox) to get its bounds.
+A cell value isn't placed anywhere until you pass it to [`std::layout::inst`](/language/std-layout#inst), which places its layout, or [`std::schematic::inst`](/language/std-schematic#inst), which places its schematic. Pass it to [`std::layout::bbox`](/language/std-layout#bbox) to get its bounds.
 
 ## Instance values
 
@@ -35,3 +35,24 @@ let bounds = std::layout::bbox(placed);
 Only the fields the cell declares with [`pub let`](/language/cells-functions#public-fields) can be read this way. Reading another top-level `let` of the cell is an error. A field that holds a function, cell function, or variant constructor also can't be read through an instance.
 
 Imported GDS cells expose fields found in the file, including pin names when pin layers are configured.
+
+## Schematic instances
+
+`SchematicInst` is a cell placed in a schematic with [`std::schematic::inst`](/language/std-schematic#inst). It has no position, so its only fields are the cell's public fields.
+
+<FieldTable rows={[
+  {name: '<cell field>', type: 'Declared type', description: 'A public field of the cell. A signal on one of the cell\'s ports reads as the instance\'s terminal.'},
+]} />
+
+```argon
+let nmos = std::schematic::inst(mos(true, 1., 2));
+std::schematic::connect(a, nmos.g);
+```
+
+Like `Inst`, the type can't be written in source, and only `pub` fields can be read.
+
+## Reading across views
+
+Each kind of instance reads what its view of the cell has. Through an `Inst`, geometry and layout instances are placed in the parent. Through a `SchematicInst`, signals on the cell's ports become the instance's terminals, and schematic instances the cell holds read through to the parent's nets.
+
+Anything else a field holds reads as a *detached* placeholder: a signal or schematic instance through an `Inst`; geometry or a layout instance through a `SchematicInst`; and a signal on a net that isn't a port of the cell. Holding a detached value is fine. Using it, for example reading a field of it or connecting it, is an error that names the field it was read from. See [reading across views](/language/schematic#reading-across-views).

@@ -356,7 +356,10 @@ mod tests {
 
     use crate::{
         ast::Span,
-        parse::{STD_LAYOUT_PATH, STD_LAYOUT_SOURCE, STD_PATH, STD_SOURCE},
+        parse::{
+            STD_LAYOUT_PATH, STD_LAYOUT_SOURCE, STD_PATH, STD_SCHEMATIC_PATH, STD_SCHEMATIC_SOURCE,
+            STD_SOURCE,
+        },
     };
 
     use super::{
@@ -511,6 +514,7 @@ mod tests {
                 STD_LAYOUT_SOURCE,
                 "let first_rect = rect(r.layer);",
             ),
+            (STD_SCHEMATIC_PATH, STD_SCHEMATIC_SOURCE, "enum DeviceKind"),
         ] {
             let start = source
                 .find(needle)
