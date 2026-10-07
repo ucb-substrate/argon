@@ -1,3 +1,5 @@
+use std::layout::rect;
+
 cell scopes() {
     let x0 = 1.0;
     let y0 = 2.0;

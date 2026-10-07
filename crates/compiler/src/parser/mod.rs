@@ -244,6 +244,10 @@ mod tests {
             ("use |", ImportPath),
             ("use lib::shape |;", Keyword("as")),
             ("use lib::shape as |;", NewIdentifier),
+            ("use lib::{|}", ImportPath),
+            ("use lib::{shape, |}", ImportPath),
+            ("use lib::{shape |};", Keyword("as")),
+            ("use lib::{shape as |};", NewIdentifier),
             ("cell top() { let | = 1.; }", NewIdentifier),
             ("cell top() { for | in [] {} }", NewIdentifier),
             ("cell top() { let value = re|; }", Expression),
@@ -1077,6 +1081,50 @@ mod tests {
     }
 
     #[test]
+    fn grouped_use_declarations_desugar_per_item() {
+        use crate::ast::Decl;
+
+        let src = "use lib::geometry::{width, height as h,};\nfn f() {}";
+        let ast = parse(src).expect("a grouped use should parse");
+        let uses = ast
+            .ast
+            .decls
+            .iter()
+            .filter_map(|decl| match decl {
+                Decl::Use(decl) => Some(decl),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(uses.len(), 2);
+        for (decl, item, alias, text) in [
+            (uses[0], "width", None, "width"),
+            (uses[1], "height", Some("h"), "height as h"),
+        ] {
+            assert_eq!(
+                decl.path
+                    .iter()
+                    .map(|part| part.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["lib", "geometry", item]
+            );
+            assert_eq!(decl.alias.as_ref().map(|alias| alias.name.as_str()), alias);
+            assert_eq!(&src[decl.span.start()..decl.span.end()], text);
+        }
+        assert_eq!(uses[0].path[0].span, uses[1].path[0].span);
+        assert!(matches!(ast.ast.decls[2], Decl::Fn(_)));
+
+        assert!(parse("use std::layout::{rect};").is_ok());
+        let error = parse("use std::layout::{};").expect_err("an empty group is an error");
+        assert!(
+            error
+                .iter()
+                .any(|error| error.message.contains("at least one item"))
+        );
+        assert!(parse("use {rect};").is_err());
+        assert!(parse("use std::layout::{rect, crect}").is_err());
+    }
+
+    #[test]
     fn literal_values_and_spans() {
         use crate::ast::{Decl, Expr, Statement};
 
@@ -1122,7 +1170,7 @@ mod tests {
     fn scope_orders_are_lexical_and_reset_in_nested_scopes() {
         use crate::ast::{Decl, Expr, Statement};
 
-        let src = "cell c() { rect(); alpha(); if true { beta(); } else {}; for i in range_full(0, 2) { gamma(); } { delta(); }; }";
+        let src = "cell c() { float(); alpha(); if true { beta(); } else {}; for i in range_full(0, 2) { gamma(); } { delta(); }; }";
         let mut parser = super::grammar::Parser::new(src, 0);
         let ast = parser.parse_root();
         assert!(parser.errors.is_empty(), "{:?}", parser.errors);
@@ -1131,11 +1179,11 @@ mod tests {
         };
 
         let Statement::Expr {
-            value: Expr::Call(rect),
+            value: Expr::Call(float),
             ..
         } = &cell.scope.stmts[0]
         else {
-            panic!("expected rect call");
+            panic!("expected float call");
         };
         let Statement::Expr {
             value: Expr::Call(alpha),
@@ -1163,7 +1211,7 @@ mod tests {
         };
 
         // Builtins do not consume ordinals because they do not produce scopes.
-        assert_eq!(rect.scope_order, 0);
+        assert_eq!(float.scope_order, 0);
         assert_eq!(alpha.scope_order, 0);
         assert_eq!(if_.scope_order, 1);
         assert_eq!(for_.scope_order, 2);

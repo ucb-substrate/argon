@@ -1,3 +1,5 @@
+use std::layout::rect;
+
 // A type parameter stands for one type per call: `last` returns whatever
 // element type its argument has, and the checker knows which.
 fn second<T>(items: [T]) -> T {

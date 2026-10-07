@@ -52,7 +52,7 @@ fn direct_views_can_request_a_new_density_decision(cx: &mut gpui::TestAppContext
     let source = directory.path().join("lib.ar");
     std::fs::write(
         &source,
-        "cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }",
+        "use std::layout::rect;\ncell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }",
     )
     .unwrap();
     let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
@@ -343,6 +343,7 @@ fn instance_lod_preserves_hidden_descendants_and_hierarchy_cutoffs() {
     std::fs::write(
         &source,
         r#"
+use std::layout::{inst, rect};
 cell leaf() { let shape = rect("met1", x0=0., y0=0., x1=1., y1=1.); }
 cell branch() { let child = inst(leaf(), x=0., y=0.); }
 cell top() { let child = inst(branch(), x=0., y=0.); }
@@ -417,6 +418,7 @@ fn cold_pan_defers_expansion_and_keeps_the_rendering_indicator(cx: &mut gpui::Te
     std::fs::write(
         &source,
         r#"
+use std::layout::{inst, rect};
 cell leaf() { let shape = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
 cell top() {
     for row in std::range(100) {
@@ -552,7 +554,7 @@ fn recentering_keeps_tiles_used_by_the_last_presented_camera(cx: &mut gpui::Test
 fn interleaved_layers_coalesce_before_visiting_sram_leaf_shapes() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("lib.ar");
-    let mut program = String::from("cell top() {\n");
+    let mut program = String::from("use std::layout::rect;\ncell top() {\n");
     for y in 0..32 {
         for x in 0..32 {
             for layer in ["met1", "met2"] {
@@ -709,6 +711,7 @@ fn resizing_keeps_the_retained_layout_visible(cx: &mut gpui::TestAppContext) {
     std::fs::write(
         &source,
         r#"
+use std::layout::{inst, rect};
 cell leaf() { let shape = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
 cell top() {
     for row in std::range(64) {
@@ -893,6 +896,7 @@ fn full_editor_pan_and_zoom_settle_without_presentation_oscillation(cx: &mut gpu
     std::fs::write(
         &source,
         r#"
+use std::layout::{inst, rect};
 cell leaf() { let shape = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
 cell top() {
     for row in std::range(128) {
@@ -1020,6 +1024,7 @@ fn edits_and_small_zoom_steps_keep_a_complete_frame(cx: &mut gpui::TestAppContex
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("lib.ar");
     let program = r#"
+use std::layout::{inst, rect};
 cell leaf() { let shape = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
 cell top() {
     for row in std::range(96) {
@@ -1171,7 +1176,7 @@ cell top() {
 fn direct_frame_stays_visible_until_the_first_pan_raster_arrives(cx: &mut gpui::TestAppContext) {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("lib.ar");
-    let mut program = String::from("cell top() {\n");
+    let mut program = String::from("use std::layout::rect;\ncell top() {\n");
     for i in 0..3000 {
         let x = (i % 60) * 10;
         let y = (i / 60) * 10;
@@ -1295,6 +1300,7 @@ fn reused_render_indexes_invalidate_changed_children_and_match_fresh_pixels() {
     std::fs::write(
         &source,
         r#"
+use std::layout::{inst, rect};
 cell leaf() { let r = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
 cell unchanged() { let r = rect("met2", x0=0., y0=0., x1=10., y1=10.); }
 cell top() { let a = inst(leaf(), x=0., y=0.); let b = inst(unchanged(), x=70., y=0.); }
@@ -1419,13 +1425,14 @@ fn rectangle_placement_handoff(cx: &mut gpui::TestAppContext, dense: bool) {
     let layer_name = "met1";
     let program = if dense {
         r#"
+use std::layout::{inst, rect};
 cell leaf() { let shape = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
 cell top() { for row in std::range(96) { for col in std::range(96) {
     let child = inst(leaf(), x=(col as Float)*12., y=(row as Float)*12.);
 } } }
 "#
     } else {
-        "cell top() { let existing = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.); }"
+        "use std::layout::rect;\ncell top() { let existing = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.); }"
     };
     std::fs::write(&source, program).unwrap();
     let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
@@ -1590,7 +1597,7 @@ cell top() { for row in std::range(96) { for col in std::range(96) {
     let edited = program.replace(
         "cell top() {",
         &format!(
-            "cell top() {{ let {var_name} = rect(\"{layer_name}\", x0i={}, y0i={}, x1i={}, y1i={})!;",
+            "cell top() {{ let {var_name} = std::layout::rect(\"{layer_name}\", x0i={}, y0i={}, x1i={}, y1i={})!;",
             compile::format_initial_condition(rect.x0, 0.1),
             compile::format_initial_condition(rect.y0, 0.1),
             compile::format_initial_condition(rect.x1, 0.1),

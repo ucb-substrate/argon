@@ -22,9 +22,10 @@ pub enum StaticErrorKind {
     /// parameter names, enum variants, and struct fields.
     #[error("duplicate name declaration")]
     DuplicateNameDeclaration,
-    /// Attempted to declare an object with the same name as a built-in object.
+    /// Attempted to declare or import an object with the same name as a
+    /// built-in object.
     ///
-    /// For example, users cannot declare cells or functions named `rect`.
+    /// For example, users cannot declare cells or functions named `eq`.
     #[error("redeclaration of built-in object")]
     RedeclarationOfBuiltin,
     /// A cell's top-level `let` shadows a field an instance already answers.
@@ -36,8 +37,17 @@ pub enum StaticErrorKind {
     #[error("`{name}` is reserved for instance position; a cell field cannot be named `x` or `y`")]
     ReservedCellField { name: String },
     /// Geometry of a cell was read before the cell was placed.
-    #[error("`{cell}` is a cell; place it with `inst(...)` before reading field `{field}`")]
+    #[error(
+        "`{cell}` is a cell; place it with `std::layout::inst(...)` before reading field `{field}`"
+    )]
     CellFieldBeforePlacement { cell: String, field: String },
+    /// A bare name or a `std::` path that does not resolve names an item of a
+    /// `std` submodule.
+    #[error("`{name}` moved to `{path}`; import it with `use {path};`")]
+    MovedItem { name: String, path: String },
+    /// A native item was used as a value rather than called.
+    #[error("`{name}` can only be called")]
+    NativeNotCallable { name: String },
     /// A field that holds a function was read through an instance.
     #[error(
         "field `{field}` of cell `{cell}` holds a {kind}, which cannot be read through an instance"

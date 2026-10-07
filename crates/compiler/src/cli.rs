@@ -468,7 +468,7 @@ mod tests {
     fn execution_writes_binary_output_without_gds_by_default() {
         let source = temp_source(
             "run",
-            "cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=20.); }\n",
+            "use std::layout::rect;\ncell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=20.); }\n",
         );
         let directory = source.parent().expect("source should have a parent");
         let artifact_path = directory.join("top.bin");
@@ -489,7 +489,8 @@ mod tests {
         let source = temp_source("bool-root", "");
         let dependency = temp_source(
             "bool-dependency",
-            r#"cell device(enabled: Bool, w: Float, count: Int) {
+            r#"use std::layout::rect;
+cell device(enabled: Bool, w: Float, count: Int) {
     if enabled {
         rect("met1", x0=0., y0=0., w=w, h=10.);
     } else {
@@ -533,7 +534,8 @@ mod tests {
     fn execution_evaluates_arithmetic_cell_arguments() {
         let source = temp_source(
             "arithmetic-args",
-            "cell top(x: Float, n: Int, flag: Bool) {\n\
+            "use std::layout::rect;\n\
+             cell top(x: Float, n: Int, flag: Bool) {\n\
              let h = if flag { 10. } else { 20. };\n\
              let r = rect(\"met1\", x0=x, y0=n as Float, x1=x + 10., y1=n as Float + h);\n\
              }\n",
@@ -548,7 +550,8 @@ mod tests {
     fn execution_evaluates_a_function_call_and_string_cell_argument() {
         let source = temp_source(
             "call-args",
-            "fn double(x: Float) -> Float { 2. * x }\n\
+            "use std::layout::rect;\n\
+             fn double(x: Float) -> Float { 2. * x }\n\
              cell top(layer: String, w: Float) {\n\
              let r = rect(layer, x0=0., y0=0., x1=w, y1=10.);\n\
              }\n",
@@ -562,7 +565,8 @@ mod tests {
     fn execution_evaluates_a_sequence_cell_argument() {
         let source = temp_source(
             "seq-args",
-            "cell top(items: [Float]) {\n\
+            "use std::layout::rect;\n\
+             cell top(items: [Float]) {\n\
              let r = rect(\"met1\", x0=0., y0=0., x1=head(items), y1=10.);\n\
              }\n",
         );
@@ -574,7 +578,8 @@ mod tests {
     fn execution_accepts_an_empty_sequence_cell_argument() {
         let source = temp_source(
             "empty-seq-args",
-            "cell top(items: [Float]) {\n\
+            "use std::layout::rect;\n\
+             cell top(items: [Float]) {\n\
              let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=20.);\n\
              }\n",
         );
@@ -586,7 +591,8 @@ mod tests {
     fn execution_evaluates_an_enum_cell_argument() {
         let source = temp_source(
             "enum-args",
-            "enum Mode { Fast, Slow, }\n\
+            "use std::layout::rect;\n\
+             enum Mode { Fast, Slow, }\n\
              cell top(m: Mode) {\n\
              let w = match m { Mode::Fast => 10., Mode::Slow => 20., };\n\
              let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=10.);\n\
@@ -600,7 +606,8 @@ mod tests {
     fn execution_evaluates_a_struct_variant_cell_argument() {
         let source = temp_source(
             "struct-variant-args",
-            "enum Mode { Sized { w: Float, h: Float }, Fast, }\n\
+            "use std::layout::rect;\n\
+             enum Mode { Sized { w: Float, h: Float }, Fast, }\n\
              cell top(m: Mode) {\n\
              let w = match m { Mode::Sized { w, .. } => w, Mode::Fast => 10., };\n\
              let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=10.);\n\
@@ -618,7 +625,8 @@ mod tests {
     fn execution_evaluates_an_option_cell_argument() {
         let source = temp_source(
             "option-args",
-            "cell top(w: Float, n: Option<Int> = None) {\n\
+            "use std::layout::rect;\n\
+             cell top(w: Float, n: Option<Int> = None) {\n\
              let count = std::unwrap_or(n, 1);\n\
              let r = rect(\"met1\", x0=0., y0=0., x1=w * (count as Float), y1=w);\n\
              }\n",
@@ -633,7 +641,8 @@ mod tests {
     fn execution_accepts_keyword_cell_arguments() {
         let source = temp_source(
             "kwargs",
-            "cell top(w: Float = 100., h: Float = w) {\n\
+            "use std::layout::rect;\n\
+             cell top(w: Float = 100., h: Float = w) {\n\
              let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=h);\n\
              }\n",
         );
@@ -694,6 +703,7 @@ mod tests {
         let source = temp_source(
             "gds-root",
             "use lib::macros::sram;\n\
+             use std::layout::inst;\n\
              cell top() {\n\
              let imported = inst(sram(), x=0., y=0.);\n\
              eq(imported.gds_rect_0.x0, 0.);\n\
@@ -731,7 +741,8 @@ mod tests {
     fn imports_and_reexports_a_non_rounded_gds_path() {
         let source = temp_source(
             "gds-path-root",
-            "cell top() {\n\
+            "use std::layout::inst;\n\
+             cell top() {\n\
              let imported = inst(routes(), x=0., y=0.);\n\
              eq(imported.gds_path_0.width, 20.);\n\
              eq(imported.gds_path_0.begin_extension, 10.);\n\
@@ -789,7 +800,8 @@ mod tests {
     fn constrains_an_imported_gds_shape_field() {
         let source = temp_source(
             "gds-shape-constraint",
-            "cell top() {\n\
+            "use std::layout::inst;\n\
+             cell top() {\n\
              let imported = inst(sram());\n\
              eq(imported.gds_rect_0.x0, 100.);\n\
              eq(imported.y, 0.);\n\
@@ -826,7 +838,8 @@ mod tests {
     fn constrains_a_shape_through_imported_gds_hierarchy() {
         let source = temp_source(
             "nested-gds-shape-constraint",
-            "cell top() {\n\
+            "use std::layout::inst;\n\
+             cell top() {\n\
              let imported = inst(sram());\n\
              eq(imported.gds_inst_0.gds_rect_0.x0, 100.);\n\
              eq(imported.y, 0.);\n\
@@ -863,7 +876,7 @@ mod tests {
     fn gds_cells_are_declared_before_source_cells() {
         let source = temp_source(
             "gds-declaration-order",
-            "cell top() { let imported = inst(sram(), x=0., y=0.); }\n",
+            "use std::layout::inst;\ncell top() { let imported = inst(sram(), x=0., y=0.); }\n",
         );
         let directory = source.parent().expect("source should have a parent");
         let artifact_path = directory.join("imported.bin");
@@ -940,7 +953,7 @@ mod tests {
     fn missing_text_layer_is_reported_cleanly() {
         let source = temp_source(
             "missing-text-layer",
-            "cell top() {\n    text(\"label\", \"missing.label\", 0., 0.);\n}\n",
+            "use std::layout::text;\ncell top() {\n    text(\"label\", \"missing.label\", 0., 0.);\n}\n",
         );
         let tech = basic_tech();
         let diagnostic = render_failed(failed(execution_args(source, "top()", tech.clone())));
@@ -957,9 +970,10 @@ mod tests {
     fn standard_library_errors_show_embedded_source_lines() {
         let source = temp_source(
             "std-diagnostic",
-            r#"cell top() {
+            r#"use std::layout::crect;
+cell top() {
     let r = crect(layer="missing.drawing", x0=0., y0=0., w=10., h=10.);
-    std::array(r, 2, 20., 0.);
+    std::layout::array(r, 2, 20., 0.);
 }
 "#,
         );
@@ -973,14 +987,14 @@ mod tests {
             "{diagnostic}"
         );
         assert!(
-            diagnostic.contains("--> <argon-std>/lib.ar:"),
+            diagnostic.contains("--> <argon-std>/layout.ar:"),
             "{diagnostic}"
         );
         assert!(
             diagnostic.contains("let first_rect = rect(r.layer);"),
             "{diagnostic}"
         );
-        assert!(!diagnostic.contains("<argon-std>/lib.ar:1:1"));
+        assert!(!diagnostic.contains("<argon-std>/layout.ar:1:1"));
     }
 
     #[test]

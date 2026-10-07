@@ -1,3 +1,5 @@
+use std::layout::{inst, rect};
+
 fn count<T>(items: [T]) -> Int {
     if items == [] { 0 } else { 1 + count(tail(items)) }
 }

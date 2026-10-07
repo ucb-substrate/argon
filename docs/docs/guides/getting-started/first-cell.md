@@ -55,7 +55,7 @@ Press <kbd>O</kbd> again and open `inset_rect()`. You don't need to save first: 
 3. Pick `met1` and draw a larger rectangle around the first.
 4. Press <kbd>Esc</kbd> to return to selection mode.
 
-Look at `lib.ar` in Neovim: each rectangle is now a `rect` call. The GUI writes into the buffer, not the file, so these edits can be undone like any other. The calls use initial values such as `x0i` and `y1i`, which is what lets you drag unconstrained edges later.
+Look at `lib.ar` in Neovim: each rectangle is now a [`std::layout::rect`](/language/std-layout#rect) call, written with its full path so the file needs no import. The GUI writes into the buffer, not the file, so these edits can be undone like any other. The calls use initial values such as `x0i` and `y1i`, which is what lets you drag unconstrained edges later.
 
 ## Check the project
 

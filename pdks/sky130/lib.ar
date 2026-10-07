@@ -1,6 +1,8 @@
+use std::layout::{crect, inst, rect};
+
 cell fet1v8(nfet: Bool, w: Float, nf: Int) {
     let poly = crect(layer="poly.drawing", x0=0., y0=0., w=150., h = w + 260.);
-    pub let poly_bbox = std::array(poly, nf, 430., 0.);
+    pub let poly_bbox = std::layout::array(poly, nf, 430., 0.);
     eq(poly_bbox.x0, 0.);
     eq(poly_bbox.y0, 0.);
     let diff = rect(
@@ -11,14 +13,14 @@ cell fet1v8(nfet: Bool, w: Float, nf: Int) {
         y1 = poly_bbox.y1 - 130.
     )!;
     let li1 = crect(layer="li1.drawing", x1=poly_bbox.x0 - 55., y0=diff.y0 - 100., w=170., y1=diff.y1 + 100.);
-    pub let li1_bbox = std::array(li1, nf + 1, 430., 0.);
+    pub let li1_bbox = std::layout::array(li1, nf + 1, 430., 0.);
     eq(li1_bbox.x0, li1.x0);
     eq(li1_bbox.y0, li1.y0);
     pub let sdm = rect(if nfet { "nsdm.drawing" } else { "psdm.drawing" }, x0 = diff.x0 - 130., x1=diff.x1 + 130., y0=diff.y0 - 130., y1=diff.y1+130.);
 
     let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
     let ny = (diff.h + 170. - 80.) as Int / 340. as Int;
-    std::center_rects(li1_bbox, std::array2(licon, nf + 1, ny, 430., 340.));
+    std::layout::center_rects(li1_bbox, std::layout::array2(licon, nf + 1, ny, 430., 340.));
 }
 
 cell tap(ntap: Int, w: Float, h: Float) {
@@ -27,7 +29,7 @@ cell tap(ntap: Int, w: Float, h: Float) {
     pub let sdm = rect(if ntap == 1 { "nsdm.drawing" } else { "psdm.drawing" }, x0=tap.x0 - 130., x1=tap.x1 + 130., y0=tap.y0 - 130., y1=tap.y1 + 130.);
     let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
     let cons = crect(x0=li1.x0, x1=li1.x1, y0=li1.y0+80., y1=li1.y1-80.);
-    std::center_rects(cons, std::max_array(licon, cons.w, cons.h, 340., 340.));
+    std::layout::center_rects(cons, std::layout::max_array(licon, cons.w, cons.h, 340., 340.));
 }
 
 cell inv(nw: Float, pw: Float, nf: Int) {
@@ -52,21 +54,21 @@ cell inv(nw: Float, pw: Float, nf: Int) {
     pub let o_li_right = rect("li1.drawing", x0=a_li_mid.x1 + 170., w=170., y0=o_li_bot.y0, y1=o_li_top.y1);
     eq(o_li_bot.x1, o_li_right.x1);
     let li1 = crect(layer="li1.drawing", x1=o_li_bot.x0, w=170., y0=nmos.li1_bbox.y0, y1=o_li_bot.y1);
-    let li1_bbox_bot = std::array(li1, (nf + 1) / 2, 860., 0.);
+    let li1_bbox_bot = std::layout::array(li1, (nf + 1) / 2, 860., 0.);
     eq(li1_bbox_bot.x0, o_li_bot.x0);
     eq(li1_bbox_bot.y1, o_li_bot.y1);
     let li1 = crect(layer="li1.drawing", x1=o_li_bot.x0, w=170., y1=pmos.li1_bbox.y1, y0=o_li_top.y0);
-    let li1_bbox_top = std::array(li1, (nf + 1) / 2, 860., 0.);
+    let li1_bbox_top = std::layout::array(li1, (nf + 1) / 2, 860., 0.);
     eq(li1_bbox_top.x0, o_li_top.x0);
     eq(li1_bbox_top.y0, o_li_top.y0);
 
     // Connect sources to taps.
     let li1 = crect(layer="li1.drawing", x1=o_li_bot.x0, w=170., y0=ptap.li1.y0, y1=nmos.li1_bbox.y1);
-    let li1_bbox_bot = std::array(li1, nf + 1 - (nf + 1) / 2, 860., 0.);
+    let li1_bbox_bot = std::layout::array(li1, nf + 1 - (nf + 1) / 2, 860., 0.);
     eq(li1_bbox_bot.x0, nmos.li1_bbox.x0);
     eq(li1_bbox_bot.y0, ptap.li1.y0);
     let li1 = crect(layer="li1.drawing", x1=o_li_bot.x0, w=170., y1=ntap.li1.y1, y0=pmos.li1_bbox.y0);
-    let li1_bbox_top = std::array(li1, nf + 1 - (nf + 1) / 2, 860., 0.);
+    let li1_bbox_top = std::layout::array(li1, nf + 1 - (nf + 1) / 2, 860., 0.);
     eq(li1_bbox_top.x0, pmos.li1_bbox.x0);
     eq(li1_bbox_top.y1, ntap.li1.y1);
 
@@ -77,12 +79,12 @@ cell inv(nw: Float, pw: Float, nf: Int) {
     eq(a_poly_mid.y0 + a_poly_mid.y1, a_npc_mid.y0 + a_npc_mid.y1);
 
     let poly = crect(layer="poly.drawing", x0=0., y0=nmos.poly_bbox.y0, y1=pmos.poly_bbox.y1, w=150.);
-    let poly_bbox = std::array(poly, nf, 430., 0.);
+    let poly_bbox = std::layout::array(poly, nf, 430., 0.);
     eq(poly_bbox.x0, nmos.poly_bbox.x0);
     eq(poly_bbox.y0, nmos.poly_bbox.y0);
 
     let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
-    let licon_bbox = std::array(licon, nf, 430., 0.);
+    let licon_bbox = std::layout::array(licon, nf, 430., 0.);
     eq(licon_bbox.x0, a_li_mid.x0 + 80.);
     eq(licon_bbox.y0, a_li_mid.y0);
 }
@@ -255,8 +257,8 @@ fn v12_array(r1: Rect, r2: Rect) {
 }
 
 fn centered_via_array(r1: Rect, r2: Rect, via: Rect, xpitch: Float, ypitch: Float) {
-    let intersection = std::intersection(r1, r2);
-    let via_array = std::max_array(via, intersection.w, intersection.h, xpitch, ypitch);
+    let intersection = std::layout::intersection(r1, r2);
+    let via_array = std::layout::max_array(via, intersection.w, intersection.h, xpitch, ypitch);
     eq(via_array.x0 - intersection.x0, intersection.x1 - via_array.x1);
     eq(via_array.y0 - intersection.y0, intersection.y1 - via_array.y1);
 }

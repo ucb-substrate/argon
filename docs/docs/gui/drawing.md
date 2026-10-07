@@ -9,13 +9,15 @@ Canvas shortcuts work while the canvas has focus and no text field is active.
 
 Rectangles, polygons, paths, and instances that the GUI adds at the top level of a cell are bound with [`pub let`](/language/cells-functions#public-fields), so a parent cell can read them through an instance. Inside a loop, branch, or block they're bound with a plain `let`.
 
+The GUI writes each call with its full [`std::layout`](/language/std-layout) path, such as `std::layout::rect(...)` or `std::layout::inst(...)`, so the source needs no `use` line for it.
+
 ## Select
 
 Press <kbd>S</kbd>. You can select shapes, instances, edges, and dimension labels; what's selected determines which edits are available. Press <kbd>Q</kbd> to edit a selected dimension.
 
 ## Rectangle
 
-Pick a layer, press <kbd>R</kbd>, and click two opposite corners. <kbd>Backspace</kbd> discards the first corner. The [`rect`](/language/builtins/geometry#rect) call the GUI writes uses initial values (`x0i` and so on), so you can drag the rectangle around until constraints pin it down.
+Pick a layer, press <kbd>R</kbd>, and click two opposite corners. <kbd>Backspace</kbd> discards the first corner. The [`std::layout::rect`](/language/std-layout#rect) call the GUI writes uses initial values (`x0i` and so on), so you can drag the rectangle around until constraints pin it down.
 
 ## Polygon
 

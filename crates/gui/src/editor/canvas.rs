@@ -11514,7 +11514,7 @@ pub(crate) fn find_obj_path(
             }
             SolvedValue::Instance(_) => {
                 string_path.push(name);
-                string_path = vec![format!("bbox({})", string_path.join("."))];
+                string_path = vec![format!("std::layout::bbox({})", string_path.join("."))];
             }
             _ => reachable = false,
         }
@@ -11965,7 +11965,8 @@ mod tests {
         let source_path = directory.path().join("lib.ar");
         std::fs::write(
             &source_path,
-            r#"cell top() {
+            r#"use std::layout::rect;
+cell top() {
     rect("met1", x0=0., y0=0., x1=100., y1=1.);
 }
 "#,
@@ -12024,6 +12025,7 @@ mod tests {
         std::fs::write(
             &source_path,
             r#"
+use std::layout::rect;
 cell top() {
     rect("met1", x0=0., y0=0., x1=1., y1=1.);
     rect("met1", x0=2., y0=0., x1=3., y1=1.);
@@ -12064,6 +12066,7 @@ cell top() {
         std::fs::write(
             &source_path,
             r#"
+use std::layout::{inst, path, rect};
 cell bit() {
     let body = rect("met1", x0=0., y0=0., x1=8., y1=20.);
     let route = path("met1", 3,
@@ -13010,6 +13013,7 @@ cell top() {
         std::fs::write(
             &source,
             r#"
+use std::layout::{inst, rect};
 cell free() { let r = rect("met1", x0i=10., y0i=10., x1i=90., y1i=90.)!; }
 cell partial() { let r = rect("met1", x0i=10., y0i=10., x1=90., y1=90.)!; }
 cell fixed() { let r = rect("met1", x0=10., y0=10., x1=90., y1=90.); }
@@ -14195,7 +14199,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         let source_path = directory.path().join("lib.ar");
         std::fs::write(
             &source_path,
-            "cell top() {\n    let shape = rect(\"met1\", x0i=1.2, y0i=0., x1i=10.3, y1i=10.)!;\n}\n",
+            "use std::layout::rect;\ncell top() {\n    let shape = rect(\"met1\", x0i=1.2, y0i=0., x1i=10.3, y1i=10.)!;\n}\n",
         )
         .unwrap();
         let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
@@ -14321,6 +14325,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         std::fs::write(
             &source_path,
             r#"
+use std::layout::{inst, rect};
 cell leaf(width: Float) {
     let shape = rect("met1", x0=0., y0=0., x1=width, y1=5.)!;
 }
@@ -14368,6 +14373,7 @@ cell top() {
         std::fs::write(
             &source_path,
             r#"
+use std::layout::{inst, rect};
 cell child() {
     pub let shape = rect("met1", x0=0., y0=0., x1=10., y1=5.);
     let hidden = rect("met1", x0=20., y0=0., x1=30., y1=5.);
@@ -14421,7 +14427,7 @@ cell top() {
 
         assert_eq!(
             find_obj_path(&[instance_id], &state, scope),
-            (true, vec!["bbox(child_instance)".to_owned()])
+            (true, vec!["std::layout::bbox(child_instance)".to_owned()])
         );
         assert_eq!(
             find_obj_path(&[instance_id, child_rect_id], &state, scope),

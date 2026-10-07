@@ -32,7 +32,7 @@ use crate::ast::{
     VariantPayload, WorkspaceAst,
 };
 use crate::gds::{ImportedGdsElement, import_gds};
-use crate::parse::{CellInvocation, ParseOutput, WorkspaceParseAst};
+use crate::parse::{CellInvocation, ParseOutput, STD_MODULES, WorkspaceParseAst};
 use crate::solver::{ConstraintId, Var};
 use crate::tech::{Technology, read_tech};
 use crate::workspace::WorkspaceConfig;
@@ -110,34 +110,97 @@ pub(crate) const MAX_TEXT_LEN: usize = 512;
 /// the literals directly and must be updated alongside this constant.
 pub const RESERVED_CELL_FIELDS: [&str; 2] = ["x", "y"];
 
-pub const BUILTINS: [&str; 14] = [
-    "cons",
-    "head",
-    "tail",
-    "range_full",
-    "crect",
-    "rect",
-    "polygon",
-    "path",
-    "text",
-    "float",
-    "eq",
-    "dimension",
-    "inst",
-    "bbox",
+/// Functions the compiler implements that every module calls by bare name.
+pub const BUILTINS: [&str; 6] = ["cons", "head", "tail", "range_full", "float", "eq"];
+
+/// Helpers of `std::layout` for which a `std::` path reports the module they
+/// are in.
+const MOVED_STD_HELPERS: [&str; 8] = [
+    "intersection",
+    "union",
+    "array",
+    "array2",
+    "max_array",
+    "eq_rect",
+    "center_rects",
+    "crect2rect",
 ];
+
+/// An item the compiler implements but binds inside a `std` module, so that
+/// it is reached by path or `use` like any other item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Native {
+    Rect,
+    Crect,
+    Polygon,
+    Path,
+    Text,
+    Dimension,
+    LayoutInst,
+    Bbox,
+}
+
+impl Native {
+    pub const ALL: [Native; 8] = [
+        Native::Rect,
+        Native::Crect,
+        Native::Polygon,
+        Native::Path,
+        Native::Text,
+        Native::Dimension,
+        Native::LayoutInst,
+        Native::Bbox,
+    ];
+
+    /// The module the native is bound in.
+    pub fn module(self) -> &'static [&'static str] {
+        &["std", "layout"]
+    }
+
+    /// The name the native is bound to in its module.
+    pub fn name(self) -> &'static str {
+        match self {
+            Native::Rect => "rect",
+            Native::Crect => "crect",
+            Native::Polygon => "polygon",
+            Native::Path => "path",
+            Native::Text => "text",
+            Native::Dimension => "dimension",
+            Native::LayoutInst => "inst",
+            Native::Bbox => "bbox",
+        }
+    }
+
+    /// The full path the native is reached by, such as `std::layout::rect`.
+    pub fn path(self) -> String {
+        self.module().iter().chain([&self.name()]).join("::")
+    }
+
+    /// The natives bound in `module`.
+    pub fn in_module(module: &[String]) -> impl Iterator<Item = Native> + '_ {
+        Self::ALL
+            .into_iter()
+            .filter(move |native| native.module().iter().eq(module.iter()))
+    }
+
+    /// The native bound to `name` in its module.
+    pub fn named(name: &str) -> Option<Native> {
+        Self::ALL.into_iter().find(|native| native.name() == name)
+    }
+}
 
 /// The module that the leading segments of a qualified `path` name.
 ///
-/// `std::…` is absolute into the standard library, `lib::…` is absolute from
-/// the workspace root, and anything else is relative to `current`. `items` is
-/// how many trailing segments name the thing being resolved rather than its
-/// module: one for a `use` or a call, two for an `Enum::Variant`.
+/// `std::…` is absolute into the standard library and its submodules, `lib::…`
+/// is absolute from the workspace root, and anything else is relative to
+/// `current`. `items` is how many trailing segments name the thing being
+/// resolved rather than its module: one for a `use` or a call, two for an
+/// `Enum::Variant`.
 ///
 /// Which of the three forms a path takes is decided by its *first* segment, so
 /// the trailing item segments are dropped only after that: `use lib;` names the
 /// workspace root, not a child of the current module.
-pub(crate) fn module_prefix<'a>(
+pub fn module_prefix<'a>(
     current: &ModPath,
     path: impl IntoIterator<Item = &'a str>,
     items: usize,
@@ -145,7 +208,11 @@ pub(crate) fn module_prefix<'a>(
     let path: Vec<&str> = path.into_iter().collect();
     let prefix = &path[..path.len().saturating_sub(items)];
     match path.first().copied() {
-        Some("std") => vec!["std".to_string()],
+        Some("std") => ["std"]
+            .into_iter()
+            .chain(prefix.iter().skip(1).copied())
+            .map(str::to_string)
+            .collect(),
         Some("lib") => prefix.iter().skip(1).map(|name| name.to_string()).collect(),
         _ => current
             .iter()
@@ -182,6 +249,8 @@ pub fn static_compile(
 pub struct TypedWorkspace {
     pub ast: WorkspaceAst<VarIdTyMetadata>,
     pub defs: Arc<TypeDefs>,
+    /// The native item bound to each `VarId` that names one.
+    pub natives: Arc<IndexMap<VarId, Native>>,
 }
 
 impl std::ops::Deref for TypedWorkspace {
@@ -1186,6 +1255,8 @@ pub(crate) struct VarIdTyPass<'a> {
     cell_fields: &'a IndexMap<VarId, CellFields>,
     /// Struct and enum definitions of every module typed before this one.
     type_defs: &'a TypeDefs,
+    /// The native items bound by every module typed so far, this one included.
+    natives: &'a mut IndexMap<VarId, Native>,
     /// Struct and enum definitions of this module.
     local_defs: TypeDefs,
     /// The struct declarations of this module, by the id of each struct's name.
@@ -1336,6 +1407,8 @@ struct WorkspaceTyping<'a> {
     cell_fields: IndexMap<VarId, CellFields>,
     /// Struct and enum definitions of every typed module.
     type_defs: TypeDefs,
+    /// The native items bound by every typed module.
+    natives: IndexMap<VarId, Native>,
     ast: WorkspaceAst<VarIdTyMetadata>,
     errors: Vec<StaticError>,
     next_id: VarId,
@@ -1349,18 +1422,19 @@ pub(crate) fn execute_var_id_ty_pass<'a>(
         mod_bindings: IndexMap::new(),
         cell_fields: IndexMap::new(),
         type_defs: TypeDefs::new(),
+        natives: IndexMap::new(),
         ast: IndexMap::new(),
         errors: Vec::new(),
         next_id: 1,
     };
-    let std_mod_path = vec!["std".to_string()];
-    let std_mod_path = ast.get_key_value(&std_mod_path).map(|(k, _)| k);
+    // `std` is never a DAG edge, so its modules are typed first, in their
+    // fixed order.
+    let std_paths = STD_MODULES
+        .iter()
+        .filter_map(|module| ast.get_key_value(&module.mod_path()).map(|(path, _)| path))
+        .collect_vec();
     if let Some((root, _)) = ast.get_key_value(&vec![]) {
-        for path in [std_mod_path, Some(root)]
-            .into_iter()
-            .flatten()
-            .chain(ast.keys())
-        {
+        for path in std_paths.into_iter().chain([root]).chain(ast.keys()) {
             execute_var_id_ty_pass_inner(ast, dag, path, &mut typing);
         }
     }
@@ -1368,6 +1442,7 @@ pub(crate) fn execute_var_id_ty_pass<'a>(
         TypedWorkspace {
             ast: typing.ast,
             defs: Arc::new(typing.type_defs),
+            natives: Arc::new(typing.natives),
         },
         typing.errors,
     )
@@ -1396,6 +1471,7 @@ fn execute_var_id_ty_pass_inner<'a>(
         mod_bindings: &typing.mod_bindings,
         cell_fields: &typing.cell_fields,
         type_defs: &typing.type_defs,
+        natives: &mut typing.natives,
         local_defs: TypeDefs::new(),
         struct_decls: IndexMap::new(),
         infer: InferCtx::default(),
@@ -1464,6 +1540,8 @@ pub enum Ty {
     Param(Arc<TyParamTy>),
     /// An inference variable, solved and removed before its unit is finished.
     Infer(InferId),
+    /// The binding of a native item, which may only be called.
+    Native(Native),
 }
 
 /// A type parameter of a generic declaration.
@@ -1613,6 +1691,7 @@ fn function_kind(ty: &Ty) -> Option<&'static str> {
         Ty::Fn(_) => Some("function"),
         Ty::CellFn(_) => Some("cell generator"),
         Ty::Ctor(_) => Some("variant constructor"),
+        Ty::Native(_) => Some("builtin function"),
         Ty::Seq(inner) => function_kind(inner),
         Ty::Tuple(tys) => tys.iter().find_map(function_kind),
         Ty::Struct(ty) => ty.args.iter().find_map(function_kind),
@@ -1752,7 +1831,8 @@ pub(crate) fn subst(ty: &Ty, map: &HashMap<VarId, Ty>) -> Ty {
         | Ty::Point
         | Ty::String
         | Ty::Nil
-        | Ty::Infer(_) => ty.clone(),
+        | Ty::Infer(_)
+        | Ty::Native(_) => ty.clone(),
     }
 }
 
@@ -1995,6 +2075,7 @@ impl std::fmt::Display for Ty {
             Ty::Ctor(c) => write!(f, "{}::{}", c.enum_name, c.variant),
             Ty::Param(param) => write!(f, "{}", param.name),
             Ty::Infer(_) => write!(f, "_"),
+            Ty::Native(native) => write!(f, "fn {}", native.name()),
         }
     }
 }
@@ -2407,6 +2488,7 @@ impl<'a> VarIdTyPass<'a> {
             }
         }
         self.bind_prelude();
+        self.bind_natives();
         for decl in &self.ast.ast.decls {
             if let Decl::Use(u) = decl {
                 self.declare_use_decl(u);
@@ -3192,6 +3274,15 @@ impl<'a> VarIdTyPass<'a> {
         if let Some(binding) = self.module_item(&module, &item.name) {
             return Ok(binding);
         }
+        if path[0].name == "std"
+            && module == ["std"]
+            && MOVED_STD_HELPERS.contains(&item.name.as_str())
+        {
+            return Err(QualifiedError::Moved {
+                name: format!("std::{}", item.name),
+                path: format!("std::layout::{}", item.name),
+            });
+        }
         if module == *self.current_path || self.mod_bindings.contains_key(&module) {
             return Err(QualifiedError::Undeclared {
                 name: item.name.to_string(),
@@ -3208,6 +3299,9 @@ impl<'a> VarIdTyPass<'a> {
                 (span, StaticErrorKind::InvalidVariant(variant))
             }
             QualifiedError::Undeclared { name } => (span, StaticErrorKind::UndeclaredVar { name }),
+            QualifiedError::Moved { name, path } => {
+                (span, StaticErrorKind::MovedItem { name, path })
+            }
             QualifiedError::NotAnEnum { span } => (span, StaticErrorKind::NotAnEnum),
         };
         self.errors.push(StaticError {
@@ -3269,27 +3363,53 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
+    /// Binds the native items of this module, if it is a `std` module that
+    /// has any.
+    fn bind_natives(&mut self) {
+        for native in Native::in_module(self.current_path) {
+            let id = self.alloc(&Substr::from(native.name()), Ty::Native(native));
+            self.natives.insert(id, native);
+        }
+    }
+
     fn declare_use_decl(&mut self, use_decl: &UseDecl<Substr, ParseMetadata>) {
         let item = use_decl.path.last().expect("use paths are non-empty");
         let local_name = use_decl.alias.as_ref().unwrap_or(item);
-        let imported = self.resolve_qualified(&use_decl.path).ok();
-        if let Some(binding) = imported {
-            self.bindings
-                .last_mut()
-                .unwrap()
-                .var_bindings
-                .insert(local_name.name.clone(), binding);
-        } else {
+        // A call of a one-segment builtin name types as the builtin before the
+        // name is looked up, so an import under that name would be ignored.
+        if BUILTINS.contains(&local_name.name.as_str()) {
             self.errors.push(StaticError {
-                span: self.span(use_decl.span),
-                kind: StaticErrorKind::UnresolvedImport {
-                    path: use_decl
-                        .path
-                        .iter()
-                        .map(|ident| ident.name.as_str())
-                        .join("::"),
-                },
+                span: self.span(local_name.span),
+                kind: StaticErrorKind::RedeclarationOfBuiltin,
             });
+            return;
+        }
+        match self.resolve_qualified(&use_decl.path) {
+            Ok(binding) => {
+                self.bindings
+                    .last_mut()
+                    .unwrap()
+                    .var_bindings
+                    .insert(local_name.name.clone(), binding);
+            }
+            Err(QualifiedError::Moved { name, path }) => {
+                self.errors.push(StaticError {
+                    span: self.span(use_decl.span),
+                    kind: StaticErrorKind::MovedItem { name, path },
+                });
+            }
+            Err(_) => {
+                self.errors.push(StaticError {
+                    span: self.span(use_decl.span),
+                    kind: StaticErrorKind::UnresolvedImport {
+                        path: use_decl
+                            .path
+                            .iter()
+                            .map(|ident| ident.name.as_str())
+                            .join("::"),
+                    },
+                });
+            }
         }
     }
 
@@ -3620,6 +3740,13 @@ impl<'a> VarIdTyPass<'a> {
                 let (def, ty_name) = match &ty {
                     Ty::Struct(s) => (s.def, s.name.clone()),
                     Ty::Enum(e) => (e.def, e.name.clone()),
+                    Ty::Native(_) => {
+                        self.errors.push(StaticError {
+                            span: self.span(name.span),
+                            kind: StaticErrorKind::UnknownType,
+                        });
+                        return Ty::Unknown;
+                    }
                     _ => {
                         self.check_ty_arg_arity(name.span, &self.display(&ty), 0, args.len());
                         return ty;
@@ -4194,6 +4321,19 @@ impl<'a> VarIdTyPass<'a> {
                     (Some(varid), Ty::Cell(Arc::new(ty.cell.subst(&map))))
                 }
                 Ty::Ctor(ctor) => self.typecheck_ctor_call(varid, &ctor, call_span, args, explicit),
+                Ty::Native(native) => {
+                    if let Some(explicit) = explicit {
+                        self.errors.push(StaticError {
+                            span: self.span(call_span),
+                            kind: StaticErrorKind::TypeArgArity {
+                                ty: name.to_owned(),
+                                expected: 0,
+                                found: explicit.len(),
+                            },
+                        });
+                    }
+                    (Some(varid), self.typecheck_native(native, call_span, args))
+                }
                 ty => {
                     self.errors.push(StaticError {
                         span: self.span(call_span),
@@ -4208,11 +4348,110 @@ impl<'a> VarIdTyPass<'a> {
             }
             self.errors.push(StaticError {
                 span: self.span(call_span),
-                kind: StaticErrorKind::UndeclaredVar {
-                    name: name.to_owned(),
-                },
+                kind: self.undeclared(name, is_local),
             });
             (None, Ty::Unknown)
+        }
+    }
+
+    /// The error for a name that does not resolve. A bare name of a native
+    /// says which module to import it from.
+    fn undeclared(&self, name: &str, bare: bool) -> StaticErrorKind {
+        match Native::named(name).filter(|_| bare) {
+            Some(native) => StaticErrorKind::MovedItem {
+                name: name.to_owned(),
+                path: native.path(),
+            },
+            None => StaticErrorKind::UndeclaredVar {
+                name: name.to_owned(),
+            },
+        }
+    }
+
+    /// Checks a call of a native item and returns the call's type.
+    fn typecheck_native(
+        &mut self,
+        native: Native,
+        call_span: cfgrammar::Span,
+        args: &crate::ast::Args<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        match native {
+            Native::Rect | Native::Crect => {
+                let sig = if native == Native::Crect {
+                    &builtin_sig::CRECT
+                } else {
+                    &builtin_sig::RECT
+                };
+                self.typecheck_args(call_span, args, sig);
+                Ty::Rect
+            }
+            Native::Polygon => {
+                let coordinates = args.kwargs.iter().filter_map(|kwarg| {
+                    let name = kwarg.name.name.as_str();
+                    polygon_coordinate(name).map(|_| (name, Ty::Float))
+                });
+                let sig = Signature::positional([Ty::String, Ty::Int]).keywords(coordinates);
+                self.typecheck_args(call_span, args, &sig);
+                Ty::Polygon
+            }
+            Native::Path => {
+                let keywords = args.kwargs.iter().filter_map(|kwarg| {
+                    let name = kwarg.name.name.as_str();
+                    (matches!(
+                        name,
+                        "width"
+                            | "widthi"
+                            | "begin_extension"
+                            | "begin_extensioni"
+                            | "end_extension"
+                            | "end_extensioni"
+                    ) || polygon_coordinate(name).is_some())
+                    .then_some((name, Ty::Float))
+                });
+                let sig = Signature::positional([Ty::String, Ty::Int]).keywords(keywords);
+                self.typecheck_args(call_span, args, &sig);
+                Ty::Path
+            }
+            Native::Text => {
+                // text, layer, x, y
+                self.typecheck_args(call_span, args, &builtin_sig::TEXT);
+                Ty::Nil
+            }
+            Native::Bbox => {
+                self.assert_eq_arity(call_span, args.posargs.len(), 1);
+                // `assert_eq_arity` only records a diagnostic, so the argument
+                // must still be fetched fallibly, as the sibling natives do.
+                if let Some(arg) = args.posargs.first() {
+                    let argty = self.shallow(&arg.ty());
+                    if !matches!(argty, Ty::Cell(_) | Ty::Inst(_)) {
+                        self.errors.push(StaticError {
+                            span: self.span(call_span),
+                            kind: StaticErrorKind::IncorrectTyCategory {
+                                found: self.display(&argty),
+                                expected: "Cell/Inst".to_string(),
+                            },
+                        });
+                    }
+                }
+                Ty::Rect
+            }
+            Native::Dimension => {
+                self.typecheck_args(call_span, args, &builtin_sig::DIMENSION);
+                Ty::Nil
+            }
+            Native::LayoutInst => {
+                self.typecheck_args(call_span, args, &builtin_sig::INST);
+                if let Some(ty) = args.posargs.first() {
+                    self.assert_ty_is_cell(ty.span(), &ty.ty());
+                    match self.shallow(&ty.ty()) {
+                        Ty::Cell(c) => Ty::Inst(c.clone()),
+                        Ty::Any => Ty::Any,
+                        _ => Ty::Unknown,
+                    }
+                } else {
+                    Ty::Unknown
+                }
+            }
         }
     }
 }
@@ -4226,6 +4465,8 @@ enum QualifiedError {
     },
     /// The module exists but has no such item.
     Undeclared { name: String },
+    /// The item is in a `std` submodule, at `path`.
+    Moved { name: String, path: String },
     /// The second-to-last segment names neither an enum nor a module.
     NotAnEnum { span: cfgrammar::Span },
 }
@@ -4275,7 +4516,8 @@ fn mentions_param(ty: &Ty, id: VarId) -> bool {
         | Ty::Point
         | Ty::String
         | Ty::Nil
-        | Ty::Infer(_) => false,
+        | Ty::Infer(_)
+        | Ty::Native(_) => false,
     }
 }
 
@@ -4327,29 +4569,42 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         // Parser grammar ensures paths cannot be empty.
         assert!(!input.path.is_empty());
         let explicit = self.explicit_args(input);
-        if input.path.len() == 1 {
+        let resolved = if input.path.len() == 1 {
             let name = &input.path[0].name;
-            if let Some((varid, ty)) = self.lookup(name) {
-                (Some(varid), self.value_ty(ty, explicit, input.span))
+            if let Some(binding) = self.lookup(name) {
+                Some(binding)
             } else if self.demand_local(name, input.span) {
-                (None, Ty::Unknown)
+                None
             } else {
                 self.errors.push(StaticError {
                     span: self.span(input.span),
-                    kind: StaticErrorKind::UndeclaredVar {
-                        name: name.to_string(),
+                    kind: self.undeclared(name, true),
+                });
+                None
+            }
+        } else {
+            match self.resolve_qualified(&input.path) {
+                Ok(binding) => Some(binding),
+                Err(error) => {
+                    self.report_qualified_error(error, input.span);
+                    None
+                }
+            }
+        };
+        match resolved {
+            // A native is not a value; only a call reaches it, through
+            // `dispatch_call_expr`.
+            Some((_, Ty::Native(native))) => {
+                self.errors.push(StaticError {
+                    span: self.span(input.span),
+                    kind: StaticErrorKind::NativeNotCallable {
+                        name: native.name().to_owned(),
                     },
                 });
                 (None, Ty::Unknown)
             }
-        } else {
-            match self.resolve_qualified(&input.path) {
-                Ok((varid, ty)) => (Some(varid), self.value_ty(ty, explicit, input.span)),
-                Err(error) => {
-                    self.report_qualified_error(error, input.span);
-                    (None, Ty::Unknown)
-                }
-            }
+            Some((varid, ty)) => (Some(varid), self.value_ty(ty, explicit, input.span)),
+            None => (None, Ty::Unknown),
         }
     }
 
@@ -5189,47 +5444,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
         if func.path.len() == 1 {
             match func.path[0].name.as_str() {
-                name @ "crect" | name @ "rect" => {
-                    let sig = if name == "crect" {
-                        &builtin_sig::CRECT
-                    } else {
-                        &builtin_sig::RECT
-                    };
-                    self.typecheck_args(input.span, args, sig);
-                    (None, Ty::Rect)
-                }
-                "polygon" => {
-                    let coordinates = args.kwargs.iter().filter_map(|kwarg| {
-                        let name = kwarg.name.name.as_str();
-                        polygon_coordinate(name).map(|_| (name, Ty::Float))
-                    });
-                    let sig = Signature::positional([Ty::String, Ty::Int]).keywords(coordinates);
-                    self.typecheck_args(input.span, args, &sig);
-                    (None, Ty::Polygon)
-                }
-                "path" => {
-                    let keywords = args.kwargs.iter().filter_map(|kwarg| {
-                        let name = kwarg.name.name.as_str();
-                        (matches!(
-                            name,
-                            "width"
-                                | "widthi"
-                                | "begin_extension"
-                                | "begin_extensioni"
-                                | "end_extension"
-                                | "end_extensioni"
-                        ) || polygon_coordinate(name).is_some())
-                        .then_some((name, Ty::Float))
-                    });
-                    let sig = Signature::positional([Ty::String, Ty::Int]).keywords(keywords);
-                    self.typecheck_args(input.span, args, &sig);
-                    (None, Ty::Path)
-                }
-                "text" => {
-                    // text, layer, x, y
-                    self.typecheck_args(input.span, args, &builtin_sig::TEXT);
-                    (None, Ty::Nil)
-                }
                 "cons" => self.call_scheme(&builtin_sig::CONS, input.span, args),
                 "head" => self.call_scheme(&builtin_sig::HEAD, input.span, args),
                 "tail" => self.call_scheme(&builtin_sig::TAIL, input.span, args),
@@ -5239,24 +5453,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     self.typecheck_args(input.span, args, &builtin_sig::RANGE_FULL);
                     (None, Ty::Seq(Box::new(Ty::Int)))
                 }
-                "bbox" => {
-                    self.assert_eq_arity(input.span, args.posargs.len(), 1);
-                    // `assert_eq_arity` only records a diagnostic, so the argument
-                    // must still be fetched fallibly, as the sibling builtins do.
-                    if let Some(arg) = args.posargs.first() {
-                        let argty = self.shallow(&arg.ty());
-                        if !matches!(argty, Ty::Cell(_) | Ty::Inst(_)) {
-                            self.errors.push(StaticError {
-                                span: self.span(input.span),
-                                kind: StaticErrorKind::IncorrectTyCategory {
-                                    found: self.display(&argty),
-                                    expected: "Cell/Inst".to_string(),
-                                },
-                            });
-                        }
-                    }
-                    (None, Ty::Rect)
-                }
                 "float" => {
                     self.typecheck_args(input.span, args, &builtin_sig::NONE);
                     (None, Ty::Float)
@@ -5264,23 +5460,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "eq" => {
                     self.typecheck_args(input.span, args, &builtin_sig::EQ);
                     (None, Ty::Nil)
-                }
-                "dimension" => {
-                    self.typecheck_args(input.span, args, &builtin_sig::DIMENSION);
-                    (None, Ty::Nil)
-                }
-                "inst" => {
-                    self.typecheck_args(input.span, args, &builtin_sig::INST);
-                    if let Some(ty) = args.posargs.first() {
-                        self.assert_ty_is_cell(ty.span(), &ty.ty());
-                        match self.shallow(&ty.ty()) {
-                            Ty::Cell(c) => (None, Ty::Inst(c.clone())),
-                            Ty::Any => (None, Ty::Any),
-                            _ => (None, Ty::Unknown),
-                        }
-                    } else {
-                        (None, Ty::Unknown)
-                    }
                 }
                 name => {
                     let lookup = self.lookup(name);
@@ -6795,9 +6974,10 @@ mod module_prefix_tests {
             module_prefix(&current(), ["lib", "utils", "item"], 1),
             ["utils"]
         );
+        assert_eq!(module_prefix(&current(), ["std", "item"], 1), ["std"]);
         assert_eq!(
             module_prefix(&current(), ["std", "shapes", "item"], 1),
-            ["std"]
+            ["std", "shapes"]
         );
     }
 
@@ -7072,6 +7252,8 @@ struct ExecPass<'a> {
     /// Struct and enum definitions, read for cell-argument checks and struct
     /// literal field order.
     defs: &'a TypeDefs,
+    /// The native item bound to each `VarId` that names one.
+    natives: &'a IndexMap<VarId, Native>,
     tech: Technology,
     gds_imports: HashMap<VarId, (String, PathBuf)>,
     cell_states: IndexMap<CellId, CellState>,
@@ -7216,6 +7398,7 @@ impl<'a> ExecPass<'a> {
         Self {
             ast,
             defs: &workspace.defs,
+            natives: &workspace.natives,
             tech,
             gds_imports,
             cell_states: IndexMap::new(),
@@ -7373,9 +7556,6 @@ impl<'a> ExecPass<'a> {
             });
         }
         let path = match input.cell[0] {
-            "std" => {
-                vec!["std".to_string()]
-            }
             "lib" => input
                 .cell
                 .iter()
@@ -9172,9 +9352,13 @@ impl<'a> ExecPass<'a> {
                 value
             }
             Expr::Call(c) => {
-                if BUILTINS.contains(&c.func.path.last().unwrap().name.as_str()) {
+                let native = c.metadata.0.and_then(|id| self.natives.get(&id).copied());
+                let builtin = c.metadata.0.is_none()
+                    && c.func.path.len() == 1
+                    && BUILTINS.contains(&c.func.path[0].name.as_str());
+                if builtin || native.is_some() {
                     self.new_deferred_value(loc, |this| {
-                        PartialEvalState::Call(Box::new(PartialCallExpr {
+                        let call = PartialCallExpr {
                             expr: c.clone(),
                             state: CallExprState {
                                 posargs: c
@@ -9190,7 +9374,14 @@ impl<'a> ExecPass<'a> {
                                     .map(|arg| this.visit_expr(loc, &arg.value))
                                     .collect(),
                             },
-                        }))
+                        };
+                        match native {
+                            Some(native) => PartialEvalState::Native(Box::new(PartialNativeCall {
+                                native,
+                                call,
+                            })),
+                            None => PartialEvalState::Call(Box::new(call)),
+                        }
                     })
                 } else {
                     let callee = self
@@ -9821,634 +10012,6 @@ impl<'a> ExecPass<'a> {
         let state = self.cell_states.get_mut(&cell_id).unwrap();
         let progress = match &mut vref.state {
             PartialEvalState::Call(c) => match c.expr.func.path.last().unwrap().name.as_str() {
-                f @ "crect" | f @ "rect" => {
-                    let layer_arg = if f == "crect" {
-                        c.expr
-                            .args
-                            .kwargs
-                            .iter()
-                            .zip(c.state.kwargs.iter())
-                            .find(|(k, _)| k.name.name == "layer")
-                            .map(|(_, arg_vid)| *arg_vid)
-                    } else {
-                        c.state.posargs.first().copied()
-                    };
-                    // `None` means the call has no layer at all (a `crect`
-                    // without the kwarg), which is legal; `Some(..)` still has
-                    // to be read fallibly because an `Any` argument reaches
-                    // here without the static checker having proven it a string.
-                    let layer = match layer_arg {
-                        None => Some(None),
-                        Some(arg_vid) => {
-                            let span = self.span(&vref.loc, c.expr.span);
-                            match self.typed_string(arg_vid, vid, cell_id, &span) {
-                                Typed::Ready(layer) => Some(Some(layer)),
-                                Typed::Pending => None,
-                                Typed::Invalid => return self.poison(cell_id, vid),
-                            }
-                        }
-                    };
-                    if let Some(layer) = layer {
-                        let id = self.object_id();
-                        let span = self.span(&vref.loc, c.expr.span);
-                        let state = self.cell_state_mut(cell_id);
-                        let rect = Rect {
-                            id,
-                            layer,
-                            x0: state.new_solver_var(&span).into(),
-                            y0: state.new_solver_var(&span).into(),
-                            x1: state.new_solver_var(&span).into(),
-                            y1: state.new_solver_var(&span).into(),
-                            construction: f == "crect",
-                            span: Some(span.clone()),
-                        };
-                        state.objects.insert(rect.id, rect.clone().into());
-                        state.emit.push(Emit {
-                            scope: vref.loc.scope,
-                            value: vid,
-                            span,
-                        });
-                        self.values
-                            .insert(vid, Defer::Ready(Value::Rect(rect.clone())));
-                        for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
-                            let lhs = self.value_id();
-                            let (priority, initial_condition) = match kwarg.name.name.as_str() {
-                                "x0" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.x0.clone())));
-                                    (6, None)
-                                }
-                                "x0i" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.x0.clone())));
-                                    (6, Some(RectInitialCondition::X0(rect.id)))
-                                }
-                                "x1" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.x1.clone())));
-                                    (5, None)
-                                }
-                                "x1i" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.x1.clone())));
-                                    (5, Some(RectInitialCondition::X1(rect.id)))
-                                }
-                                "y0" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.y0.clone())));
-                                    (4, None)
-                                }
-                                "y0i" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.y0.clone())));
-                                    (4, Some(RectInitialCondition::Y0(rect.id)))
-                                }
-                                "y1" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.y1.clone())));
-                                    (3, None)
-                                }
-                                "y1i" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.y1.clone())));
-                                    (3, Some(RectInitialCondition::Y1(rect.id)))
-                                }
-                                "w" => {
-                                    self.values.insert(
-                                        lhs,
-                                        Defer::Ready(Value::Linear(
-                                            rect.x1.clone() - rect.x0.clone(),
-                                        )),
-                                    );
-                                    (2, None)
-                                }
-                                "h" => {
-                                    self.values.insert(
-                                        lhs,
-                                        Defer::Ready(Value::Linear(
-                                            rect.y1.clone() - rect.y0.clone(),
-                                        )),
-                                    );
-                                    (1, None)
-                                }
-                                "layer" => {
-                                    continue;
-                                }
-                                x => unreachable!("unsupported kwarg `{x}`"),
-                            };
-                            // Use the value expression's span (e.g. `100.` in
-                            // `x1i=100.`) rather than the whole kwarg, so the GUI
-                            // can rewrite just the value when persisting a
-                            // solution-space-exploration drag.
-                            let span = self.span(&vref.loc, kwarg.value.span());
-                            self.new_deferred_value(vref.loc, |_| {
-                                PartialEvalState::Constraint(PartialConstraint {
-                                    lhs,
-                                    rhs: *rhs,
-                                    fallback: kwarg.name.name.ends_with('i'),
-                                    priority,
-                                    span,
-                                    initial_condition,
-                                })
-                            });
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                }
-                "polygon" => {
-                    if let (Defer::Ready(_), Defer::Ready(point_spec)) = (
-                        &self.values[&c.state.posargs[0]],
-                        &self.values[&c.state.posargs[1]],
-                    ) {
-                        let point_spec = point_spec.clone();
-                        let span = self.span(&vref.loc, c.expr.span);
-                        let layer = match self.typed_string(c.state.posargs[0], vid, cell_id, &span)
-                        {
-                            Typed::Ready(layer) => layer,
-                            Typed::Pending => return Ok(false),
-                            Typed::Invalid => return self.poison(cell_id, vid),
-                        };
-                        let points: Vec<(LinearExpr, LinearExpr)> = match point_spec {
-                            Value::Int(count) => {
-                                let Ok(count) = usize::try_from(count) else {
-                                    self.errors.push(ExecError {
-                                        span: Some(self.span(&vref.loc, c.expr.span)),
-                                        cell: cell_id,
-                                        kind: ExecErrorKind::InvalidPolygon,
-                                    });
-                                    return self.poison(cell_id, vid);
-                                };
-                                if count < 3 {
-                                    self.errors.push(ExecError {
-                                        span: Some(self.span(&vref.loc, c.expr.span)),
-                                        cell: cell_id,
-                                        kind: ExecErrorKind::InvalidPolygon,
-                                    });
-                                    return self.poison(cell_id, vid);
-                                }
-                                if count > MAX_SHAPE_POINTS {
-                                    self.errors.push(ExecError {
-                                        span: Some(self.span(&vref.loc, c.expr.span)),
-                                        cell: cell_id,
-                                        kind: ExecErrorKind::LimitExceeded {
-                                            what: "polygon vertex count".to_owned(),
-                                            limit: MAX_SHAPE_POINTS,
-                                        },
-                                    });
-                                    return self.poison(cell_id, vid);
-                                }
-                                let state = self.cell_state_mut(cell_id);
-                                (0..count)
-                                    .map(|_| {
-                                        (
-                                            state.new_solver_var(&span).into(),
-                                            state.new_solver_var(&span).into(),
-                                        )
-                                    })
-                                    .collect()
-                            }
-                            _ => {
-                                self.errors.push(ExecError {
-                                    span: Some(self.span(&vref.loc, c.expr.span)),
-                                    cell: cell_id,
-                                    kind: ExecErrorKind::InvalidType,
-                                });
-                                return self.poison(cell_id, vid);
-                            }
-                        };
-                        if points.len() < 3 {
-                            self.errors.push(ExecError {
-                                span: Some(self.span(&vref.loc, c.expr.span)),
-                                cell: cell_id,
-                                kind: ExecErrorKind::InvalidPolygon,
-                            });
-                            return self.poison(cell_id, vid);
-                        }
-                        for kwarg in &c.expr.args.kwargs {
-                            let coordinate = polygon_coordinate(kwarg.name.name.as_str())
-                                .expect("polygon kwargs were statically validated");
-                            if coordinate.index >= points.len() {
-                                self.errors.push(ExecError {
-                                    span: Some(self.span(&vref.loc, kwarg.name.span)),
-                                    cell: cell_id,
-                                    kind: ExecErrorKind::IndexOutOfBounds,
-                                });
-                                return self.poison(cell_id, vid);
-                            }
-                        }
-
-                        let id = self.object_id();
-                        let polygon = Polygon {
-                            id,
-                            layer,
-                            points,
-                            construction: false,
-                            span: Some(span.clone()),
-                        };
-                        let state = self.cell_state_mut(cell_id);
-                        state.objects.insert(id, polygon.clone().into());
-                        state.emit.push(Emit {
-                            scope: vref.loc.scope,
-                            value: vid,
-                            span,
-                        });
-                        self.values
-                            .insert(vid, Defer::Ready(Value::Polygon(polygon.clone())));
-                        for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
-                            let coordinate = polygon_coordinate(kwarg.name.name.as_str())
-                                .expect("polygon kwargs were statically validated");
-                            let expr = match coordinate.axis {
-                                PolygonAxis::X => polygon.points[coordinate.index].0.clone(),
-                                PolygonAxis::Y => polygon.points[coordinate.index].1.clone(),
-                            };
-                            let lhs = self.value_id();
-                            self.values.insert(lhs, Defer::Ready(Value::Linear(expr)));
-                            let span = self.span(&vref.loc, kwarg.value.span());
-                            self.new_deferred_value(vref.loc, |_| {
-                                PartialEvalState::Constraint(PartialConstraint {
-                                    lhs,
-                                    rhs: *rhs,
-                                    fallback: coordinate.initial,
-                                    priority: i32::MAX
-                                        - i32::try_from(coordinate.index.saturating_mul(2))
-                                            .unwrap_or(i32::MAX)
-                                        - i32::from(matches!(coordinate.axis, PolygonAxis::Y)),
-                                    span,
-                                    initial_condition: coordinate.initial.then_some(
-                                        match coordinate.axis {
-                                            PolygonAxis::X => RectInitialCondition::PolygonX(
-                                                polygon.id,
-                                                coordinate.index,
-                                            ),
-                                            PolygonAxis::Y => RectInitialCondition::PolygonY(
-                                                polygon.id,
-                                                coordinate.index,
-                                            ),
-                                        },
-                                    ),
-                                })
-                            });
-                        }
-                        true
-                    } else {
-                        for arg in &c.state.posargs {
-                            if !self.values[arg].is_ready() {
-                                self.add_value_dependent(*arg, vid);
-                            }
-                        }
-                        false
-                    }
-                }
-                "path" => {
-                    if let (Defer::Ready(_), Defer::Ready(_)) = (
-                        &self.values[&c.state.posargs[0]],
-                        &self.values[&c.state.posargs[1]],
-                    ) {
-                        let layer_span = self.span(&vref.loc, c.expr.span);
-                        let layer = match self.typed_string(
-                            c.state.posargs[0],
-                            vid,
-                            cell_id,
-                            &layer_span,
-                        ) {
-                            Typed::Ready(layer) => layer,
-                            Typed::Pending => return Ok(false),
-                            Typed::Invalid => return self.poison(cell_id, vid),
-                        };
-                        let point_spec = &self.values[&c.state.posargs[1]];
-                        let count = match point_spec.as_ref().unwrap_ready().as_ref() {
-                            ValueRef::Int(count) => usize::try_from(*count).ok(),
-                            _ => {
-                                self.errors.push(ExecError {
-                                    span: Some(self.span(&vref.loc, c.expr.span)),
-                                    cell: cell_id,
-                                    kind: ExecErrorKind::InvalidType,
-                                });
-                                return self.poison(cell_id, vid);
-                            }
-                        };
-                        let Some(count) = count.filter(|count| *count >= 2) else {
-                            self.errors.push(ExecError {
-                                span: Some(self.span(&vref.loc, c.expr.span)),
-                                cell: cell_id,
-                                kind: ExecErrorKind::InvalidPath,
-                            });
-                            return self.poison(cell_id, vid);
-                        };
-                        if count > MAX_SHAPE_POINTS {
-                            self.errors.push(ExecError {
-                                span: Some(self.span(&vref.loc, c.expr.span)),
-                                cell: cell_id,
-                                kind: ExecErrorKind::LimitExceeded {
-                                    what: "path point count".to_owned(),
-                                    limit: MAX_SHAPE_POINTS,
-                                },
-                            });
-                            return self.poison(cell_id, vid);
-                        }
-                        for kwarg in &c.expr.args.kwargs {
-                            let name = kwarg.name.name.as_str();
-                            if let Some(coordinate) = polygon_coordinate(name)
-                                && coordinate.index >= count
-                            {
-                                self.errors.push(ExecError {
-                                    span: Some(self.span(&vref.loc, kwarg.name.span)),
-                                    cell: cell_id,
-                                    kind: ExecErrorKind::IndexOutOfBounds,
-                                });
-                                return self.poison(cell_id, vid);
-                            }
-                        }
-
-                        let id = self.object_id();
-                        let span = self.span(&vref.loc, c.expr.span);
-                        let has_begin_extension = c.expr.args.kwargs.iter().any(|kwarg| {
-                            matches!(
-                                kwarg.name.name.as_str(),
-                                "begin_extension" | "begin_extensioni"
-                            )
-                        });
-                        let has_end_extension = c.expr.args.kwargs.iter().any(|kwarg| {
-                            matches!(kwarg.name.name.as_str(), "end_extension" | "end_extensioni")
-                        });
-                        let state = self.cell_state_mut(cell_id);
-                        let width = state.new_solver_var(&span).into();
-                        // Extensions are free variables even when no kwarg
-                        // names them, exactly as `width` always is. Making
-                        // them conditional meant `eq(p.begin_extension, 5.)`
-                        // degenerated to `0 - 5 = 0` and reported a bare
-                        // "inconsistent constraint" with nothing to say the
-                        // extension had never become a variable.
-                        //
-                        // The default of zero is a *fallback*, so it applies
-                        // only if nothing else determines the extension: a
-                        // path that ignores extensions still solves to zero,
-                        // and one that constrains them now works.
-                        let extension = |state: &mut CellState, named: bool| {
-                            let var = state.new_solver_var(&span);
-                            if !named {
-                                state
-                                    .compiler_defaults
-                                    .push_back((var.into(), span.clone()));
-                            }
-                            LinearExpr::from(var)
-                        };
-                        let begin_extension = extension(state, has_begin_extension);
-                        let end_extension = extension(state, has_end_extension);
-                        let points = (0..count)
-                            .map(|_| {
-                                (
-                                    state.new_solver_var(&span).into(),
-                                    state.new_solver_var(&span).into(),
-                                )
-                            })
-                            .collect();
-                        let path = Path {
-                            id,
-                            layer,
-                            width,
-                            points,
-                            begin_extension,
-                            end_extension,
-                            construction: false,
-                            span: Some(span.clone()),
-                        };
-                        state.objects.insert(id, path.clone().into());
-                        state.emit.push(Emit {
-                            scope: vref.loc.scope,
-                            value: vid,
-                            span,
-                        });
-                        self.values
-                            .insert(vid, Defer::Ready(Value::Path(path.clone())));
-                        for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
-                            let name = kwarg.name.name.as_str();
-                            let (expr, fallback, priority, initial_condition) = match name {
-                                "width" | "widthi" => (
-                                    path.width.clone(),
-                                    name == "widthi",
-                                    i32::MAX,
-                                    (name == "widthi")
-                                        .then_some(RectInitialCondition::PathWidth(path.id)),
-                                ),
-                                "begin_extension" | "begin_extensioni" => (
-                                    path.begin_extension.clone(),
-                                    name == "begin_extensioni",
-                                    i32::MAX - 1,
-                                    (name == "begin_extensioni").then_some(
-                                        RectInitialCondition::PathBeginExtension(path.id),
-                                    ),
-                                ),
-                                "end_extension" | "end_extensioni" => (
-                                    path.end_extension.clone(),
-                                    name == "end_extensioni",
-                                    i32::MAX - 2,
-                                    (name == "end_extensioni")
-                                        .then_some(RectInitialCondition::PathEndExtension(path.id)),
-                                ),
-                                _ => {
-                                    let coordinate = polygon_coordinate(name)
-                                        .expect("path kwargs were statically validated");
-                                    let expr = match coordinate.axis {
-                                        PolygonAxis::X => path.points[coordinate.index].0.clone(),
-                                        PolygonAxis::Y => path.points[coordinate.index].1.clone(),
-                                    };
-                                    let initial_condition =
-                                        coordinate.initial.then_some(match coordinate.axis {
-                                            PolygonAxis::X => RectInitialCondition::PathX(
-                                                path.id,
-                                                coordinate.index,
-                                            ),
-                                            PolygonAxis::Y => RectInitialCondition::PathY(
-                                                path.id,
-                                                coordinate.index,
-                                            ),
-                                        });
-                                    (
-                                        expr,
-                                        coordinate.initial,
-                                        i32::MAX
-                                            - 3
-                                            - i32::try_from(coordinate.index.saturating_mul(2))
-                                                .unwrap_or(i32::MAX)
-                                            - i32::from(matches!(coordinate.axis, PolygonAxis::Y)),
-                                        initial_condition,
-                                    )
-                                }
-                            };
-                            let lhs = self.value_id();
-                            self.values.insert(lhs, Defer::Ready(Value::Linear(expr)));
-                            let span = self.span(&vref.loc, kwarg.value.span());
-                            self.new_deferred_value(vref.loc, |_| {
-                                PartialEvalState::Constraint(PartialConstraint {
-                                    lhs,
-                                    rhs: *rhs,
-                                    fallback,
-                                    priority,
-                                    span,
-                                    initial_condition,
-                                })
-                            });
-                        }
-                        true
-                    } else {
-                        for arg in &c.state.posargs {
-                            if !self.values[arg].is_ready() {
-                                self.add_value_dependent(*arg, vid);
-                            }
-                        }
-                        false
-                    }
-                }
-                "text" => {
-                    let (args, unready): (Vec<_>, Vec<_>) =
-                        c.state.posargs.iter().partition_map(|v| {
-                            if let Defer::Ready(v) = &self.values[v] {
-                                Either::Left(v)
-                            } else {
-                                Either::Right(*v)
-                            }
-                        });
-                    if unready.is_empty() {
-                        assert_eq!(args.len(), 4);
-                        let span = self.span(&vref.loc, c.expr.span);
-                        // Each argument has to be re-read fallibly: `Any`
-                        // satisfies the static signature, so none of these
-                        // types has actually been proven.
-                        let (Some(text_val), Some(layer), Some(x), Some(y)) = (
-                            args[0].get_string().cloned(),
-                            args[1].get_string().cloned(),
-                            args[2].get_linear().cloned(),
-                            args[3].get_linear().cloned(),
-                        ) else {
-                            self.invalid_type(cell_id, &span);
-                            return self.poison(cell_id, vid);
-                        };
-                        let id = object_id(&mut self.next_id);
-                        let state = self.cell_states.get_mut(&cell_id).unwrap();
-                        let text = Text {
-                            id,
-                            text: text_val,
-                            layer,
-                            x,
-                            y,
-                            span: Some(span.clone()),
-                        };
-                        state.object_emit.push(ObjectEmit {
-                            scope: vref.loc.scope,
-                            object: text.id,
-                            span,
-                        });
-                        state.objects.insert(text.id, text.clone().into());
-                        self.values.insert(vid, Defer::Ready(Value::Nil));
-                        true
-                    } else {
-                        for arg_vid in unready {
-                            self.add_value_dependent(arg_vid, vid);
-                        }
-                        false
-                    }
-                }
-                "bbox" => {
-                    let arg = &self.values[&c.state.posargs[0]];
-                    if let Some(val) = arg.get_ready() {
-                        let span = self.span(&vref.loc, c.expr.span);
-                        let r = match val {
-                            Value::Inst(i) => {
-                                if let Defer::Ready(cell) = &self.values[&i.cell] {
-                                    let cell_id = cell.as_ref().unwrap_cell();
-                                    Some(self.bbox(*cell_id).map(|r| {
-                                        let r = r.transform(i.reflect, i.angle);
-                                        Rect {
-                                            id: r.id,
-                                            layer: r.layer,
-                                            x0: LinearExpr::from(r.x0) + i.x.clone(),
-                                            y0: LinearExpr::from(r.y0) + i.y.clone(),
-                                            x1: LinearExpr::from(r.x1) + i.x.clone(),
-                                            y1: LinearExpr::from(r.y1) + i.y.clone(),
-                                            construction: true,
-                                            span: None,
-                                        }
-                                    }))
-                                } else {
-                                    self.add_value_dependent(i.cell, vid);
-                                    None
-                                }
-                            }
-                            Value::Cell(c) => Some(self.bbox(*c).map(|r| Rect {
-                                id: r.id,
-                                layer: r.layer,
-                                x0: r.x0.into(),
-                                y0: r.y0.into(),
-                                x1: r.x1.into(),
-                                y1: r.y1.into(),
-                                construction: true,
-                                span: None,
-                            })),
-                            _ => {
-                                self.errors.push(ExecError {
-                                    span: Some(span.clone()),
-                                    cell: cell_id,
-                                    kind: ExecErrorKind::InvalidType,
-                                });
-                                return self.poison(cell_id, vid);
-                            }
-                        };
-                        if let Some(r) = r {
-                            if let Some(r) = r {
-                                let id = object_id(&mut self.next_id);
-                                let state = self.cell_states.get_mut(&cell_id).unwrap();
-                                let orect = Rect {
-                                    id,
-                                    layer: None,
-                                    x0: r.x0,
-                                    y0: r.y0,
-                                    x1: r.x1,
-                                    y1: r.y1,
-                                    construction: true,
-                                    span: Some(span.clone()),
-                                };
-                                state.objects.insert(orect.id, orect.clone().into());
-                                state.emit.push(Emit {
-                                    scope: vref.loc.scope,
-                                    value: vid,
-                                    span,
-                                });
-                                self.values.insert(vid, Defer::Ready(Value::Rect(orect)));
-                                true
-                            } else {
-                                // default to a zero rectangle
-                                self.errors.push(ExecError {
-                                    span: Some(span.clone()),
-                                    cell: cell_id,
-                                    kind: ExecErrorKind::EmptyBbox,
-                                });
-                                let id = object_id(&mut self.next_id);
-                                let state = self.cell_states.get_mut(&cell_id).unwrap();
-                                let orect = Rect {
-                                    id,
-                                    layer: None,
-                                    x0: 0.0.into(),
-                                    y0: 0.0.into(),
-                                    x1: 0.0.into(),
-                                    y1: 0.0.into(),
-                                    construction: true,
-                                    span: Some(span),
-                                };
-                                state.objects.insert(orect.id, orect.clone().into());
-                                self.values.insert(vid, Defer::Ready(Value::Rect(orect)));
-                                true
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        self.add_value_dependent(c.state.posargs[0], vid);
-                        false
-                    }
-                }
                 "float" => {
                     let span = Span {
                         path: state.scopes[&vref.loc.scope].span.path.clone(),
@@ -10659,207 +10222,6 @@ impl<'a> ExecPass<'a> {
                         false
                     }
                 }
-                "dimension" => {
-                    let (args, unready): (Vec<_>, Vec<_>) =
-                        c.state.posargs.iter().partition_map(|v| {
-                            if let Defer::Ready(v) = &self.values[v] {
-                                Either::Left(v)
-                            } else {
-                                Either::Right(*v)
-                            }
-                        });
-                    if unready.is_empty() {
-                        assert_eq!(args.len(), 7);
-                        let span = self.span(&vref.loc, c.expr.span);
-                        // `Any` satisfies the static signature, so the runtime
-                        // types still have to be checked here.
-                        let horiz = args[6].get_bool().copied();
-                        let linears = args[..6]
-                            .iter()
-                            .map(|arg| arg.get_linear().cloned())
-                            .collect::<Option<Vec<_>>>();
-                        let (Some(horiz), Some(linears)) = (horiz, linears) else {
-                            self.invalid_type(cell_id, &span);
-                            return self.poison(cell_id, vid);
-                        };
-                        // Positional order is (p, n, value, coord, pstop, nstop).
-                        let [p, n, value, coord, pstop, nstop] =
-                            <[LinearExpr; 6]>::try_from(linears)
-                                .expect("dimension takes six solver expressions");
-                        let id = object_id(&mut self.next_id);
-                        let state = self.cell_states.get_mut(&cell_id).unwrap();
-                        let expr = p.clone() - n.clone() - value.clone();
-                        let constraint = state.solver.constrain_eq0(expr);
-                        let dim = Dimension {
-                            id,
-                            horiz,
-                            nstop,
-                            pstop,
-                            coord,
-                            value,
-                            n,
-                            p,
-                            constraint,
-                            span: Some(span.clone()),
-                        };
-                        state.constraint_span_map.insert(constraint, span.clone());
-                        state.object_emit.push(ObjectEmit {
-                            scope: vref.loc.scope,
-                            object: dim.id,
-                            span,
-                        });
-                        state.objects.insert(dim.id, dim.clone().into());
-                        self.values.insert(vid, Defer::Ready(Value::Nil));
-                        true
-                    } else {
-                        for arg_vid in unready {
-                            self.add_value_dependent(arg_vid, vid);
-                        }
-                        false
-                    }
-                }
-                "inst" => {
-                    // Every kwarg here is optional, and every one of them can
-                    // arrive as `Any`, so absence and a wrong runtime type are
-                    // distinct outcomes: absence falls back to the default,
-                    // a wrong type is an `InvalidType` diagnostic.
-                    let kwarg_vid = |name: &str| {
-                        c.expr
-                            .args
-                            .kwargs
-                            .iter()
-                            .zip(c.state.kwargs.iter())
-                            .find_map(|(kwarg, arg_vid)| {
-                                (kwarg.name.name == name).then_some((kwarg, *arg_vid))
-                            })
-                    };
-                    let reflect_arg = kwarg_vid("reflect");
-                    let angle_arg = kwarg_vid("angle");
-                    let construction_arg = kwarg_vid("construction");
-
-                    let mut pending = false;
-                    let mut read_bool = |this: &mut Self,
-                                         arg: Option<(
-                        &KwArgValue<Substr, VarIdTyMetadata>,
-                        ValueId,
-                    )>| match arg {
-                        None => Ok(None),
-                        Some((kwarg, arg_vid)) => {
-                            let span = this.span(&vref.loc, kwarg.value.span());
-                            match this.typed_bool(arg_vid, vid, cell_id, &span) {
-                                Typed::Ready(v) => Ok(Some(v)),
-                                Typed::Pending => {
-                                    pending = true;
-                                    Ok(None)
-                                }
-                                Typed::Invalid => Err(()),
-                            }
-                        }
-                    };
-                    let refl = match read_bool(self, reflect_arg) {
-                        Ok(value) => value,
-                        Err(()) => return self.poison(cell_id, vid),
-                    };
-                    let construction = match read_bool(self, construction_arg) {
-                        Ok(value) => value,
-                        Err(()) => return self.poison(cell_id, vid),
-                    };
-                    let angle = match angle_arg {
-                        None => None,
-                        Some((kwarg, arg_vid)) => {
-                            let span = self.span(&vref.loc, kwarg.value.span());
-                            match self.typed_int(arg_vid, vid, cell_id, &span) {
-                                Typed::Ready(degrees) => {
-                                    Some(match ((degrees % 360) + 360) % 360 {
-                                        0 => Rotation::R0,
-                                        90 => Rotation::R90,
-                                        180 => Rotation::R180,
-                                        270 => Rotation::R270,
-                                        _ => {
-                                            self.errors.push(ExecError {
-                                                span: Some(span),
-                                                cell: cell_id,
-                                                kind: ExecErrorKind::InvalidRotation,
-                                            });
-                                            Rotation::R0
-                                        }
-                                    })
-                                }
-                                Typed::Pending => {
-                                    pending = true;
-                                    None
-                                }
-                                Typed::Invalid => return self.poison(cell_id, vid),
-                            }
-                        }
-                    };
-                    if !pending {
-                        let id = object_id(&mut self.next_id);
-                        let span = self.span(&vref.loc, c.expr.span);
-                        let state = self.cell_states.get_mut(&cell_id).unwrap();
-                        let inst = Instance {
-                            id,
-                            x: state.new_solver_var(&span).into(),
-                            y: state.new_solver_var(&span).into(),
-                            cell: *c.state.posargs.first().unwrap(),
-                            reflect: refl.unwrap_or_default(),
-                            angle: angle.unwrap_or_default(),
-                            construction: construction.unwrap_or_default(),
-                            span: span.clone(),
-                        };
-                        state.emit.push(Emit {
-                            scope: vref.loc.scope,
-                            value: vid,
-                            span,
-                        });
-                        state.objects.insert(inst.id, inst.clone().into());
-                        for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
-                            let lhs = self.value_id();
-                            let (priority, initial_condition) = match kwarg.name.name.as_str() {
-                                "x" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(inst.x.clone())));
-                                    (2, None)
-                                }
-                                "xi" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(inst.x.clone())));
-                                    (2, Some(RectInitialCondition::InstanceX(inst.id)))
-                                }
-                                "y" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(inst.y.clone())));
-                                    (1, None)
-                                }
-                                "yi" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(inst.y.clone())));
-                                    (1, Some(RectInitialCondition::InstanceY(inst.id)))
-                                }
-                                _ => continue,
-                            };
-                            // Use the value expression's span (e.g. `100.` in
-                            // `x1i=100.`) rather than the whole kwarg, so the GUI
-                            // can rewrite just the value when persisting a
-                            // solution-space-exploration drag.
-                            let span = self.span(&vref.loc, kwarg.value.span());
-                            self.new_deferred_value(vref.loc, |_| {
-                                PartialEvalState::Constraint(PartialConstraint {
-                                    lhs,
-                                    rhs: *rhs,
-                                    fallback: kwarg.name.name.ends_with('i'),
-                                    priority,
-                                    span,
-                                    initial_condition,
-                                })
-                            });
-                        }
-                        self.values.insert(vid, Defer::Ready(Value::Inst(inst)));
-                        true
-                    } else {
-                        false
-                    }
-                }
                 _ => {
                     // Must be calling a cell generator.
                     // User functions are never deferred.
@@ -10900,6 +10262,880 @@ impl<'a> ExecPass<'a> {
                     }
                 }
             },
+            PartialEvalState::Native(native_call) => {
+                let native = native_call.native;
+                let c = &mut native_call.call;
+                match native {
+                    Native::Rect | Native::Crect => {
+                        let layer_arg = if native == Native::Crect {
+                            c.expr
+                                .args
+                                .kwargs
+                                .iter()
+                                .zip(c.state.kwargs.iter())
+                                .find(|(k, _)| k.name.name == "layer")
+                                .map(|(_, arg_vid)| *arg_vid)
+                        } else {
+                            c.state.posargs.first().copied()
+                        };
+                        // `None` means the call has no layer at all (a `crect`
+                        // without the kwarg), which is legal; `Some(..)` still has
+                        // to be read fallibly because an `Any` argument reaches
+                        // here without the static checker having proven it a string.
+                        let layer = match layer_arg {
+                            None => Some(None),
+                            Some(arg_vid) => {
+                                let span = self.span(&vref.loc, c.expr.span);
+                                match self.typed_string(arg_vid, vid, cell_id, &span) {
+                                    Typed::Ready(layer) => Some(Some(layer)),
+                                    Typed::Pending => None,
+                                    Typed::Invalid => return self.poison(cell_id, vid),
+                                }
+                            }
+                        };
+                        if let Some(layer) = layer {
+                            let id = self.object_id();
+                            let span = self.span(&vref.loc, c.expr.span);
+                            let state = self.cell_state_mut(cell_id);
+                            let rect = Rect {
+                                id,
+                                layer,
+                                x0: state.new_solver_var(&span).into(),
+                                y0: state.new_solver_var(&span).into(),
+                                x1: state.new_solver_var(&span).into(),
+                                y1: state.new_solver_var(&span).into(),
+                                construction: native == Native::Crect,
+                                span: Some(span.clone()),
+                            };
+                            state.objects.insert(rect.id, rect.clone().into());
+                            state.emit.push(Emit {
+                                scope: vref.loc.scope,
+                                value: vid,
+                                span,
+                            });
+                            self.values
+                                .insert(vid, Defer::Ready(Value::Rect(rect.clone())));
+                            for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter())
+                            {
+                                let lhs = self.value_id();
+                                let (priority, initial_condition) = match kwarg.name.name.as_str() {
+                                    "x0" => {
+                                        self.values.insert(
+                                            lhs,
+                                            Defer::Ready(Value::Linear(rect.x0.clone())),
+                                        );
+                                        (6, None)
+                                    }
+                                    "x0i" => {
+                                        self.values.insert(
+                                            lhs,
+                                            Defer::Ready(Value::Linear(rect.x0.clone())),
+                                        );
+                                        (6, Some(RectInitialCondition::X0(rect.id)))
+                                    }
+                                    "x1" => {
+                                        self.values.insert(
+                                            lhs,
+                                            Defer::Ready(Value::Linear(rect.x1.clone())),
+                                        );
+                                        (5, None)
+                                    }
+                                    "x1i" => {
+                                        self.values.insert(
+                                            lhs,
+                                            Defer::Ready(Value::Linear(rect.x1.clone())),
+                                        );
+                                        (5, Some(RectInitialCondition::X1(rect.id)))
+                                    }
+                                    "y0" => {
+                                        self.values.insert(
+                                            lhs,
+                                            Defer::Ready(Value::Linear(rect.y0.clone())),
+                                        );
+                                        (4, None)
+                                    }
+                                    "y0i" => {
+                                        self.values.insert(
+                                            lhs,
+                                            Defer::Ready(Value::Linear(rect.y0.clone())),
+                                        );
+                                        (4, Some(RectInitialCondition::Y0(rect.id)))
+                                    }
+                                    "y1" => {
+                                        self.values.insert(
+                                            lhs,
+                                            Defer::Ready(Value::Linear(rect.y1.clone())),
+                                        );
+                                        (3, None)
+                                    }
+                                    "y1i" => {
+                                        self.values.insert(
+                                            lhs,
+                                            Defer::Ready(Value::Linear(rect.y1.clone())),
+                                        );
+                                        (3, Some(RectInitialCondition::Y1(rect.id)))
+                                    }
+                                    "w" => {
+                                        self.values.insert(
+                                            lhs,
+                                            Defer::Ready(Value::Linear(
+                                                rect.x1.clone() - rect.x0.clone(),
+                                            )),
+                                        );
+                                        (2, None)
+                                    }
+                                    "h" => {
+                                        self.values.insert(
+                                            lhs,
+                                            Defer::Ready(Value::Linear(
+                                                rect.y1.clone() - rect.y0.clone(),
+                                            )),
+                                        );
+                                        (1, None)
+                                    }
+                                    "layer" => {
+                                        continue;
+                                    }
+                                    x => unreachable!("unsupported kwarg `{x}`"),
+                                };
+                                // Use the value expression's span (e.g. `100.` in
+                                // `x1i=100.`) rather than the whole kwarg, so the GUI
+                                // can rewrite just the value when persisting a
+                                // solution-space-exploration drag.
+                                let span = self.span(&vref.loc, kwarg.value.span());
+                                self.new_deferred_value(vref.loc, |_| {
+                                    PartialEvalState::Constraint(PartialConstraint {
+                                        lhs,
+                                        rhs: *rhs,
+                                        fallback: kwarg.name.name.ends_with('i'),
+                                        priority,
+                                        span,
+                                        initial_condition,
+                                    })
+                                });
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    Native::Polygon => {
+                        if let (Defer::Ready(_), Defer::Ready(point_spec)) = (
+                            &self.values[&c.state.posargs[0]],
+                            &self.values[&c.state.posargs[1]],
+                        ) {
+                            let point_spec = point_spec.clone();
+                            let span = self.span(&vref.loc, c.expr.span);
+                            let layer =
+                                match self.typed_string(c.state.posargs[0], vid, cell_id, &span) {
+                                    Typed::Ready(layer) => layer,
+                                    Typed::Pending => return Ok(false),
+                                    Typed::Invalid => return self.poison(cell_id, vid),
+                                };
+                            let points: Vec<(LinearExpr, LinearExpr)> = match point_spec {
+                                Value::Int(count) => {
+                                    let Ok(count) = usize::try_from(count) else {
+                                        self.errors.push(ExecError {
+                                            span: Some(self.span(&vref.loc, c.expr.span)),
+                                            cell: cell_id,
+                                            kind: ExecErrorKind::InvalidPolygon,
+                                        });
+                                        return self.poison(cell_id, vid);
+                                    };
+                                    if count < 3 {
+                                        self.errors.push(ExecError {
+                                            span: Some(self.span(&vref.loc, c.expr.span)),
+                                            cell: cell_id,
+                                            kind: ExecErrorKind::InvalidPolygon,
+                                        });
+                                        return self.poison(cell_id, vid);
+                                    }
+                                    if count > MAX_SHAPE_POINTS {
+                                        self.errors.push(ExecError {
+                                            span: Some(self.span(&vref.loc, c.expr.span)),
+                                            cell: cell_id,
+                                            kind: ExecErrorKind::LimitExceeded {
+                                                what: "polygon vertex count".to_owned(),
+                                                limit: MAX_SHAPE_POINTS,
+                                            },
+                                        });
+                                        return self.poison(cell_id, vid);
+                                    }
+                                    let state = self.cell_state_mut(cell_id);
+                                    (0..count)
+                                        .map(|_| {
+                                            (
+                                                state.new_solver_var(&span).into(),
+                                                state.new_solver_var(&span).into(),
+                                            )
+                                        })
+                                        .collect()
+                                }
+                                _ => {
+                                    self.errors.push(ExecError {
+                                        span: Some(self.span(&vref.loc, c.expr.span)),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::InvalidType,
+                                    });
+                                    return self.poison(cell_id, vid);
+                                }
+                            };
+                            if points.len() < 3 {
+                                self.errors.push(ExecError {
+                                    span: Some(self.span(&vref.loc, c.expr.span)),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::InvalidPolygon,
+                                });
+                                return self.poison(cell_id, vid);
+                            }
+                            for kwarg in &c.expr.args.kwargs {
+                                let coordinate = polygon_coordinate(kwarg.name.name.as_str())
+                                    .expect("polygon kwargs were statically validated");
+                                if coordinate.index >= points.len() {
+                                    self.errors.push(ExecError {
+                                        span: Some(self.span(&vref.loc, kwarg.name.span)),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::IndexOutOfBounds,
+                                    });
+                                    return self.poison(cell_id, vid);
+                                }
+                            }
+
+                            let id = self.object_id();
+                            let polygon = Polygon {
+                                id,
+                                layer,
+                                points,
+                                construction: false,
+                                span: Some(span.clone()),
+                            };
+                            let state = self.cell_state_mut(cell_id);
+                            state.objects.insert(id, polygon.clone().into());
+                            state.emit.push(Emit {
+                                scope: vref.loc.scope,
+                                value: vid,
+                                span,
+                            });
+                            self.values
+                                .insert(vid, Defer::Ready(Value::Polygon(polygon.clone())));
+                            for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter())
+                            {
+                                let coordinate = polygon_coordinate(kwarg.name.name.as_str())
+                                    .expect("polygon kwargs were statically validated");
+                                let expr = match coordinate.axis {
+                                    PolygonAxis::X => polygon.points[coordinate.index].0.clone(),
+                                    PolygonAxis::Y => polygon.points[coordinate.index].1.clone(),
+                                };
+                                let lhs = self.value_id();
+                                self.values.insert(lhs, Defer::Ready(Value::Linear(expr)));
+                                let span = self.span(&vref.loc, kwarg.value.span());
+                                self.new_deferred_value(vref.loc, |_| {
+                                    PartialEvalState::Constraint(PartialConstraint {
+                                        lhs,
+                                        rhs: *rhs,
+                                        fallback: coordinate.initial,
+                                        priority: i32::MAX
+                                            - i32::try_from(coordinate.index.saturating_mul(2))
+                                                .unwrap_or(i32::MAX)
+                                            - i32::from(matches!(coordinate.axis, PolygonAxis::Y)),
+                                        span,
+                                        initial_condition: coordinate.initial.then_some(
+                                            match coordinate.axis {
+                                                PolygonAxis::X => RectInitialCondition::PolygonX(
+                                                    polygon.id,
+                                                    coordinate.index,
+                                                ),
+                                                PolygonAxis::Y => RectInitialCondition::PolygonY(
+                                                    polygon.id,
+                                                    coordinate.index,
+                                                ),
+                                            },
+                                        ),
+                                    })
+                                });
+                            }
+                            true
+                        } else {
+                            for arg in &c.state.posargs {
+                                if !self.values[arg].is_ready() {
+                                    self.add_value_dependent(*arg, vid);
+                                }
+                            }
+                            false
+                        }
+                    }
+                    Native::Path => {
+                        if let (Defer::Ready(_), Defer::Ready(_)) = (
+                            &self.values[&c.state.posargs[0]],
+                            &self.values[&c.state.posargs[1]],
+                        ) {
+                            let layer_span = self.span(&vref.loc, c.expr.span);
+                            let layer = match self.typed_string(
+                                c.state.posargs[0],
+                                vid,
+                                cell_id,
+                                &layer_span,
+                            ) {
+                                Typed::Ready(layer) => layer,
+                                Typed::Pending => return Ok(false),
+                                Typed::Invalid => return self.poison(cell_id, vid),
+                            };
+                            let point_spec = &self.values[&c.state.posargs[1]];
+                            let count = match point_spec.as_ref().unwrap_ready().as_ref() {
+                                ValueRef::Int(count) => usize::try_from(*count).ok(),
+                                _ => {
+                                    self.errors.push(ExecError {
+                                        span: Some(self.span(&vref.loc, c.expr.span)),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::InvalidType,
+                                    });
+                                    return self.poison(cell_id, vid);
+                                }
+                            };
+                            let Some(count) = count.filter(|count| *count >= 2) else {
+                                self.errors.push(ExecError {
+                                    span: Some(self.span(&vref.loc, c.expr.span)),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::InvalidPath,
+                                });
+                                return self.poison(cell_id, vid);
+                            };
+                            if count > MAX_SHAPE_POINTS {
+                                self.errors.push(ExecError {
+                                    span: Some(self.span(&vref.loc, c.expr.span)),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::LimitExceeded {
+                                        what: "path point count".to_owned(),
+                                        limit: MAX_SHAPE_POINTS,
+                                    },
+                                });
+                                return self.poison(cell_id, vid);
+                            }
+                            for kwarg in &c.expr.args.kwargs {
+                                let name = kwarg.name.name.as_str();
+                                if let Some(coordinate) = polygon_coordinate(name)
+                                    && coordinate.index >= count
+                                {
+                                    self.errors.push(ExecError {
+                                        span: Some(self.span(&vref.loc, kwarg.name.span)),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::IndexOutOfBounds,
+                                    });
+                                    return self.poison(cell_id, vid);
+                                }
+                            }
+
+                            let id = self.object_id();
+                            let span = self.span(&vref.loc, c.expr.span);
+                            let has_begin_extension = c.expr.args.kwargs.iter().any(|kwarg| {
+                                matches!(
+                                    kwarg.name.name.as_str(),
+                                    "begin_extension" | "begin_extensioni"
+                                )
+                            });
+                            let has_end_extension = c.expr.args.kwargs.iter().any(|kwarg| {
+                                matches!(
+                                    kwarg.name.name.as_str(),
+                                    "end_extension" | "end_extensioni"
+                                )
+                            });
+                            let state = self.cell_state_mut(cell_id);
+                            let width = state.new_solver_var(&span).into();
+                            // Extensions are free variables even when no kwarg
+                            // names them, exactly as `width` always is. Making
+                            // them conditional meant `eq(p.begin_extension, 5.)`
+                            // degenerated to `0 - 5 = 0` and reported a bare
+                            // "inconsistent constraint" with nothing to say the
+                            // extension had never become a variable.
+                            //
+                            // The default of zero is a *fallback*, so it applies
+                            // only if nothing else determines the extension: a
+                            // path that ignores extensions still solves to zero,
+                            // and one that constrains them now works.
+                            let extension = |state: &mut CellState, named: bool| {
+                                let var = state.new_solver_var(&span);
+                                if !named {
+                                    state
+                                        .compiler_defaults
+                                        .push_back((var.into(), span.clone()));
+                                }
+                                LinearExpr::from(var)
+                            };
+                            let begin_extension = extension(state, has_begin_extension);
+                            let end_extension = extension(state, has_end_extension);
+                            let points = (0..count)
+                                .map(|_| {
+                                    (
+                                        state.new_solver_var(&span).into(),
+                                        state.new_solver_var(&span).into(),
+                                    )
+                                })
+                                .collect();
+                            let path = Path {
+                                id,
+                                layer,
+                                width,
+                                points,
+                                begin_extension,
+                                end_extension,
+                                construction: false,
+                                span: Some(span.clone()),
+                            };
+                            state.objects.insert(id, path.clone().into());
+                            state.emit.push(Emit {
+                                scope: vref.loc.scope,
+                                value: vid,
+                                span,
+                            });
+                            self.values
+                                .insert(vid, Defer::Ready(Value::Path(path.clone())));
+                            for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter())
+                            {
+                                let name = kwarg.name.name.as_str();
+                                let (expr, fallback, priority, initial_condition) = match name {
+                                    "width" | "widthi" => (
+                                        path.width.clone(),
+                                        name == "widthi",
+                                        i32::MAX,
+                                        (name == "widthi")
+                                            .then_some(RectInitialCondition::PathWidth(path.id)),
+                                    ),
+                                    "begin_extension" | "begin_extensioni" => (
+                                        path.begin_extension.clone(),
+                                        name == "begin_extensioni",
+                                        i32::MAX - 1,
+                                        (name == "begin_extensioni").then_some(
+                                            RectInitialCondition::PathBeginExtension(path.id),
+                                        ),
+                                    ),
+                                    "end_extension" | "end_extensioni" => (
+                                        path.end_extension.clone(),
+                                        name == "end_extensioni",
+                                        i32::MAX - 2,
+                                        (name == "end_extensioni").then_some(
+                                            RectInitialCondition::PathEndExtension(path.id),
+                                        ),
+                                    ),
+                                    _ => {
+                                        let coordinate = polygon_coordinate(name)
+                                            .expect("path kwargs were statically validated");
+                                        let expr = match coordinate.axis {
+                                            PolygonAxis::X => {
+                                                path.points[coordinate.index].0.clone()
+                                            }
+                                            PolygonAxis::Y => {
+                                                path.points[coordinate.index].1.clone()
+                                            }
+                                        };
+                                        let initial_condition =
+                                            coordinate.initial.then_some(match coordinate.axis {
+                                                PolygonAxis::X => RectInitialCondition::PathX(
+                                                    path.id,
+                                                    coordinate.index,
+                                                ),
+                                                PolygonAxis::Y => RectInitialCondition::PathY(
+                                                    path.id,
+                                                    coordinate.index,
+                                                ),
+                                            });
+                                        (
+                                            expr,
+                                            coordinate.initial,
+                                            i32::MAX
+                                                - 3
+                                                - i32::try_from(coordinate.index.saturating_mul(2))
+                                                    .unwrap_or(i32::MAX)
+                                                - i32::from(matches!(
+                                                    coordinate.axis,
+                                                    PolygonAxis::Y
+                                                )),
+                                            initial_condition,
+                                        )
+                                    }
+                                };
+                                let lhs = self.value_id();
+                                self.values.insert(lhs, Defer::Ready(Value::Linear(expr)));
+                                let span = self.span(&vref.loc, kwarg.value.span());
+                                self.new_deferred_value(vref.loc, |_| {
+                                    PartialEvalState::Constraint(PartialConstraint {
+                                        lhs,
+                                        rhs: *rhs,
+                                        fallback,
+                                        priority,
+                                        span,
+                                        initial_condition,
+                                    })
+                                });
+                            }
+                            true
+                        } else {
+                            for arg in &c.state.posargs {
+                                if !self.values[arg].is_ready() {
+                                    self.add_value_dependent(*arg, vid);
+                                }
+                            }
+                            false
+                        }
+                    }
+                    Native::Text => {
+                        let (args, unready): (Vec<_>, Vec<_>) =
+                            c.state.posargs.iter().partition_map(|v| {
+                                if let Defer::Ready(v) = &self.values[v] {
+                                    Either::Left(v)
+                                } else {
+                                    Either::Right(*v)
+                                }
+                            });
+                        if unready.is_empty() {
+                            assert_eq!(args.len(), 4);
+                            let span = self.span(&vref.loc, c.expr.span);
+                            // Each argument has to be re-read fallibly: `Any`
+                            // satisfies the static signature, so none of these
+                            // types has actually been proven.
+                            let (Some(text_val), Some(layer), Some(x), Some(y)) = (
+                                args[0].get_string().cloned(),
+                                args[1].get_string().cloned(),
+                                args[2].get_linear().cloned(),
+                                args[3].get_linear().cloned(),
+                            ) else {
+                                self.invalid_type(cell_id, &span);
+                                return self.poison(cell_id, vid);
+                            };
+                            let id = object_id(&mut self.next_id);
+                            let state = self.cell_states.get_mut(&cell_id).unwrap();
+                            let text = Text {
+                                id,
+                                text: text_val,
+                                layer,
+                                x,
+                                y,
+                                span: Some(span.clone()),
+                            };
+                            state.object_emit.push(ObjectEmit {
+                                scope: vref.loc.scope,
+                                object: text.id,
+                                span,
+                            });
+                            state.objects.insert(text.id, text.clone().into());
+                            self.values.insert(vid, Defer::Ready(Value::Nil));
+                            true
+                        } else {
+                            for arg_vid in unready {
+                                self.add_value_dependent(arg_vid, vid);
+                            }
+                            false
+                        }
+                    }
+                    Native::Bbox => {
+                        let arg = &self.values[&c.state.posargs[0]];
+                        if let Some(val) = arg.get_ready() {
+                            let span = self.span(&vref.loc, c.expr.span);
+                            let r = match val {
+                                Value::Inst(i) => {
+                                    if let Defer::Ready(cell) = &self.values[&i.cell] {
+                                        let cell_id = cell.as_ref().unwrap_cell();
+                                        Some(self.bbox(*cell_id).map(|r| {
+                                            let r = r.transform(i.reflect, i.angle);
+                                            Rect {
+                                                id: r.id,
+                                                layer: r.layer,
+                                                x0: LinearExpr::from(r.x0) + i.x.clone(),
+                                                y0: LinearExpr::from(r.y0) + i.y.clone(),
+                                                x1: LinearExpr::from(r.x1) + i.x.clone(),
+                                                y1: LinearExpr::from(r.y1) + i.y.clone(),
+                                                construction: true,
+                                                span: None,
+                                            }
+                                        }))
+                                    } else {
+                                        self.add_value_dependent(i.cell, vid);
+                                        None
+                                    }
+                                }
+                                Value::Cell(c) => Some(self.bbox(*c).map(|r| Rect {
+                                    id: r.id,
+                                    layer: r.layer,
+                                    x0: r.x0.into(),
+                                    y0: r.y0.into(),
+                                    x1: r.x1.into(),
+                                    y1: r.y1.into(),
+                                    construction: true,
+                                    span: None,
+                                })),
+                                _ => {
+                                    self.errors.push(ExecError {
+                                        span: Some(span.clone()),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::InvalidType,
+                                    });
+                                    return self.poison(cell_id, vid);
+                                }
+                            };
+                            if let Some(r) = r {
+                                if let Some(r) = r {
+                                    let id = object_id(&mut self.next_id);
+                                    let state = self.cell_states.get_mut(&cell_id).unwrap();
+                                    let orect = Rect {
+                                        id,
+                                        layer: None,
+                                        x0: r.x0,
+                                        y0: r.y0,
+                                        x1: r.x1,
+                                        y1: r.y1,
+                                        construction: true,
+                                        span: Some(span.clone()),
+                                    };
+                                    state.objects.insert(orect.id, orect.clone().into());
+                                    state.emit.push(Emit {
+                                        scope: vref.loc.scope,
+                                        value: vid,
+                                        span,
+                                    });
+                                    self.values.insert(vid, Defer::Ready(Value::Rect(orect)));
+                                    true
+                                } else {
+                                    // default to a zero rectangle
+                                    self.errors.push(ExecError {
+                                        span: Some(span.clone()),
+                                        cell: cell_id,
+                                        kind: ExecErrorKind::EmptyBbox,
+                                    });
+                                    let id = object_id(&mut self.next_id);
+                                    let state = self.cell_states.get_mut(&cell_id).unwrap();
+                                    let orect = Rect {
+                                        id,
+                                        layer: None,
+                                        x0: 0.0.into(),
+                                        y0: 0.0.into(),
+                                        x1: 0.0.into(),
+                                        y1: 0.0.into(),
+                                        construction: true,
+                                        span: Some(span),
+                                    };
+                                    state.objects.insert(orect.id, orect.clone().into());
+                                    self.values.insert(vid, Defer::Ready(Value::Rect(orect)));
+                                    true
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            self.add_value_dependent(c.state.posargs[0], vid);
+                            false
+                        }
+                    }
+                    Native::Dimension => {
+                        let (args, unready): (Vec<_>, Vec<_>) =
+                            c.state.posargs.iter().partition_map(|v| {
+                                if let Defer::Ready(v) = &self.values[v] {
+                                    Either::Left(v)
+                                } else {
+                                    Either::Right(*v)
+                                }
+                            });
+                        if unready.is_empty() {
+                            assert_eq!(args.len(), 7);
+                            let span = self.span(&vref.loc, c.expr.span);
+                            // `Any` satisfies the static signature, so the runtime
+                            // types still have to be checked here.
+                            let horiz = args[6].get_bool().copied();
+                            let linears = args[..6]
+                                .iter()
+                                .map(|arg| arg.get_linear().cloned())
+                                .collect::<Option<Vec<_>>>();
+                            let (Some(horiz), Some(linears)) = (horiz, linears) else {
+                                self.invalid_type(cell_id, &span);
+                                return self.poison(cell_id, vid);
+                            };
+                            // Positional order is (p, n, value, coord, pstop, nstop).
+                            let [p, n, value, coord, pstop, nstop] =
+                                <[LinearExpr; 6]>::try_from(linears)
+                                    .expect("dimension takes six solver expressions");
+                            let id = object_id(&mut self.next_id);
+                            let state = self.cell_states.get_mut(&cell_id).unwrap();
+                            let expr = p.clone() - n.clone() - value.clone();
+                            let constraint = state.solver.constrain_eq0(expr);
+                            let dim = Dimension {
+                                id,
+                                horiz,
+                                nstop,
+                                pstop,
+                                coord,
+                                value,
+                                n,
+                                p,
+                                constraint,
+                                span: Some(span.clone()),
+                            };
+                            state.constraint_span_map.insert(constraint, span.clone());
+                            state.object_emit.push(ObjectEmit {
+                                scope: vref.loc.scope,
+                                object: dim.id,
+                                span,
+                            });
+                            state.objects.insert(dim.id, dim.clone().into());
+                            self.values.insert(vid, Defer::Ready(Value::Nil));
+                            true
+                        } else {
+                            for arg_vid in unready {
+                                self.add_value_dependent(arg_vid, vid);
+                            }
+                            false
+                        }
+                    }
+                    Native::LayoutInst => {
+                        // Every kwarg here is optional, and every one of them can
+                        // arrive as `Any`, so absence and a wrong runtime type are
+                        // distinct outcomes: absence falls back to the default,
+                        // a wrong type is an `InvalidType` diagnostic.
+                        let kwarg_vid = |name: &str| {
+                            c.expr
+                                .args
+                                .kwargs
+                                .iter()
+                                .zip(c.state.kwargs.iter())
+                                .find_map(|(kwarg, arg_vid)| {
+                                    (kwarg.name.name == name).then_some((kwarg, *arg_vid))
+                                })
+                        };
+                        let reflect_arg = kwarg_vid("reflect");
+                        let angle_arg = kwarg_vid("angle");
+                        let construction_arg = kwarg_vid("construction");
+
+                        let mut pending = false;
+                        let mut read_bool = |this: &mut Self,
+                                             arg: Option<(
+                            &KwArgValue<Substr, VarIdTyMetadata>,
+                            ValueId,
+                        )>| match arg {
+                            None => Ok(None),
+                            Some((kwarg, arg_vid)) => {
+                                let span = this.span(&vref.loc, kwarg.value.span());
+                                match this.typed_bool(arg_vid, vid, cell_id, &span) {
+                                    Typed::Ready(v) => Ok(Some(v)),
+                                    Typed::Pending => {
+                                        pending = true;
+                                        Ok(None)
+                                    }
+                                    Typed::Invalid => Err(()),
+                                }
+                            }
+                        };
+                        let refl = match read_bool(self, reflect_arg) {
+                            Ok(value) => value,
+                            Err(()) => return self.poison(cell_id, vid),
+                        };
+                        let construction = match read_bool(self, construction_arg) {
+                            Ok(value) => value,
+                            Err(()) => return self.poison(cell_id, vid),
+                        };
+                        let angle = match angle_arg {
+                            None => None,
+                            Some((kwarg, arg_vid)) => {
+                                let span = self.span(&vref.loc, kwarg.value.span());
+                                match self.typed_int(arg_vid, vid, cell_id, &span) {
+                                    Typed::Ready(degrees) => {
+                                        Some(match ((degrees % 360) + 360) % 360 {
+                                            0 => Rotation::R0,
+                                            90 => Rotation::R90,
+                                            180 => Rotation::R180,
+                                            270 => Rotation::R270,
+                                            _ => {
+                                                self.errors.push(ExecError {
+                                                    span: Some(span),
+                                                    cell: cell_id,
+                                                    kind: ExecErrorKind::InvalidRotation,
+                                                });
+                                                Rotation::R0
+                                            }
+                                        })
+                                    }
+                                    Typed::Pending => {
+                                        pending = true;
+                                        None
+                                    }
+                                    Typed::Invalid => return self.poison(cell_id, vid),
+                                }
+                            }
+                        };
+                        if !pending {
+                            let id = object_id(&mut self.next_id);
+                            let span = self.span(&vref.loc, c.expr.span);
+                            let state = self.cell_states.get_mut(&cell_id).unwrap();
+                            let inst = Instance {
+                                id,
+                                x: state.new_solver_var(&span).into(),
+                                y: state.new_solver_var(&span).into(),
+                                cell: *c.state.posargs.first().unwrap(),
+                                reflect: refl.unwrap_or_default(),
+                                angle: angle.unwrap_or_default(),
+                                construction: construction.unwrap_or_default(),
+                                span: span.clone(),
+                            };
+                            state.emit.push(Emit {
+                                scope: vref.loc.scope,
+                                value: vid,
+                                span,
+                            });
+                            state.objects.insert(inst.id, inst.clone().into());
+                            for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter())
+                            {
+                                let lhs = self.value_id();
+                                let (priority, initial_condition) = match kwarg.name.name.as_str() {
+                                    "x" => {
+                                        self.values.insert(
+                                            lhs,
+                                            Defer::Ready(Value::Linear(inst.x.clone())),
+                                        );
+                                        (2, None)
+                                    }
+                                    "xi" => {
+                                        self.values.insert(
+                                            lhs,
+                                            Defer::Ready(Value::Linear(inst.x.clone())),
+                                        );
+                                        (2, Some(RectInitialCondition::InstanceX(inst.id)))
+                                    }
+                                    "y" => {
+                                        self.values.insert(
+                                            lhs,
+                                            Defer::Ready(Value::Linear(inst.y.clone())),
+                                        );
+                                        (1, None)
+                                    }
+                                    "yi" => {
+                                        self.values.insert(
+                                            lhs,
+                                            Defer::Ready(Value::Linear(inst.y.clone())),
+                                        );
+                                        (1, Some(RectInitialCondition::InstanceY(inst.id)))
+                                    }
+                                    _ => continue,
+                                };
+                                // Use the value expression's span (e.g. `100.` in
+                                // `x1i=100.`) rather than the whole kwarg, so the GUI
+                                // can rewrite just the value when persisting a
+                                // solution-space-exploration drag.
+                                let span = self.span(&vref.loc, kwarg.value.span());
+                                self.new_deferred_value(vref.loc, |_| {
+                                    PartialEvalState::Constraint(PartialConstraint {
+                                        lhs,
+                                        rhs: *rhs,
+                                        fallback: kwarg.name.name.ends_with('i'),
+                                        priority,
+                                        span,
+                                        initial_condition,
+                                    })
+                                });
+                            }
+                            self.values.insert(vid, Defer::Ready(Value::Inst(inst)));
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
+            }
             PartialEvalState::Arith(arith) => {
                 if let (Defer::Ready(vl), Defer::Ready(vr)) =
                     (&self.values[&arith.left], &self.values[&arith.right])
@@ -12203,7 +12439,7 @@ pub enum Value {
     ///   // ...
     /// }
     ///
-    /// let mycell_inst = inst(mycell(), x=0, y=0);
+    /// let mycell_inst = std::layout::inst(mycell(), x=0, y=0);
     /// ```
     ///
     /// `mycell_inst` is a value of type `Inst`.
@@ -13081,6 +13317,7 @@ enum PartialEvalState<T: AstMetadata> {
     BoolOp(Box<PartialBoolOp<T>>),
     UnaryOp(PartialUnaryOp<T>),
     Call(Box<PartialCallExpr<T>>),
+    Native(Box<PartialNativeCall<T>>),
     FieldAccess(Box<PartialFieldAccessExpr<T>>),
     IndexFieldAccess(Box<PartialIndexFieldAccessExpr<T>>),
     Index(Box<PartialIndexExpr<T>>),
@@ -13120,6 +13357,14 @@ impl<T: AstMetadata> PartialEvalState<T> {
                 .posargs
                 .iter()
                 .chain(e.state.kwargs.iter())
+                .copied()
+                .collect(),
+            Self::Native(e) => e
+                .call
+                .state
+                .posargs
+                .iter()
+                .chain(e.call.state.kwargs.iter())
                 .copied()
                 .collect(),
             Self::FieldAccess(e) => vec![e.state.base],
@@ -13216,6 +13461,13 @@ pub enum MatchExprState {
 struct PartialCallExpr<T: AstMetadata> {
     expr: CallExpr<Substr, T>,
     state: CallExprState,
+}
+
+/// A call of a native item, deferred until its arguments are ready.
+#[derive(Debug, Clone)]
+struct PartialNativeCall<T: AstMetadata> {
+    native: Native,
+    call: PartialCallExpr<T>,
 }
 
 #[derive(Debug, Clone)]

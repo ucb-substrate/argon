@@ -1,3 +1,5 @@
+use std::layout::rect;
+
 cell top() {
     let lst = cons(500., cons(300., cons(800., cons(200., cons(1400., [])))));
     for w in lst {

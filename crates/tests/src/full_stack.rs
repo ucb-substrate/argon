@@ -33,6 +33,7 @@ pub enum GuiEvent {
         kind: OutputKind,
         scope: Option<Span>,
         rect_count: usize,
+        object_count: usize,
     },
     Message {
         typ: tower_lsp_server::ls_types::MessageType,
@@ -66,14 +67,14 @@ impl Gui for HeadlessGui {
     }
 
     async fn update_cell(self, _: context::Context, update: CompilationUpdate) -> bool {
-        let (kind, scope, rect_count, revision) = {
+        let (kind, scope, rect_count, object_count, revision) = {
             let mut previous = self.snapshot.lock().unwrap();
             let Some(snapshot) = update.materialize(previous.as_ref()) else {
                 return false;
             };
             *previous = Some(snapshot.clone());
-            let (kind, scope, rect_count) = snapshot_details(&snapshot.output);
-            (kind, scope, rect_count, snapshot.revision)
+            let (kind, scope, rect_count, object_count) = snapshot_details(&snapshot.output);
+            (kind, scope, rect_count, object_count, snapshot.revision)
         };
         if let Some(scope) = scope.clone() {
             *self.selected_scope.lock().expect("selected scope") = Some(scope);
@@ -85,6 +86,7 @@ impl Gui for HeadlessGui {
                 kind,
                 scope,
                 rect_count,
+                object_count,
             })
             .expect("full-stack test should still be receiving GUI events");
         let _permit = self.update_gate.acquire().await.unwrap();
@@ -131,20 +133,21 @@ impl Gui for HeadlessGui {
     async fn activate(self, _: context::Context) {}
 }
 
-fn snapshot_details(output: &CompileOutput) -> (OutputKind, Option<Span>, usize) {
+fn snapshot_details(output: &CompileOutput) -> (OutputKind, Option<Span>, usize, usize) {
     let (kind, data) = match output {
         CompileOutput::Valid(data) => (OutputKind::Data, Some(data)),
         CompileOutput::ExecErrors(output) => (OutputKind::Data, output.output.as_ref()),
         CompileOutput::StaticErrors(_) => (OutputKind::StaticErrors, None),
         CompileOutput::FatalParseErrors => (OutputKind::FatalParseErrors, None),
     };
-    let (scope, rect_count) = data.map(gui_snapshot).unwrap_or((None, 0));
-    (kind, scope, rect_count)
+    let (scope, rect_count, object_count) = data.map(gui_snapshot).unwrap_or((None, 0, 0));
+    (kind, scope, rect_count, object_count)
 }
 
-fn gui_snapshot(data: &CompiledData) -> (Option<Span>, usize) {
+/// The top cell's root scope, its rect count, and its total object count.
+fn gui_snapshot(data: &CompiledData) -> (Option<Span>, usize, usize) {
     let Some(cell) = data.cells.get(&data.top) else {
-        return (None, 0);
+        return (None, 0, 0);
     };
     let scope = cell.scopes.get(&cell.root).map(|scope| scope.span.clone());
     let rect_count = cell
@@ -152,7 +155,7 @@ fn gui_snapshot(data: &CompiledData) -> (Option<Span>, usize) {
         .values()
         .filter(|object| object.get_rect().is_some())
         .count();
-    (scope, rect_count)
+    (scope, rect_count, cell.objects.len())
 }
 
 pub struct Session {
@@ -327,6 +330,7 @@ impl Session {
 mod tests {
     use std::{collections::HashSet, future::Future};
 
+    use analyzer::rpc::{DimensionParams, DrawSegmentConstraint, PathParams, PolygonParams};
     use argonc::compile::BasicRect;
 
     use super::*;
@@ -383,6 +387,7 @@ mod tests {
                         kind: OutputKind::Data,
                         scope,
                         rect_count,
+                        ..
                     } if !drew_rect => {
                         saw_compilation_update |= !active_compilations.is_empty();
                         let scope = scope.expect("compiled top cell should expose its root scope");
@@ -447,9 +452,9 @@ mod tests {
             finish_nvim(child).await;
             let source = std::fs::read_to_string(session.project.join("lib.ar"))
                 .expect("read round-tripped source");
-            assert!(source.contains("pub let gui_rect = rect("));
+            assert!(source.contains("pub let gui_rect = std::layout::rect("));
             assert!(source.contains("x0i = 1.2, y0i = 0., x1i = 10.3, y1i = 10."));
-            assert!(source.contains("let editor_rect = rect("));
+            assert!(source.contains("let editor_rect = std::layout::rect("));
         })
         .await;
     }
@@ -538,7 +543,7 @@ mod tests {
         assert_completes("waiting for navigation requests", async {
             let _guard = FULL_STACK_LOCK.lock().await;
             let mut session = Session::new(
-                "cell top() {\n    let width = 100.;\n    let r = rect(\"met1\", x0=0., y0=0., x1=width, y1=width);\n}\ncell child(w: Float, h: Float = w, layer: String = \"met1\") {\n    let body = rect(layer, x0=0., y0=0., x1=w, y1=h);\n}\n",
+                "use std::layout::rect;\ncell top() {\n    let width = 100.;\n    let r = rect(\"met1\", x0=0., y0=0., x1=width, y1=width);\n}\ncell child(w: Float, h: Float = w, layer: String = \"met1\") {\n    let body = rect(layer, x0=0., y0=0., x1=w, y1=h);\n}\n",
             )
             .await;
             session.start_analyzer();
@@ -551,6 +556,140 @@ mod tests {
 
             std::fs::write(&session.ack, "ok\n").expect("acknowledge navigation");
             finish_nvim(child).await;
+        })
+        .await;
+    }
+
+    /// Every statement a GUI tool inserts names layout natives by full path,
+    /// so it compiles in a module without `use` declarations.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn generated_geometry_compiles_without_imports() {
+        assert_completes("waiting for generated geometry to compile", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new("cell child() {}\ncell top() {\n}\n").await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("generated");
+            let analyzer = session.connect_analyzer().await;
+            analyzer
+                .register(context::current(), session.gui_addr())
+                .await
+                .expect("register headless GUI");
+
+            // Each edit is made against the scope of the snapshot compiled
+            // from the previous one, as the GUI would. Every edit adds one
+            // object to the top cell, so `step` objects precede edit `step`.
+            let mut last_revision = None;
+            for step in 0..=5_usize {
+                let scope = loop {
+                    match session.next_event().await {
+                        GuiEvent::UpdateCell {
+                            revision,
+                            kind: OutputKind::Data,
+                            scope: Some(scope),
+                            object_count,
+                            ..
+                        } if Some(revision) > last_revision && object_count == step => {
+                            last_revision = Some(revision);
+                            break scope;
+                        }
+                        GuiEvent::UpdateCell {
+                            kind: kind @ (OutputKind::StaticErrors | OutputKind::FatalParseErrors),
+                            ..
+                        } => panic!("generated source should compile, got {kind:?}"),
+                        _ => {}
+                    }
+                };
+                let inserted = match step {
+                    0 => analyzer
+                        .draw_rect(
+                            context::current(),
+                            scope,
+                            "r".to_owned(),
+                            BasicRect {
+                                layer: Some("met1".to_owned()),
+                                x0: 0.,
+                                y0: 0.,
+                                x1: 10.,
+                                y1: 20.,
+                                construction: false,
+                            },
+                        )
+                        .await
+                        .map(|result| result.is_some()),
+                    1 => analyzer
+                        .draw_polygon(
+                            context::current(),
+                            scope,
+                            "polygon0".to_owned(),
+                            PolygonParams {
+                                layer: "met1".to_owned(),
+                                points: vec![(20., 0.), (30., 0.), (25., 10.)],
+                                constraints: vec![DrawSegmentConstraint::Horizontal(1)],
+                            },
+                        )
+                        .await
+                        .map(|span| span.is_some()),
+                    2 => analyzer
+                        .draw_path(
+                            context::current(),
+                            scope,
+                            "path0".to_owned(),
+                            PathParams {
+                                layer: "met1".to_owned(),
+                                width: 2.,
+                                points: vec![(40., 0.), (40., 20.)],
+                                constraints: vec![DrawSegmentConstraint::Vertical(1)],
+                            },
+                        )
+                        .await
+                        .map(|span| span.is_some()),
+                    3 => analyzer
+                        .place_instance(context::current(), scope, "child()".to_owned(), 50., 0.)
+                        .await
+                        .map(|span| span.is_some()),
+                    4 => analyzer
+                        .draw_dimension(
+                            context::current(),
+                            scope,
+                            DimensionParams {
+                                p: "r.x1".to_owned(),
+                                n: "r.x0".to_owned(),
+                                value: "10.".to_owned(),
+                                coord: "r.y1 + 5.".to_owned(),
+                                pstop: "r.y1".to_owned(),
+                                nstop: "r.y1".to_owned(),
+                                horiz: "true".to_owned(),
+                            },
+                        )
+                        .await
+                        .map(|span| span.is_some()),
+                    _ => break,
+                };
+                assert!(
+                    inserted.expect("GUI edit request should reach analyzer"),
+                    "edit {step} should change the source buffer"
+                );
+            }
+
+            std::fs::write(&session.gui_edit_ack, "ok\n").expect("acknowledge generated edits");
+            std::fs::write(&session.ack, "ok\n").expect("acknowledge generated geometry");
+            finish_nvim(child).await;
+            let path = session.project.join("lib.ar");
+            let source = std::fs::read_to_string(&path).expect("read generated source");
+            assert!(!source.contains("use "), "{source}");
+            for call in [
+                "std::layout::rect(",
+                "std::layout::polygon(",
+                "std::layout::path(",
+                "std::layout::inst(child()",
+                "std::layout::dimension(",
+            ] {
+                assert!(source.contains(call), "missing {call} in\n{source}");
+            }
+            let ast = argonc::parse::parse_workspace_with_std(&path).ast();
+            let (_, errors) =
+                argonc::compile::static_compile(&ast).expect("generated source should analyze");
+            assert!(errors.errors.is_empty(), "{source}\n{:?}", errors.errors);
         })
         .await;
     }

@@ -15,7 +15,7 @@ Calling a cell runs its body with the given arguments and produces a cell value:
 let child = inverter(1200., 2000., 4);
 ```
 
-A cell value isn't placed anywhere until you pass it to [`inst`](/language/builtins/hierarchy#inst). Pass it to [`bbox`](/language/builtins/hierarchy#bbox) to get its bounds.
+A cell value isn't placed anywhere until you pass it to [`std::layout::inst`](/language/std-layout#inst). Pass it to [`std::layout::bbox`](/language/std-layout#bbox) to get its bounds.
 
 ## Instance values
 
@@ -28,8 +28,8 @@ A cell value isn't placed anywhere until you pass it to [`inst`](/language/built
 ]} />
 
 ```argon
-let placed = inst(inverter(1200., 2000., 4), x=100., y=50.);
-let bounds = bbox(placed);
+let placed = std::layout::inst(inverter(1200., 2000., 4), x=100., y=50.);
+let bounds = std::layout::bbox(placed);
 ```
 
 Only the fields the cell declares with [`pub let`](/language/cells-functions#public-fields) can be read this way. Reading another top-level `let` of the cell is an error. A field that holds a function, cell function, or variant constructor also can't be read through an instance.

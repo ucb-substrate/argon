@@ -167,10 +167,10 @@ mod tests {
         )
     }
 
-    /// Compiles `cell` from a one-file workspace without the standard library.
+    /// Compiles `cell` from a one-file workspace with the standard library.
     fn compile_source(source: &str, cell: &str, args: Vec<CellArg>) -> CompileOutput {
         let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
-        let ast = IndexMap::from([(Vec::new(), root)]);
+        let ast = crate::parse::with_std(root);
         compile(
             &ast,
             CompileInput {
@@ -364,8 +364,10 @@ mod tests {
     /// cell type is shared (`Arc`-interned) rather than copied per reference,
     /// both variants scale linearly in `depth`.
     fn gen_hier(depth: usize, double_ref: bool) -> String {
-        let mut s =
-            String::from("cell h0() {\n    rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n}\n");
+        let mut s = String::from(
+            "use std::layout::{inst, rect};\n\
+             cell h0() {\n    rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n}\n",
+        );
         for k in 1..=depth {
             let body = if double_ref {
                 format!("    let child = h{}();\n    let i = inst(child);\n", k - 1)
@@ -908,19 +910,15 @@ mod tests {
     #[test]
     fn coupled_fallbacks_are_not_batched() {
         let root = parse_source_text(
-            "cell top() {\n\
+            "use std::layout::rect;\n\
+             cell top() {\n\
              let a = rect(\"met1\", x0i = 5., x1i = 50., y0i = 0., y1i = 8.);\n\
              eq(a.x1, a.x0 + 10.);\n\
              }",
             PathBuf::from("/virtual/lib.ar"),
         )
         .unwrap();
-        let std = parse_source_text(
-            crate::parse::STD_SOURCE,
-            PathBuf::from(crate::parse::STD_PATH),
-        )
-        .unwrap();
-        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let ast = crate::parse::with_std(root);
         let out = compile(
             &ast,
             CompileInput {
@@ -977,12 +975,7 @@ mod tests {
     fn geometry_digest_distinguishes_what_a_user_can_see() {
         let compile_source = |source: &str| {
             let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
-            let std = parse_source_text(
-                crate::parse::STD_SOURCE,
-                PathBuf::from(crate::parse::STD_PATH),
-            )
-            .unwrap();
-            let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+            let ast = crate::parse::with_std(root);
             compile(
                 &ast,
                 CompileInput {
@@ -994,22 +987,30 @@ mod tests {
             .geometry_digest()
         };
 
-        let base = "cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }";
+        let base = "use std::layout::rect;\n\
+                    cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }";
         assert_eq!(compile_source(base), compile_source(base), "stable");
         assert_ne!(
             compile_source(base),
-            compile_source("cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=11., y1=10.); }"),
+            compile_source(
+                "use std::layout::rect;\n\
+                 cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=11., y1=10.); }"
+            ),
             "a moved edge must change the digest"
         );
         assert_ne!(
             compile_source(base),
-            compile_source("cell top() { let r = rect(\"met2\", x0=0., y0=0., x1=10., y1=10.); }"),
+            compile_source(
+                "use std::layout::rect;\n\
+                 cell top() { let r = rect(\"met2\", x0=0., y0=0., x1=10., y1=10.); }"
+            ),
             "a different layer must change the digest"
         );
         assert_ne!(
             compile_source(base),
             compile_source(
-                "cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
+                "use std::layout::rect;\n\
+                 cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
                  let s = rect(\"met1\", x0=20., y0=0., x1=30., y1=10.); }"
             ),
             "an extra shape must change the digest"
@@ -1361,11 +1362,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(scope_names.contains(&"cell top"));
         assert!(scope_names.contains(&"0 cell middle"));
-        assert!(scope_names.contains(&"0 cell bot"));
-        assert!(scope_names.contains(&"0 fn make_rect"));
-        assert!(scope_names.contains(&"1 fn emit_rect"));
-        assert!(scope_names.contains(&"1 block"));
-        assert!(scope_names.contains(&"2 else"));
+        assert!(scope_names.contains(&"1 cell bot"));
+        assert!(scope_names.contains(&"2 fn make_rect"));
+        assert!(scope_names.contains(&"3 fn emit_rect"));
+        assert!(scope_names.contains(&"3 block"));
+        assert!(scope_names.contains(&"4 else"));
     }
 
     /// `examples/cell_out_of_order` is `examples/hierarchy` with `top` moved
@@ -1406,7 +1407,8 @@ mod tests {
     #[test]
     fn a_cell_may_read_fields_of_a_cell_declared_below_it() {
         let errors = static_errors_of(
-            "cell top() {\n\
+            "use std::layout::{inst, rect};\n\
+             cell top() {\n\
                  let l = inst(bot());\n\
                  eq(l.met1.x0, 0.);\n\
                  let w = l.met1.w;\n\
@@ -1419,7 +1421,8 @@ mod tests {
         // A misspelled field of a later cell is still a plain field error.
         assert!(matches!(
             static_errors_of(
-                "cell top() {\n\
+                "use std::layout::{inst, rect};\n\
+                 cell top() {\n\
                      let l = inst(bot());\n\
                      eq(l.met2.x0, 0.);\n\
                  }\n\
@@ -1457,7 +1460,8 @@ mod tests {
         // The same arguments name the same cell, so the cycle is caught as
         // soon as it closes.
         let errors = compile_source(
-            "cell forever() {\n\
+            "use std::layout::{inst, rect};\n\
+             cell forever() {\n\
                  let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
                  let again = inst(forever());\n\
              }\n",
@@ -1476,7 +1480,8 @@ mod tests {
         // Ever-changing arguments run into the depth limit instead.
         let errors = crate::run_with_stack("argon-compile", || {
             compile_source(
-                "cell forever(n: Int) {\n\
+                "use std::layout::{inst, rect};\n\
+                 cell forever(n: Int) {\n\
                      let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
                      let again = inst(forever(n + 1));\n\
                  }\n",
@@ -1497,7 +1502,8 @@ mod tests {
     #[test]
     fn cells_may_instantiate_each_other() {
         let data = compile_source(
-            "cell a(n: Int) {\n\
+            "use std::layout::{inst, rect};\n\
+             cell a(n: Int) {\n\
                  pub let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
                  if n > 0 {\n\
                      let b = inst(b(n - 1));\n\
@@ -1527,7 +1533,8 @@ mod tests {
     #[test]
     fn a_field_declared_later_in_the_same_cell_is_typed_on_demand() {
         let errors = static_errors_of(
-            "cell a(n: Int) {\n\
+            "use std::layout::{inst, rect};\n\
+             cell a(n: Int) {\n\
                  let k = if n > 0 { inst(a(n - 1)).z.w } else { 0. };\n\
                  pub let z = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
              }\n",
@@ -1541,7 +1548,8 @@ mod tests {
     #[test]
     fn a_queued_field_read_again_is_typed_before_its_reader_is_retried() {
         let errors = static_errors_of(
-            "cell x() {\n\
+            "use std::layout::{inst, rect};\n\
+             cell x() {\n\
                  eq(inst(a()).f.x0, inst(b()).g.x0);\n\
              }\n\
              cell a() {\n\
@@ -1560,7 +1568,8 @@ mod tests {
     #[test]
     fn an_untyped_local_hides_a_module_declaration_of_the_same_name() {
         let errors = static_errors_of(
-            "cell user() {\n\
+            "use std::layout::{inst, rect};\n\
+             cell user() {\n\
                  let v = inst(top()).a;\n\
              }\n\
              cell top() {\n\
@@ -1580,7 +1589,8 @@ mod tests {
     #[test]
     fn a_statement_typed_out_of_order_sees_the_nearest_lets_above_it() {
         let errors = static_errors_of(
-            "cell user() {\n\
+            "use std::layout::{inst, rect};\n\
+             cell user() {\n\
                  eq(inst(top()).c, 1.);\n\
              }\n\
              cell top() {\n\
@@ -1597,7 +1607,9 @@ mod tests {
     /// closes the cycle, and nothing else cascades from it.
     #[test]
     fn a_field_whose_type_depends_on_itself_is_an_error() {
-        let errors = static_errors_of("cell a(n: Int) {\n    pub let f = inst(a(n - 1)).f;\n}\n");
+        let errors = static_errors_of(
+            "use std::layout::inst;\ncell a(n: Int) {\n    pub let f = inst(a(n - 1)).f;\n}\n",
+        );
         assert!(
             matches!(
                 errors.as_slice(),
@@ -1606,7 +1618,7 @@ mod tests {
             "{errors:?}"
         );
 
-        let source = "cell a() {\n    pub let f = inst(b()).g;\n}\ncell b() {\n    pub let g = inst(a()).f;\n}\n";
+        let source = "use std::layout::inst;\ncell a() {\n    pub let f = inst(b()).g;\n}\ncell b() {\n    pub let g = inst(a()).f;\n}\n";
         let errors = static_errors(source);
         assert!(
             matches!(
@@ -1619,7 +1631,8 @@ mod tests {
 
         // Through a local: `z` reads `k`, whose type needs `z`.
         let errors = static_errors_of(
-            "cell a(n: Int) {\n    pub let k = inst(a(n - 1)).z;\n    pub let z = k;\n}\n",
+            "use std::layout::inst;\n\
+             cell a(n: Int) {\n    pub let k = inst(a(n - 1)).z;\n    pub let z = k;\n}\n",
         );
         assert!(
             matches!(
@@ -1634,7 +1647,8 @@ mod tests {
     /// types, and `Any` is how code accepts either.
     #[test]
     fn cell_types_are_nominal() {
-        let cells = "cell a() {\n\
+        let cells = "use std::layout::{inst, rect};\n\
+                     cell a() {\n\
                          let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
                      }\n\
                      cell b() {\n\
@@ -1658,7 +1672,8 @@ mod tests {
     /// `let` above it, and the field an instance answers is the last one.
     #[test]
     fn a_repeated_top_level_let_rebinds_sequentially() {
-        let cells = "cell top() {\n\
+        let cells = "use std::layout::{inst, rect};\n\
+                     cell top() {\n\
                          let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
                          let s = r.w;\n\
                          pub let r = 5.;\n\
@@ -2295,6 +2310,8 @@ mod tests {
     #[test]
     fn nested_and_proxied_shape_cell_arguments() {
         let source = r#"
+use std::layout::{crect, inst, polygon, rect};
+
 struct Pair {
     a: Rect,
     b: Point,
@@ -2479,6 +2496,8 @@ cell top() {
     #[test]
     fn tuple_cell_arguments() {
         let source = r#"
+use std::layout::{inst, rect};
+
 struct Placed {
     at: (Float, Float),
     size: (Int, Rect),
@@ -2543,7 +2562,7 @@ cell top() {
             y1: 10.,
         };
         let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
-        let ast = IndexMap::from([(Vec::new(), root)]);
+        let ast = crate::parse::with_std(root);
         let child = |args: Vec<CellArg>| {
             compile(
                 &ast,
@@ -2593,6 +2612,8 @@ cell top() {
     #[test]
     fn an_unsolved_shape_argument_waits_for_the_caller() {
         let source = r#"
+use std::layout::{inst, rect};
+
 cell child(r: Rect) {
     let v = rect("met1", x0=r.x0, y0=r.y0, w=10., h=10.);
 }
@@ -2615,11 +2636,11 @@ cell top() {
         );
     }
 
-    /// Type-checks a one-file workspace and returns the kinds of its static
-    /// errors.
+    /// Type-checks a one-file workspace with the standard library and returns
+    /// the kinds of its static errors.
     fn static_errors_of(source: &str) -> Vec<StaticErrorKind> {
         let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
-        let ast = IndexMap::from([(Vec::new(), root)]);
+        let ast = crate::parse::with_std(root);
         let (_, output) = static_compile(&ast).unwrap();
         output.errors.into_iter().map(|error| error.kind).collect()
     }
@@ -2809,7 +2830,7 @@ cell top() {
             [StaticErrorKind::DuplicateNameDeclaration]
         ));
         assert!(matches!(
-            static_errors_of("struct rect { a: Int, }\n").as_slice(),
+            static_errors_of("struct eq { a: Int, }\n").as_slice(),
             [StaticErrorKind::RedeclarationOfBuiltin]
         ));
         // Forward references that do not close a cycle are fine, in any order.
@@ -3547,6 +3568,7 @@ cell top() {
     #[test]
     fn underconstrained_errors_point_to_each_source_expression() {
         let source = r#"
+            use std::layout::rect;
             cell top() {
                 let first = rect("met1");
                 let second = rect("met1");
@@ -3554,12 +3576,7 @@ cell top() {
         "#;
         let path = PathBuf::from("/virtual/lib.ar");
         let root = parse_source_text(source, path.clone()).unwrap();
-        let std = parse_source_text(
-            crate::parse::STD_SOURCE,
-            PathBuf::from(crate::parse::STD_PATH),
-        )
-        .unwrap();
-        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let ast = crate::parse::with_std(root);
 
         let errors = compile(
             &ast,
@@ -3746,6 +3763,7 @@ cell top() {
     fn polygon_points_require_named_coordinate_fields() {
         let root = parse_source_text(
             r#"
+                use std::layout::polygon;
                 cell top() {
                     let p = polygon("met1", 3,
                         x0=0., y0=0.,
@@ -3758,12 +3776,7 @@ cell top() {
             PathBuf::from("/virtual/lib.ar"),
         )
         .unwrap();
-        let std = parse_source_text(
-            crate::parse::STD_SOURCE,
-            PathBuf::from(crate::parse::STD_PATH),
-        )
-        .unwrap();
-        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let ast = crate::parse::with_std(root);
         let (_, output) = static_compile(&ast).unwrap();
         assert!(output.errors.iter().any(|error| matches!(
             &error.kind,
@@ -3775,6 +3788,7 @@ cell top() {
     fn polygon_constructor_has_one_count_based_signature() {
         let root = parse_source_text(
             r#"
+                use std::layout::polygon;
                 cell top() {
                     let p = polygon("met1", [
                         (0., 0.,),
@@ -3786,12 +3800,7 @@ cell top() {
             PathBuf::from("/virtual/lib.ar"),
         )
         .unwrap();
-        let std = parse_source_text(
-            crate::parse::STD_SOURCE,
-            PathBuf::from(crate::parse::STD_PATH),
-        )
-        .unwrap();
-        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let ast = crate::parse::with_std(root);
         let (_, output) = static_compile(&ast).unwrap();
         assert!(output.errors.iter().any(|error| matches!(
             &error.kind,
@@ -3801,12 +3810,7 @@ cell top() {
 
     fn static_errors(source: &str) -> Vec<crate::compile::StaticError> {
         let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
-        let std = parse_source_text(
-            crate::parse::STD_SOURCE,
-            PathBuf::from(crate::parse::STD_PATH),
-        )
-        .unwrap();
-        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let ast = crate::parse::with_std(root);
         let (_, output) = static_compile(&ast).unwrap();
         output.errors
     }
@@ -3825,6 +3829,7 @@ cell top() {
     fn keyword_parameters_type_check() {
         let errors = static_errors(
             r#"
+            use std::layout::{inst, rect};
             fn scaled(x: Float, scale: Float = 2., offset: Float = x) -> Float {
                 x * scale + offset
             }
@@ -3910,6 +3915,7 @@ cell top() {
     fn comparison_source(comparison: &str) -> String {
         format!(
             r#"
+                use std::layout::rect;
                 enum E {{ A, B }}
                 fn ident(value: Any) -> Any {{ value }}
                 cell top() {{
@@ -3999,6 +4005,7 @@ cell top() {
     fn fn_decl_source(decl: &str) -> String {
         format!(
             r#"
+                use std::layout::rect;
                 enum E {{ A, B }}
                 {decl}
                 cell top() {{
@@ -4068,6 +4075,7 @@ cell top() {
     fn argon_path_dimensions_are_constrained_and_exported() {
         let root = parse_source_text(
             r#"
+                use std::layout::path;
                 cell top() {
                     let route = path("met1", 3,
                         width=20.,
@@ -4086,12 +4094,7 @@ cell top() {
             PathBuf::from("/virtual/lib.ar"),
         )
         .unwrap();
-        let std = parse_source_text(
-            crate::parse::STD_SOURCE,
-            PathBuf::from(crate::parse::STD_PATH),
-        )
-        .unwrap();
-        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let ast = crate::parse::with_std(root);
         let output = compile(
             &ast,
             CompileInput {
@@ -4187,6 +4190,7 @@ cell top() {
     fn sharp_path_corner_matches_klayout_cutoff_outline() {
         let root = parse_source_text(
             r#"
+                use std::layout::path;
                 cell top() {
                     path("met1", 4,
                         width=20.,
@@ -4200,12 +4204,7 @@ cell top() {
             PathBuf::from("/virtual/lib.ar"),
         )
         .unwrap();
-        let std = parse_source_text(
-            crate::parse::STD_SOURCE,
-            PathBuf::from(crate::parse::STD_PATH),
-        )
-        .unwrap();
-        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let ast = crate::parse::with_std(root);
         let output = compile(
             &ast,
             CompileInput {
@@ -4456,7 +4455,7 @@ cell top() {
         // Indexing the argument slice after `assert_eq_arity` merely records a
         // diagnostic made a one-token typo crash `--check`, the path the
         // language server runs on every keystroke.
-        let errors = check_source("cell top() { let b = bbox(); }");
+        let errors = check_source("use std::layout::bbox;\ncell top() { let b = bbox(); }");
         assert!(
             errors.iter().any(|error| matches!(
                 error,
@@ -4534,9 +4533,11 @@ cell top() {
         for source in [
             "cell top() { let v = 1!; }",
             "cell top() { let v = \"hi\"!; }",
-            "cell bot() { let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!; }
+            "use std::layout::rect;
+             cell bot() { let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!; }
              cell top() { let v = bot()!; }",
-            "cell top() {
+            "use std::layout::rect;
+             cell top() {
                  let a = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);
                  let b = rect(\"met2\", x0=0., y0=0., x1=1., y1=1.);
                  let s = [a, b]!;
@@ -4580,7 +4581,8 @@ cell top() {
         // to be rejected where it is created.
         assert_reports(
             &run_source(
-                "cell top() {
+                "use std::layout::rect;
+                 cell top() {
                      let a = rect(\"met1\", x0=0., y0=0., y1=1.);
                      eq(a.x1, 1. / 0.);
                  }",
@@ -4595,13 +4597,15 @@ cell top() {
         // on allocation failure, bypassing diagnostics entirely.
         assert_reports(
             &run_source(
-                "cell top() { let p = polygon(\"met1\", 1000000000000000, x0=0., y0=0.)!; }",
+                "use std::layout::polygon;\n\
+                 cell top() { let p = polygon(\"met1\", 1000000000000000, x0=0., y0=0.)!; }",
             ),
             |error| matches!(error, ExecErrorKind::LimitExceeded { .. }),
         );
         assert_reports(
             &run_source(
-                "cell top() { let p = path(\"met1\", 1000000000000000, width=1., x0=0., y0=0.)!; }",
+                "use std::layout::path;\n\
+                 cell top() { let p = path(\"met1\", 1000000000000000, width=1., x0=0., y0=0.)!; }",
             ),
             |error| matches!(error, ExecErrorKind::LimitExceeded { .. }),
         );
@@ -4641,8 +4645,10 @@ cell top() {
         // analyzer pushed the whole string into an LSP diagnostic on every
         // keystroke.
         let depth = 16;
-        let mut source =
-            String::from("cell h0() { let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!; }\n");
+        let mut source = String::from(
+            "use std::layout::{inst, rect};\n\
+             cell h0() { let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!; }\n",
+        );
         for k in 1..=depth {
             source.push_str(&format!(
                 "cell h{k}() {{ let p = inst(h{}()); let q = inst(h{}()); }}\n",
@@ -4678,12 +4684,14 @@ cell top() {
         // `Unknown` left the other three still reporting a second error, so
         // they all go through `Ty::is_wildcard` now and all are covered here.
         for source in [
-            "cell top() {
+            "use std::layout::rect;
+             cell top() {
                  let a = float();
                  eq(a, undeclared_thing);
                  let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=a)!;
              }",
-            "cell top() { let c = missing_cell(); let i = inst(c); }",
+            "use std::layout::inst;\n\
+             cell top() { let c = missing_cell(); let i = inst(c); }",
             "cell top() { let a = undeclared_thing + 1.; }",
             "cell top() { let a = 1. + undeclared_thing; }",
             "cell top() { let a = -undeclared_thing; }",
@@ -4713,7 +4721,8 @@ cell top() {
         // every check it silently suppressed the caller's checks too, and
         // `--check` accepted a program the evaluator refuses.
         let errors = check_source(
-            "enum E { A, B }
+            "use std::layout::rect;
+             enum E { A, B }
              fn pick(v: Any, k: Float) -> Float { match v { k => 1., } }
              cell top() {
                  let n = pick(E::A, 2.);
@@ -4730,7 +4739,8 @@ cell top() {
         // A match that does name an enum still type checks.
         assert!(
             check_source(
-                "enum E { A, B }
+                "use std::layout::rect;
+                 enum E { A, B }
                  cell top() {
                      let e = E::A;
                      let w = match e { E::A => 1., E::B => 2., };
@@ -4769,7 +4779,8 @@ cell top() {
         // map, so a typo was reported as "place it with `inst(...)` first" --
         // advice that cannot help, because placing the cell reports the typo.
         let errors = check_source(
-            "cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!; }
+            "use std::layout::{rect, text};
+             cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!; }
              cell top() {
                  let c = child();
                  text(\"t\", \"text.label\", c.nonexistent.x0, 0.);
@@ -4797,7 +4808,8 @@ cell top() {
         // map `{"r": Rect}` that contained it. The evaluator refuses the same
         // read, so the type checker now agrees with it.
         let errors = check_source(
-            "cell child() { pub let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
+            "use std::layout::{rect, text};
+             cell child() { pub let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
              cell top() {
                  let c = child();
                  text(\"t\", \"text.label\", c.r.x0, 0.);
@@ -4814,7 +4826,8 @@ cell top() {
 
         // The same read on an uncalled cell function names the call it needs.
         let errors = check_source(
-            "cell child() { pub let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
+            "use std::layout::{rect, text};
+             cell child() { pub let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
              cell top() { text(\"t\", \"text.label\", child.r.x0, 0.); }",
         );
         assert!(
@@ -4855,7 +4868,8 @@ cell top() {
         for source in [
             "cell top() { let w = if true { let x = 1.; x } else { 2. }; }",
             "fn f(x: Float) -> Float { x + 1. }",
-            "cell top(x: Float) { let r = rect(\"met1\", x0=x, y0=0., x1=1., y1=1.)!; }",
+            "use std::layout::rect;\n\
+             cell top(x: Float) { let r = rect(\"met1\", x0=x, y0=0., x1=1., y1=1.)!; }",
             "cell top() { for x in std::range(3) { float(); } }",
         ] {
             let errors = check_source(source);
@@ -4876,7 +4890,8 @@ cell top() {
         // misspelling lands.
         assert_reports(
             &run_source(
-                "fn left_edge(i: Any) -> Any { i.wdie.x0 }
+                "use std::layout::{inst, rect};
+                 fn left_edge(i: Any) -> Any { i.wdie.x0 }
                  cell child() { let wide = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }
                  cell top() {
                      let i = inst(child());
@@ -4893,7 +4908,8 @@ cell top() {
 
     #[test]
     fn only_pub_fields_are_readable_through_an_instance() {
-        let source = "cell child() {
+        let source = "use std::layout::{inst, rect};
+             cell child() {
                  pub let a = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);
                  let b = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);
              }
@@ -4926,7 +4942,8 @@ cell top() {
                  pub let shown = 1.;
                  let hidden = 2.;
              }\n";
-        let top = "cell top() {
+        let top = "use std::layout::inst;
+             cell top() {
                  let i = inst(child());
                  let v = i.shown + i.hidden;
              }\n";
@@ -4940,7 +4957,8 @@ cell top() {
         }
 
         let root = parse_source_text(
-            "cell top() {
+            "use std::layout::inst;
+             cell top() {
                  let i = inst(cells::child());
                  let v = i.shown + i.hidden;
              }",
@@ -4948,7 +4966,8 @@ cell top() {
         )
         .unwrap();
         let cells = parse_source_text(child, PathBuf::from("/virtual/cells.ar")).unwrap();
-        let ast = IndexMap::from([(Vec::new(), root), (vec!["cells".to_owned()], cells)]);
+        let mut ast = crate::parse::with_std(root);
+        ast.insert(vec!["cells".to_owned()], cells);
         let (_, output) = static_compile(&ast).unwrap();
         assert!(
             matches!(
@@ -4968,7 +4987,8 @@ cell top() {
     #[test]
     fn the_last_binding_of_a_field_decides_its_visibility() {
         let errors = static_errors_of(
-            "cell child() {
+            "use std::layout::inst;
+             cell child() {
                  pub let a = 1.;
                  let a = 2.;
                  let b = 1.;
@@ -4985,7 +5005,8 @@ cell top() {
         );
 
         let data = compile_top(
-            "cell top() {
+            "use std::layout::rect;
+             cell top() {
                  pub let a = 1.;
                  let a = 2.;
                  let b = 1.;
@@ -5008,12 +5029,14 @@ cell top() {
     #[test]
     fn a_private_field_of_an_unplaced_cell_is_reported_as_private() {
         for source in [
-            "cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
+            "use std::layout::{rect, text};
+             cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
              cell top() {
                  let c = child();
                  text(\"t\", \"text.label\", c.r.x0, 0.);
              }",
-            "cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
+            "use std::layout::{rect, text};
+             cell child() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!; }
              cell top() { text(\"t\", \"text.label\", child.r.x0, 0.); }",
         ] {
             let errors = check_source(source);
@@ -5029,7 +5052,9 @@ cell top() {
     /// field that reads itself is not a cycle.
     #[test]
     fn a_private_field_is_not_typed_on_demand() {
-        let errors = static_errors_of("cell a(n: Int) {\n    let f = inst(a(n - 1)).f;\n}\n");
+        let errors = static_errors_of(
+            "use std::layout::inst;\ncell a(n: Int) {\n    let f = inst(a(n - 1)).f;\n}\n",
+        );
         assert!(
             matches!(errors.as_slice(), [StaticErrorKind::PrivateField { field, cell }]
                 if field == "f" && cell == "a"),
@@ -5073,7 +5098,8 @@ cell top() {
     fn a_private_field_read_through_any_is_a_run_time_error() {
         assert_reports(
             &run_source(
-                "fn width(i: Any) -> Any { i.secret.w }
+                "use std::layout::{inst, rect};
+                 fn width(i: Any) -> Any { i.secret.w }
                  cell pad() { let secret = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }
                  cell top() {
                      let p = inst(pad(), x=0., y=0.);
@@ -5092,7 +5118,8 @@ cell top() {
     #[test]
     fn reachable_field_names_are_public_fields() {
         let data = compile_top(
-            "cell child() {
+            "use std::layout::{inst, rect};
+             cell child() {
                  pub let a = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);
                  let alias = a;
                  let hidden = rect(\"met1\", x0=2., y0=0., x1=3., y1=1.);
@@ -5131,7 +5158,8 @@ cell top() {
     #[test]
     fn instances_read_scalar_fields() {
         let data = compile_top(
-            "fn width_of(i: Any) -> Any { i.width }
+            "use std::layout::{inst, rect};
+             fn width_of(i: Any) -> Any { i.width }
              cell pad() {
                  pub let count = 3;
                  pub let width = 2.5;
@@ -5158,7 +5186,8 @@ cell top() {
     #[test]
     fn instance_fields_place_nested_geometry_and_points_in_the_parent() {
         let data = compile_top(
-            "struct Pins { pad: Rect, tip: Point, count: Int }
+            "use std::layout::{inst, polygon, rect};
+             struct Pins { pad: Rect, tip: Point, count: Int }
              cell pad() {
                  let tri = polygon(\"met1\", 3, x0=0., y0=0., x1=10., y1=0., x2=10., y2=20.);
                  pub let pins = Pins {
@@ -5190,7 +5219,8 @@ cell top() {
     #[test]
     fn a_cell_held_in_a_field_can_be_placed_by_the_parent() {
         let data = compile_top(
-            "cell leaf() { let r = rect(\"met1\", x0=0., y0=0., x1=5., y1=5.); }
+            "use std::layout::{inst, rect};
+             cell leaf() { let r = rect(\"met1\", x0=0., y0=0., x1=5., y1=5.); }
              cell holder() { pub let c = leaf(); }
              cell top() {
                  let h = inst(holder(), x=0., y=0.);
@@ -5203,7 +5233,8 @@ cell top() {
     #[test]
     fn an_instance_reads_the_last_binding_of_a_shadowed_field() {
         let data = compile_top(
-            "cell pad() {
+            "use std::layout::{inst, rect};
+             cell pad() {
                  pub let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
                  pub let a = 4.;
              }
@@ -5223,7 +5254,8 @@ cell top() {
     #[test]
     fn a_poisoned_instance_field_reports_only_its_own_error() {
         let errors = run_source(
-            "cell pad() {
+            "use std::layout::{crect, inst, rect};
+             cell pad() {
                  let c = crect(x0=0., y0=0., x1=10., y1=10.);
                  pub let layer = c.layer;
              }
@@ -5241,7 +5273,8 @@ cell top() {
     #[test]
     fn reading_a_function_field_through_an_instance_is_a_static_error() {
         let errors = check_source(
-            "fn double(x: Int) -> Int { x * 2 }
+            "use std::layout::inst;
+             fn double(x: Int) -> Int { x * 2 }
              cell pad() { pub let f = double; pub let fs = [double]; }
              cell top() {
                  let p = inst(pad(), x=0., y=0.);
@@ -5267,7 +5300,8 @@ cell top() {
     fn reading_a_function_field_through_any_is_a_run_time_error() {
         assert_reports(
             &run_source(
-                "fn double(x: Int) -> Int { x * 2 }
+                "use std::layout::inst;
+                 fn double(x: Int) -> Int { x * 2 }
                  fn read_f(i: Any) -> Any { i.f }
                  cell pad() { pub let f = double; }
                  cell top() {
@@ -5289,7 +5323,8 @@ cell top() {
         // that produced a second, unrelated error about the empty-string layer
         // being absent from the technology file.
         let errors = run_source(
-            "cell top() {
+            "use std::layout::{crect, rect};
+             cell top() {
                  let c = crect(x0=0., y0=0., x1=10., y1=10.);
                  let r = rect(c.layer, x0=0., y0=0., x1=10., y1=10.)!;
              }",
@@ -5320,7 +5355,8 @@ cell top() {
         // "inconsistent constraint" with nothing to say the extension had
         // never become a variable.
         let data = compile_top(
-            "cell top() {
+            "use std::layout::path;
+             cell top() {
                  let p = path(\"met1\", 2, width=1., x0=0., y0=0., x1=10., y1=0.);
                  eq(p.begin_extension, 5.);
              }",
@@ -5350,7 +5386,8 @@ cell top() {
         // panicked on the still-deferred value -- an internal compiler error
         // on a program that compiled before extensions became variables.
         let data = compile_top(
-            "cell top() {
+            "use std::layout::{path, rect};
+             cell top() {
                  let p = path(\"met1\", 2, width=1., x0=0., y0=0., x1=10., y1=0.);
                  let z = 1. / (p.begin_extension + 1.);
                  let r = rect(\"met1\", x0=0., y0=0., x1=z, y1=1.)!;
@@ -5368,15 +5405,19 @@ cell top() {
         // `Ty::Any` satisfies every static check, so each builtin has to test
         // the runtime type itself.
         for source in [
-            "fn mk() -> Any { 3 }
+            "use std::layout::text;
+             fn mk() -> Any { 3 }
              cell top() { text(mk(), \"met1.label\", 0., 0.); }",
             "fn e(a: Any, b: Any) { eq(a, b); }
              cell top() { e(1, 2); }",
-            "fn mk() -> Any { 3 }
+            "use std::layout::rect;
+             fn mk() -> Any { 3 }
              cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=mk(), y1=1.)!; }",
-            "fn f(c: Any) -> Any { inst(c) }
+            "use std::layout::inst;
+             fn f(c: Any) -> Any { inst(c) }
              cell top() { let i = f(5.); }",
-            "fn f(c: Any) -> Any { inst(c) }
+            "use std::layout::inst;
+             fn f(c: Any) -> Any { inst(c) }
              cell top() { let i = f(5.); let v = i.foo; }",
         ] {
             assert_reports(&run_source(source), |error| {
@@ -5395,7 +5436,8 @@ cell top() {
             format!("cell top() {{ let v = {}; }}", vec!["1"; 2000].join("+")),
             format!("cell top() {{ let v = {}; }}", vec!["1"; 2000].join("*")),
             format!(
-                "cell top() {{ let a = rect(\"met1\"); let v = a{}; }}",
+                "use std::layout::rect;\n\
+                 cell top() {{ let a = rect(\"met1\"); let v = a{}; }}",
                 ".f".repeat(2000)
             ),
         ] {
@@ -5415,7 +5457,8 @@ cell top() {
     fn bbox_excludes_construction_geometry() {
         // `bbox` used to include construction geometry that the GDS exporter
         // drops, so a placement computed from it did not match the output.
-        let source = "cell bot() {
+        let source = "use std::layout::{bbox, crect, rect};
+                      cell bot() {
                           let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.)!;
                           let c = crect(layer=\"met2\", x0=-500., y0=-500., x1=500., y1=500.);
                       }
@@ -5458,6 +5501,243 @@ cell top() {
             .collect()
     }
 
+    /// A native is reached through a grouped import, an alias, or its full
+    /// path, and behaves the same through each.
+    #[test]
+    fn natives_resolve_through_imports_aliases_and_paths() {
+        let data = compile_top(
+            "use std::layout::{inst as place, rect as r};\n\
+             use std::layout::crect;\n\
+             cell child() {\n\
+                 pub let m = r(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
+             }\n\
+             cell top() {\n\
+                 let i = place(child(), x=0., y=0.);\n\
+                 let c = crect(x0=0., y0=0., x1=5., y1=5.);\n\
+                 let q = std::layout::rect(\"met2\", x0=c.x0, y0=0., x1=i.m.x1, y1=1.);\n\
+                 let b = std::layout::bbox(i);\n\
+                 eq(b.x1 + c.x1, 15.);\n\
+             }",
+        );
+        let top = &data.cells[&data.top];
+        assert_eq!(
+            top.objects
+                .values()
+                .filter(|object| matches!(object, SolvedValue::Instance(_)))
+                .count(),
+            1
+        );
+        let met2 = top
+            .objects
+            .values()
+            .find_map(|object| match object {
+                SolvedValue::Rect(rect) if rect.layer.as_deref() == Some("met2") => Some(rect),
+                _ => None,
+            })
+            .expect("the fully qualified rect is drawn");
+        assert_relative_eq!(met2.x0.0, 0., epsilon = EPSILON);
+        assert_relative_eq!(met2.x1.0, 10., epsilon = EPSILON);
+    }
+
+    /// A bare call of a native that is not imported names the module it is in.
+    #[test]
+    fn a_bare_native_without_an_import_names_its_module() {
+        for name in [
+            "rect",
+            "crect",
+            "polygon",
+            "path",
+            "text",
+            "dimension",
+            "inst",
+            "bbox",
+        ] {
+            let errors = static_errors_of(&format!("cell top() {{ {name}(); }}"));
+            let path = format!("std::layout::{name}");
+            assert!(
+                matches!(
+                    errors.as_slice(),
+                    [StaticErrorKind::MovedItem { name: found, path: to }]
+                        if found == name && *to == path
+                ),
+                "{name}: {errors:?}"
+            );
+        }
+        let errors = static_errors_of("cell top() { let f = rect; }");
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [StaticErrorKind::MovedItem { name, .. }] if name == "rect"
+            ),
+            "{errors:?}"
+        );
+        let message = StaticErrorKind::MovedItem {
+            name: "rect".to_owned(),
+            path: "std::layout::rect".to_owned(),
+        }
+        .to_string();
+        assert_eq!(
+            message,
+            "`rect` moved to `std::layout::rect`; import it with `use std::layout::rect;`"
+        );
+    }
+
+    /// The geometry helpers live in `std::layout`; a `std::` path to one
+    /// names the module, whether it is called or imported.
+    #[test]
+    fn a_std_path_to_a_layout_helper_names_its_module() {
+        let errors = static_errors_of(
+            "use std::center_rects;\n\
+             cell top() {\n\
+                 let r = std::array(std::layout::rect(\"met1\"), 2, 1., 0.);\n\
+             }",
+        );
+        let moved = errors
+            .iter()
+            .filter_map(|error| match error {
+                StaticErrorKind::MovedItem { name, path } => Some((name.as_str(), path.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            moved,
+            [
+                ("std::center_rects", "std::layout::center_rects"),
+                ("std::array", "std::layout::array"),
+            ],
+            "{errors:?}"
+        );
+
+        let data = compile_top(
+            "use std::layout::{array, rect};\n\
+             cell top() {\n\
+                 let via = rect(\"met1\", x0=0., y0=0., x1=2., y1=2.);\n\
+                 let row = array(via, 3, 4., 0.);\n\
+                 eq(row.x0, 0.);\n\
+                 eq(row.y0, 0.);\n\
+                 let met2 = rect(\"met2\", x0=1., y0=0., x1=20., y1=2.);\n\
+                 let bounds = std::layout::intersection(row, met2);\n\
+                 eq(bounds.x1, std::min(10., 30.));\n\
+             }",
+        );
+        assert!(rect_count(&data) >= 4);
+    }
+
+    /// A `use` may not bind a name that a call resolves as a builtin first.
+    #[test]
+    fn a_use_may_not_bind_a_builtin_name() {
+        for source in [
+            "use lib::eq;\ncell top() {}",
+            "use std::layout::rect as head;\ncell top() {}",
+            "use std::layout::{crect, rect as float};\ncell top() {}",
+        ] {
+            let errors = static_errors_of(source);
+            assert!(
+                matches!(errors.as_slice(), [StaticErrorKind::RedeclarationOfBuiltin]),
+                "{source}: {errors:?}"
+            );
+        }
+    }
+
+    /// The names of natives are free for user items, which do not disturb a
+    /// native imported under another name.
+    #[test]
+    fn user_items_may_share_a_native_name() {
+        let data = compile_top(
+            "use std::layout::rect as shape;\n\
+             fn rect(w: Float) -> Float { w * 2. }\n\
+             cell inst() {\n\
+                 pub let s = shape(\"met1\", x0=0., y0=0., x1=rect(5.), y1=1.);\n\
+             }\n\
+             cell top() {\n\
+                 let i = std::layout::inst(inst(), x=0., y=0.);\n\
+                 eq(i.s.x1, 10.);\n\
+             }",
+        );
+        let child = data
+            .cells
+            .values()
+            .find(|cell| cell.name == "inst")
+            .expect("the cell named `inst` is compiled");
+        let rect = child
+            .objects
+            .values()
+            .find_map(|object| match object {
+                SolvedValue::Rect(rect) => Some(rect),
+                _ => None,
+            })
+            .expect("the child draws a rect");
+        assert_relative_eq!(rect.x1.0, 10., epsilon = EPSILON);
+    }
+
+    /// A native may only be called: not read as a value, named as a type,
+    /// or given type arguments.
+    #[test]
+    fn natives_may_only_be_called() {
+        let errors = static_errors_of(
+            "use std::layout::rect;\n\
+             cell top() {\n\
+                 let f = rect;\n\
+                 let g = std::layout::bbox;\n\
+             }",
+        );
+        let names = errors
+            .iter()
+            .filter_map(|error| match error {
+                StaticErrorKind::NativeNotCallable { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["rect", "bbox"], "{errors:?}");
+        assert_eq!(
+            StaticErrorKind::NativeNotCallable {
+                name: "rect".to_owned()
+            }
+            .to_string(),
+            "`rect` can only be called"
+        );
+
+        let errors = static_errors_of("use std::layout::rect;\nfn f(x: rect) {}");
+        assert!(
+            !errors.is_empty()
+                && errors
+                    .iter()
+                    .all(|error| matches!(error, StaticErrorKind::UnknownType)),
+            "{errors:?}"
+        );
+        let errors = static_errors_of(
+            "use std::layout::rect;\ncell top() { let r = rect::<Int>(\"met1\"); }",
+        );
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [StaticErrorKind::TypeArgArity {
+                    expected: 0,
+                    found: 1,
+                    ..
+                }]
+            ),
+            "{errors:?}"
+        );
+    }
+
+    /// The `std` root is typed before its submodules, so it may not refer to
+    /// them; the submodules may refer to the root.
+    #[test]
+    fn the_std_root_stands_alone() {
+        let root = parse_source_text("cell top() {}", PathBuf::from("/virtual/lib.ar")).unwrap();
+        let std = parse_source_text(
+            crate::parse::STD_SOURCE,
+            PathBuf::from(crate::parse::STD_PATH),
+        )
+        .unwrap();
+        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let (_, output) = static_compile(&ast).unwrap();
+        assert!(output.errors.is_empty(), "{:?}", output.errors);
+        let errors = static_errors_of("cell top() {}");
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
     fn compile_top(source: &str) -> CompiledData {
         let (_dir, output) = scratch_workspace("layout", source);
         assert!(
@@ -5485,7 +5765,8 @@ cell top() {
         // field-access expression, so the multiplicity grew with coding style
         // rather than with the design.
         let data = compile_top(
-            "cell bot() {
+            "use std::layout::{inst, path, polygon, rect};
+             cell bot() {
                  pub let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);
                  pub let p = polygon(\"met2\", 3, x0=0., y0=0., x1=10., y1=0., x2=5., y2=10.);
                  pub let q = path(\"met3\", 2, width=10., begin_extension=0., end_extension=0.,
@@ -5522,7 +5803,8 @@ cell top() {
         // proxy of its geometry appeared in the parent with no corresponding
         // struct anywhere in the file.
         let data = compile_top(
-            "cell bot() { pub let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=50.); }
+            "use std::layout::{inst, rect};
+             cell bot() { pub let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=50.); }
              cell top() {
                  let i = inst(bot(), x=1000., y=0., construction=true);
                  let r = rect(\"met2\", x0=i.m.x0, y0=0., x1=i.m.x1, y1=1.);
@@ -5540,7 +5822,8 @@ cell top() {
         // from the resolved emission list rather than where the proxy is
         // constructed.
         let data = compile_top(
-            "fn second(lst: [Any]) -> Any { head(tail(lst)) }
+            "use std::layout::{inst, rect};
+             fn second(lst: [Any]) -> Any { head(tail(lst)) }
              cell bot() {
                  pub let m = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.);
                  pub let n = rect(\"met1\", x0=200., y0=0., x1=300., y1=100.);
@@ -5572,7 +5855,8 @@ cell top() {
         // `2147483647` in the GDS -- collapsing both edges of this rect onto
         // one point -- while the run still reported success.
         let errors = run_source(
-            "cell top() { let a = rect(\"met1\", x0=3000000000., y0=0., x1=4000000000., y1=10.); }",
+            "use std::layout::rect;\n\
+             cell top() { let a = rect(\"met1\", x0=3000000000., y0=0., x1=4000000000., y1=10.); }",
         );
         assert_reports(&errors, |error| {
             matches!(error, ExecErrorKind::CoordinateOutOfRange { .. })
@@ -5586,7 +5870,8 @@ cell top() {
         // solver's grid check only looks at variables. The label used to be
         // snapped silently on export.
         let errors = run_source(
-            "cell top() {
+            "use std::layout::{rect, text};
+             cell top() {
                  let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
                  text(\"t\", \"met1\", 0.04, 0.06);
              }",
@@ -5596,7 +5881,8 @@ cell top() {
         });
         assert!(
             run_source(
-                "cell top() {
+                "use std::layout::{rect, text};
+                 cell top() {
                      let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
                      text(\"t\", \"met1\", 0.1, 5.);
                  }"
@@ -5612,7 +5898,8 @@ cell top() {
         // them; the bare "invalid rounding" text gave an author no way to tell
         // floating-point noise from an unrepresentable layout.
         let errors = run_source(
-            "cell top() {
+            "use std::layout::rect;
+             cell top() {
                  let a = rect(\"met1\", y0=0., y1=10., x0=0.);
                  let b = rect(\"met2\", y0=0., y1=10., x0=0.);
                  eq(a.x1 + b.x1, 1.);
@@ -5641,7 +5928,8 @@ cell top() {
         // The width was silently absolutized and the extensions passed
         // straight through as a negative BGNEXTN/ENDEXTN.
         let errors = run_source(
-            "cell top() {
+            "use std::layout::path;
+             cell top() {
                  let p = path(\"met1\", 2, width=-10., begin_extension=0., end_extension=0.,
                               x0=0., y0=0., x1=100., y1=0.);
              }",
@@ -5650,7 +5938,8 @@ cell top() {
             matches!(error, ExecErrorKind::NegativePathWidth(_))
         });
         let errors = run_source(
-            "cell top() {
+            "use std::layout::path;
+             cell top() {
                  let p = path(\"met1\", 2, width=10., begin_extension=-5., end_extension=-5.,
                               x0=0., y0=0., x1=100., y1=0.);
              }",
@@ -5670,7 +5959,8 @@ cell top() {
         // A GDS STRING record is a byte string with no encoding negotiation,
         // and its length limit is counted in bytes, not characters.
         let errors = run_source(
-            "cell top() {
+            "use std::layout::{rect, text};
+             cell top() {
                  let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
                  text(\"héllo\", \"met1\", 0., 5.);
              }",
@@ -5680,7 +5970,8 @@ cell top() {
         });
         let long = "a".repeat(MAX_TEXT_LEN + 1);
         let errors = run_source(&format!(
-            "cell top() {{
+            "use std::layout::{{rect, text}};
+             cell top() {{
                  let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);
                  text(\"{long}\", \"met1\", 0., 5.);
              }}"
@@ -5695,7 +5986,8 @@ cell top() {
         // `range_full`'s loop was guarded by `if step > 0` with no `else`, so
         // the natural descending range silently produced an empty sequence.
         let data = compile_top(
-            "cell top() {
+            "use std::layout::rect;
+             cell top() {
                  for i in range_full(3, 0, -1) {
                      rect(\"met1\", x0=(i as Float) * 10., y0=0., x1=(i as Float) * 10. + 5., y1=5.);
                  }
@@ -5759,7 +6051,8 @@ cell top() {
         // `... = 40.` and reported `inconsistent constraint` on a system that
         // is satisfiable at 20 per path.
         let data = compile_top(
-            "cell top() {
+            "use std::layout::path;
+             cell top() {
                  let p = path(\"met1\", 2, width=1., x0=0., y0=0., x1=10., y1=0.);
                  let q = path(\"met1\", 2, width=1., x0=0., y0=5., x1=10., y1=5.);
                  eq(p.begin_extension + p.end_extension
@@ -5787,7 +6080,8 @@ cell top() {
         // never fired it never reached `fallback_constraints_used`, which is
         // what the GUI writes a drag back to source through.
         let data = compile_top_underconstrained(
-            "cell top() {
+            "use std::layout::{path, rect};
+             cell top() {
                  let p = path(\"met1\", 2, width=1., x0=0., y0=0., x1=10., y1=0.);
                  let r = rect(\"met1\", x0i=5., y0=0., x1=10., y1=10.);
                  eq(p.begin_extension, r.x0);
@@ -5814,7 +6108,8 @@ cell top() {
         // not open", blanking the GUI canvas over a single typo.
         let (_dir, output) = scratch_workspace(
             "run",
-            "cell top() {
+            "use std::layout::{crect, rect};
+             cell top() {
                  let c = crect(x0=0., y0=0., x1=10., y1=10.);
                  let r = rect(c.layer, x0=0., y0=0., x1=10., y1=10.)!;
                  let bad = rect(\"no_such_layer\", x0=0., y0=0., x1=1., y1=1.)!;
@@ -5859,7 +6154,8 @@ cell top() {
         // of them would be noise about a mistake the author has already been
         // told about.
         let errors = run_source(
-            "cell top() {
+            "use std::layout::{crect, rect};
+             cell top() {
                  let c = crect(x0=0., y0=0., x1=10., y1=10.);
                  let l = c.layer;
                  let r1 = rect(l, x0=0., y0=0., x1=1., y1=1.)!;
@@ -5948,7 +6244,9 @@ cell top() {
             (format!("true || {emits}"), 0),
             (format!("false || {emits}"), 1),
         ] {
-            let data = compile_top(&format!("cell top() {{ let a = {cond}; }}"));
+            let data = compile_top(&format!(
+                "use std::layout::rect;\ncell top() {{ let a = {cond}; }}"
+            ));
             assert_eq!(
                 layout_objects(&data, data.top).len(),
                 drawn,
@@ -6122,7 +6420,7 @@ cell top() {
             |e| matches!(e, StaticErrorKind::CannotEmit(ty) if ty == "T"),
         );
         rejects(
-            "{ inst(v); v }",
+            "{ std::layout::inst(v); v }",
             |e| matches!(e, StaticErrorKind::IncorrectTyCategory { found, .. } if found == "T"),
         );
         rejects(
@@ -6487,7 +6785,8 @@ cell top() {
         // `top` reads the fields of `pad` before `pad` is declared, so the
         // pattern's statement is typed on demand.
         let data = compile_source(
-            "struct Pad { r: Rect, via: Rect }
+            "use std::layout::{inst, rect};
+             struct Pad { r: Rect, via: Rect }
              cell top() {
                  let p = inst(pad(), x=0., y=0.);
                  let r = rect(\"met2\", x0=0., y0=0., w=p.shape.w, h=p.via.h);
@@ -6512,7 +6811,8 @@ cell top() {
         // A value typed `Any` reaches the pattern unchecked.
         for body in ["let S { a } = v; a", "match v { S { a } => a, }"] {
             let errors = run_source(&format!(
-                "struct S {{ a: Float }}
+                "use std::layout::rect;
+                 struct S {{ a: Float }}
                  struct T {{ a: Float }}
                  fn f(v: Any) -> Float {{ {body} }}
                  cell top() {{
@@ -6737,7 +7037,8 @@ cell top() {
     fn sequence_literals_evaluate_their_elements_in_order() {
         for literal in ["[100., 200., 300.]", "[100., 200., 300.,]"] {
             let data = compile_top(&format!(
-                "cell top() {{
+                "use std::layout::rect;
+                 cell top() {{
                      let ws = {literal};
                      let r = rect(\"met1\", x0=ws[0], y0=0., y1=ws[1], x1=ws[2]);
                  }}"
@@ -6751,7 +7052,8 @@ cell top() {
 
         // Elements are arbitrary expressions, evaluated where they are written.
         let data = compile_top(
-            "fn twice(x: Float) -> Float { 2. * x }
+            "use std::layout::rect;
+             fn twice(x: Float) -> Float { 2. * x }
              cell top() {
                  let ws = [twice(50.), 40. + 60., [7., 300.][1]];
                  let r = rect(\"met1\", x0=0., y0=0., x1=ws[0] + ws[1], y1=ws[2]);
@@ -6768,7 +7070,8 @@ cell top() {
     #[test]
     fn sequence_literals_hold_rects_nest_and_iterate() {
         let data = compile_top(
-            "cell top() {
+            "use std::layout::rect;
+             cell top() {
                  let a = rect(\"met1\", x0=0., y0=0., w=10., h=10.);
                  let b = rect(\"met1\", x0=20., y0=0., w=30., h=10.);
                  let rects = [a, b];
@@ -6814,7 +7117,8 @@ cell top() {
     #[test]
     fn generic_sequence_functions_run_on_rects() {
         let data = compile_top(
-            "cell top() {
+            "use std::layout::rect;
+             cell top() {
                  let a = rect(\"met1\", x0=0., y0=0., w=10., h=10.);
                  let b = rect(\"met1\", x0=20., y0=0., w=30., h=10.);
                  let rects = cons(a, cons(b, []));
@@ -6837,7 +7141,8 @@ cell top() {
     #[test]
     fn option_cell_arguments_distinguish_cells() {
         let data = compile_top(
-            "cell via(n: Option<Int>) {
+            "use std::layout::{inst, rect};
+             cell via(n: Option<Int>) {
                  let count = std::unwrap_or(n, 1);
                  let r = rect(\"met1\", x0=0., y0=0., w=10. * (count as Float), h=10.);
              }
@@ -6857,7 +7162,8 @@ cell top() {
     #[test]
     fn enum_payloads_are_matched_and_compared_at_run_time() {
         let data = compile_top(
-            "enum Shape { Circle(Float), Box(Float, Float), Empty, }
+            "use std::layout::rect;
+             enum Shape { Circle(Float), Box(Float, Float), Empty, }
              fn width(s: Shape) -> Float {
                  match s { Shape::Circle(r) => 2. * r, Shape::Box(w, _) => w, Shape::Empty => 0., }
              }
@@ -6877,7 +7183,8 @@ cell top() {
     #[test]
     fn struct_variant_payloads_are_matched_and_compared_at_run_time() {
         let data = compile_top(
-            "enum Shape { Circle { r: Float }, Box { w: Float, h: Float }, Empty, }
+            "use std::layout::rect;
+             enum Shape { Circle { r: Float }, Box { w: Float, h: Float }, Empty, }
              enum Tag { Named { n: Int }, Bare, }
              fn width(s: Shape) -> Float {
                  match s {
@@ -6907,7 +7214,8 @@ cell top() {
     #[test]
     fn struct_variant_cell_arguments_keep_declaration_order() {
         let data = compile_top(
-            "enum Shape { Box { w: Float, h: Float }, }
+            "use std::layout::{inst, rect};
+             enum Shape { Box { w: Float, h: Float }, }
              cell shape(s: Shape) {
                  let r = rect(\"met1\", x0=0., y0=0., w=match s { Shape::Box { w, .. } => w, }, h=10.);
              }

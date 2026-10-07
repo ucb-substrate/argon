@@ -42,7 +42,7 @@ directory name is also the URL prefix.
 | Directory | Sidebar | Contents |
 | --- | --- | --- |
 | `docs/guides/` | Guides | `index.md` lists the guides; each guide is a subdirectory, currently only `getting-started/` |
-| `docs/language/` | Language | Language chapters, then `builtins/`, `std.mdx`, and `types/` for the reference |
+| `docs/language/` | Language | Language chapters, then `builtins/`, `std.mdx`, `std-layout.mdx`, and `types/` for the reference |
 | `docs/gui/` | GUI | The visual editor |
 | `docs/tools/` | Tools | `arc`, `argone`, `argonc`, and the Neovim plugin |
 
