@@ -7521,6 +7521,7 @@ cell inv(pw: Float, nw: Float, nf: Int) {
                  let b = Signal();\n\
                  device(DeviceKind::Res, [a, b], \"\", value=1., ok=1, fine=\"x\", bad=true);\n\
                  device(DeviceKind::Res, [a, b], \"\", value=1., value=2.);\n\
+                 device(DeviceKind::Res, [a, b], \"\", w=1., W=2.);\n\
                  device(DeviceKind::Res, [a, b], 3);\n\
              }",
         );
@@ -7529,6 +7530,7 @@ cell inv(pw: Float, nw: Float, nf: Int) {
                 errors.as_slice(),
                 [
                     StaticErrorKind::InvalidDeviceParamType { name, found },
+                    StaticErrorKind::DuplicateKwArg,
                     StaticErrorKind::DuplicateKwArg,
                     StaticErrorKind::IncorrectTy { .. },
                 ] if name == "bad" && found == "Bool"
@@ -8016,6 +8018,7 @@ cell inv(pw: Float, nw: Float, nf: Int) {
         for valid in [
             "device(DeviceKind::Mos, [t[0], t[1], t[2], t[3]], \"nch\", w=1.)",
             "device(DeviceKind::Res, [t[0], t[1]], \"\", value=1000.)",
+            "device(DeviceKind::Res, [t[0], t[1]], \"\", VALUE=1000.)",
             "device(DeviceKind::Res, [t[0], t[1]], \"rpoly\", w=1.)",
             "device(DeviceKind::Cap, [t[0], t[1]], \"\", value=1)",
             "device(DeviceKind::Cap, [t[0], t[1]], \"cmim\", value=\"1p\")",
@@ -8041,6 +8044,11 @@ cell inv(pw: Float, nw: Float, nf: Int) {
             ),
             (
                 "device(DeviceKind::Mos, [t[0], t[1], t[2], t[3]], \"nch\", value=1.)",
+                "Mos",
+                "does not take a `value`",
+            ),
+            (
+                "device(DeviceKind::Mos, [t[0], t[1], t[2], t[3]], \"nch\", Value=1.)",
                 "Mos",
                 "does not take a `value`",
             ),

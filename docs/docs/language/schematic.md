@@ -128,7 +128,7 @@ Names are unique within a cell, compared without regard to case. A repeated name
 | `Bjt` | `Q` | 3 or 4 (c, b, e, and an optional substrate) | Required | Not allowed |
 | `Subckt` | `X` | 1 or more | Required | Not allowed |
 
-A resistor or capacitor needs a model, a `value`, or both. The model is a name without whitespace; `""` means no model. Every keyword argument is a device parameter, which must be a `Float`, `Int`, or `String`. A `Float` parameter may depend on constraints, and the device waits until it is solved.
+A resistor or capacitor needs a model, a `value`, or both. The model is a name without whitespace; `""` means no model. Every keyword argument is a device parameter, which must be a `Float`, `Int`, or `String`. Netlists ignore case, so two parameters may not differ only in case, and `VALUE` is the same as `value`. A `Float` parameter may depend on constraints, and the device waits until it is solved.
 
 ```argon
 device(DeviceKind::Res, [a, b], "", value=1000.);

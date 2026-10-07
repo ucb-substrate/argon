@@ -62,8 +62,8 @@ connect(out, nmos.d);
   {name: 'kind', type: 'DeviceKind', typeHref: '#devicekind', requirement: 'Required, positional', description: 'The kind of device, which decides its terminals and whether it needs a model.'},
   {name: 'terminals', type: '[Signal]', typeHref: '#signal', requirement: 'Required, positional', description: 'The signals the device connects to, in the order its kind expects.'},
   {name: 'model', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: 'The model name, without whitespace, or "" for none.'},
-  {name: 'value', type: 'Float | Int | String', requirement: 'Optional keyword', description: 'The value of a Res or Cap device. Other kinds do not take it.'},
-  {name: '<name>', type: 'Float | Int | String', requirement: 'Optional keyword', description: 'A device parameter, kept in the order written. A Float must be solved to a finite number.'},
+  {name: 'value', type: 'Float | Int | String', requirement: 'Optional keyword', description: 'The value of a Res or Cap device, in any case (VALUE also works). Other kinds do not take it.'},
+  {name: '<name>', type: 'Float | Int | String', requirement: 'Optional keyword', description: 'A device parameter, kept in the order written. Names must differ other than in case. A Float must be solved to a finite number.'},
 ]} />
 
 <Returns type="()">Nothing; the device is added to the cell.</Returns>

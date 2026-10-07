@@ -4569,12 +4569,13 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     /// Checks the keyword arguments of `device`, which are the device's
-    /// parameters: any names, each a `Float`, `Int`, or `String`.
+    /// parameters: any names, distinct regardless of case as in a netlist,
+    /// each a `Float`, `Int`, or `String`.
     fn typecheck_device_params(&mut self, kwargs: &[KwArgValue<Substr, VarIdTyMetadata>]) {
         let mut seen = IndexSet::new();
         for kwarg in kwargs {
             let name = kwarg.name.name.as_str();
-            if !seen.insert(name) {
+            if !seen.insert(name.to_ascii_lowercase()) {
                 self.errors.push(StaticError {
                     span: self.span(kwarg.name.span),
                     kind: StaticErrorKind::DuplicateKwArg,
@@ -10470,7 +10471,7 @@ impl<'a> ExecPass<'a> {
                     );
                 }
             };
-            if name == "value" {
+            if name.eq_ignore_ascii_case("value") {
                 value = Some(param);
             } else {
                 params.push((name, param));
