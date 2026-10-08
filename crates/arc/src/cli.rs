@@ -73,6 +73,10 @@ struct RunArgs {
     /// Also write target/argon.gds.
     #[arg(long)]
     gds: bool,
+    /// Write only target/argon.gds: no binary compiler output, and none of the
+    /// debug information the editor reads, which uses much less memory.
+    #[arg(long, conflicts_with_all = ["output", "gds"])]
+    gds_only: bool,
 }
 
 #[derive(Debug, Args)]
@@ -180,21 +184,22 @@ fn run_cell(args: RunArgs) -> Result<()> {
         )
     })?;
     status("Running", &format!("{} in {}", args.cell, library.name));
-    let output = args
-        .output
-        .unwrap_or_else(|| library.target_path("argon.bin"));
     let mut command = compiler_command(&args.library.argonc, &library);
-    command
-        .arg("--cell")
-        .arg(args.cell)
-        .arg("--tech")
-        .arg(tech)
-        .arg("--output")
-        .arg(&output);
-    if args.gds {
+    command.arg("--cell").arg(args.cell).arg("--tech").arg(tech);
+    let output = if args.gds_only {
         let gds = library.target_path("argon.gds");
-        command.arg("--gds").arg(gds);
-    }
+        command.arg("--gds").arg(&gds).arg("--gds-only");
+        gds
+    } else {
+        let output = args
+            .output
+            .unwrap_or_else(|| library.target_path("argon.bin"));
+        command.arg("--output").arg(&output);
+        if args.gds {
+            command.arg("--gds").arg(library.target_path("argon.gds"));
+        }
+        output
+    };
     run_compiler(command)?;
     status("Finished", &format!("output: {}", output.display()));
     Ok(())

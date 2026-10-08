@@ -5,7 +5,7 @@ description: Index of the functions and types available to Argon source.
 
 # Built-in functions
 
-Built-in functions are provided by the compiler and need no module prefix. Their names are reserved: no declaration may reuse one. They fall into five groups:
+Built-in functions are provided by the compiler and need no module prefix. Their names are reserved: no declaration may reuse one. They fall into six groups:
 
 | Page | Functions |
 | --- | --- |
@@ -14,6 +14,7 @@ Built-in functions are provided by the compiler and need no module prefix. Their
 | [Hierarchy](/language/builtins/hierarchy) | `inst`, `bbox` |
 | [Collections](/language/builtins/collections) | `list`, `cons`, `head`, `tail`, `range_full`, `seq_len`, `seq_concat`, `seq_flatten`, `seq_sum`, `seq_any`, `seq_all` |
 | [Math](/language/builtins/math) | `max_float`, `min_float`, `max_int`, `min_int` |
+| [Vias](/language/builtins/vias) | `max_via_array` |
 
 Functions written in Argon itself live under `std::`; see the [standard library](/language/std).
 

@@ -1,0 +1,37 @@
+---
+title: Via built-ins
+description: Choosing the largest via array between two shapes.
+sidebar_label: Vias
+---
+
+import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReference';
+
+# Via built-ins
+
+## `max_via_array`
+
+<ApiItem id="max-via-array" name="max_via_array" signature={'max_via_array(size: Float, space: Float, bot_enc: (Float, Float), top_enc: (Float, Float), bot: Rect, top: Rect, bot_ext_dir: Int, top_ext_dir: Int, longer: Bool, later_wins_ties: Bool) -> (Int, Int, Float, Float, Float, Float, Int, Float)'} summary={<>Chooses the via array with the most cuts that fits where two shapes overlap.</>}>
+
+<ParameterTable rows={[
+  {name: 'size', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required, positional', description: 'Width of a square cut.'},
+  {name: 'space', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required, positional', description: 'Spacing between cuts.'},
+  {name: 'bot_enc', type: '(Float, Float)', typeHref: '/language/types/collections#tuples', requirement: 'Required, positional', description: 'Enclosure of the cuts by the bottom shape, as (short side, long side).'},
+  {name: 'top_enc', type: '(Float, Float)', typeHref: '/language/types/collections#tuples', requirement: 'Required, positional', description: 'Enclosure of the cuts by the top shape, as (short side, long side).'},
+  {name: 'bot', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required, positional', description: 'The bottom shape.'},
+  {name: 'top', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required, positional', description: 'The top shape.'},
+  {name: 'bot_ext_dir', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required, positional', description: 'Direction of the bottom enclosure\'s long side: 0 for either, 1 for horizontal, 2 for vertical.'},
+  {name: 'top_ext_dir', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required, positional', description: 'Direction of the top enclosure\'s long side, as for bot_ext_dir.'},
+  {name: 'longer', type: 'Bool', typeHref: '/language/types/scalars#bool', requirement: 'Required, positional', description: 'When a shape is too narrow for a cut, still place a row of cuts along its length rather than a single cut.'},
+  {name: 'later_wins_ties', type: 'Bool', typeHref: '/language/types/scalars#bool', requirement: 'Required, positional', description: 'Prefer the later enclosure orientation when two leave the same area outside the shapes.'},
+]} />
+
+<Returns type="(Int, Int, Float, Float, Float, Float, Int, Float)" href="/language/types/collections#tuples">Cuts in x and y; the bottom enclosure in x and y; the top enclosure in x and y; the total number of cuts; and the enclosure area that falls outside the shapes.</Returns>
+
+It tries the four orientations of the two enclosures and keeps the one with the most cuts, then the least enclosure area outside the shapes. The array is centered on the shapes' overlap, or on `bot` if they do not overlap. Like a comparison, it waits until the solver has fixed both shapes and compares values snapped to the manufacturing grid.
+
+```argon
+let choice = max_via_array(170., 170., (0., 80.,), (30., 60.,), active, li, 0, 0, false, false);
+let cuts = choice.6;
+```
+
+</ApiItem>

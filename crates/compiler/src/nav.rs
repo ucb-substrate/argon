@@ -833,6 +833,22 @@ fn builtin_signature(name: &str) -> Option<SignatureInfo> {
             &["a: Float", "b: Float"],
             &[],
         ),
+        "max_via_array" => signature(
+            "fn max_via_array(size: Float, space: Float, bot_enc: (Float, Float), top_enc: (Float, Float), bot: Rect, top: Rect, bot_ext_dir: Int, top_ext_dir: Int, longer: Bool, later_wins_ties: Bool) -> (Int, Int, Float, Float, Float, Float, Int, Float)",
+            &[
+                "size: Float",
+                "space: Float",
+                "bot_enc: (Float, Float)",
+                "top_enc: (Float, Float)",
+                "bot: Rect",
+                "top: Rect",
+                "bot_ext_dir: Int",
+                "top_ext_dir: Int",
+                "longer: Bool",
+                "later_wins_ties: Bool",
+            ],
+            &[],
+        ),
         "max_int" => signature(
             "fn max_int(a: Int, b: Int) -> Int",
             &["a: Int", "b: Int"],

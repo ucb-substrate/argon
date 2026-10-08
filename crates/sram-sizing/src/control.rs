@@ -229,8 +229,10 @@ impl LogicPath {
     }
 
     /// Gradient descent with backtracking: a step that increases the delay is
-    /// undone and retried at half the size.
-    fn size(&mut self, opts: OptimizerOpts) {
+    /// undone and retried at half the size. With `early_exit`, it stops at the
+    /// first accepted step that leaves every value unchanged, which gives the
+    /// same result as running all `max_iter` steps.
+    fn size(&mut self, opts: OptimizerOpts, early_exit: bool) {
         let n = self.values.len();
         let mut lr = opts.lr;
         let mut base = vec![0.0; n];
@@ -242,22 +244,32 @@ impl LogicPath {
         while iter < opts.max_iter {
             grad.fill(0.0);
             let delay = self.delay_grad(&mut grad);
-            if delay > base_delay * (1.0 + 1e-9) {
-                step *= 0.5;
-                if step == 0.0 {
-                    self.values.copy_from_slice(&base);
-                    return;
-                }
-            } else {
+            let accepted = delay <= base_delay * (1.0 + 1e-9);
+            if accepted {
                 base_delay = delay;
                 base.copy_from_slice(&self.values);
                 base_grad.copy_from_slice(&grad);
                 step = lr;
                 lr *= opts.lr_decay;
                 iter += 1;
+            } else {
+                step *= 0.5;
+                if step == 0.0 {
+                    self.values.copy_from_slice(&base);
+                    return;
+                }
             }
+            let mut moved = false;
             for i in 0..n {
-                self.values[i] = f64::max(base[i] - step * base_grad[i], 1.0);
+                let next = f64::max(base[i] - step * base_grad[i], 1.0);
+                moved |= next.to_bits() != base[i].to_bits();
+                self.values[i] = next;
+            }
+            // Every later step starts from these same values, so it has the
+            // same gradient and is accepted, and its step size is no larger, so
+            // rounding returns each value to the same bits again.
+            if early_exit && accepted && !moved {
+                break;
             }
         }
         if self.delay() > base_delay * (1.0 + 1e-9) {
@@ -272,29 +284,48 @@ fn size_chain(models: &[GateModel], branch: &[f64], load: f64, opts: OptimizerOp
     // Each problem takes tens of millions of descent steps; sizing many
     // organizations in one process repeats many of them.
     static SOLVED: OnceLock<Mutex<HashMap<Vec<u64>, Vec<f64>>>> = OnceLock::new();
-    let key = models
+    let key = chain_key(models, branch, load, opts);
+    #[cfg(test)]
+    tests::ASKED
+        .with_borrow_mut(|asked| asked.push((models.to_vec(), branch.to_vec(), load, opts)));
+    let solved = SOLVED.get_or_init(Default::default);
+    if let Some(sizes) = solved.lock().unwrap().get(&key) {
+        return sizes.clone();
+    }
+    let sizes = solve_chain(models, branch, load, opts, true);
+    solved.lock().unwrap().insert(key, sizes.clone());
+    sizes
+}
+
+/// Identifies a sizing problem by the bits of everything that determines its
+/// solution.
+fn chain_key(models: &[GateModel], branch: &[f64], load: f64, opts: OptimizerOpts) -> Vec<u64> {
+    models
         .iter()
         .flat_map(|m| [m.res, m.cin, m.cout])
         .chain(branch.iter().copied())
         .chain([load, opts.lr, opts.lr_decay, opts.max_iter as f64])
         .map(f64::to_bits)
-        .collect::<Vec<_>>();
-    let solved = SOLVED.get_or_init(Default::default);
-    if let Some(sizes) = solved.lock().unwrap().get(&key) {
-        return sizes.clone();
-    }
+        .collect()
+}
+
+fn solve_chain(
+    models: &[GateModel],
+    branch: &[f64],
+    load: f64,
+    opts: OptimizerOpts,
+    early_exit: bool,
+) -> Vec<f64> {
     let mut path = LogicPath {
         models: models.to_vec(),
         branch: branch.iter().map(|&b| (b > 0.0).then_some(b)).collect(),
         load,
         values: vec![2.0; models.len() - 1],
     };
-    path.size(opts);
-    let sizes = std::iter::once(1.0)
+    path.size(opts, early_exit);
+    std::iter::once(1.0)
         .chain((0..path.values.len()).map(|v| path.value(v)))
-        .collect::<Vec<_>>();
-    solved.lock().unwrap().insert(key, sizes.clone());
-    sizes
+        .collect()
 }
 
 /// Gates of one decoder tree node, listed from input to output.
@@ -795,4 +826,41 @@ pub fn periphery_sizing(p: SramParams, col: &ColParams) -> Option<PeripherySizin
         write_driver_en_buffer: buffer(WE_CAP * wmask_bits as f64),
         wlen_buffer: buffer(NAND2_MODEL.cin * (addr_width * 2) as f64),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+
+    use super::*;
+
+    type Problem = (Vec<GateModel>, Vec<f64>, f64, OptimizerOpts);
+
+    thread_local! {
+        /// The chains `size_chain` is asked to size on this thread.
+        pub(super) static ASKED: RefCell<Vec<Problem>> = const { RefCell::new(Vec::new()) };
+    }
+
+    #[test]
+    fn early_exit_matches_the_full_descent() {
+        for (granularity, mux_ratio, num_words, data_width) in [(8, 4, 64, 24), (8, 8, 2048, 64)] {
+            SramParams::new(granularity, mux_ratio, num_words, data_width)
+                .unwrap()
+                .size();
+        }
+        let bits = |sizes: Vec<f64>| sizes.into_iter().map(f64::to_bits).collect::<Vec<_>>();
+        let mut seen = HashSet::new();
+        for (models, branch, load, opts) in ASKED.take() {
+            if !seen.insert(chain_key(&models, &branch, load, opts)) {
+                continue;
+            }
+            assert_eq!(
+                bits(solve_chain(&models, &branch, load, opts, true)),
+                bits(solve_chain(&models, &branch, load, opts, false)),
+                "{models:?} {branch:?} {load}"
+            );
+        }
+        assert!(seen.len() >= 5, "only {} chains sized", seen.len());
+    }
 }

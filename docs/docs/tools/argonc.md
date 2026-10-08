@@ -22,9 +22,11 @@ argonc <ROOT> (--check | --cell <EXPR>) [OPTIONS]
 | `--gds-import <NAME=PATH>` | Repeatable | Import a GDS cell. `NAME` may be a module path. |
 | `-o, --output <PATH>` | Beside `lib.ar` | Where to write the compiled layout. |
 | `--gds <PATH>` | None | Also write GDS to this path. |
+| `--gds-only` | Off | Write only the GDS given by `--gds`. Skips the compiled layout and the debugging information only the editor reads, so it uses much less memory. Can't be combined with `--output`. |
 | `--error-format` | `human` | `human` or `json`. |
 
 ```bash
 argonc . --check
 argonc . --cell 'top()' --tech tech.toml -o target/top.bin --gds target/top.gds
+argonc . --cell 'top()' --tech tech.toml --gds target/top.gds --gds-only
 ```
