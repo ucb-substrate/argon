@@ -749,6 +749,13 @@ pub(crate) struct Namer {
 }
 
 impl Namer {
+    /// A namer that never hands out any of `reserved`.
+    pub(crate) fn with_reserved<'a>(reserved: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            taken: reserved.into_iter().map(str::to_ascii_lowercase).collect(),
+        }
+    }
+
     /// `name`, or the first free name with a numeric suffix, which is then
     /// taken.
     pub(crate) fn claim(&mut self, name: &str) -> String {

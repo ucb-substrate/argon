@@ -22,9 +22,15 @@ argonc <ROOT> (--check | --cell <EXPR>) [OPTIONS]
 | `--gds-import <NAME=PATH>` | Repeatable | Import a GDS cell. `NAME` may be a module path. |
 | `-o, --output <PATH>` | Beside `lib.ar` | Where to write the compiled layout. |
 | `--gds <PATH>` | None | Also write GDS to this path. |
+| `--spice <PATH>` | None | Also write a SPICE netlist to this path. Requires `--cell`. |
+| `--spectre <PATH>` | None | Also write a Spectre netlist to this path. Requires `--cell`. |
+| `--netlist-width <COLS>` | `80` | Break netlist lines longer than this many characters; `0` turns wrapping off. Requires `--spice` or `--spectre`. |
 | `--error-format` | `human` | `human` or `json`. |
 
 ```bash
 argonc . --check
 argonc . --cell 'top()' --tech tech.toml -o target/top.bin --gds target/top.gds
+argonc . --cell 'inv(2., 1., 2)' --tech tech.toml --spice target/inv.spice --spectre target/inv.scs
 ```
+
+Netlists are described in [Schematics](/language/schematic#netlists).
