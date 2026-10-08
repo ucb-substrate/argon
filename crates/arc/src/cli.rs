@@ -8,7 +8,7 @@ use std::{
 use crate::{Library, create_workspace, doc, find_manifest_path, format_workspace};
 use anyhow::{Context, Result, anyhow, bail};
 use argonc::diagnostics::{self, Diagnostic};
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "The Argon library manager")]
@@ -61,6 +61,7 @@ struct LibraryArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(group(ArgGroup::new("netlist").args(["spice", "spectre"]).multiple(true)))]
 struct RunArgs {
     #[command(flatten)]
     library: LibraryArgs,
@@ -73,6 +74,15 @@ struct RunArgs {
     /// Also write target/argon.gds.
     #[arg(long)]
     gds: bool,
+    /// Also write a SPICE netlist to target/argon.spice.
+    #[arg(long)]
+    spice: bool,
+    /// Also write a Spectre netlist to target/argon.scs.
+    #[arg(long)]
+    spectre: bool,
+    /// Wrap netlist lines longer than this many columns; 0 disables wrapping.
+    #[arg(long, value_name = "COLS", requires = "netlist")]
+    netlist_width: Option<usize>,
 }
 
 #[derive(Debug, Args)]
@@ -173,31 +183,52 @@ fn check(args: LibraryArgs) -> Result<()> {
 
 fn run_cell(args: RunArgs) -> Result<()> {
     let library = Library::load(&args.library.manifest_path)?;
+    let output = args
+        .output
+        .clone()
+        .unwrap_or_else(|| library.target_path("argon.bin"));
+    let command = run_command(&library, &args, &output)?;
+    status("Running", &format!("{} in {}", args.cell, library.name));
+    run_compiler(command)?;
+    status("Finished", &format!("output: {}", output.display()));
+    Ok(())
+}
+
+/// The compiler command that runs `args.cell`, writing `output` and any
+/// requested GDS and netlists.
+fn run_command(library: &Library, args: &RunArgs, output: &Path) -> Result<Command> {
     let tech = library.tech.as_ref().ok_or_else(|| {
         anyhow!(
             "cannot run a cell because manifest `{}` does not set `tech`; add `tech = \"path/to/tech.toml\"`",
             library.manifest_path.display()
         )
     })?;
-    status("Running", &format!("{} in {}", args.cell, library.name));
-    let output = args
-        .output
-        .unwrap_or_else(|| library.target_path("argon.bin"));
-    let mut command = compiler_command(&args.library.argonc, &library);
+    let mut command = compiler_command(&args.library.argonc, library);
     command
         .arg("--cell")
-        .arg(args.cell)
+        .arg(&args.cell)
         .arg("--tech")
         .arg(tech)
         .arg("--output")
-        .arg(&output);
+        .arg(output);
     if args.gds {
         let gds = library.target_path("argon.gds");
         command.arg("--gds").arg(gds);
     }
-    run_compiler(command)?;
-    status("Finished", &format!("output: {}", output.display()));
-    Ok(())
+    if args.spice {
+        command
+            .arg("--spice")
+            .arg(library.target_path("argon.spice"));
+    }
+    if args.spectre {
+        command
+            .arg("--spectre")
+            .arg(library.target_path("argon.scs"));
+    }
+    if let Some(width) = args.netlist_width {
+        command.arg("--netlist-width").arg(width.to_string());
+    }
+    Ok(command)
 }
 
 fn compiler_command(argonc: &Path, library: &Library) -> Command {
@@ -280,11 +311,76 @@ fn print_error(message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use clap::Parser;
 
-    use super::{Cli, CommandKind};
+    use super::{Cli, CommandKind, run_command};
+    use crate::Library;
+
+    /// The arguments `arc run <args>` passes to the compiler for the inverter
+    /// example.
+    fn compiler_args(args: &[&str]) -> Vec<String> {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/schematic_inverter/Argon.toml");
+        let manifest = manifest.to_str().expect("path should be UTF-8");
+        let cli = Cli::try_parse_from(
+            [
+                "arc",
+                "run",
+                "--manifest-path",
+                manifest,
+                "--cell",
+                "inv(2., 1., 2)",
+            ]
+            .into_iter()
+            .chain(args.iter().copied()),
+        )
+        .unwrap();
+        let CommandKind::Run(args) = cli.command else {
+            panic!("run subcommand should be selected");
+        };
+        let library = Library::load(&args.library.manifest_path).unwrap();
+        run_command(&library, &args, Path::new("out.bin"))
+            .unwrap()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// The value that follows `flag` in `args`.
+    fn value_of<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let index = args.iter().position(|arg| arg == flag)?;
+        args.get(index + 1).map(String::as_str)
+    }
+
+    #[test]
+    fn run_passes_netlist_options_to_the_compiler() {
+        let args = compiler_args(&["--spice", "--spectre", "--netlist-width", "100"]);
+        let target = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/schematic_inverter/target");
+        let spice = value_of(&args, "--spice").expect("--spice should be passed");
+        assert_eq!(Path::new(spice), target.join("argon.spice"));
+        let spectre = value_of(&args, "--spectre").expect("--spectre should be passed");
+        assert_eq!(Path::new(spectre), target.join("argon.scs"));
+        assert_eq!(value_of(&args, "--netlist-width"), Some("100"));
+
+        let args = compiler_args(&["--spectre"]);
+        assert!(value_of(&args, "--spectre").is_some());
+        assert!(!args.iter().any(|arg| arg == "--spice"));
+        assert!(!args.iter().any(|arg| arg == "--netlist-width"));
+    }
+
+    #[test]
+    fn netlist_width_requires_a_netlist() {
+        let error =
+            Cli::try_parse_from(["arc", "run", "--cell", "top()", "--netlist-width", "100"])
+                .expect_err("--netlist-width without a netlist should be rejected");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
 
     #[test]
     fn parses_documentation_output_directory() {

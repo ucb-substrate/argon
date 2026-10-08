@@ -23,6 +23,7 @@ pub use result::{
     CompileOutput, ExecError, ExecErrorCompileOutput, ExecErrorKind, StaticError,
     StaticErrorCompileOutput, StaticErrorKind,
 };
+pub(crate) use schematic::Namer;
 pub use schematic::{
     Detached, DetachedKind, DetachedReason, Device, DeviceKind, Element, Net, NetIdx, NodeId,
     ParamValue, Schematic, SchematicInstValue, SchematicInstance, SignalRef,

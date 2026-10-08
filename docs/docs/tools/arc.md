@@ -58,7 +58,7 @@ Parses, resolves, and type-checks the library without running a cell. No technol
 ## `arc run`
 
 ```text
-arc run --cell <EXPR> [--output <PATH>] [--gds]
+arc run --cell <EXPR> [--output <PATH>] [--gds] [--spice] [--spectre] [--netlist-width <COLS>]
 ```
 
 | Option | Required/default | Description |
@@ -66,17 +66,23 @@ arc run --cell <EXPR> [--output <PATH>] [--gds]
 | `--cell <EXPR>` | Required | Cell to run, such as `top(10., 20.)`. Arguments are Argon expressions evaluated in the library's scope. |
 | `-o, --output <PATH>` | `target/argon.bin` | Where to write the compiled layout. |
 | `--gds` | Off | Also write `target/argon.gds`. |
+| `--spice` | Off | Also write a SPICE netlist to `target/argon.spice`. |
+| `--spectre` | Off | Also write a Spectre netlist to `target/argon.scs`. |
+| `--netlist-width <COLS>` | `80` | Break netlist lines longer than this many characters; `0` turns wrapping off. Requires `--spice` or `--spectre`. |
 | `--manifest-path <PATH>` | `Argon.toml` | Library to run. |
 | `--argonc <PATH>` | `ARGONC` or `argonc` | Compiler executable to use. |
 
 ```bash
 arc run --cell 'top(10., 20.)'
 arc run --cell 'top(10., 20.)' --gds
+arc run --cell 'inv(2., 1., 2)' --spice --spectre
 ```
 
 :::tip
 Quote the cell expression so the shell doesn't interpret the parentheses.
 :::
+
+Netlists are described in [Schematics](/language/schematic#netlists).
 
 ## `arc doc`
 

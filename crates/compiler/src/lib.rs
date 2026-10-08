@@ -8,6 +8,7 @@ pub mod gds;
 pub mod gdscache;
 pub mod incremental;
 pub mod nav;
+pub mod netlist;
 pub mod parse;
 mod parser;
 pub mod solver;
@@ -35,6 +36,31 @@ pub fn run_with_stack<T: Send + 'static>(name: &str, f: impl FnOnce() -> T + Sen
         Ok(value) => value,
         Err(payload) => std::panic::resume_unwind(payload),
     }
+}
+
+/// Writes `path` by having `write` fill a sibling temporary file, then
+/// renaming it into place, so a failed write never leaves a truncated file.
+pub(crate) fn write_atomically(
+    path: &std::path::Path,
+    prefix: &str,
+    write: impl FnOnce(&std::path::Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix).suffix(".tmp");
+    // Temporary files are created 0600; give the result the mode
+    // `File::create` would have.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o644));
+    }
+    let temp = builder.tempfile_in(parent)?;
+    write(temp.path())?;
+    temp.persist(path)
+        .map_err(|e| anyhow::anyhow!("could not finalize `{}`: {e}", path.display()))?;
+    Ok(())
 }
 
 /// A global allocator that tracks live and peak heap usage so that the scaling

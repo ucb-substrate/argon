@@ -1,0 +1,36 @@
+use std::schematic::{DeviceKind, Signal};
+use std::schematic::{device, connect};
+use std::schematic::inst as sinst;
+
+cell mos(nfet: Bool, w: Float, nf: Int) {
+    pub let d = Signal();
+    pub let g = Signal();
+    pub let s = Signal();
+    pub let b = Signal();
+
+    let model = if nfet {
+        "sky130_fd_pr__nfet_01v8"
+    } else {
+        "sky130_fd_pr__pfet_01v8"
+    };
+
+    device(DeviceKind::Subckt, [d, g, s, b], model, l=0.15, w=w, nf=nf);
+}
+
+cell inv(pw: Float, nw: Float, nf: Int) {
+    pub let a = Signal();
+    pub let out = Signal();
+    pub let vdd = Signal();
+    pub let vss = Signal();
+
+    let nmos = sinst(mos(true, nw, nf));
+    let pmos = sinst(mos(false, pw, nf));
+    connect(a, nmos.g);
+    connect(a, pmos.g);
+    connect(out, nmos.d);
+    connect(out, pmos.d);
+    connect(vdd, pmos.s);
+    connect(vdd, pmos.b);
+    connect(vss, nmos.s);
+    connect(vss, nmos.b);
+}
