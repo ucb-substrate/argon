@@ -51,38 +51,48 @@ impl<'a> ExecPass<'a> {
             })
             .collect::<Option<SmallVec<[Option<Value>; 4]>>>()?;
         self.direct_too_deep = false;
+        self.direct_tail = None;
         self.direct_fn(cell, index, args, 0)
     }
 
+    /// Evaluates a call to the function `index`. A tail call in its body
+    /// continues the loop here rather than nesting, so tail recursion does
+    /// not count toward [`MAX_DIRECT_DEPTH`].
     fn direct_fn(
         &mut self,
         cell: CellId,
-        index: DeclIndex,
-        args: SmallVec<[Option<Value>; 4]>,
+        mut index: DeclIndex,
+        mut args: SmallVec<[Option<Value>; 4]>,
         depth: u32,
     ) -> Option<Value> {
         if depth > MAX_DIRECT_DEPTH {
             self.direct_too_deep = true;
         }
-        if self.direct_too_deep {
-            self.purity[index.0 as usize] = Purity::TooDeep;
-            return None;
+        loop {
+            if self.direct_too_deep {
+                self.purity[index.0 as usize] = Purity::TooDeep;
+                return None;
+            }
+            let decl = self.fn_decls[index.0 as usize];
+            let mut env = Env::new();
+            for (param, arg) in decl.args.iter().zip(args) {
+                let value = match arg {
+                    Some(value) => value,
+                    // A default sees the parameters before it.
+                    None => self.direct_expr(cell, &mut env, param.default.as_ref()?, depth)?,
+                };
+                env.push((param.metadata.0, value));
+            }
+            let value = self.direct_scope(cell, &mut env, &decl.scope, depth);
+            if self.direct_too_deep {
+                self.purity[index.0 as usize] = Purity::TooDeep;
+            }
+            let value = value?;
+            match self.direct_tail.take() {
+                Some((callee, callee_args)) => (index, args) = (callee, callee_args),
+                None => return Some(value),
+            }
         }
-        let decl = self.fn_decls[index.0 as usize];
-        let mut env = Env::new();
-        for (param, arg) in decl.args.iter().zip(args) {
-            let value = match arg {
-                Some(value) => value,
-                // A default sees the parameters before it.
-                None => self.direct_expr(cell, &mut env, param.default.as_ref()?, depth)?,
-            };
-            env.push((param.metadata.0, value));
-        }
-        let value = self.direct_scope(cell, &mut env, &decl.scope, depth);
-        if self.direct_too_deep {
-            self.purity[index.0 as usize] = Purity::TooDeep;
-        }
-        value
     }
 
     fn direct_scope(
@@ -345,6 +355,12 @@ impl<'a> ExecPass<'a> {
                         Some(arg) => Some(self.direct_expr(cell, env, arg, depth)?),
                         None => None,
                     });
+                }
+                // A tail call's value is the caller's, so the caller's loop
+                // makes it once this body is done; this value stands in.
+                if c.tail {
+                    self.direct_tail = Some((index, args));
+                    return Some(Value::Nil);
                 }
                 self.direct_fn(cell, index, args, depth + 1)
             }

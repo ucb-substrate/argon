@@ -75,6 +75,106 @@ fn is_off_grid(value: f64, snapped: f64, grid: f64) -> bool {
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
 pub struct Var(u64);
 
+/// The values of solved variables. A solver numbers its variables densely and
+/// solves almost all of them, so this is indexed by variable.
+#[derive(Clone, Default)]
+struct SolvedValues(Vec<Option<f64>>);
+
+impl SolvedValues {
+    fn get(&self, var: &Var) -> Option<&f64> {
+        self.0.get(var.0 as usize)?.as_ref()
+    }
+
+    fn contains_key(&self, var: &Var) -> bool {
+        self.get(var).is_some()
+    }
+
+    fn insert(&mut self, var: Var, value: f64) -> Option<f64> {
+        let index = var.0 as usize;
+        if index >= self.0.len() {
+            self.0.resize(index + 1, None);
+        }
+        self.0[index].replace(value)
+    }
+}
+
+/// A set of variables in insertion order, where removing one moves the last
+/// into its place, as `IndexSet::swap_remove` does. Indexed by variable.
+#[derive(Clone, Default)]
+pub struct VarSet {
+    vars: Vec<Var>,
+    /// One more than each variable's position in `vars`, or 0 when absent.
+    positions: Vec<u32>,
+}
+
+impl VarSet {
+    fn position(&self, var: &Var) -> Option<usize> {
+        match self.positions.get(var.0 as usize) {
+            Some(&p) if p > 0 => Some(p as usize - 1),
+            _ => None,
+        }
+    }
+
+    pub fn contains(&self, var: &Var) -> bool {
+        self.position(var).is_some()
+    }
+
+    pub fn insert(&mut self, var: Var) -> bool {
+        if self.contains(&var) {
+            return false;
+        }
+        let index = var.0 as usize;
+        if index >= self.positions.len() {
+            self.positions.resize(index + 1, 0);
+        }
+        self.vars.push(var);
+        self.positions[index] = self.vars.len() as u32;
+        true
+    }
+
+    pub fn swap_remove(&mut self, var: &Var) -> bool {
+        let Some(position) = self.position(var) else {
+            return false;
+        };
+        self.positions[var.0 as usize] = 0;
+        self.vars.swap_remove(position);
+        if let Some(moved) = self.vars.get(position) {
+            self.positions[moved.0 as usize] = position as u32 + 1;
+        }
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.vars.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.vars.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Var> {
+        self.vars.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a VarSet {
+    type Item = &'a Var;
+    type IntoIter = std::slice::Iter<'a, Var>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.vars.iter()
+    }
+}
+
+/// What [`Solver::constrain_eq`] did with a constraint.
+pub enum Constrained {
+    /// Solved its one unknown at once, without recording it; whether the
+    /// value was off the grid.
+    AtOnce { off_grid: bool },
+    /// Recorded it, under this ID.
+    Recorded(ConstraintId),
+}
+
 #[derive(Clone)]
 pub struct Solver {
     grid: f64,
@@ -83,9 +183,11 @@ pub struct Solver {
     constraints: FxIndexMap<ConstraintId, LinearExpr>,
     var_to_constraints: FxIndexMap<Var, ConstraintSet>,
     // Solved and unsolved vars are separate to reduce overhead of many solved variables.
-    solved_vars: FxIndexMap<Var, f64>,
-    unsolved_vars: FxIndexSet<Var>,
-    updated_vars: FxIndexSet<Var>,
+    solved_vars: SolvedValues,
+    unsolved_vars: VarSet,
+    /// Variables solved since the last [`Self::clear_updated_vars`], in the
+    /// order they were solved. A variable is solved at most once.
+    updated_vars: Vec<Var>,
     back_substitute_stack: Vec<ConstraintId>,
     inconsistent_constraints: FxIndexSet<ConstraintId>,
     /// Variables whose solved value missed the grid, with the value the
@@ -114,9 +216,9 @@ impl Default for Solver {
             next_constraint: 0,
             constraints: FxIndexMap::default(),
             var_to_constraints: FxIndexMap::default(),
-            solved_vars: FxIndexMap::default(),
-            unsolved_vars: FxIndexSet::default(),
-            updated_vars: FxIndexSet::default(),
+            solved_vars: SolvedValues::default(),
+            unsolved_vars: VarSet::default(),
+            updated_vars: Vec::new(),
             back_substitute_stack: Vec::new(),
             inconsistent_constraints: FxIndexSet::default(),
             off_grid_vars: FxIndexMap::default(),
@@ -261,7 +363,7 @@ impl Solver {
     }
 
     #[inline]
-    pub fn updated_vars(&self) -> &FxIndexSet<Var> {
+    pub fn updated_vars(&self) -> &[Var] {
         &self.updated_vars
     }
 
@@ -282,14 +384,14 @@ impl Solver {
         self.grid
     }
 
-    pub fn unsolved_vars(&self) -> &FxIndexSet<Var> {
+    pub fn unsolved_vars(&self) -> &VarSet {
         &self.unsolved_vars
     }
 
     pub fn solve_var(&mut self, var: Var, val: f64) {
         let old = self.solved_vars.insert(var, val);
         if old.is_none() {
-            self.updated_vars.insert(var);
+            self.updated_vars.push(var);
         }
         self.unsolved_vars.swap_remove(&var);
     }
@@ -299,6 +401,109 @@ impl Solver {
     pub fn constrain_eq0(&mut self, expr: LinearExpr) -> ConstraintId {
         let id = self.next_constraint;
         self.next_constraint += 1;
+        if self.solve_at_once(&expr, &LinearExpr::from(0.)).is_none() {
+            self.record_eq0(id, expr);
+        }
+        id
+    }
+
+    /// Constrains `lhs - rhs` to 0, as [`Self::constrain_eq0`] would, but
+    /// without building the difference when the constraint is solved at once.
+    pub fn constrain_eq(&mut self, lhs: &LinearExpr, rhs: &LinearExpr) -> Constrained {
+        let id = self.next_constraint;
+        self.next_constraint += 1;
+        match self.solve_at_once(lhs, rhs) {
+            Some(off_grid) => Constrained::AtOnce { off_grid },
+            None => {
+                self.record_eq0(id, LinearExpr::difference(lhs, rhs));
+                Constrained::Recorded(id)
+            }
+        }
+    }
+
+    /// When back substitution would leave the constraint `lhs - rhs = 0` with
+    /// one term, solves that term's variable as it would, and goes on to the
+    /// constraints the variable is in; such a constraint is then dropped, so it
+    /// is never recorded. Returns whether the value was off the grid, or `None`
+    /// if the constraint has to be recorded.
+    fn solve_at_once(&mut self, lhs: &LinearExpr, rhs: &LinearExpr) -> Option<bool> {
+        // Each term as `LinearExpr::simplify` sees it: a value it removes, or
+        // the one variable it keeps.
+        let mut terms = SmallVec::<[Result<f64, (f64, Var)>; 4]>::new();
+        let mut unknown = None;
+        for (coeff, var) in lhs
+            .coeffs
+            .iter()
+            .copied()
+            .chain(rhs.coeffs.iter().map(|(c, v)| (-c, *v)))
+        {
+            let term = if relative_eq!(coeff, 0., epsilon = EPSILON) {
+                Ok(0.)
+            } else {
+                match self.solved_vars.get(&var) {
+                    Some(value) => Ok(coeff * value),
+                    None if unknown.is_none() => {
+                        unknown = Some((coeff, var));
+                        Err((coeff, var))
+                    }
+                    None => return None,
+                }
+            };
+            terms.push(term);
+        }
+        let (coeff, var) = unknown?;
+        // The removed terms, summed left to right, are added to the constant.
+        let mut removed: Option<f64> = None;
+        for term in terms.into_iter().flatten() {
+            removed = Some(removed.map_or(term, |sum| sum + term));
+        }
+        let constant = (lhs.constant - rhs.constant) + removed.unwrap_or(0.);
+        Some(self.solve_term(var, coeff, constant))
+    }
+
+    /// Solves `var`, which is not solved yet, from `var = rhs` as
+    /// [`Self::constrain_eq`] would, but without looking `var` up. Returns
+    /// whether the value was off the grid, or `None` when `rhs` is not known
+    /// yet, in which case nothing changes.
+    pub fn solve_fresh(&mut self, var: Var, rhs: &LinearExpr) -> Option<bool> {
+        let mut removed: Option<f64> = None;
+        for (coeff, solved) in rhs.coeffs.iter() {
+            let coeff = -coeff;
+            let term = if relative_eq!(coeff, 0., epsilon = EPSILON) {
+                0.
+            } else {
+                coeff * self.solved_vars.get(solved)?
+            };
+            removed = Some(removed.map_or(term, |sum| sum + term));
+        }
+        self.next_constraint += 1;
+        let constant = (0. - rhs.constant) + removed.unwrap_or(0.);
+        Some(self.solve_term(var, 1., constant))
+    }
+
+    /// Solves `var` from the constraint `coeff * var + constant = 0` as back
+    /// substitution would, and goes on to the constraints `var` is in.
+    /// Returns whether the value was off the grid.
+    fn solve_term(&mut self, var: Var, coeff: f64, constant: f64) -> bool {
+        let val = -constant / coeff;
+        let rounded_val = crate::tech::snap(val, self.grid);
+        let off_grid = is_off_grid(val, rounded_val, self.grid);
+        if off_grid {
+            self.off_grid_vars.insert(var, val);
+        }
+        self.solve_var(var, rounded_val);
+        if let Some(constraints) = self.var_to_constraints.get(&var) {
+            self.back_substitute_stack
+                .extend(constraints.iter().copied());
+            while !self.back_substitute_stack.is_empty() {
+                self.try_back_substitute();
+            }
+        }
+        off_grid
+    }
+
+    /// Records the constraint `id`, `expr = 0`, and back-substitutes from it.
+    fn record_eq0(&mut self, id: ConstraintId, expr: LinearExpr) {
         for (_, var) in &expr.coeffs {
             self.var_to_constraints.entry(*var).or_default().insert(id);
         }
@@ -308,7 +513,11 @@ impl Solver {
         while !self.back_substitute_stack.is_empty() {
             self.try_back_substitute();
         }
-        id
+    }
+
+    /// Whether the constraint `id` is still in the system.
+    pub fn is_live(&self, id: ConstraintId) -> bool {
+        self.constraints.contains_key(&id)
     }
 
     // Tries to back substitute using the given [`ConstraintId`].
@@ -1232,7 +1441,7 @@ impl LinearExpr {
     }
 
     /// Substitutes variables in `table` and removes entries with coefficient 0.
-    fn simplify(&mut self, table: &FxIndexMap<Var, f64>) {
+    fn simplify(&mut self, table: &SolvedValues) {
         // Removed terms are summed left to right, then added to the constant.
         let mut removed: Option<f64> = None;
         self.coeffs.retain(|(coeff, var)| {
@@ -1569,6 +1778,108 @@ mod tests {
         s.constrain_eq0(c(vec![(1., a), (1., b), (1., d)], -1.)); // a + b + c = 1  => 1/3 each
         s.solve();
         assert!(!s.off_grid_vars().is_empty());
+    }
+
+    /// `VarSet` keeps the same order as an `IndexSet` under the same inserts
+    /// and swap-removes.
+    #[test]
+    fn var_set_matches_index_set() {
+        let mut set = VarSet::default();
+        let mut reference = FxIndexSet::default();
+        let mut state = 7u64;
+        for _ in 0..20_000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let var = Var((state >> 33) % 64);
+            if (state >> 20).is_multiple_of(3) {
+                assert_eq!(set.swap_remove(&var), reference.swap_remove(&var));
+            } else {
+                assert_eq!(set.insert(var), reference.insert(var));
+            }
+            assert_eq!(set.contains(&var), reference.contains(&var));
+            assert!(set.iter().eq(reference.iter()));
+        }
+    }
+
+    /// A constraint solved at once leaves the solver as recording it and back
+    /// substituting would: the same values to the bit, the same off-grid and
+    /// inconsistent records, the same live constraints, and the same next ID.
+    #[test]
+    fn constraints_solved_at_once_match_recorded_ones() {
+        // Right-hand sides of `var = rhs`, then whole constraints.
+        let rhss = |solved: [Var; 2]| {
+            vec![
+                LinearExpr::from(120.),
+                LinearExpr::from(-0.),
+                LinearExpr::from(1.2),
+                c(vec![(1., solved[0])], 35.),
+                c(vec![(1., solved[0]), (-1., solved[1])], -0.5),
+                c(vec![(0.5, solved[0]), (0.5, solved[1])], 0.),
+                c(vec![(1. / 3., solved[1]), (1e-12, solved[0])], 7.),
+            ]
+        };
+        let constraints = |var: Var, solved: [Var; 2], other: Var| {
+            let mut constraints: Vec<LinearExpr> = rhss(solved)
+                .iter()
+                .map(|rhs| LinearExpr::difference(&LinearExpr::from(var), rhs))
+                .collect();
+            constraints.extend([
+                c(vec![(3., var), (-2.5, solved[1]), (1e-12, other)], 1e-9),
+                c(vec![(1., var), (1., var)], -10.),
+                c(vec![(1., var), (-1., other)], 0.),
+                c(vec![(1., solved[0])], -101.),
+                c(vec![(1., solved[0])], -100.),
+            ]);
+            constraints
+        };
+        for index in 0..12 {
+            let mut results = Vec::new();
+            for way in 0..4 {
+                let mut solver = Solver::with_grid(5.);
+                let solved = [solver.new_var(), solver.new_var()];
+                solver.constrain_eq0(c(vec![(1., solved[0])], -101.));
+                solver.constrain_eq0(c(vec![(1., solved[1])], -2003.));
+                let (var, other) = (solver.new_var(), solver.new_var());
+                // A constraint `var` is already in is solved along with it.
+                let later = solver.new_var();
+                solver.constrain_eq0(c(vec![(1., later), (-1., var)], -10.));
+                let expr = constraints(var, solved, other).swap_remove(index);
+                let id = solver.next_constraint;
+                match way {
+                    0 => {
+                        solver.next_constraint += 1;
+                        solver.record_eq0(id, expr);
+                    }
+                    1 => {
+                        solver.constrain_eq0(expr);
+                    }
+                    2 => {
+                        solver.constrain_eq(&expr, &LinearExpr::from(0.));
+                    }
+                    _ => {
+                        // Only the `var = rhs` forms apply.
+                        if index >= 7 {
+                            continue;
+                        }
+                        let rhs = rhss(solved).swap_remove(index);
+                        solver.solve_fresh(var, &rhs).expect("rhs is known");
+                    }
+                }
+                let next = solver.constrain_eq0(LinearExpr::from(0.));
+                results.push((
+                    [var, other, later].map(|v| solver.value_of(v).map(f64::to_bits)),
+                    solver.off_grid_vars().clone(),
+                    solver.inconsistent_constraints().clone(),
+                    solver.is_live(id),
+                    solver.constraints.len(),
+                    next,
+                ));
+            }
+            for result in &results[1..] {
+                assert_eq!(&results[0], result, "expression {index}");
+            }
+        }
     }
 
     #[test]

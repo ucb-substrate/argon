@@ -42,7 +42,7 @@ use crate::ast::{
 };
 use crate::gds::{ImportedGdsElement, import_gds};
 use crate::parse::{CellInvocation, ParseOutput, WorkspaceParseAst};
-use crate::solver::{ConstraintId, Var};
+use crate::solver::{Constrained, ConstraintId, Var};
 use crate::tech::{Technology, read_tech};
 use crate::workspace::WorkspaceConfig;
 use crate::{
@@ -6426,6 +6426,18 @@ mod module_prefix_tests {
 }
 
 #[cfg(test)]
+mod size_tests {
+    use super::{Object, Value};
+
+    /// Each object table entry is a pointer, and values stay small.
+    #[test]
+    fn objects_and_values_stay_compact() {
+        assert_eq!(std::mem::size_of::<Object>(), 16);
+        assert!(std::mem::size_of::<Value>() <= 32);
+    }
+}
+
+#[cfg(test)]
 mod builtin_tests {
     use super::{BUILTINS, Builtin};
 
@@ -6532,7 +6544,7 @@ pub type CellId = u64;
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize, Ord, PartialOrd)]
 pub struct SeqNum(u64);
 
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Serialize, Deserialize)]
 pub struct ObjectId(u64);
 
 impl ObjectId {
@@ -7137,9 +7149,18 @@ impl<'a> std::ops::Index<&ValueId> for ValueStore<'a> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Emit {
-    value: ValueId,
+    target: EmitTarget,
     scope: ScopeId,
     span: Span,
+}
+
+/// What an [`Emit`] emits.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+enum EmitTarget {
+    /// A value `!` was applied to.
+    Value(ValueId),
+    /// An object a builtin made, which needs no value kept for it.
+    Object(ObjectId),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -7359,7 +7380,8 @@ struct CellState {
     bound_values: Vec<ValueId>,
     emit: Vec<Emit>,
     object_emit: Vec<ObjectEmit>,
-    objects: FxIndexMap<ObjectId, Object>,
+    /// Objects in creation order, which is also ID order.
+    objects: Vec<(ObjectId, Object)>,
     deferred: Worklist,
     root_scope: ScopeId,
     scopes: FxIndexMap<ScopeId, ExecScope>,
@@ -7521,6 +7543,16 @@ struct ExecPass<'a> {
     purity: Vec<direct::Purity>,
     /// Whether the direct evaluation under way nested too deeply.
     direct_too_deep: bool,
+    /// A tail call made by the directly evaluated body under way: the
+    /// callee and its arguments. See [`direct`].
+    direct_tail: Option<(DeclIndex, SmallVec<[Option<Value>; 4]>)>,
+    /// Whether a called cell failed outright, which ends evaluation.
+    aborted: bool,
+    /// Whether the nesting limit has left a value on the worklist since it
+    /// was last drained. See [`ExecPass::drain_worklist`].
+    nesting_deferred: bool,
+    /// Whether a worklist drain is under way.
+    draining: bool,
     errors: Vec<ExecError>,
     profile_started: Option<Instant>,
 }
@@ -7538,6 +7570,23 @@ struct ExecPass<'a> {
 /// proxy is built: `!` can be applied to a value that *selects* a proxy built
 /// earlier -- `elem(inst.arr)!` -- so only the resolved object ID identifies
 /// which one the author meant.
+/// Stores each rect of `value` that `objects`, sorted by ID, lacks.
+fn restore_rects(value: &Value, objects: &mut Vec<(ObjectId, Object)>) {
+    match value {
+        Value::Rect(rect) => {
+            if let Err(index) = objects.binary_search_by_key(&rect.id, |(id, _)| *id) {
+                objects.insert(index, (rect.id, Object::Rect(rect.clone())));
+            }
+        }
+        Value::Seq(seq) => {
+            for value in seq.iter() {
+                restore_rects(value, objects);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn mark_emitted_proxies_as_layout(
     cell: &mut CompiledCell,
     proxies: &FxIndexSet<ObjectId>,
@@ -7673,6 +7722,10 @@ impl<'a> ExecPass<'a> {
             cell_start: 0,
             purity: Vec::new(),
             direct_too_deep: false,
+            direct_tail: None,
+            aborted: false,
+            nesting_deferred: false,
+            draining: false,
             errors: Vec::new(),
             profile_started: std::env::var_os("ARGON_PROFILE").map(|_| Instant::now()),
         }
@@ -8078,7 +8131,12 @@ impl<'a> ExecPass<'a> {
             }
             index += 1;
         }
-        let unsolved_vars = state.solver.unsolved_vars().clone();
+        let unsolved_vars = state
+            .solver
+            .unsolved_vars()
+            .iter()
+            .copied()
+            .collect::<FxIndexSet<_>>();
         let spans = unsolved_vars
             .iter()
             .filter_map(|var| state.var_span_map.get(var).cloned())
@@ -8280,7 +8338,7 @@ impl<'a> ExecPass<'a> {
                         sse_basis: SseBasis::Nullspace(Vec::new()),
                         root_scope: root_scope_id,
                         unsolved_vars: Default::default(),
-                        objects: Default::default(),
+                        objects: Vec::new(),
                         constraint_span_map: FxIndexMap::default(),
                         var_span_map: FxIndexMap::default(),
                         var_dependents: FxIndexMap::default(),
@@ -8347,6 +8405,9 @@ impl<'a> ExecPass<'a> {
                 }
             }
             self.operands.truncate(operands);
+            if self.aborted {
+                return Err(());
+            }
             self.maybe_collect(cell_id, values_start);
         }
         self.release_frame(fid);
@@ -8361,6 +8422,9 @@ impl<'a> ExecPass<'a> {
                 state.deferred.pop()
             } {
                 progress |= self.eval_partial(cell_id, vid)?;
+                if self.aborted {
+                    return Err(());
+                }
                 // A constraint that determines a variable on its own solves it
                 // at once, so what waits on the variable can go on now. Only
                 // variables tied up with others wait for the solve below.
@@ -8490,8 +8554,8 @@ impl<'a> ExecPass<'a> {
         invalid.extend(
             self.cell_state(cell_id)
                 .objects
-                .values()
-                .filter_map(|object| object.get_inst())
+                .iter()
+                .filter_map(|(_, object)| object.get_inst())
                 .filter(|inst| {
                     !self.values[&inst.cell]
                         .get_ready()
@@ -8509,13 +8573,18 @@ impl<'a> ExecPass<'a> {
                 // reported why. Adding `CannotEmit` on top would be the second
                 // error for one mistake, and the `Err` below would then throw
                 // away the layout the rest of the cell produced.
-                .filter(|emit| !self.is_poisoned(emit.value))
-                .filter(|emit| {
-                    !self.values[&emit.value]
+                .filter_map(|emit| match emit.target {
+                    EmitTarget::Value(value) => Some((emit, value)),
+                    EmitTarget::Object(_) => None,
+                })
+                .filter(|(_, value)| !self.is_poisoned(*value))
+                .filter(|(_, value)| {
+                    !self.values[value]
                         .get_ready()
                         .and_then(Value::obj_ids)
                         .is_some_and(|ids| ids.is_elem())
                 })
+                .map(|(emit, _)| emit)
                 .map(|emit| (emit.span.clone(), ExecErrorKind::CannotEmit)),
         );
         if !invalid.is_empty() {
@@ -8949,9 +9018,11 @@ impl<'a> ExecPass<'a> {
         let mut objects = std::mem::take(&mut self.cell_state_mut(cell).objects);
         let debug_info = self.debug_info;
         let state = self.cell_states.get(&cell).expect("cell not found");
-        let mut emit_obj = |obj: &Object| -> SolvedValue {
+        let mut emit_obj = |obj: Object| -> SolvedValue {
             match obj {
                 Object::Rect(rect) => {
+                    // Moved out when nothing else shares it.
+                    let rect = Arc::try_unwrap(rect).unwrap_or_else(|rect| (*rect).clone());
                     let x0 = state
                         .solver
                         .eval_expr(&rect.x0)
@@ -8984,13 +9055,13 @@ impl<'a> ExecPass<'a> {
                     }
                     SolvedValue::Rect(Rect {
                         id: rect.id,
-                        layer: rect.layer.clone(),
-                        x0: (x0, rect.x0.clone()),
-                        y0: (y0, rect.y0.clone()),
-                        x1: (x1, rect.x1.clone()),
-                        y1: (y1, rect.y1.clone()),
+                        layer: rect.layer,
+                        x0: (x0, rect.x0),
+                        y0: (y0, rect.y0),
+                        x1: (x1, rect.x1),
+                        y1: (y1, rect.y1),
                         construction: rect.construction,
-                        span: rect.span.clone(),
+                        span: rect.span,
                     })
                 }
                 Object::Polygon(polygon) => SolvedValue::Polygon(Polygon {
@@ -9202,19 +9273,25 @@ impl<'a> ExecPass<'a> {
 
         let mut emitted = FxIndexSet::default();
         for emit in state.emit.iter() {
-            // A poisoned value reported its own diagnostic and never became an
-            // object. Skipping it is what lets the rest of the cell reach the
-            // GUI instead of the whole compile returning no layout at all.
-            if matches!(
-                self.values[&emit.value].as_ref().into_ready(),
-                Some(Value::Poison)
-            ) {
-                continue;
-            }
-            let obj_id = emit_value(emit.value)
-                .expect("failed to emit")
-                .into_elem()
-                .expect("emitted non-element object");
+            let obj_id = match emit.target {
+                EmitTarget::Object(id) => id,
+                EmitTarget::Value(value) => {
+                    // A poisoned value reported its own diagnostic and never
+                    // became an object. Skipping it is what lets the rest of
+                    // the cell reach the GUI instead of the whole compile
+                    // returning no layout at all.
+                    if matches!(
+                        self.values[&value].as_ref().into_ready(),
+                        Some(Value::Poison)
+                    ) {
+                        continue;
+                    }
+                    emit_value(value)
+                        .expect("failed to emit")
+                        .into_elem()
+                        .expect("emitted non-element object")
+                }
+            };
             emitted.insert(obj_id);
             if debug_info {
                 ccell
@@ -9264,6 +9341,18 @@ impl<'a> ExecPass<'a> {
                 }
             }
         }
+        if !debug_info {
+            // Construction rects with nothing to report were not stored; the
+            // ones a field names are put back in their place.
+            debug_assert!(objects.is_sorted_by_key(|(id, _)| *id));
+            for (_, (_, value)) in state.scopes[&state.root_scope].bindings.iter() {
+                if let Some(value) = self.values[value].as_ref().into_ready()
+                    && value.obj_ids().is_some()
+                {
+                    restore_rects(value, &mut objects);
+                }
+            }
+        }
 
         // Without debug information, an object only the editor would show is
         // dropped: one that is not drawn, not an instance, not named by a
@@ -9297,7 +9386,7 @@ impl<'a> ExecPass<'a> {
         // Taken from the back while the source shrinks, so the two forms are
         // never both held whole, then put back in order.
         while let Some((id, obj)) = objects.pop() {
-            let solved = emit_obj(&obj);
+            let solved = emit_obj(obj);
             if keep(id, &solved) {
                 ccell.objects.insert(id, solved);
             }
@@ -9408,12 +9497,15 @@ impl<'a> ExecPass<'a> {
             .bound_values
             .iter()
             .chain(state.fields.values())
-            .chain(state.emit.iter().map(|emit| &emit.value))
+            .chain(state.emit.iter().filter_map(|emit| match &emit.target {
+                EmitTarget::Value(value) => Some(value),
+                EmitTarget::Object(_) => None,
+            }))
             .chain(
                 state
                     .objects
-                    .values()
-                    .filter_map(|object| Some(&object.get_inst()?.cell)),
+                    .iter()
+                    .filter_map(|(_, object)| Some(&object.get_inst()?.cell)),
             )
             .chain(self.cell_values.values())
         {
@@ -9839,31 +9931,7 @@ impl<'a> ExecPass<'a> {
         loc: DynLoc,
         state: impl FnOnce(&mut Self) -> PartialEvalState<'a>,
     ) -> ValueId {
-        self.new_value(loc, true, state)
-    }
-
-    /// Like [`Self::new_deferred_value`], but always left to the worklist: a
-    /// cell call, whose evaluation executes the cell and can fail outright.
-    fn new_queued_value(
-        &mut self,
-        loc: DynLoc,
-        state: impl FnOnce(&mut Self) -> PartialEvalState<'a>,
-    ) -> ValueId {
-        self.new_value(loc, false, state)
-    }
-
-    fn new_value(
-        &mut self,
-        loc: DynLoc,
-        eager: bool,
-        state: impl FnOnce(&mut Self) -> PartialEvalState<'a>,
-    ) -> ValueId {
         let vid = self.value_id();
-        // A value left to the worklist goes on the stack before its inputs, so
-        // that they are evaluated first.
-        if !eager {
-            self.cell_state_mut(loc.cell).deferred.insert(vid);
-        }
         let state = state(self);
         let holds_frame = state.needs_frame();
         if holds_frame {
@@ -9875,18 +9943,34 @@ impl<'a> ExecPass<'a> {
             waiters: Waiters::default(),
         };
         let nests = eval.state.visits_code();
-        if eager && (!nests || self.eager_nesting < MAX_EAGER_NESTING) {
+        if !nests || self.eager_nesting < MAX_EAGER_NESTING {
             self.eager_nesting += u32::from(nests);
             let resolved = loop {
-                let progress = self
-                    .eval_deferred(vid, &mut eval)
-                    .expect("only a cell call fails outright");
+                let progress = match self.eval_deferred(vid, &mut eval) {
+                    Ok(progress) => progress,
+                    // A called cell failed outright. Visiting stops, so the
+                    // failure unwinds to the statement loop, which returns it.
+                    Err(()) => {
+                        self.aborted = true;
+                        false
+                    }
+                };
                 if self.values.contains_key(&vid) {
                     break true;
                 }
-                if !progress {
-                    break false;
+                if progress {
+                    continue;
                 }
+                // Whatever the nesting limit left on the worklist is resumed
+                // once the stack has unwound, before anything else can come
+                // to wait on it; then this value is tried again.
+                if self.eager_nesting == u32::from(nests) && self.nesting_deferred && !self.aborted
+                {
+                    self.nesting_deferred = false;
+                    self.drain_worklist(loc.cell);
+                    continue;
+                }
+                break false;
             };
             self.eager_nesting -= u32::from(nests);
             if resolved {
@@ -9896,10 +9980,11 @@ impl<'a> ExecPass<'a> {
                 self.schedule_dependents(loc.cell, vid);
                 return vid;
             }
-            self.cell_state_mut(loc.cell).deferred.insert(vid);
-        } else if eager {
-            self.cell_state_mut(loc.cell).deferred.insert(vid);
         }
+        if nests && self.eager_nesting >= MAX_EAGER_NESTING {
+            self.nesting_deferred = true;
+        }
+        self.cell_state_mut(loc.cell).deferred.insert(vid);
         let eval = match self.spare_evals.pop() {
             Some(mut spare) => {
                 *spare = eval;
@@ -9915,6 +10000,9 @@ impl<'a> ExecPass<'a> {
     /// stack until the expression it is part of has been visited, so that a
     /// collection while visiting a later operand keeps it.
     fn visit_expr(&mut self, loc: DynLoc, expr: &'a Expr<Substr, VarIdTyMetadata>) -> ValueId {
+        if self.aborted {
+            return self.nil_value;
+        }
         let mark = self.operands.len();
         let value = self.visit_expr_inner(loc, expr);
         self.operands.truncate(mark);
@@ -9923,6 +10011,29 @@ impl<'a> ExecPass<'a> {
             self.collect_values(loc.cell, self.cell_start);
         }
         value
+    }
+
+    /// Evaluates what is on `cell_id`'s worklist until it is empty, without
+    /// solving: only what can be evaluated now. Does nothing while a drain is
+    /// already under way, which picks up what this one would have.
+    fn drain_worklist(&mut self, cell_id: CellId) {
+        if self.draining {
+            return;
+        }
+        self.draining = true;
+        while let Some(vid) = self.cell_state_mut(cell_id).deferred.pop() {
+            if self.eval_partial(cell_id, vid).is_err() {
+                self.aborted = true;
+            }
+            if self.aborted {
+                break;
+            }
+            self.cell_state_mut(cell_id).schedule_solved_dependents();
+            if self.next_value_id >= self.collect_at {
+                self.collect_values(cell_id, self.cell_start);
+            }
+        }
+        self.draining = false;
     }
 
     fn visit_expr_inner(
@@ -9958,7 +10069,7 @@ impl<'a> ExecPass<'a> {
                 let span = self.span(&loc, e.span);
                 self.cell_state_mut(loc.cell).emit.push(Emit {
                     scope: loc.scope,
-                    value,
+                    target: EmitTarget::Value(value),
                     span,
                 });
                 value
@@ -10100,7 +10211,7 @@ impl<'a> ExecPass<'a> {
                                 &val.args,
                                 explicit,
                             );
-                            let value = self.new_queued_value(loc, |_| {
+                            let value = self.new_deferred_value(loc, |_| {
                                 PartialEvalState::Call(PartialCallExpr {
                                     expr: c,
                                     builtin: None,
@@ -10378,8 +10489,9 @@ impl<'a> ExecPass<'a> {
                     construction: true,
                     span: Some(span.clone()),
                 };
-                self.register_shape_arg(cell_id, rect.id, rect.clone().into(), *drawable);
-                Value::Rect(Box::new(rect))
+                let rect = Arc::new(rect);
+                self.register_shape_arg(cell_id, rect.id, Object::Rect(rect.clone()), *drawable);
+                Value::Rect(rect)
             }
             CellArg::Polygon {
                 layer,
@@ -10393,8 +10505,14 @@ impl<'a> ExecPass<'a> {
                     construction: true,
                     span: Some(span.clone()),
                 };
-                self.register_shape_arg(cell_id, polygon.id, polygon.clone().into(), *drawable);
-                Value::Polygon(Box::new(polygon))
+                let polygon = Arc::new(polygon);
+                self.register_shape_arg(
+                    cell_id,
+                    polygon.id,
+                    Object::Polygon(polygon.clone()),
+                    *drawable,
+                );
+                Value::Polygon(polygon)
             }
             CellArg::Path {
                 layer,
@@ -10414,10 +10532,11 @@ impl<'a> ExecPass<'a> {
                     construction: true,
                     span: Some(span.clone()),
                 };
-                self.register_shape_arg(cell_id, path.id, path.clone().into(), *drawable);
-                Value::Path(Box::new(path))
+                let path = Arc::new(path);
+                self.register_shape_arg(cell_id, path.id, Object::Path(path.clone()), *drawable);
+                Value::Path(path)
             }
-            CellArg::Point(x, y) => Value::Point(Box::new(((*x).into(), (*y).into()))),
+            CellArg::Point(x, y) => Value::Point(Arc::new(((*x).into(), (*y).into()))),
             CellArg::Tuple(v) => Value::Tuple(
                 v.iter()
                     .map(|arg| self.bind_cell_arg(cell_id, span, arg))
@@ -10436,7 +10555,7 @@ impl<'a> ExecPass<'a> {
         drawable: bool,
     ) {
         let state = self.cell_state_mut(cell_id);
-        state.objects.insert(id, object);
+        state.objects.push((id, object));
         if drawable {
             state.proxy_objects.insert(id);
         }
@@ -10600,7 +10719,7 @@ impl<'a> ExecPass<'a> {
             }
             Value::Tuple(items) => {
                 let mut args = Vec::with_capacity(items.len());
-                for v in items {
+                for v in items.iter() {
                     match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
                         Some(arg) => args.push(arg),
                         None => return Ok(None),
@@ -10621,6 +10740,101 @@ impl<'a> ExecPass<'a> {
                 return Err(());
             }
         })
+    }
+
+    /// Constrains `lhs` to the keyword argument `rhs`, as a fallback for an
+    /// initial value: at once when `rhs` is a known number, otherwise once it
+    /// is ready. `span` is the argument's value. Returns whether this solved
+    /// a variable, on the grid, without keeping a constraint.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the parts of one keyword argument"
+    )]
+    fn constrain_kwarg(
+        &mut self,
+        loc: DynLoc,
+        lhs: &LinearExpr,
+        rhs: ValueId,
+        fallback: bool,
+        priority: i32,
+        span: cfgrammar::Span,
+        initial_condition: Option<RectInitialCondition>,
+    ) -> bool {
+        if let Some(Defer::Ready(Value::Linear(value))) = self.values.get(&rhs) {
+            if fallback {
+                let expr = LinearExpr::difference(lhs, value);
+                self.add_constraint(
+                    loc.cell,
+                    expr,
+                    true,
+                    priority,
+                    |this| this.span(&loc, span),
+                    initial_condition,
+                );
+                return false;
+            }
+            let solver = &mut self.cell_states.get_mut(&loc.cell).unwrap().solver;
+            let constraint = match solver.constrain_eq(lhs, value) {
+                Constrained::AtOnce { off_grid } => return !off_grid,
+                Constrained::Recorded(constraint) => constraint,
+            };
+            if solver.is_live(constraint) || solver.inconsistent_constraints().contains(&constraint)
+            {
+                let span = self.span(&loc, span);
+                self.cell_state_mut(loc.cell)
+                    .constraint_span_map
+                    .insert(constraint, span);
+            }
+            return false;
+        }
+        let span = self.span(&loc, span);
+        let lhs = self.new_ready_value(Value::Linear(lhs.clone()));
+        self.new_deferred_value(loc, |_| {
+            PartialEvalState::Constraint(PartialConstraint {
+                lhs,
+                rhs,
+                fallback,
+                priority,
+                span,
+                initial_condition,
+            })
+        });
+        false
+    }
+
+    /// Constrains `expr` to 0, or keeps it as a fallback for when nothing else
+    /// determines its variables. `span` locates it for diagnostics.
+    fn add_constraint(
+        &mut self,
+        cell_id: CellId,
+        expr: LinearExpr,
+        fallback: bool,
+        priority: i32,
+        span: impl FnOnce(&Self) -> Span,
+        initial_condition: Option<RectInitialCondition>,
+    ) {
+        if fallback {
+            let span = span(self);
+            self.cell_state_mut(cell_id)
+                .fallback_constraints
+                .push(FallbackConstraint {
+                    priority,
+                    constraint: expr,
+                    span,
+                    initial_condition,
+                });
+            return;
+        }
+        let solver = &mut self.cell_state_mut(cell_id).solver;
+        let constraint = solver.constrain_eq0(expr);
+        // Only a constraint the solver keeps, or finds inconsistent, is ever
+        // reported.
+        if solver.is_live(constraint) || solver.inconsistent_constraints().contains(&constraint) {
+            let span = span(self);
+            self.cell_state_mut(cell_id)
+                .constraint_span_map
+                .insert(constraint, span);
+        }
     }
 
     /// Applies the result of an operation on ready values: stores the value,
@@ -10761,6 +10975,9 @@ impl<'a> ExecPass<'a> {
             PartialEvalState::BoolOp(_) => self.eval_bool_op(vid, vref),
             PartialEvalState::ForItem(_) => self.eval_for_item(vid, vref),
             PartialEvalState::ForLoop(_) => self.eval_for(vid, vref),
+            PartialEvalState::Call(PartialCallExpr { builtin: None, .. }) => {
+                self.eval_cell_call(vid, vref)
+            }
             _ => self.eval_operation(vid, vref),
         }
     }
@@ -10805,106 +11022,140 @@ impl<'a> ExecPass<'a> {
                     if let Some(layer) = layer {
                         let id = self.object_id();
                         let span = self.span(&vref.loc, c.expr.span);
+                        let debug_info = self.debug_info;
                         let state = self.cell_state_mut(cell_id);
-                        let rect = Rect {
+                        let vars = [(); 4].map(|_| state.solver.new_var());
+                        let rect = Arc::new(Rect {
                             id,
                             layer,
-                            x0: state.new_solver_var(&span).into(),
-                            y0: state.new_solver_var(&span).into(),
-                            x1: state.new_solver_var(&span).into(),
-                            y1: state.new_solver_var(&span).into(),
+                            x0: vars[0].into(),
+                            y0: vars[1].into(),
+                            x1: vars[2].into(),
+                            y1: vars[3].into(),
                             construction: f == "crect",
                             span: Some(span.clone()),
-                        };
-                        state.objects.insert(rect.id, rect.clone().into());
-                        state.emit.push(Emit {
-                            scope: vref.loc.scope,
-                            value: vid,
-                            span,
                         });
+                        // Without debug information, emission drops a
+                        // construction rect that has nothing to report, so
+                        // one is stored only once that is known not to hold.
+                        let droppable = !debug_info && rect.construction && rect.layer.is_none();
+                        if !droppable {
+                            state.objects.push((rect.id, Object::Rect(rect.clone())));
+                        }
+                        if debug_info {
+                            state.emit.push(Emit {
+                                scope: vref.loc.scope,
+                                target: EmitTarget::Object(rect.id),
+                                span,
+                            });
+                        }
                         self.values
-                            .insert(vid, Defer::Ready(Value::Rect(Box::new(rect.clone()))));
+                            .insert(vid, Defer::Ready(Value::Rect(rect.clone())));
+                        // Only a variable left unsolved or solved off the grid
+                        // is ever reported, so only such a one needs its span.
+                        let mut needs_span = [true; 4];
+                        // Coordinates no earlier argument has constrained.
+                        let mut fresh = [true; 4];
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
-                            let lhs = self.value_id();
-                            let (priority, initial_condition) = match kwarg.name.name.as_str() {
-                                "x0" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.x0.clone())));
-                                    (6, None)
-                                }
+                            let coordinate = match kwarg.name.name.as_str() {
+                                "x0" => Some(0),
+                                "y0" => Some(1),
+                                "x1" => Some(2),
+                                "y1" => Some(3),
+                                _ => None,
+                            };
+                            if let Some(i) = coordinate
+                                && fresh[i]
+                                && let Some(Defer::Ready(Value::Linear(value))) =
+                                    self.values.get(rhs)
+                                && let Some(off_grid) = self
+                                    .cell_states
+                                    .get_mut(&cell_id)
+                                    .unwrap()
+                                    .solver
+                                    .solve_fresh(vars[i], value)
+                            {
+                                fresh[i] = false;
+                                needs_span[i] = off_grid;
+                                continue;
+                            }
+                            match kwarg.name.name.as_str() {
+                                "x0" | "x0i" => fresh[0] = false,
+                                "y0" | "y0i" => fresh[1] = false,
+                                "x1" | "x1i" => fresh[2] = false,
+                                "y1" | "y1i" => fresh[3] = false,
+                                "w" => (fresh[0], fresh[2]) = (false, false),
+                                "h" => (fresh[1], fresh[3]) = (false, false),
+                                _ => {}
+                            }
+                            let (lhs, priority, initial_condition) = match kwarg.name.name.as_str()
+                            {
+                                "x0" => (rect.x0.clone(), 6, None),
                                 "x0i" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.x0.clone())));
-                                    (6, Some(RectInitialCondition::X0(rect.id)))
+                                    (rect.x0.clone(), 6, Some(RectInitialCondition::X0(rect.id)))
                                 }
-                                "x1" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.x1.clone())));
-                                    (5, None)
-                                }
+                                "x1" => (rect.x1.clone(), 5, None),
                                 "x1i" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.x1.clone())));
-                                    (5, Some(RectInitialCondition::X1(rect.id)))
+                                    (rect.x1.clone(), 5, Some(RectInitialCondition::X1(rect.id)))
                                 }
-                                "y0" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.y0.clone())));
-                                    (4, None)
-                                }
+                                "y0" => (rect.y0.clone(), 4, None),
                                 "y0i" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.y0.clone())));
-                                    (4, Some(RectInitialCondition::Y0(rect.id)))
+                                    (rect.y0.clone(), 4, Some(RectInitialCondition::Y0(rect.id)))
                                 }
-                                "y1" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.y1.clone())));
-                                    (3, None)
-                                }
+                                "y1" => (rect.y1.clone(), 3, None),
                                 "y1i" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(rect.y1.clone())));
-                                    (3, Some(RectInitialCondition::Y1(rect.id)))
+                                    (rect.y1.clone(), 3, Some(RectInitialCondition::Y1(rect.id)))
                                 }
-                                "w" => {
-                                    self.values.insert(
-                                        lhs,
-                                        Defer::Ready(Value::Linear(LinearExpr::difference(
-                                            &rect.x1, &rect.x0,
-                                        ))),
-                                    );
-                                    (2, None)
-                                }
-                                "h" => {
-                                    self.values.insert(
-                                        lhs,
-                                        Defer::Ready(Value::Linear(LinearExpr::difference(
-                                            &rect.y1, &rect.y0,
-                                        ))),
-                                    );
-                                    (1, None)
-                                }
-                                "layer" => {
-                                    continue;
-                                }
+                                "w" => (LinearExpr::difference(&rect.x1, &rect.x0), 2, None),
+                                "h" => (LinearExpr::difference(&rect.y1, &rect.y0), 1, None),
+                                "layer" => continue,
                                 x => unreachable!("unsupported kwarg `{x}`"),
                             };
                             // Use the value expression's span (e.g. `100.` in
                             // `x1i=100.`) rather than the whole kwarg, so the GUI
                             // can rewrite just the value when persisting a
                             // solution-space-exploration drag.
-                            let span = self.span(&vref.loc, kwarg.value.span());
-                            self.new_deferred_value(vref.loc, |_| {
-                                PartialEvalState::Constraint(PartialConstraint {
-                                    lhs,
-                                    rhs: *rhs,
-                                    fallback: kwarg.name.name.ends_with('i'),
-                                    priority,
-                                    span,
-                                    initial_condition,
-                                })
-                            });
+                            let solved = self.constrain_kwarg(
+                                vref.loc,
+                                &lhs,
+                                *rhs,
+                                kwarg.name.name.ends_with('i'),
+                                priority,
+                                kwarg.value.span(),
+                                initial_condition,
+                            );
+                            if let Some(i) = coordinate
+                                && solved
+                            {
+                                needs_span[i] = false;
+                            }
+                        }
+                        let state = self.cell_states.get_mut(&cell_id).unwrap();
+                        for (var, needs_span) in vars.into_iter().zip(needs_span) {
+                            if needs_span {
+                                state.var_span_map.insert(var, rect.span.clone().unwrap());
+                            }
+                        }
+                        if droppable {
+                            // Solved on the grid, unflipped, and in range.
+                            let quiet = needs_span == [false; 4]
+                                && match vars.map(|var| state.solver.value_of(var)) {
+                                    [Some(x0), Some(y0), Some(x1), Some(y1)] => {
+                                        let mut reports = Vec::new();
+                                        check_coordinates(
+                                            [x0, y0, x1, y1],
+                                            &self.tech,
+                                            cell_id,
+                                            &None,
+                                            &mut reports,
+                                        );
+                                        x0 <= x1 && y0 <= y1 && reports.is_empty()
+                                    }
+                                    _ => false,
+                                };
+                            if !quiet {
+                                state.objects.push((rect.id, Object::Rect(rect)));
+                            }
                         }
                         true
                     } else {
@@ -11004,14 +11255,15 @@ impl<'a> ExecPass<'a> {
                             span: Some(span.clone()),
                         };
                         let state = self.cell_state_mut(cell_id);
-                        state.objects.insert(id, polygon.clone().into());
+                        let polygon = Arc::new(polygon);
+                        state.objects.push((id, Object::Polygon(polygon.clone())));
                         state.emit.push(Emit {
                             scope: vref.loc.scope,
-                            value: vid,
+                            target: EmitTarget::Object(polygon.id),
                             span,
                         });
                         self.values
-                            .insert(vid, Defer::Ready(Value::Polygon(Box::new(polygon.clone()))));
+                            .insert(vid, Defer::Ready(Value::Polygon(polygon.clone())));
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let coordinate = polygon_coordinate(kwarg.name.name.as_str())
                                 .expect("polygon kwargs were statically validated");
@@ -11019,33 +11271,26 @@ impl<'a> ExecPass<'a> {
                                 PolygonAxis::X => polygon.points[coordinate.index].0.clone(),
                                 PolygonAxis::Y => polygon.points[coordinate.index].1.clone(),
                             };
-                            let lhs = self.value_id();
-                            self.values.insert(lhs, Defer::Ready(Value::Linear(expr)));
-                            let span = self.span(&vref.loc, kwarg.value.span());
-                            self.new_deferred_value(vref.loc, |_| {
-                                PartialEvalState::Constraint(PartialConstraint {
-                                    lhs,
-                                    rhs: *rhs,
-                                    fallback: coordinate.initial,
-                                    priority: i32::MAX
-                                        - i32::try_from(coordinate.index.saturating_mul(2))
-                                            .unwrap_or(i32::MAX)
-                                        - i32::from(matches!(coordinate.axis, PolygonAxis::Y)),
-                                    span,
-                                    initial_condition: coordinate.initial.then_some(
-                                        match coordinate.axis {
-                                            PolygonAxis::X => RectInitialCondition::PolygonX(
-                                                polygon.id,
-                                                coordinate.index,
-                                            ),
-                                            PolygonAxis::Y => RectInitialCondition::PolygonY(
-                                                polygon.id,
-                                                coordinate.index,
-                                            ),
-                                        },
-                                    ),
-                                })
-                            });
+                            let priority = i32::MAX
+                                - i32::try_from(coordinate.index.saturating_mul(2))
+                                    .unwrap_or(i32::MAX)
+                                - i32::from(matches!(coordinate.axis, PolygonAxis::Y));
+                            self.constrain_kwarg(
+                                vref.loc,
+                                &expr,
+                                *rhs,
+                                coordinate.initial,
+                                priority,
+                                kwarg.value.span(),
+                                coordinate.initial.then_some(match coordinate.axis {
+                                    PolygonAxis::X => {
+                                        RectInitialCondition::PolygonX(polygon.id, coordinate.index)
+                                    }
+                                    PolygonAxis::Y => {
+                                        RectInitialCondition::PolygonY(polygon.id, coordinate.index)
+                                    }
+                                }),
+                            );
                         }
                         true
                     } else {
@@ -11173,14 +11418,15 @@ impl<'a> ExecPass<'a> {
                             construction: false,
                             span: Some(span.clone()),
                         };
-                        state.objects.insert(id, path.clone().into());
+                        let path = Arc::new(path);
+                        state.objects.push((id, Object::Path(path.clone())));
                         state.emit.push(Emit {
                             scope: vref.loc.scope,
-                            value: vid,
+                            target: EmitTarget::Object(path.id),
                             span,
                         });
                         self.values
-                            .insert(vid, Defer::Ready(Value::Path(Box::new(path.clone()))));
+                            .insert(vid, Defer::Ready(Value::Path(path.clone())));
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let name = kwarg.name.name.as_str();
                             let (expr, fallback, priority, initial_condition) = match name {
@@ -11236,19 +11482,15 @@ impl<'a> ExecPass<'a> {
                                     )
                                 }
                             };
-                            let lhs = self.value_id();
-                            self.values.insert(lhs, Defer::Ready(Value::Linear(expr)));
-                            let span = self.span(&vref.loc, kwarg.value.span());
-                            self.new_deferred_value(vref.loc, |_| {
-                                PartialEvalState::Constraint(PartialConstraint {
-                                    lhs,
-                                    rhs: *rhs,
-                                    fallback,
-                                    priority,
-                                    span,
-                                    initial_condition,
-                                })
-                            });
+                            self.constrain_kwarg(
+                                vref.loc,
+                                &expr,
+                                *rhs,
+                                fallback,
+                                priority,
+                                kwarg.value.span(),
+                                initial_condition,
+                            );
                         }
                         true
                     } else {
@@ -11299,7 +11541,7 @@ impl<'a> ExecPass<'a> {
                             object: text.id,
                             span,
                         });
-                        state.objects.insert(text.id, text.clone().into());
+                        state.objects.push((text.id, text.clone().into()));
                         self.values.insert(vid, Defer::Ready(Value::Nil));
                         true
                     } else {
@@ -11368,14 +11610,14 @@ impl<'a> ExecPass<'a> {
                                     construction: true,
                                     span: Some(span.clone()),
                                 };
-                                state.objects.insert(orect.id, orect.clone().into());
+                                let orect = Arc::new(orect);
+                                state.objects.push((orect.id, Object::Rect(orect.clone())));
                                 state.emit.push(Emit {
                                     scope: vref.loc.scope,
-                                    value: vid,
+                                    target: EmitTarget::Object(orect.id),
                                     span,
                                 });
-                                self.values
-                                    .insert(vid, Defer::Ready(Value::Rect(Box::new(orect))));
+                                self.values.insert(vid, Defer::Ready(Value::Rect(orect)));
                                 true
                             } else {
                                 // default to a zero rectangle
@@ -11396,9 +11638,9 @@ impl<'a> ExecPass<'a> {
                                     construction: true,
                                     span: Some(span),
                                 };
-                                state.objects.insert(orect.id, orect.clone().into());
-                                self.values
-                                    .insert(vid, Defer::Ready(Value::Rect(Box::new(orect))));
+                                let orect = Arc::new(orect);
+                                state.objects.push((orect.id, Object::Rect(orect.clone())));
+                                self.values.insert(vid, Defer::Ready(Value::Rect(orect)));
                                 true
                             }
                         } else {
@@ -11649,7 +11891,7 @@ impl<'a> ExecPass<'a> {
                             object: dim.id,
                             span,
                         });
-                        state.objects.insert(dim.id, dim.clone().into());
+                        state.objects.push((dim.id, dim.clone().into()));
                         self.values.insert(vid, Defer::Ready(Value::Nil));
                         true
                     } else {
@@ -11750,97 +11992,49 @@ impl<'a> ExecPass<'a> {
                         };
                         state.emit.push(Emit {
                             scope: vref.loc.scope,
-                            value: vid,
+                            target: EmitTarget::Object(inst.id),
                             span,
                         });
-                        state.objects.insert(inst.id, inst.clone().into());
+                        let inst = Arc::new(inst);
+                        state.objects.push((inst.id, Object::Inst(inst.clone())));
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
-                            let lhs = self.value_id();
-                            let (priority, initial_condition) = match kwarg.name.name.as_str() {
-                                "x" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(inst.x.clone())));
-                                    (2, None)
-                                }
-                                "xi" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(inst.x.clone())));
-                                    (2, Some(RectInitialCondition::InstanceX(inst.id)))
-                                }
-                                "y" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(inst.y.clone())));
-                                    (1, None)
-                                }
-                                "yi" => {
-                                    self.values
-                                        .insert(lhs, Defer::Ready(Value::Linear(inst.y.clone())));
-                                    (1, Some(RectInitialCondition::InstanceY(inst.id)))
-                                }
+                            let (lhs, priority, initial_condition) = match kwarg.name.name.as_str()
+                            {
+                                "x" => (inst.x.clone(), 2, None),
+                                "xi" => (
+                                    inst.x.clone(),
+                                    2,
+                                    Some(RectInitialCondition::InstanceX(inst.id)),
+                                ),
+                                "y" => (inst.y.clone(), 1, None),
+                                "yi" => (
+                                    inst.y.clone(),
+                                    1,
+                                    Some(RectInitialCondition::InstanceY(inst.id)),
+                                ),
                                 _ => continue,
                             };
                             // Use the value expression's span (e.g. `100.` in
                             // `x1i=100.`) rather than the whole kwarg, so the GUI
                             // can rewrite just the value when persisting a
                             // solution-space-exploration drag.
-                            let span = self.span(&vref.loc, kwarg.value.span());
-                            self.new_deferred_value(vref.loc, |_| {
-                                PartialEvalState::Constraint(PartialConstraint {
-                                    lhs,
-                                    rhs: *rhs,
-                                    fallback: kwarg.name.name.ends_with('i'),
-                                    priority,
-                                    span,
-                                    initial_condition,
-                                })
-                            });
+                            self.constrain_kwarg(
+                                vref.loc,
+                                &lhs,
+                                *rhs,
+                                kwarg.name.name.ends_with('i'),
+                                priority,
+                                kwarg.value.span(),
+                                initial_condition,
+                            );
                         }
-                        self.values
-                            .insert(vid, Defer::Ready(Value::Inst(Box::new(inst))));
+                        self.values.insert(vid, Defer::Ready(Value::Inst(inst)));
                         true
                     } else {
                         false
                     }
                 }
-                None => {
-                    // Must be calling a cell generator.
-                    // User functions are never deferred.
-                    let mut arg_vals = Vec::with_capacity(c.state.posargs.len());
-                    let mut unready = Vec::new();
-                    for arg_vid in c.state.posargs.iter() {
-                        match self.values[arg_vid].clone() {
-                            Defer::Ready(v) => {
-                                match self.cell_arg_from_value(cell_id, *arg_vid, &v) {
-                                    Ok(Some(arg)) => arg_vals.push(arg),
-                                    Ok(None) => unready.push(*arg_vid),
-                                    // The diagnostic is already recorded, here
-                                    // or when the argument was poisoned.
-                                    Err(()) => return self.poison(vid),
-                                }
-                            }
-                            _ => unready.push(*arg_vid),
-                        }
-                    }
-                    if unready.is_empty() {
-                        let scope_name = (self.entry_cell != Some(cell_id)).then(|| {
-                            format!(
-                                "{} cell {}",
-                                c.expr.scope_order,
-                                c.expr.func.path.iter().map(|ident| &ident.name).join("::")
-                            )
-                        });
-                        let cell =
-                            self.execute_cell(c.expr.metadata.0.unwrap(), arg_vals, scope_name)?;
-                        self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
-                        self.cell_values.insert(cell, vid);
-                        true
-                    } else {
-                        for arg_vid in unready {
-                            self.add_value_dependent(arg_vid, vid);
-                        }
-                        false
-                    }
-                }
+                None => unreachable!("a cell call is evaluated by `eval_cell_call`"),
             },
             PartialEvalState::Arith(arith) => {
                 if let (Defer::Ready(vl), Defer::Ready(vr)) =
@@ -11927,38 +12121,35 @@ impl<'a> ExecPass<'a> {
                                             &mut move |v| match v {
                                                 SolvedValue::Rect(rect) => {
                                                     let id = object_id(obj_id);
-                                                    let rect = rect
-                                                        .to_float()
-                                                        .transform(inst.reflect, inst.angle);
+                                                    let [x0, y0, x1, y1] = transform_bounds(
+                                                        [
+                                                            rect.x0.0, rect.y0.0, rect.x1.0,
+                                                            rect.y1.0,
+                                                        ],
+                                                        inst.reflect,
+                                                        inst.angle,
+                                                    );
                                                     let xrect = Rect {
                                                         id,
                                                         layer: rect.layer.clone(),
-                                                        x0: LinearExpr::add(
-                                                            rect.x0,
-                                                            inst.x.clone(),
-                                                        ),
-                                                        y0: LinearExpr::add(
-                                                            rect.y0,
-                                                            inst.y.clone(),
-                                                        ),
-                                                        x1: LinearExpr::add(
-                                                            rect.x1,
-                                                            inst.x.clone(),
-                                                        ),
-                                                        y1: LinearExpr::add(
-                                                            rect.y1,
-                                                            inst.y.clone(),
-                                                        ),
+                                                        x0: LinearExpr::add(x0, inst.x.clone()),
+                                                        y0: LinearExpr::add(y0, inst.y.clone()),
+                                                        x1: LinearExpr::add(x1, inst.x.clone()),
+                                                        y1: LinearExpr::add(y1, inst.y.clone()),
                                                         // A view of geometry the instance already draws, so it
                                                         // is construction geometry -- drawing it again would put a
                                                         // phantom shape on top of the SREF. `!` opts back in; see
                                                         // `mark_emitted_proxies_as_layout`.
                                                         construction: true,
-                                                        span: rect.span.clone(),
+                                                        span: None,
                                                     };
                                                     proxies.insert(xrect.id);
-                                                    objects.insert(xrect.id, xrect.clone().into());
-                                                    Value::Rect(Box::new(xrect))
+                                                    let xrect = Arc::new(xrect);
+                                                    objects.push((
+                                                        xrect.id,
+                                                        Object::Rect(xrect.clone()),
+                                                    ));
+                                                    Value::Rect(xrect)
                                                 }
                                                 SolvedValue::Polygon(polygon) => {
                                                     let id = object_id(obj_id);
@@ -11992,9 +12183,12 @@ impl<'a> ExecPass<'a> {
                                                         span: polygon.span.clone(),
                                                     };
                                                     proxies.insert(polygon.id);
-                                                    objects
-                                                        .insert(polygon.id, polygon.clone().into());
-                                                    Value::Polygon(Box::new(polygon))
+                                                    let polygon = Arc::new(polygon);
+                                                    objects.push((
+                                                        polygon.id,
+                                                        Object::Polygon(polygon.clone()),
+                                                    ));
+                                                    Value::Polygon(polygon)
                                                 }
                                                 SolvedValue::Path(path) => {
                                                     let id = object_id(obj_id);
@@ -12035,8 +12229,12 @@ impl<'a> ExecPass<'a> {
                                                         span: path.span.clone(),
                                                     };
                                                     proxies.insert(path.id);
-                                                    objects.insert(path.id, path.clone().into());
-                                                    Value::Path(Box::new(path))
+                                                    let path = Arc::new(path);
+                                                    objects.push((
+                                                        path.id,
+                                                        Object::Path(path.clone()),
+                                                    ));
+                                                    Value::Path(path)
                                                 }
                                                 SolvedValue::Instance(cinst) => {
                                                     let (angle, reflect, cx, cy) = cascade(
@@ -12063,8 +12261,12 @@ impl<'a> ExecPass<'a> {
                                                         span: cinst.span.clone(),
                                                     };
                                                     proxies.insert(oinst.id);
-                                                    objects.insert(oinst.id, oinst.clone().into());
-                                                    Value::Inst(Box::new(oinst))
+                                                    let oinst = Arc::new(oinst);
+                                                    objects.push((
+                                                        oinst.id,
+                                                        Object::Inst(oinst.clone()),
+                                                    ));
+                                                    Value::Inst(oinst)
                                                 }
                                                 _ => unreachable!(),
                                             },
@@ -12139,18 +12341,15 @@ impl<'a> ExecPass<'a> {
                         return self.poison(vid);
                     };
                     let expr = LinearExpr::difference(lhs, rhs);
-                    let state = self.cell_states.get_mut(&cell_id).unwrap();
-                    if c.fallback {
-                        state.fallback_constraints.push(FallbackConstraint {
-                            priority: c.priority,
-                            constraint: expr,
-                            span: c.span.clone(),
-                            initial_condition: c.initial_condition,
-                        });
-                    } else {
-                        let constraint = state.solver.constrain_eq0(expr);
-                        state.constraint_span_map.insert(constraint, c.span.clone());
-                    }
+                    let span = &c.span;
+                    self.add_constraint(
+                        cell_id,
+                        expr,
+                        c.fallback,
+                        c.priority,
+                        |_| span.clone(),
+                        c.initial_condition,
+                    );
                     self.values.insert(vid, DeferValue::Ready(Value::Nil));
                     true
                 } else {
@@ -12177,7 +12376,7 @@ impl<'a> ExecPass<'a> {
                     .collect::<Option<Vec<_>>>();
                 if let Some(items) = items {
                     self.values
-                        .insert(vid, DeferValue::Ready(Value::Tuple(items)));
+                        .insert(vid, DeferValue::Ready(Value::Tuple(items.into())));
                     true
                 } else {
                     let dep = tuple
@@ -12252,6 +12451,53 @@ impl<'a> ExecPass<'a> {
         };
 
         Ok(progress)
+    }
+
+    /// Executes a called cell once its arguments resolve.
+    #[inline(never)]
+    fn eval_cell_call(&mut self, vid: ValueId, vref: &mut PartialEval<'a>) -> Result<bool, ()> {
+        let cell_id = vref.loc.cell;
+        let PartialEvalState::Call(c) = &mut vref.state else {
+            unreachable!()
+        };
+        Ok({
+            // Must be calling a cell generator.
+            // User functions are never deferred.
+            let mut arg_vals = Vec::with_capacity(c.state.posargs.len());
+            let mut unready = Vec::new();
+            for arg_vid in c.state.posargs.iter() {
+                match self.values[arg_vid].clone() {
+                    Defer::Ready(v) => {
+                        match self.cell_arg_from_value(cell_id, *arg_vid, &v) {
+                            Ok(Some(arg)) => arg_vals.push(arg),
+                            Ok(None) => unready.push(*arg_vid),
+                            // The diagnostic is already recorded, here
+                            // or when the argument was poisoned.
+                            Err(()) => return self.poison(vid),
+                        }
+                    }
+                    _ => unready.push(*arg_vid),
+                }
+            }
+            if unready.is_empty() {
+                let scope_name = (self.entry_cell != Some(cell_id)).then(|| {
+                    format!(
+                        "{} cell {}",
+                        c.expr.scope_order,
+                        c.expr.func.path.iter().map(|ident| &ident.name).join("::")
+                    )
+                });
+                let cell = self.execute_cell(c.expr.metadata.0.unwrap(), arg_vals, scope_name)?;
+                self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
+                self.cell_values.insert(cell, vid);
+                true
+            } else {
+                for arg_vid in unready {
+                    self.add_value_dependent(arg_vid, vid);
+                }
+                false
+            }
+        })
     }
 
     /// Advances an `if`, visiting the branch its condition selects.
@@ -12724,10 +12970,12 @@ pub enum Value {
     String(String),
     Linear(LinearExpr),
     Int(i64),
-    Rect(Box<Rect<LinearExpr>>),
-    Polygon(Box<Polygon<LinearExpr>>),
-    Path(Box<Path<LinearExpr>>),
-    Point(Box<(LinearExpr, LinearExpr)>),
+    /// Shapes are shared with the cell's objects and between the values that
+    /// copy them.
+    Rect(Arc<Rect<LinearExpr>>),
+    Polygon(Arc<Polygon<LinearExpr>>),
+    Path(Arc<Path<LinearExpr>>),
+    Point(Arc<(LinearExpr, LinearExpr)>),
     Bool(bool),
     /// A function, by its declaration's index in the evaluator.
     Fn(DeclIndex),
@@ -12767,9 +13015,10 @@ pub enum Value {
     /// ```
     ///
     /// `mycell_inst` is a value of type `Inst`.
-    Inst(Box<Instance>),
+    Inst(Arc<Instance>),
     Seq(Arc<Seq>),
-    Tuple(Vec<Value>),
+    /// Shared, because loops and field reads clone values.
+    Tuple(Arc<[Value]>),
     /// A struct value. Shared, because loops and field reads clone values
     /// and its field map is large relative to the scalar variants.
     Struct(Arc<StructValue>),
@@ -12788,10 +13037,10 @@ pub enum Value {
 impl Value {
     pub fn to_obj(&self) -> Option<Object> {
         match self {
-            Self::Rect(r) => Some(Object::Rect((**r).clone())),
-            Self::Polygon(p) => Some(Object::Polygon((**p).clone())),
-            Self::Path(p) => Some(Object::Path((**p).clone())),
-            Self::Inst(i) => Some(Object::Inst((**i).clone())),
+            Self::Rect(r) => Some(Object::Rect(r.clone())),
+            Self::Polygon(p) => Some(Object::Polygon(p.clone())),
+            Self::Path(p) => Some(Object::Path(p.clone())),
+            Self::Inst(i) => Some(Object::Inst(i.clone())),
             _ => None,
         }
     }
@@ -12968,7 +13217,7 @@ pub struct StructValue {
     /// value which arrived as `Any` is the struct they expect.
     pub name: String,
     /// The fields in declaration order.
-    pub fields: IndexMap<String, Value>,
+    pub fields: FxIndexMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13011,48 +13260,50 @@ pub enum SolvedValue {
 
 #[enumify]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Every variant is a pointer, so the object table stays compact; shapes and
+/// instances are shared with the values that name them.
 pub enum Object {
-    Rect(Rect<LinearExpr>),
-    Polygon(Polygon<LinearExpr>),
-    Path(Path<LinearExpr>),
-    Text(Text<LinearExpr>),
-    Dimension(Dimension<LinearExpr>),
-    Inst(Instance),
+    Rect(Arc<Rect<LinearExpr>>),
+    Polygon(Arc<Polygon<LinearExpr>>),
+    Path(Arc<Path<LinearExpr>>),
+    Text(Box<Text<LinearExpr>>),
+    Dimension(Box<Dimension<LinearExpr>>),
+    Inst(Arc<Instance>),
 }
 
 impl From<Rect<LinearExpr>> for Object {
     fn from(value: Rect<LinearExpr>) -> Self {
-        Self::Rect(value)
+        Self::Rect(Arc::new(value))
     }
 }
 
 impl From<Polygon<LinearExpr>> for Object {
     fn from(value: Polygon<LinearExpr>) -> Self {
-        Self::Polygon(value)
+        Self::Polygon(Arc::new(value))
     }
 }
 
 impl From<Path<LinearExpr>> for Object {
     fn from(value: Path<LinearExpr>) -> Self {
-        Self::Path(value)
+        Self::Path(Arc::new(value))
     }
 }
 
 impl From<Text<LinearExpr>> for Object {
     fn from(value: Text<LinearExpr>) -> Self {
-        Self::Text(value)
+        Self::Text(Box::new(value))
     }
 }
 
 impl From<Dimension<LinearExpr>> for Object {
     fn from(value: Dimension<LinearExpr>) -> Self {
-        Self::Dimension(value)
+        Self::Dimension(Box::new(value))
     }
 }
 
 impl From<Instance> for Object {
     fn from(value: Instance) -> Self {
-        Self::Inst(value)
+        Self::Inst(Arc::new(value))
     }
 }
 
@@ -14290,18 +14541,30 @@ pub fn path_outline(
         .then_some(outline)
 }
 
+/// The bounds `[x0, y0, x1, y1]` of a rect after reflecting and rotating it.
+fn transform_bounds([x0, y0, x1, y1]: [f64; 4], reflect_vert: bool, angle: Rotation) -> [f64; 4] {
+    let mat = tmat(angle, reflect_vert);
+    let p0p = ifmatvec(mat, (x0, y0));
+    let p1p = ifmatvec(mat, (x1, y1));
+    [
+        p0p.0.min(p1p.0),
+        p0p.1.min(p1p.1),
+        p0p.0.max(p1p.0),
+        p0p.1.max(p1p.1),
+    ]
+}
+
 impl Rect<f64> {
     fn transform(&self, reflect_vert: bool, angle: Rotation) -> Self {
-        let mat = tmat(angle, reflect_vert);
-        let p0p = ifmatvec(mat, (self.x0, self.y0));
-        let p1p = ifmatvec(mat, (self.x1, self.y1));
+        let [x0, y0, x1, y1] =
+            transform_bounds([self.x0, self.y0, self.x1, self.y1], reflect_vert, angle);
         Self {
             id: self.id,
             layer: self.layer.clone(),
-            x0: p0p.0.min(p1p.0),
-            y0: p0p.1.min(p1p.1),
-            x1: p0p.0.max(p1p.0),
-            y1: p0p.1.max(p1p.1),
+            x0,
+            y0,
+            x1,
+            y1,
             construction: self.construction,
             span: None,
         }

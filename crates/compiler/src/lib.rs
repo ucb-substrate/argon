@@ -2278,6 +2278,7 @@ mod tests {
              struct Run { a: Int, b: Int, t: Int, }
              fn fib(n: Int) -> Int { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }
              fn count_up(n: Int, acc: Int) -> Int { if n == 0 { acc } else { count_up(n - 1, acc + 2) } }
+             fn depth(n: Int) -> Int { if n == 0 { 0 } else { 1 + depth(n - 1) } }
              fn covers(runs: [Run], c: Int) -> Bool { std::any([for r in runs { r.a <= c && c <= r.b }]) }
              fn area(s: Shape) -> Float { match s { Shape::Dot => 0., Shape::Bar(n, w) => n as Float * w, } }
              fn scaled(x: Float, k: Float = 2., offset: Float = x) -> Float { x * k + offset }
@@ -2301,7 +2302,8 @@ mod tests {
                  let w = fib(10) as Float + count_up(500, 0) as Float + area(Shape::Bar(3, 2.5))
                      + area(Shape::Dot) + scaled(1.5) + scaled(1.5, k=3.) + pick((2, 0.5,))
                      + evens(list(1, 2, 3, 4)) as Float + snap5(12.3) + snap5(-12.3) + span_of(base)
-                     + widen(runs[1]).b as Float + lists(7) as Float + third(later) as Float;
+                     + widen(runs[1]).b as Float + lists(7) as Float + third(later) as Float
+                     + depth(100) as Float;
                  let h = if covers(runs, 5) { 1. } else { 2. } + max_float(0., span_of(later));
                  let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=h + 5.);
                  eq(later.x1, 20.);
@@ -2354,15 +2356,31 @@ mod tests {
 
     #[test]
     fn output_without_debug_info_keeps_geometry_and_diagnostics() {
-        let source = "cell child() {
+        let source = "fn flipped_height() -> Float {
+                 let r = crect(x0=64., y0=0., x1=60., y1=4.);
+                 r.y1 - r.y0
+             }
+             fn far_height() -> Float {
+                 let r = crect(x0=0., y0=0., x1=1000000000000000., y1=4.);
+                 r.y1 - r.y0
+             }
+             fn unnamed_height() -> Float {
+                 let r = crect(x0=70., y0=0., x1=74., y1=4.);
+                 r.y1 - r.y0
+             }
+             cell child() {
                  let named = crect(x0=0., y0=0., w=4., h=4.);
                  let hidden = crect(x0=10., y0=0., w=4., h=4.);
                  let bad_layer = crect(layer=\"nope\", x0=20., y0=0., w=4., h=4.);
                  let drawn = rect(\"met1\", x0=named.x0, y0=named.y0, w=4., h=4.);
+                 let pinned = crect(x0=30., y0=0., x1=34., y1=4.);
+                 let pair = cons(crect(x0=40., y0=0., x1=44., y1=4.), cons(crect(x0=50., y0=0., x1=54., y1=4.), []));
+                 let heights = flipped_height() + far_height() + unnamed_height();
              }
              cell top() {
                  let c = inst(child(), x=0., y=0.);
                  let r = rect(\"met2\", x0=c.named.x0, y0=c.named.y1, w=8., h=2.);
+                 let s = rect(\"met2\", x0=c.pinned.x0, y0=c.pinned.y1, x1=c.pair[1].x1, y1=c.pair[0].y1 + 10.);
              }";
         let (_dir, output) = scratch_workspace("lean", source);
         let mut ast = output.ast();
@@ -2405,7 +2423,7 @@ mod tests {
             &invocation,
             &config,
         ));
-        assert_eq!(full.0.len(), 1, "{:#?}", full.0);
+        assert_eq!(full.0.len(), 3, "{:#?}", full.0);
         assert_eq!(lean.0, full.0);
         assert_eq!(lean.1, full.1);
         assert!(lean.2 < full.2, "{} of {} objects kept", lean.2, full.2);

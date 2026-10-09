@@ -648,20 +648,23 @@ fn concat_runs(a: [[Run]], b: [[Run]]) -> [[Run]] { lib::logic::routing::concat(
 // Whether a run on the other layer's track `t` covers crossing point `c`.
 fn covers(runs: [Run], c: Int) -> Bool { std::any([for r in runs { (r.a <= c && c <= r.b) }]) }
 
-// Like-supply crossings of run r with the other layer's runs.
-fn crossing_count(r: Run, other: [[Run]], j: Int) -> Int {
-    std::len([for k in range_full(j, r.b + 1, 2) if covers(other[k], r.t) { k }])
+// The other layer's tracks, from `j` on, where run r has a like-supply crossing.
+fn crossing_tracks(r: Run, other: [[Run]], j: Int) -> [Int] {
+    [for k in range_full(j, r.b + 1, 2) if covers(other[k], r.t) { k }]
+}
+
+// Whether run r has a like-supply crossing on track `k` or a later one.
+fn has_crossing(r: Run, other: [[Run]], k: Int) -> Bool {
+    if k > r.b { false } else if covers(other[k], r.t) { true } else { has_crossing(r, other, k + 2) }
 }
 
 fn first_crossing(r: Run) -> Int { r.a + (r.a + r.t) % 2 }
 
-fn draw_crossings(g: Grid, r: Run, other: [[Run]], j: Int) -> Rect {
-    for k in range_full(j, r.b + 1, 2) {
-        if covers(other[k], r.t) {
-            let x = cx(g, r.t);
-            let y = cy(g, k);
-            lib::columns::util::draw_box("via.drawing", cbox(x - 75., y - 75., x + 75., y + 75.));
-        }
+fn draw_crossings(g: Grid, r: Run, tracks: [Int]) -> Rect {
+    for k in tracks {
+        let x = cx(g, r.t);
+        let y = cy(g, k);
+        lib::columns::util::draw_box("via.drawing", cbox(x - 75., y - 75., x + 75., y + 75.));
     }
     cbox(0., 0., 0., 0.)
 }
@@ -687,36 +690,36 @@ fn hits_target(g: Grid, r: Run, t: Target, vertical: Bool) -> Bool {
     ((along && across) && (tall && (t.supply == r.t % 2 && t.skip != r.t)))
 }
 
-fn target_hits(g: Grid, r: Run, targets: [Target], vertical: Bool) -> Int {
-    std::len([for t in targets if hits_target(g, r, t, vertical) { t }])
+fn target_hits(g: Grid, r: Run, targets: [Target], vertical: Bool) -> [Target] {
+    [for t in targets if hits_target(g, r, t, vertical) { t }]
 }
 
-fn draw_target_vias(g: Grid, r: Run, targets: [Target], vertical: Bool) -> Rect {
-    for t in targets {
-        if hits_target(g, r, t, vertical) {
-            let rect = t.rect;
-            let area = if vertical { from_spans(m1_track(g, r.t), vspan(rect)) } else { from_spans(hspan(rect), m2_track(g, r.t)) };
-            via_cuts(area);
-        }
+fn draw_target_vias(g: Grid, r: Run, hits: [Target], vertical: Bool) -> Rect {
+    for t in hits {
+        let rect = t.rect;
+        let area = if vertical { from_spans(m1_track(g, r.t), vspan(rect)) } else { from_spans(hspan(rect), m2_track(g, r.t)) };
+        via_cuts(area);
     }
     cbox(0., 0., 0., 0.)
 }
 
 // Draws the runs of one layer that connect to anything, with their vias.
-// Crossing vias are drawn from the M1 side only.
+// Crossing vias are drawn from the M1 side only, so an M2 run only needs to
+// know that it has one.
 fn draw_runs(g: Grid, tracks: [[Run]], other: [[Run]], target_st: [[Target]], vertical: Bool) -> Int {
     for runs in tracks {
         for r in runs {
-            let targets = target_st[r.t / 16];
-            let crossings = crossing_count(r, other, first_crossing(r));
-            if crossings + target_hits(g, r, targets, vertical) > 0 {
-                if vertical {
+            let hits = target_hits(g, r, target_st[r.t / 16], vertical);
+            if vertical {
+                let crossings = crossing_tracks(r, other, first_crossing(r));
+                if (crossings != [] || hits != []) {
                     m1(from_spans(m1_track(g, r.t), layer_span(g, r, vertical)));
-                    draw_crossings(g, r, other, first_crossing(r));
-                } else {
-                    m2(from_spans(layer_span(g, r, vertical), m2_track(g, r.t)));
+                    draw_crossings(g, r, crossings);
+                    draw_target_vias(g, r, hits, vertical);
                 }
-                draw_target_vias(g, r, targets, vertical);
+            } else if (hits != [] || has_crossing(r, other, first_crossing(r))) {
+                m2(from_spans(layer_span(g, r, vertical), m2_track(g, r.t)));
+                draw_target_vias(g, r, hits, vertical);
             }
         }
     }

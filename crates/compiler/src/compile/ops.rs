@@ -192,7 +192,7 @@ pub(super) fn field(base: &Value, field: &str) -> OpResult {
         Value::Seq(Arc::new(
             points
                 .iter()
-                .map(|(x, y)| Value::Point(Box::new((x.clone(), y.clone()))))
+                .map(|(x, y)| Value::Point(Arc::new((x.clone(), y.clone()))))
                 .collect(),
         ))
     };
@@ -311,7 +311,7 @@ pub(super) fn struct_lit<'v>(
             };
             value.map(|value| (name.clone(), value))
         })
-        .collect::<Option<IndexMap<_, _>>>()
+        .collect::<Option<FxIndexMap<_, _>>>()
         .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
     Ok(Value::Struct(Arc::new(StructValue {
         name: ty.name.clone(),
@@ -432,7 +432,7 @@ pub(super) fn max_via_array(solver: &Solver, args: &[&Value]) -> OpResult {
     for (index, value) in args.iter().enumerate() {
         match (index, value) {
             (0 | 1, Value::Linear(expr)) => exprs.push(expr),
-            (2 | 3, Value::Tuple(pair)) => match pair.as_slice() {
+            (2 | 3, Value::Tuple(pair)) => match &**pair {
                 [Value::Linear(a), Value::Linear(b)] => exprs.extend([a, b]),
                 _ => return Err(error(ExecErrorKind::InvalidType)),
             },
@@ -465,7 +465,7 @@ pub(super) fn max_via_array(solver: &Solver, args: &[&Value]) -> OpResult {
         solver.grid(),
     );
     let float = |v: f64| Value::Linear(LinearExpr::from(v));
-    Ok(Value::Tuple(vec![
+    Ok(Value::Tuple(Arc::new([
         Value::Int(choice.0),
         Value::Int(choice.1),
         float(choice.2),
@@ -474,5 +474,5 @@ pub(super) fn max_via_array(solver: &Solver, args: &[&Value]) -> OpResult {
         float(choice.5),
         Value::Int(choice.6),
         float(choice.7),
-    ]))
+    ])))
 }
