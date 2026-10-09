@@ -70,11 +70,12 @@ fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-/// Publishes `info` in `directory` under the analyzer's process ID.
+/// Publishes `info` in `directory`, named for the analyzer's process and port.
 pub fn publish_in(directory: &Path, info: &SessionInfo) -> io::Result<SessionFile> {
     create_private_dir(directory)?;
-    let path = directory.join(format!("{}.json", info.pid));
-    let staging = directory.join(format!("{}.json.tmp", info.pid));
+    let name = format!("{}-{}", info.pid, info.port);
+    let path = directory.join(format!("{name}.json"));
+    let staging = directory.join(format!("{name}.json.tmp"));
     let _ = fs::remove_file(&staging);
     let contents = serde_json::to_vec_pretty(info).map_err(io::Error::other)?;
     write_private_file(&staging, &contents)?;
@@ -89,7 +90,7 @@ pub fn publish(info: &SessionInfo) -> io::Result<SessionFile> {
 }
 
 /// Resolves symlinks in the longest prefix of `path` that exists.
-fn canonical(path: &Path) -> PathBuf {
+pub(crate) fn canonical(path: &Path) -> PathBuf {
     for ancestor in path.ancestors() {
         if let Ok(resolved) = ancestor.canonicalize() {
             let rest = path.strip_prefix(ancestor).unwrap_or(Path::new(""));
@@ -142,6 +143,13 @@ pub fn discover_in(sessions: &Path, directory: &Path) -> Vec<(PathBuf, SessionIn
         .collect()
 }
 
+/// Every readable session record.
+pub fn list() -> Vec<(PathBuf, SessionInfo)> {
+    sessions_dir()
+        .map(|sessions| list_in(&sessions))
+        .unwrap_or_default()
+}
+
 pub fn discover(directory: &Path) -> Vec<(PathBuf, SessionInfo)> {
     sessions_dir()
         .map(|sessions| discover_in(&sessions, directory))
@@ -174,7 +182,7 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let sessions = state.path().join("sessions");
         let file = publish_in(&sessions, &info(7, state.path(), 1234)).unwrap();
-        let path = sessions.join("7.json");
+        let path = sessions.join("7-1234.json");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

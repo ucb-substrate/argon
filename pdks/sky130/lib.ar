@@ -1,3 +1,10 @@
+/// A 1.8 V transistor with `nf` gate fingers over one diffusion, contacted
+/// with local interconnect between and beside the fingers.
+///
+/// # Arguments
+/// - `nfet`: draws an NMOS device (N+ implant) if true, PMOS (P+ implant) if false.
+/// - `w`: width of each finger, which is the height of the diffusion.
+/// - `nf`: number of gate fingers.
 cell fet1v8(nfet: Bool, w: Float, nf: Int) {
     let poly = crect(layer="poly.drawing", x0=0., y0=0., w=150., h = w + 260.);
     let poly_bbox = std::array(poly, nf, 430., 0.);
@@ -21,6 +28,13 @@ cell fet1v8(nfet: Bool, w: Float, nf: Int) {
     std::center_rects(li1_bbox, std::array2(licon, nf + 1, ny, 430., 340.));
 }
 
+/// A well or substrate tap: a `w` by `h` tap diffusion covered with local
+/// interconnect and as many contacts as fit on a 340 pitch.
+///
+/// # Arguments
+/// - `ntap`: 1 for an N+ tap, which contacts an n-well; any other value for a P+ tap, which contacts the substrate.
+/// - `w`: width of the tap diffusion.
+/// - `h`: height of the tap diffusion.
 cell tap(ntap: Int, w: Float, h: Float) {
     let tap = rect("tap.drawing", x0=0., y0=0., w=w, h=h);
     let li1 = rect("li1.drawing", x0=tap.x0 + 40., y0=tap.y0 + 40., x1 = tap.x1 - 40., y1 = tap.y1 - 40.);
@@ -96,6 +110,9 @@ cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_xcoupled: Int) {
     let xcoupled_n = inst(inv(nw, pw, nf_xcoupled), x=xcoupled_p.x, reflect=true);
     eq(xcoupled_p.ntap.tap.x0, xcoupled_n.ntap.tap.x0);
     eq(xcoupled_p.ntap.tap.y0, xcoupled_n.ntap.tap.y0);
+    // One n-well across both inverter pairs, which sit closer than the well
+    // spacing rule allows.
+    rect("nwell.drawing", x0=main_p.nwell.x0, x1=xcoupled_p.nwell.x1, y0=main_p.nwell.y0, y1=main_n.nwell.y1);
     let m2p = rect("met2.drawing", w=300.)!;
     let m2n = rect("met2.drawing", w=300.)!;
     eq(m2p.x1 + 300., m2n.x0);
@@ -263,4 +280,229 @@ fn centered_via_array(r1: Rect, r2: Rect, via: Rect, xpitch: Float, ypitch: Floa
 
 cell diff_vco_top() {
     let vco = inst(diff_vco(1000., 1600., 4, 1, 2), x=0., y=0.);
+}
+
+/// A first-cut StrongARM latch comparator. While `clk` is low, PMOS switches
+/// reset both outputs and both internal nodes to VDD; when it rises, the input
+/// pair races the cross-coupled latch to a decision.
+///
+/// # Arguments
+/// - `w`: finger width of every transistor.
+/// - `nf_in`: fingers in each input transistor.
+/// - `nf_tail`: fingers in the clocked tail transistor.
+/// - `nf_latch`: fingers in each cross-coupled transistor.
+cell strongarm(w: Float = 1000., nf_in: Int = 4, nf_tail: Int = 4, nf_latch: Int = 2) {
+    // Clocked tail switch, centered on x = 0.
+    let tail = inst(fet1v8(true, w, nf_tail), y=0.);
+    eq(tail.sdm.x0 + tail.sdm.x1, 0.);
+
+    // Input pair, mirrored about x = 0.
+    let in_p = inst(fet1v8(true, w, nf_in));
+    let in_n = inst(fet1v8(true, w, nf_in));
+    eq(in_p.sdm.y0, tail.sdm.y1 + 500.);
+    eq(in_n.sdm.y0, in_p.sdm.y0);
+    eq(in_p.sdm.x1, -150.);
+    eq(in_n.sdm.x0, 150.);
+
+    // Cross-coupled NMOS pair, each centered over its input transistor.
+    let latch_nl = inst(fet1v8(true, w, nf_latch));
+    let latch_nr = inst(fet1v8(true, w, nf_latch));
+    eq(latch_nl.sdm.y0, in_p.sdm.y1 + 300.);
+    eq(latch_nr.sdm.y0, latch_nl.sdm.y0);
+    eq(latch_nl.sdm.x0 + latch_nl.sdm.x1, in_p.sdm.x0 + in_p.sdm.x1);
+    eq(latch_nr.sdm.x0 + latch_nr.sdm.x1, in_n.sdm.x0 + in_n.sdm.x1);
+
+    // Cross-coupled PMOS pair, with room below for the latch gates and
+    // cross-coupling.
+    let latch_pl = inst(fet1v8(false, w, nf_latch));
+    let latch_pr = inst(fet1v8(false, w, nf_latch));
+    eq(latch_pl.sdm.y0, latch_nl.sdm.y1 + 1100.);
+    eq(latch_pr.sdm.y0, latch_pl.sdm.y0);
+    eq(latch_pl.sdm.x0 + latch_pl.sdm.x1, latch_nl.sdm.x0 + latch_nl.sdm.x1);
+    eq(latch_pr.sdm.x0 + latch_pr.sdm.x1, latch_nr.sdm.x0 + latch_nr.sdm.x1);
+
+    // Output reset switches, outboard of the PMOS latch.
+    let reset_ol = inst(fet1v8(false, w, 1));
+    let reset_or = inst(fet1v8(false, w, 1));
+    eq(reset_ol.sdm.y0, latch_pl.sdm.y0);
+    eq(reset_or.sdm.y0, latch_pl.sdm.y0);
+    eq(reset_ol.sdm.x1 + 300., latch_pl.sdm.x0);
+    eq(reset_or.sdm.x0 - 300., latch_pr.sdm.x1);
+
+    // Internal-node reset switches, one row up.
+    let reset_xl = inst(fet1v8(false, w, 1));
+    let reset_xr = inst(fet1v8(false, w, 1));
+    eq(reset_xl.sdm.y0, latch_pl.sdm.y1 + 300.);
+    eq(reset_xr.sdm.y0, reset_xl.sdm.y0);
+    // Aligned so their sources share the PMOS latch's outer source strips.
+    eq(reset_xl.li1_bbox.x0, latch_pl.li1_bbox.x0);
+    eq(reset_xr.li1_bbox.x1, latch_pr.li1_bbox.x1);
+
+    // Substrate and n-well taps spanning the widest row.
+    let row_w = 2. * reset_ol.sdm.w + latch_pl.sdm.w + in_p.sdm.w + 900.;
+    let ptap = inst(tap(0, row_w - 260., 800.));
+    eq(ptap.sdm.y1 + 800., tail.sdm.y0);
+    eq(ptap.sdm.x0, reset_ol.sdm.x0);
+    let ntap = inst(tap(1, row_w - 260., 800.));
+    eq(ntap.sdm.y0, reset_xl.sdm.y1 + 300.);
+    eq(ntap.sdm.x0, reset_ol.sdm.x0);
+    let nwell = rect("nwell.drawing", x0=ntap.sdm.x0 - 180., x1=ntap.sdm.x1 + 180., y0=latch_pl.sdm.y0 - 180., y1=ntap.sdm.y1 + 180.);
+
+    // One implant per transistor type, so neighbors don't leave narrow gaps.
+    rect("nsdm.drawing", x0=in_p.sdm.x0, x1=in_n.sdm.x1, y0=tail.sdm.y0, y1=latch_nl.sdm.y1);
+    rect("psdm.drawing", x0=reset_ol.sdm.x0, x1=reset_or.sdm.x1, y0=latch_pl.sdm.y0, y1=reset_xl.sdm.y1);
+
+    // Power rails on met1 over the taps.
+    let vss = rect("met1.drawing", x0=ptap.li1.x0, x1=ptap.li1.x1, y0=ptap.li1.y0, y1=ptap.li1.y1);
+    let vdd = rect("met1.drawing", x0=ntap.li1.x0, x1=ntap.li1.x1, y0=ntap.li1.y0, y1=ntap.li1.y1);
+    let mcon = crect(layer="mcon.drawing", w=170., h=170., x0=0., y0=0.);
+    centered_via_array(vss, ptap.li1, mcon, 360., 360.);
+    centered_via_array(vdd, ntap.li1, mcon, 360., 360.);
+
+    // Tail sources down to the substrate tap.
+    let strap = crect(layer="li1.drawing", x0=tail.li1_bbox.x0, w=170., y0=ptap.li1.y0, y1=tail.li1_bbox.y1);
+    let straps = std::array(strap, nf_tail + 1 - (nf_tail + 1) / 2, 860., 0.);
+    eq(straps.x0, tail.li1_bbox.x0);
+    eq(straps.y0, ptap.li1.y0);
+
+    // Reset switch sources up to the n-well tap.
+    rect("li1.drawing", x0=reset_ol.li1_bbox.x0, w=170., y0=reset_ol.li1_bbox.y0, y1=ntap.li1.y1);
+    rect("li1.drawing", x1=reset_or.li1_bbox.x1, w=170., y0=reset_or.li1_bbox.y0, y1=ntap.li1.y1);
+    rect("li1.drawing", x0=reset_xl.li1_bbox.x0, w=170., y0=reset_xl.li1_bbox.y0, y1=ntap.li1.y1);
+    rect("li1.drawing", x1=reset_xr.li1_bbox.x1, w=170., y0=reset_xr.li1_bbox.y0, y1=ntap.li1.y1);
+
+    // PMOS latch sources up to the n-well tap.
+    rect("li1.drawing", x0=latch_pl.li1_bbox.x0, w=170., y0=latch_pl.li1_bbox.y0, y1=ntap.li1.y1);
+    rect("li1.drawing", x1=latch_pl.li1_bbox.x1, w=170., y0=latch_pl.li1_bbox.y0, y1=ntap.li1.y1);
+    rect("li1.drawing", x0=latch_pr.li1_bbox.x0, w=170., y0=latch_pr.li1_bbox.y0, y1=ntap.li1.y1);
+    rect("li1.drawing", x1=latch_pr.li1_bbox.x1, w=170., y0=latch_pr.li1_bbox.y0, y1=ntap.li1.y1);
+
+    // Input drains up to the NMOS latch sources: internal nodes x and y.
+    rect("li1.drawing", x0=in_p.li1_bbox.x0 + 430., w=170., y0=in_p.li1_bbox.y0, y1=latch_nl.li1_bbox.y1);
+    rect("li1.drawing", x0=in_p.li1_bbox.x0 + 1290., w=170., y0=in_p.li1_bbox.y0, y1=latch_nl.li1_bbox.y1);
+    rect("li1.drawing", x0=in_n.li1_bbox.x0 + 430., w=170., y0=in_n.li1_bbox.y0, y1=latch_nr.li1_bbox.y1);
+    rect("li1.drawing", x0=in_n.li1_bbox.x0 + 1290., w=170., y0=in_n.li1_bbox.y0, y1=latch_nr.li1_bbox.y1);
+
+    // Tail node: the tail drains and the input sources, joined on met1.
+    let tail_y = tail.li1_bbox.y1 - 185.;
+    let in_y = in_p.li1_bbox.y0 + 15.;
+    rect("met1.drawing", x0=in_p.li1_bbox.x0 - 30., x1=in_n.li1_bbox.x1 + 30., y0=tail_y - 30., y1=in_y + 200.);
+    mcon_at(tail.li1_bbox.x0 + 430., tail_y);
+    mcon_at(tail.li1_bbox.x0 + 1290., tail_y);
+    mcon_at(in_p.li1_bbox.x0, in_y);
+    mcon_at(in_p.li1_bbox.x0 + 860., in_y);
+    mcon_at(in_p.li1_bbox.x0 + 1720., in_y);
+    mcon_at(in_n.li1_bbox.x0, in_y);
+    mcon_at(in_n.li1_bbox.x0 + 860., in_y);
+    mcon_at(in_n.li1_bbox.x0 + 1720., in_y);
+
+    // Latch gates: poly from each NMOS finger up to the PMOS finger above
+    // it, tied by a bar with a contact outboard.
+    let gap = latch_nl.sdm.y1;
+    let finger = crect(layer="poly.drawing", x0=0., y0=latch_nl.poly_bbox.y1, y1=latch_pl.poly_bbox.y0, w=150.);
+    let fingers_l = std::array(finger, nf_latch, 430., 0.);
+    eq(fingers_l.x0, latch_nl.poly_bbox.x0);
+    eq(fingers_l.y0, latch_nl.poly_bbox.y1);
+    let fingers_r = std::array(finger, nf_latch, 430., 0.);
+    eq(fingers_r.x0, latch_nr.poly_bbox.x0);
+    eq(fingers_r.y0, latch_nr.poly_bbox.y1);
+    let bar_l = rect("poly.drawing", x0=latch_nl.poly_bbox.x0 - 700., x1=latch_nl.poly_bbox.x1, y0=gap + 150., h=270.);
+    let bar_r = rect("poly.drawing", x0=latch_nr.poly_bbox.x0, x1=latch_nr.poly_bbox.x1 + 700., y0=gap + 150., h=270.);
+    poly_contact(bar_l.x0 + 50., gap + 200., gap + 1100.);
+    poly_contact(bar_r.x1 - 220., gap + 200., gap + 640.);
+
+    // Latch drains: the outputs, from each NMOS drain up to the PMOS drain.
+    let outn = rect("li1.drawing", x0=latch_nl.li1_bbox.x0 + 430., w=170., y0=latch_nl.li1_bbox.y0, y1=latch_pl.li1_bbox.y1);
+    let outp = rect("li1.drawing", x0=latch_nr.li1_bbox.x0 + 430., w=170., y0=latch_nr.li1_bbox.y0, y1=latch_pr.li1_bbox.y1);
+
+    // Cross-coupling on met1: each output to the opposite latch's gate.
+    let col_l = bar_l.x0 + 50.;
+    let col_r = bar_r.x1 - 220.;
+    rect("met1.drawing", x0=outn.x0 - 60., x1=col_r + 230., y0=gap + 400., h=290.);
+    mcon_at(outn.x0, gap + 460.);
+    mcon_at(col_r, gap + 460.);
+    rect("met1.drawing", x0=col_l - 60., x1=outp.x1 + 60., y0=gap + 830., h=290.);
+    mcon_at(outp.x0, gap + 890.);
+    mcon_at(col_l, gap + 890.);
+
+    // Output reset drains to the outputs, on met1 across the PMOS row.
+    let reset_y = latch_pl.li1_bbox.y0 + 300.;
+    rect("met1.drawing", x0=reset_ol.li1_bbox.x1 - 200., x1=outn.x1 + 30., y0=reset_y - 15., h=200.);
+    mcon_at(reset_ol.li1_bbox.x1 - 170., reset_y);
+    mcon_at(outn.x0, reset_y);
+    rect("met1.drawing", x0=outp.x0 - 30., x1=reset_or.li1_bbox.x0 + 200., y0=reset_y - 15., h=200.);
+    mcon_at(reset_or.li1_bbox.x0, reset_y);
+    mcon_at(outp.x0, reset_y);
+
+    // Gates: clk on the tail, and inp and inn on the input pair, each tied by
+    // a poly bar below its fingers with a contact outboard.
+    let clk_bar = rect("poly.drawing", x0=tail.poly_bbox.x0 - 700., x1=tail.poly_bbox.x1, y1=tail.poly_bbox.y0, h=270.);
+    poly_contact(clk_bar.x0 + 50., clk_bar.y0 + 50., clk_bar.y0 + 300.);
+    let inp_bar = rect("poly.drawing", x0=in_p.poly_bbox.x0 - 700., x1=in_p.poly_bbox.x1, y1=in_p.poly_bbox.y0, h=270.);
+    poly_contact(inp_bar.x0 + 50., inp_bar.y0 + 50., inp_bar.y0 + 300.);
+    let inn_bar = rect("poly.drawing", x0=in_n.poly_bbox.x0, x1=in_n.poly_bbox.x1 + 700., y1=in_n.poly_bbox.y0, h=270.);
+    poly_contact(inn_bar.x1 - 220., inn_bar.y0 + 50., inn_bar.y0 + 300.);
+
+    // Reset gates: poly bars run outboard to a met2 clk spine on each side,
+    // and a met1 bus below the tail joins both spines to the tail gate.
+    let spine_l = reset_ol.sdm.x0 - 50.;
+    let spine_r = reset_or.sdm.x1 + 50.;
+    rect("poly.drawing", x0=spine_l - 160., x1=reset_ol.poly_bbox.x1, y1=reset_ol.poly_bbox.y0, h=270.);
+    rect("poly.drawing", x0=reset_or.poly_bbox.x0, x1=spine_r + 160., y1=reset_or.poly_bbox.y0, h=270.);
+    rect("poly.drawing", x0=spine_l - 160., x1=reset_xl.poly_bbox.x1, y0=reset_xl.poly_bbox.y1, h=270.);
+    rect("poly.drawing", x0=reset_xr.poly_bbox.x0, x1=spine_r + 160., y0=reset_xr.poly_bbox.y1, h=270.);
+    for y in [reset_ol.poly_bbox.y0 - 220., reset_xl.poly_bbox.y1 + 50.] {
+        poly_contact(spine_l - 110., y, y + 170.);
+        li_to_m2(spine_l - 110., y);
+        poly_contact(spine_r - 60., y, y + 170.);
+        li_to_m2(spine_r - 60., y);
+    }
+    let clk_y = ptap.sdm.y1 + 250.;
+    rect("met1.drawing", x0=spine_l, x1=spine_r, y0=clk_y, h=320.);
+    rect("li1.drawing", x0=clk_bar.x0 + 50., w=170., y0=clk_y + 15., y1=clk_bar.y0 + 50.);
+    mcon_at(clk_bar.x0 + 50., clk_y + 15.);
+    rect("met2.drawing", x0=spine_l, w=300., y0=clk_y, y1=reset_xl.poly_bbox.y1 + 270.);
+    rect("met2.drawing", x1=spine_r, w=300., y0=clk_y, y1=reset_xr.poly_bbox.y1 + 270.);
+    rect("via.drawing", x0=spine_l + 85., y0=clk_y + 85., w=150., h=150.);
+    rect("via.drawing", x1=spine_r - 85., y0=clk_y + 85., w=150., h=150.);
+
+    // Internal nodes up to the internal-node reset drains, on met2.
+    let node_y = latch_nl.li1_bbox.y1 - 250.;
+    let reset_y = reset_xl.li1_bbox.y0 + 500.;
+    li_to_m2(latch_nl.li1_bbox.x1 - 170., node_y);
+    li_to_m2(reset_xl.li1_bbox.x1 - 170., reset_y);
+    rect("met2.drawing", x0=latch_nl.li1_bbox.x1 - 250., w=330., y0=node_y - 80., y1=reset_y + 250.);
+    rect("met2.drawing", x0=reset_xl.li1_bbox.x1 - 250., x1=latch_nl.li1_bbox.x1 + 80., y0=reset_y - 80., h=330.);
+    li_to_m2(latch_nr.li1_bbox.x0, node_y);
+    li_to_m2(reset_xr.li1_bbox.x0, reset_y);
+    rect("met2.drawing", x0=latch_nr.li1_bbox.x0 - 80., w=330., y0=node_y - 80., y1=reset_y + 250.);
+    rect("met2.drawing", x0=latch_nr.li1_bbox.x0 - 80., x1=reset_xr.li1_bbox.x0 + 250., y0=reset_y - 80., h=330.);
+
+    // Pins: clk on the met1 bus below the tail, inp and inn on the outboard
+    // input gate contacts, and outp and outn on the latch drain straps.
+}
+
+/// A local-interconnect-to-met1 cut with its lower-left corner at (`x0`, `y0`),
+/// on a met1 pad that encloses it by 60 on every side.
+fn mcon_at(x0: Float, y0: Float) {
+    rect("mcon.drawing", x0=x0, y0=y0, w=170., h=170.);
+    rect("met1.drawing", x0=x0 - 60., y0=y0 - 60., w=290., h=290.);
+}
+
+/// A poly contact cut at (`x0`, `y0`) with its NPC, and local interconnect
+/// that encloses the cut by 80 and runs up to `y1`.
+fn poly_contact(x0: Float, y0: Float, y1: Float) {
+    rect("licon1.drawing", x0=x0, y0=y0, w=170., h=170.);
+    rect("npc.drawing", x0=x0 - 100., y0=y0 - 100., w=370., h=370.);
+    rect("li1.drawing", x0=x0 - 80., y0=y0 - 80., w=330., y1=y1);
+}
+
+/// Connects local interconnect to met2 at the 170 by 170 site whose
+/// lower-left corner is (`x0`, `y0`): an mcon and a via, stacked on met1 and
+/// met2 pads that meet the via enclosure rules.
+fn li_to_m2(x0: Float, y0: Float) {
+    rect("mcon.drawing", x0=x0, y0=y0, w=170., h=170.);
+    rect("met1.drawing", x0=x0 - 75., y0=y0 - 75., w=320., h=320.);
+    rect("via.drawing", x0=x0 + 10., y0=y0 + 10., w=150., h=150.);
+    rect("met2.drawing", x0=x0 - 80., y0=y0 - 80., w=330., h=330.);
 }

@@ -6745,6 +6745,31 @@ mod module_prefix_tests {
     }
 }
 
+/// Truncates toward zero, taking a value within float error of an integer as
+/// that integer.
+fn truncate_to_int(value: f64) -> i64 {
+    let nearest = value.round();
+    if (value - nearest).abs() <= 1e-9 * nearest.abs().max(1.) {
+        nearest as i64
+    } else {
+        value.trunc() as i64
+    }
+}
+
+#[cfg(test)]
+mod int_cast_tests {
+    use super::truncate_to_int;
+
+    #[test]
+    fn truncates_toward_zero_but_absorbs_float_error() {
+        assert_eq!(truncate_to_int(2.44), 2);
+        assert_eq!(truncate_to_int(19.38), 19);
+        assert_eq!(truncate_to_int(-2.7), -2);
+        assert_eq!(truncate_to_int(2.9999999999999996), 3);
+        assert_eq!(truncate_to_int(0.1 * 3. / 0.1), 3);
+    }
+}
+
 #[cfg(test)]
 mod initial_condition_format_tests {
     use super::format_initial_condition;
@@ -11646,7 +11671,10 @@ impl<'a> ExecPass<'a> {
                             // `f64 as i64` saturates rather than failing, so a
                             // non-finite input would silently become
                             // `i64::MAX` and feed unbounded allocation.
-                            if let Some(val) = state.solver.eval_expr(expr)
+                            // A count is not a coordinate, so it is evaluated
+                            // exactly rather than snapped to the grid.
+                            let exact = state.solver.eval_expr_exact(expr);
+                            if let Some(val) = exact
                                 && !val.is_finite()
                             {
                                 let span = self.span(&vref.loc, c.expr.span);
@@ -11657,10 +11685,7 @@ impl<'a> ExecPass<'a> {
                                 });
                                 return self.poison(cell_id, vid);
                             }
-                            let res = state
-                                .solver
-                                .eval_expr(expr)
-                                .map(|val| Value::Int(val as i64));
+                            let res = exact.map(|val| Value::Int(truncate_to_int(val)));
                             if res.is_none() {
                                 for (_, var) in expr.coeffs.clone() {
                                     self.add_var_dependent(cell_id, var, vid);

@@ -22,10 +22,11 @@ struct Args {
 enum Command {
     /// Coordinate startup with a local Argone SSH session.
     Relay,
-    /// Serve the Model Context Protocol, forwarding to the running analyzer
-    /// whose workspace contains the working directory.
+    /// Serve the Model Context Protocol, forwarding each tool call to one of
+    /// the user's running analyzers.
     Mcp {
-        /// Directory to find a session for, instead of the working directory.
+        /// Directory to resolve relative paths against and to look for a
+        /// session in first, instead of the working directory.
         #[arg(long)]
         root: Option<PathBuf>,
     },

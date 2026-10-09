@@ -8,7 +8,7 @@ sidebar_label: Agents
 
 A coding agent can edit an Argon project while you have it open. Its edits go into your Neovim buffers, the same way GUI edits do, so you watch each one land in Neovim and in the GUI. Edits stay unsaved until you save them, and each one can be undone with `u`.
 
-Agents connect through `argon-analyzer mcp`, a [Model Context Protocol](https://modelcontextprotocol.io) server. It finds the analyzer that serves the agent's working directory, so start Argon first (for example with `argone`) and then the agent.
+Agents connect through `argon-analyzer mcp`, a [Model Context Protocol](https://modelcontextprotocol.io) server. It finds the Argon sessions you have running when the agent calls a tool, so you can start, stop, and switch Argon projects without restarting the agent.
 
 ## Setup
 
@@ -32,13 +32,23 @@ That writes `.mcp.json`:
 }
 ```
 
-To search for a session from a directory other than the agent's working directory, pass `--root <DIR>`.
+Relative paths are resolved against the agent's working directory. To use a different directory, pass `--root <DIR>`.
+
+## Choosing a session
+
+Each Argon library you have open, for example with `argone`, is its own session, and one server works with all of them:
+
+- File tools (`read_file`, `edit_file`, `create_file`) use the session whose workspace contains the file.
+- The other tools take an optional `workspace` argument naming a library directory.
+- Without one, they use the session used last, then a session whose workspace contains the agent's working directory, then the only session running.
+
+`status` lists the running sessions, so an agent at the top of a repository can find the library you're working on.
 
 ## Tools
 
 | Tool | Description |
 | --- | --- |
-| `status` | Workspace root, the cell open in the GUI, follow mode, the approval mode, and the files open in Neovim. |
+| `status` | The running sessions, and for one of them: its workspace, the cell open in the GUI, follow mode, the approval mode, and the files open in Neovim. |
 | `read_file` | A file as you currently have it, unsaved edits included. |
 | `edit_file` | Find-and-replace edits applied to a Neovim buffer as one undo step. Returns the recompiled cell's shape, bounding box, and diagnostics. |
 | `create_file` | A new source file, opened as an unsaved buffer. |

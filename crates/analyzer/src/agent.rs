@@ -137,9 +137,11 @@ impl CompileSummary {
         };
         summary.cells = data.cells.len();
         if let Some(top) = data.cells.get(&data.top) {
-            for object in top.objects.values() {
+            // Count what is drawn and exported, not the construction-only
+            // copies made when a cell reads an instance's geometry.
+            for object in top.objects.values().filter(|object| object.is_layout()) {
                 match object {
-                    SolvedValue::Rect(_) => summary.rects += 1,
+                    SolvedValue::Rect(rect) if rect.layer.is_some() => summary.rects += 1,
                     SolvedValue::Polygon(_) => summary.polygons += 1,
                     SolvedValue::Path(_) => summary.paths += 1,
                     SolvedValue::Instance(_) => summary.instances += 1,
@@ -416,7 +418,7 @@ pub(crate) fn plan_insert(
 }
 
 /// Removes `.` and `..` components without touching the file system.
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -1027,6 +1029,46 @@ mod tests {
             .unwrap_err()
             .contains("overlapping")
         );
+    }
+
+    #[test]
+    fn summaries_count_only_drawn_geometry() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("lib.ar");
+        std::fs::write(
+            &source,
+            "cell bot() {\n    let met1 = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n}\n\
+             cell top() {\n    let left = inst(bot());\n    eq(left.x, 0.);\n    eq(left.y, 0.);\n    \
+             let strap = rect(\"met2\", x0=left.met1.x0, y0=0., x1=left.met1.x1, y1=left.met1.y1 / 2.);\n}\n",
+        )
+        .unwrap();
+        let ast = argonc::parse::parse_workspace_with_std(&source).ast();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let output = argonc::compile::compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+            },
+            &argonc::WorkspaceConfig::default().with_tech(Some(tech)),
+        );
+        let CompileOutput::Valid(data) = &output else {
+            panic!("the test cell should compile: {output:?}");
+        };
+        let top = &data.cells[&data.top];
+        assert!(
+            top.objects
+                .values()
+                .filter(|object| matches!(object, SolvedValue::Rect(_)))
+                .count()
+                > 1,
+            "reading left.met1 should leave construction copies to skip"
+        );
+        let summary = CompileSummary::new(Some("top()"), &output);
+        assert_eq!(summary.rects, 1);
+        assert_eq!(summary.instances, 1);
+        assert_eq!(summary.bbox, Some([0., 0., 10., 10.]));
     }
 
     #[test]

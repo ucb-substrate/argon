@@ -1,10 +1,12 @@
-//! A Model Context Protocol server that lets agents work through a running
-//! analyzer, so their edits land in the user's Neovim buffers.
+//! A Model Context Protocol server that lets agents work through running
+//! analyzers, so their edits land in the user's Neovim buffers.
 //!
-//! It speaks newline-delimited JSON-RPC on stdin and stdout and forwards tool
-//! calls to the analyzer whose workspace contains its working directory.
+//! It speaks newline-delimited JSON-RPC on stdin and stdout. Each tool call
+//! goes to the session whose workspace contains the file it names, or to the
+//! session chosen with `workspace`, the one used last, or the only one running.
 
 use std::{
+    collections::HashMap,
     io,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -23,17 +25,21 @@ use crate::{
         AgentClient, AgentStatus, CALL_DEADLINE, CompileStatus, CreateRequest, EditRequest,
         Replacement, Report,
     },
-    session, transport,
+    session::{self, SessionInfo},
+    transport,
 };
 
 /// Used when a client asks for no particular protocol version.
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 
 const INSTRUCTIONS: &str = "This server edits Argon layout sources through the user's running \
-Argon session. Edits go into the user's Neovim buffers, so the user watches them land in Neovim \
+Argon sessions. Edits go into the user's Neovim buffers, so the user watches them land in Neovim \
 and the layout GUI and can undo them. Buffers may hold unsaved changes, so read .ar files with \
 read_file rather than from disk, edit them with edit_file or create_file rather than writing \
-files, and check cells with compile_cell rather than `arc run`. Never save files; the user does.";
+files, and check cells with compile_cell rather than `arc run`. Never save files; the user does. \
+The user may have several Argon libraries open, one session each: file tools use the session \
+that contains the file, and the other tools take `workspace` to choose one. Call status to see \
+which sessions are running.";
 
 pub(crate) fn no_session_message(directory: &Path) -> String {
     format!(
@@ -42,24 +48,35 @@ pub(crate) fn no_session_message(directory: &Path) -> String {
     )
 }
 
+async fn connect_agent(info: &SessionInfo) -> io::Result<AgentClient> {
+    let token = info.token().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the session record has no valid token",
+        )
+    })?;
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, info.port));
+    let stream = transport::connect(addr, &token, transport::Role::Agent).await?;
+    let transport = tarpc::serde_transport::new(stream, Bincode::default());
+    Ok(AgentClient::new(tarpc::client::Config::default(), transport).spawn())
+}
+
+/// Forgets the record of an analyzer that is no longer listening.
+fn forget_if_gone(record: &Path, error: &io::Error) {
+    if error.kind() == io::ErrorKind::ConnectionRefused {
+        let _ = std::fs::remove_file(record);
+    }
+}
+
 /// Connects to the innermost running analyzer whose workspace contains
 /// `directory`, discarding records of analyzers that are gone.
 pub(crate) async fn connect_session(directory: &Path) -> Result<AgentClient, String> {
     let mut last_error = None;
     for (record, info) in session::discover(directory) {
-        let Some(token) = info.token() else {
-            continue;
-        };
-        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, info.port));
-        match transport::connect(addr, &token, transport::Role::Agent).await {
-            Ok(stream) => {
-                let transport = tarpc::serde_transport::new(stream, Bincode::default());
-                return Ok(AgentClient::new(tarpc::client::Config::default(), transport).spawn());
-            }
+        match connect_agent(&info).await {
+            Ok(client) => return Ok(client),
             Err(error) => {
-                if error.kind() == io::ErrorKind::ConnectionRefused {
-                    let _ = std::fs::remove_file(record);
-                }
+                forget_if_gone(&record, &error);
                 last_error = Some(error);
             }
         }
@@ -88,46 +105,213 @@ fn is_disconnected(error: &tarpc::client::RpcError) -> bool {
     )
 }
 
-/// Answers MCP messages for the session whose workspace contains `directory`.
+/// A connected analyzer.
+#[derive(Clone)]
+struct Session {
+    /// The session record, which identifies one analyzer process.
+    record: PathBuf,
+    root: PathBuf,
+    client: AgentClient,
+}
+
+/// Which session a tool call is for.
+#[derive(Clone, Copy)]
+enum Target<'a> {
+    /// The innermost session whose workspace contains this file or directory.
+    Containing(&'a Path),
+    /// The session used last, else one containing the bridge's directory,
+    /// else the only one running.
+    Default,
+}
+
+/// Shows one session's paths relative to the bridge's directory.
+struct PathView<'a> {
+    directory: &'a Path,
+    root: &'a Path,
+}
+
+impl PathView<'_> {
+    fn show(&self, path: &Path) -> String {
+        let path = self.root.join(path);
+        path.strip_prefix(self.directory)
+            .map(Path::to_path_buf)
+            .or_else(|_| {
+                session::canonical(&path)
+                    .strip_prefix(session::canonical(self.directory))
+                    .map(Path::to_path_buf)
+            })
+            .ok()
+            .filter(|relative| !relative.as_os_str().is_empty())
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    }
+}
+
+/// Answers MCP messages, routing each tool call to one of the user's
+/// running analyzers.
 pub struct Bridge {
+    /// Where relative paths are resolved, like the agent's own working directory.
     directory: PathBuf,
-    client: Mutex<Option<AgentClient>>,
+    sessions: Mutex<HashMap<PathBuf, Session>>,
+    last_used: Mutex<Option<PathBuf>>,
 }
 
 impl Bridge {
     pub fn new(directory: PathBuf) -> Self {
         Self {
             directory,
-            client: Mutex::new(None),
+            sessions: Mutex::new(HashMap::new()),
+            last_used: Mutex::new(None),
         }
     }
 
-    async fn client(&self) -> Result<AgentClient, String> {
-        let mut client = self.client.lock().await;
-        if let Some(client) = client.as_ref() {
-            return Ok(client.clone());
-        }
-        let connected = connect_session(&self.directory).await?;
-        *client = Some(connected.clone());
-        Ok(connected)
+    fn absolute(&self, path: &str) -> PathBuf {
+        let path = Path::new(path);
+        crate::agent::normalize(&if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.directory.join(path)
+        })
     }
 
-    /// Runs `call`, reconnecting once if the analyzer went away.
-    async fn call<T, F, Fut>(&self, call: F) -> Result<T, String>
+    fn view<'a>(&'a self, session: &'a Session) -> PathView<'a> {
+        PathView {
+            directory: &self.directory,
+            root: &session.root,
+        }
+    }
+
+    async fn connect(&self, record: &Path, info: &SessionInfo) -> io::Result<Session> {
+        if let Some(session) = self.sessions.lock().await.get(record) {
+            return Ok(session.clone());
+        }
+        let session = Session {
+            record: record.to_path_buf(),
+            root: info.root.clone(),
+            client: connect_agent(info).await?,
+        };
+        self.sessions
+            .lock()
+            .await
+            .insert(record.to_path_buf(), session.clone());
+        Ok(session)
+    }
+
+    async fn first_reachable(&self, candidates: Vec<(PathBuf, SessionInfo)>) -> Option<Session> {
+        for (record, info) in candidates {
+            match self.connect(&record, &info).await {
+                Ok(session) => return Some(session),
+                Err(error) => forget_if_gone(&record, &error),
+            }
+        }
+        None
+    }
+
+    /// Every session that accepts a connection, ordered by workspace.
+    async fn running(&self) -> Vec<Session> {
+        let mut running = Vec::new();
+        for (record, info) in session::list() {
+            match self.connect(&record, &info).await {
+                Ok(session) => running.push(session),
+                Err(error) => forget_if_gone(&record, &error),
+            }
+        }
+        running.sort_by(|a, b| a.root.cmp(&b.root));
+        running
+    }
+
+    fn workspaces(&self, sessions: &[Session]) -> String {
+        sessions
+            .iter()
+            .map(|session| {
+                let view = PathView {
+                    directory: &self.directory,
+                    root: Path::new(""),
+                };
+                format!("  {}", view.show(&session.root))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    async fn session(&self, target: Target<'_>) -> Result<Session, String> {
+        let path = match target {
+            Target::Containing(path) => path,
+            Target::Default => {
+                let last = self.last_used.lock().await.clone();
+                if let Some(record) = last
+                    && let Some(session) = self.sessions.lock().await.get(&record).cloned()
+                {
+                    return Ok(session);
+                }
+                if let Some(session) = self
+                    .first_reachable(session::discover(&self.directory))
+                    .await
+                {
+                    return Ok(session);
+                }
+                let mut running = self.running().await;
+                return match running.len() {
+                    0 => Err(no_session_message(&self.directory)),
+                    1 => Ok(running.remove(0)),
+                    _ => Err(format!(
+                        "Several Argon sessions are running. Pass `workspace` with one of these, or name a file in it:\n{}",
+                        self.workspaces(&running)
+                    )),
+                };
+            }
+        };
+        if let Some(session) = self.first_reachable(session::discover(path)).await {
+            return Ok(session);
+        }
+        let running = self.running().await;
+        Err(if running.is_empty() {
+            no_session_message(path)
+        } else {
+            format!(
+                "No running Argon session contains {}. Ask the user to open its library with `argone`. Running sessions:\n{}",
+                path.display(),
+                self.workspaces(&running)
+            )
+        })
+    }
+
+    /// Runs `call` against the session for `target`, choosing again once if
+    /// that analyzer went away.
+    async fn call<T, F, Fut>(&self, target: Target<'_>, call: F) -> Result<(Session, T), String>
     where
         F: Fn(AgentClient) -> Fut,
         Fut: Future<Output = Result<T, tarpc::client::RpcError>>,
     {
-        let client = self.client().await?;
-        match call(client).await {
-            Ok(value) => Ok(value),
-            Err(error) if is_disconnected(&error) => {
-                *self.client.lock().await = None;
-                let client = self.client().await?;
-                call(client).await.map_err(|error| error.to_string())
+        let mut retried = false;
+        loop {
+            let session = self.session(target).await?;
+            match call(session.client.clone()).await {
+                Ok(value) => {
+                    *self.last_used.lock().await = Some(session.record.clone());
+                    return Ok((session, value));
+                }
+                Err(error) if is_disconnected(&error) && !retried => {
+                    self.sessions.lock().await.remove(&session.record);
+                    retried = true;
+                }
+                Err(error) => return Err(error.to_string()),
             }
-            Err(error) => Err(error.to_string()),
         }
+    }
+
+    fn workspace_target<'a>(&self, workspace: &'a Option<PathBuf>) -> Target<'a> {
+        workspace
+            .as_deref()
+            .map_or(Target::Default, Target::Containing)
+    }
+
+    fn workspace_argument(&self, arguments: &Value) -> Option<PathBuf> {
+        arguments
+            .get("workspace")
+            .and_then(Value::as_str)
+            .map(|workspace| self.absolute(workspace))
     }
 
     /// The response to one JSON-RPC message, or `None` for a notification.
@@ -169,26 +353,54 @@ impl Bridge {
     }
 
     async fn run_tool(&self, name: &str, arguments: &Value) -> Result<String, String> {
+        let workspace = self.workspace_argument(arguments);
+        let target = self.workspace_target(&workspace);
         match name {
             "status" => {
-                let status = self
-                    .call(|client| async move { client.status(call_context()).await })
-                    .await?;
-                Ok(format_status(&status))
+                let running = self.running().await;
+                let result = self
+                    .call(target, |client| async move {
+                        client.status(call_context()).await
+                    })
+                    .await;
+                let (session, status) = match result {
+                    Ok(chosen) => chosen,
+                    // Listing the sessions is how the agent learns to choose.
+                    Err(_) if workspace.is_none() && running.len() > 1 => {
+                        return Ok(format!(
+                            "Running Argon sessions (pass `workspace` to choose one):\n{}",
+                            self.workspaces(&running)
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                };
+                let mut text = format_status(&status, &self.view(&session));
+                let others = running
+                    .into_iter()
+                    .filter(|other| other.record != session.record)
+                    .collect::<Vec<_>>();
+                if !others.is_empty() {
+                    text.push_str(&format!(
+                        "\nOther running sessions (pass `workspace` to use one):\n{}",
+                        self.workspaces(&others)
+                    ));
+                }
+                Ok(text)
             }
             "read_file" => {
-                let path = PathBuf::from(string_argument(arguments, "path")?);
+                let path = self.absolute(string_argument(arguments, "path")?);
                 let offset = arguments.get("offset").and_then(Value::as_u64);
                 let limit = arguments.get("limit").and_then(Value::as_u64);
-                let file = self
-                    .call(|client| {
+                let (session, file) = self
+                    .call(Target::Containing(&path), |client| {
                         let path = path.clone();
                         async move { client.read_file(call_context(), path).await }
                     })
-                    .await??;
+                    .await?;
+                let file = file?;
                 Ok(format!(
                     "{} ({})\n{}",
-                    file.path.display(),
+                    self.view(&session).show(&file.path),
                     if file.from_editor {
                         "from the Neovim buffer, which may be unsaved"
                     } else {
@@ -199,67 +411,71 @@ impl Bridge {
             }
             "edit_file" => {
                 let request = EditRequest {
-                    path: PathBuf::from(string_argument(arguments, "path")?),
+                    path: self.absolute(string_argument(arguments, "path")?),
                     edits: replacements(arguments)?,
                     label: label(arguments, "Agent edit"),
                 };
-                let report = self
-                    .call(|client| {
+                let (session, report) = self
+                    .call(Target::Containing(&request.path), |client| {
                         let request = request.clone();
                         async move { client.edit_file(call_context(), request).await }
                     })
-                    .await??;
+                    .await?;
+                let view = self.view(&session);
                 Ok(format!(
                     "Applied the edit to the Neovim buffer for {}; it is unsaved.\n{}",
-                    request.path.display(),
-                    format_report(&report)
+                    view.show(&request.path),
+                    format_report(&report?, &view)
                 ))
             }
             "create_file" => {
                 let request = CreateRequest {
-                    path: PathBuf::from(string_argument(arguments, "path")?),
+                    path: self.absolute(string_argument(arguments, "path")?),
                     contents: string_argument(arguments, "contents")?.to_owned(),
                     label: label(arguments, "Agent created a file"),
                 };
-                let report = self
-                    .call(|client| {
+                let (session, report) = self
+                    .call(Target::Containing(&request.path), |client| {
                         let request = request.clone();
                         async move { client.create_file(call_context(), request).await }
                     })
-                    .await??;
+                    .await?;
+                let view = self.view(&session);
                 Ok(format!(
                     "Created {} as an unsaved Neovim buffer.\n{}",
-                    request.path.display(),
-                    format_report(&report)
+                    view.show(&request.path),
+                    format_report(&report?, &view)
                 ))
             }
             "diagnostics" => {
-                let report = self
-                    .call(|client| async move { client.diagnostics(call_context()).await })
+                let (session, report) = self
+                    .call(target, |client| async move {
+                        client.diagnostics(call_context()).await
+                    })
                     .await?;
-                Ok(format_report(&report))
+                Ok(format_report(&report, &self.view(&session)))
             }
             "compile_cell" => {
                 let cell = string_argument(arguments, "cell")?.to_owned();
-                let report = self
-                    .call(|client| {
+                let (session, report) = self
+                    .call(target, |client| {
                         let cell = cell.clone();
                         async move { client.compile_cell(call_context(), cell).await }
                     })
-                    .await??;
-                Ok(format_report(&report))
+                    .await?;
+                Ok(format_report(&report?, &self.view(&session)))
             }
             "open_cell" => {
                 let cell = string_argument(arguments, "cell")?.to_owned();
-                let report = self
-                    .call(|client| {
+                let (session, report) = self
+                    .call(target, |client| {
                         let cell = cell.clone();
                         async move { client.open_cell(call_context(), cell).await }
                     })
-                    .await??;
+                    .await?;
                 Ok(format!(
                     "Opened {cell} in the GUI.\n{}",
-                    format_report(&report)
+                    format_report(&report?, &self.view(&session))
                 ))
             }
             _ => Err(format!("Unknown tool `{name}`.")),
@@ -340,14 +556,14 @@ fn numbered_lines(contents: &str, offset: Option<u64>, limit: Option<u64>) -> St
         .join("\n")
 }
 
-fn format_status(status: &AgentStatus) -> String {
+fn format_status(status: &AgentStatus, view: &PathView) -> String {
     let mut lines = vec![
         format!(
             "Workspace: {}",
-            status.root.as_ref().map_or_else(
-                || "(not open yet)".to_owned(),
-                |root| root.display().to_string()
-            )
+            status
+                .root
+                .as_ref()
+                .map_or_else(|| "(not open yet)".to_owned(), |root| view.show(root))
         ),
         format!(
             "Open cell: {}",
@@ -399,13 +615,13 @@ fn format_status(status: &AgentStatus) -> String {
             status
                 .open_files
                 .iter()
-                .map(|path| format!("  {}", path.display())),
+                .map(|path| format!("  {}", view.show(path))),
         );
     }
     lines.join("\n")
 }
 
-fn format_report(report: &Report) -> String {
+fn format_report(report: &Report, view: &PathView) -> String {
     let mut lines = Vec::new();
     if report.compiled_revision < report.revision {
         lines.push(format!(
@@ -454,7 +670,7 @@ fn format_report(report: &Report) -> String {
         lines.extend(report.diagnostics.iter().map(|diagnostic| {
             format!(
                 "  {}:{}:{}: {}",
-                diagnostic.path.display(),
+                view.show(&diagnostic.path),
                 diagnostic.line,
                 diagnostic.column,
                 diagnostic.message
@@ -471,7 +687,11 @@ fn format_report(report: &Report) -> String {
 fn tool_definitions() -> Value {
     let path = json!({
         "type": "string",
-        "description": "File path, relative to the workspace root or absolute."
+        "description": "File path, absolute or relative to your working directory. The Argon session whose workspace contains the file is used."
+    });
+    let workspace = json!({
+        "type": "string",
+        "description": "Directory of the Argon library to use, absolute or relative to your working directory. Needed only when several sessions are running; defaults to the one used last."
     });
     let label = json!({
         "type": "string",
@@ -484,8 +704,8 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "status",
-            "description": "Describe the running Argon session: workspace root, the cell open in the GUI, follow mode, the approval mode, and the files open in Neovim.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "description": "List the running Argon sessions and describe one: its workspace, the cell open in the GUI, follow mode, the approval mode, and the files open in Neovim.",
+            "inputSchema": { "type": "object", "properties": { "workspace": workspace } }
         },
         {
             "name": "read_file",
@@ -541,14 +761,14 @@ fn tool_definitions() -> Value {
         {
             "name": "diagnostics",
             "description": "List the current errors across the workspace and summarize the cell open in the GUI.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "inputSchema": { "type": "object", "properties": { "workspace": workspace } }
         },
         {
             "name": "compile_cell",
             "description": "Compile a cell against the current source, unsaved edits included, without changing what the GUI shows. Reports errors and the cell's shape and bounding box. Use this instead of `arc run`.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "cell": cell },
+                "properties": { "cell": cell, "workspace": workspace },
                 "required": ["cell"]
             }
         },
@@ -557,7 +777,7 @@ fn tool_definitions() -> Value {
             "description": "Show a cell in the user's GUI. Works only while the user has follow mode on (`:Argon follow` in Neovim); otherwise use compile_cell.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "cell": cell },
+                "properties": { "cell": cell, "workspace": workspace },
                 "required": ["cell"]
             }
         }
@@ -731,11 +951,15 @@ mod tests {
             }],
             messages: Vec::new(),
         };
-        let text = format_report(&report);
+        let view = PathView {
+            directory: Path::new("/work"),
+            root: Path::new("/work/lib"),
+        };
+        let text = format_report(&report, &view);
         assert!(text.contains("revision 5 has not finished"));
         assert!(text.contains("Cell top() compiled."));
         assert!(text.contains("3 rects"));
         assert!(text.contains("Bounding box: (0, 0) to (10, 5)."));
-        assert!(text.contains("lib.ar:3:5: undeclared variable"));
+        assert!(text.contains("  lib/lib.ar:3:5: undeclared variable"));
     }
 }

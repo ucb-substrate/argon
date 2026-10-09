@@ -474,6 +474,13 @@ elseif vim.env.ARGON_TEST_MODE == 'watcher' then
   await('rewritten')
   assert(contains(bufnr, '// unsaved'), 'a disk change must not discard unsaved edits')
   assert(not contains(bufnr, 'let d = rect('), 'a modified buffer should not reload')
+elseif vim.env.ARGON_TEST_MODE == 'idle' then
+  -- The Rust test only needs this session to stay open.
+elseif vim.env.ARGON_TEST_MODE == 'agent_target' then
+  wait_for('the agent edit to reach this session', function()
+    return contains(bufnr, 'let b = rect(')
+  end)
+  signal('edited')
 elseif vim.env.ARGON_TEST_MODE == 'mcp' then
   wait_for('the MCP edit to reach the buffer', function()
     return contains(bufnr, 'let b = rect(')

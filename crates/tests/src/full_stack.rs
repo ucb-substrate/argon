@@ -1166,4 +1166,101 @@ mod tests {
         })
         .await;
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_bridge_routes_calls_to_each_running_session() {
+        assert_completes("waiting for two sessions", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let extra = "let z = rect(\"met1\", x0=40., y0=0., x1=50., y1=10.);";
+            let mut first = Session::new(&one_rect()).await;
+            let mut second = Session::new(
+                &one_rect().replace(FIRST_RECT, &format!("{FIRST_RECT}\n    {extra}")),
+            )
+            .await;
+            first.start_analyzer();
+            second.start_analyzer();
+            let first_nvim = first.spawn_nvim("idle");
+            let second_nvim = second.spawn_nvim("agent_target");
+            first.connect_gui().await;
+            second.connect_gui().await;
+            first.wait_for_rects(1).await;
+            second.wait_for_rects(2).await;
+
+            // An agent whose working directory contains neither library.
+            let elsewhere = tempfile::tempdir().unwrap();
+            let bridge = analyzer::mcp::Bridge::new(elsewhere.path().to_path_buf());
+            let call = |name: &str, arguments: Value| {
+                let request = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": { "name": name, "arguments": arguments },
+                });
+                let bridge = &bridge;
+                async move {
+                    let response = bridge.handle(request).await.unwrap();
+                    let result = &response["result"];
+                    (
+                        result["content"][0]["text"].as_str().unwrap().to_owned(),
+                        result["isError"].as_bool().unwrap(),
+                    )
+                }
+            };
+            let tag = |session: &Session| {
+                session
+                    .project()
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            };
+
+            // A file path selects the session whose workspace contains it.
+            let (edited, failed) = call(
+                "edit_file",
+                json!({
+                    "path": second.project().join("lib.ar"),
+                    "label": "add a rect",
+                    "edits": [{
+                        "old_string": FIRST_RECT,
+                        "new_string": format!("{FIRST_RECT}\n    {SECOND_RECT}"),
+                    }],
+                }),
+            )
+            .await;
+            assert!(!failed && edited.contains("3 rects"), "{edited}");
+            second.await_signal("edited").await;
+
+            // `workspace` selects a session, and later calls default to it.
+            let (status, failed) = call("status", json!({ "workspace": first.project() })).await;
+            assert!(!failed, "{status}");
+            let workspace_line = status.lines().next().unwrap();
+            assert!(workspace_line.contains(&tag(&first)), "{status}");
+            assert!(
+                status.contains(&tag(&second)),
+                "status should list the other session"
+            );
+            let (diagnostics, failed) = call("diagnostics", json!({})).await;
+            assert!(!failed && diagnostics.contains("1 rects"), "{diagnostics}");
+
+            // A path no session contains is refused with the sessions to choose from.
+            let (refused, failed) = call(
+                "read_file",
+                json!({ "path": elsewhere.path().join("lib.ar") }),
+            )
+            .await;
+            assert!(
+                failed && refused.contains("No running Argon session contains"),
+                "{refused}"
+            );
+            assert!(refused.contains(&tag(&first)) && refused.contains(&tag(&second)));
+
+            std::fs::write(&first.ack, "ok\n").unwrap();
+            std::fs::write(&second.ack, "ok\n").unwrap();
+            finish_nvim(first_nvim).await;
+            finish_nvim(second_nvim).await;
+        })
+        .await;
+    }
 }
