@@ -5,8 +5,8 @@ import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';
 // and the tools reference read as separate books. Doc IDs are paths relative
 // to docs/docs/.
 const sidebars: SidebarsConfig = {
-  // One category per guide. Add new guides as further categories here and as
-  // rows in docs/docs/guides/index.md.
+  // One entry per guide: a category for a multi-page guide, a single doc
+  // otherwise. Add new guides here and as rows in docs/docs/guides/index.md.
   guides: [
     'guides/index',
     {
@@ -20,6 +20,7 @@ const sidebars: SidebarsConfig = {
         'guides/getting-started/hierarchy-export',
       ],
     },
+    'guides/sky130-inverter',
   ],
 
   language: [

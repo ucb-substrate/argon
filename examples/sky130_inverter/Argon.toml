@@ -1,0 +1,5 @@
+name = "sky130_inverter"
+tech = "../../pdks/sky130/sky130.tech.toml"
+
+[dependencies]
+sky130 = "../../pdks/sky130"
