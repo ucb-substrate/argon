@@ -1,6 +1,11 @@
 ### Argon ###
 *.gui
 
+### Claude Code ###
+# Per-developer MCP server registration and local settings.
+.mcp.json
+.claude/settings.local.json
+
 ### Illustrator ###
 *.tmp
 

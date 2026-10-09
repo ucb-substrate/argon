@@ -44,9 +44,12 @@ font_size = 14
 
 [log]
 level = "info"
+
+[agent]
+approval = "never"
 ```
 
-`font_size` and `icon_size` are in logical pixels, from 1 to 256. After editing the file, run `:Argon reload`. To change a value for this session only, use `:Argon set`; to write the current settings back to disk, use `:Argon saveConfig`.
+`font_size` and `icon_size` are in logical pixels, from 1 to 256. `agent.approval` is `"never"` or `"always"`; see [Agents](/tools/agents#approving-edits). After editing the file, run `:Argon reload`. To change a value for this session only, use `:Argon set`; to write the current settings back to disk, use `:Argon saveConfig`.
 
 ## Troubleshooting
 

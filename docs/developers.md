@@ -12,8 +12,14 @@ or newer must be available on `PATH` to run them locally.
 In normal use, Neovim launches the analyzer as an LSP child and communicates
 with it over standard input and output. The unit tests instead run the real
 analyzer library in-process and connect Neovim to its LSP stream over TCP using
-`vim.lsp.rpc.connect()`. The analyzer's separate GUI-facing RPC port connects
-to the headless GUI harness.
+`vim.lsp.rpc.connect()`. The headless GUI harness and the agent tests connect
+to the analyzer's separate RPC port.
+
+Every RPC connection opens with a handshake carrying the analyzer's session
+token and the client's role (`Gui`, `GuiCallback`, or `Agent`), and is served
+only once the token matches. The GUI opens both of its connections, so it never
+listens on a port. Tests generate their own token and pass it to
+`main_with_io_on_listener`.
 
 ## Debugging
 

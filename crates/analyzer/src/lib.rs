@@ -1,9 +1,15 @@
+pub mod agent;
 mod cell_edit;
 mod command_completion;
 mod compiler_worker;
 pub mod document;
+pub mod hook;
+pub mod mcp;
 mod navigation;
 pub mod rpc;
+pub mod session;
+pub mod transport;
+mod watcher;
 
 pub mod cli;
 
@@ -92,8 +98,26 @@ static LOG_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new
 #[serde(default, deny_unknown_fields)]
 pub struct ArgonConfig {
     pub analyzer: AnalyzerConfig,
+    pub agent: AgentConfig,
     pub gui: GuiConfig,
     pub log: LogConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentConfig {
+    pub approval: ApprovalMode,
+}
+
+/// Whether the user confirms each agent edit in Neovim before it is applied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalMode {
+    /// Agent edits apply immediately and Neovim is never asked to confirm.
+    #[default]
+    Never,
+    /// Neovim shows each agent edit and applies it only if the user accepts.
+    Always,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,6 +412,10 @@ pub(crate) struct PublishedState {
     pub(crate) nav: Option<Arc<NavIndex>>,
     pub(crate) prev_diagnostics: IndexMap<Uri, Vec<Diagnostic>>,
     pub(crate) compiled_revision: u64,
+    /// Compiler messages that accompanied the latest committed result.
+    pub(crate) messages: Vec<String>,
+    /// The latest committed result, summarized on demand for agents.
+    pub(crate) latest: Option<agent::LatestCompile>,
 }
 
 #[derive(Clone, Debug)]
@@ -629,10 +657,22 @@ pub struct State {
     gui: Arc<Mutex<GuiState>>,
     next_compilation_activity_id: Arc<AtomicU64>,
     app_config: Arc<RwLock<ArgonConfig>>,
+    /// Secret that every RPC connection must present.
+    token: transport::SessionToken,
+    session_file: Arc<std::sync::Mutex<Option<session::SessionFile>>>,
+    /// Bumped whenever an editor document opens, changes, or closes.
+    source_changes: Arc<tokio::sync::watch::Sender<u64>>,
+    /// The source revision of the latest committed compilation.
+    compiled_revisions: Arc<tokio::sync::watch::Sender<u64>>,
+    /// Whether Neovim has a follow window for agent edits.
+    follow_mode: Arc<std::sync::atomic::AtomicBool>,
+    /// Serializes agent edits so each resolves against settled text.
+    agent_edits: Arc<Mutex<()>>,
+    watcher: Arc<std::sync::Mutex<Option<watcher::WorkspaceWatcher>>>,
 }
 
 impl State {
-    fn new(server_addr: SocketAddr, editor_client: Client) -> Self {
+    fn new(server_addr: SocketAddr, editor_client: Client, token: transport::SessionToken) -> Self {
         let config = read_config().unwrap_or_else(|error| {
             error!("{error}; using default configuration");
             ArgonConfig::default()
@@ -649,7 +689,19 @@ impl State {
             gui: Default::default(),
             next_compilation_activity_id: Default::default(),
             app_config: Arc::new(RwLock::new(config)),
+            token,
+            session_file: Default::default(),
+            source_changes: Arc::new(tokio::sync::watch::Sender::new(0)),
+            compiled_revisions: Arc::new(tokio::sync::watch::Sender::new(0)),
+            follow_mode: Default::default(),
+            agent_edits: Default::default(),
+            watcher: Default::default(),
         }
+    }
+
+    pub(crate) fn notify_source_changed(&self) {
+        self.source_changes
+            .send_modify(|count| *count = count.wrapping_add(1));
     }
 
     fn apply_config(&self, config: ArgonConfig) {
@@ -745,6 +797,34 @@ impl State {
         };
         gui.connection = Some(connection.clone());
         connection
+    }
+
+    /// Records this analyzer in the user's session directory so local
+    /// clients, such as the agent bridge, can find and authenticate to it.
+    fn publish_session(&self, root_dir: &Path) {
+        let info = session::SessionInfo {
+            pid: std::process::id(),
+            root: root_dir.to_path_buf(),
+            port: self.server_addr.port(),
+            token: self.token.to_hex(),
+        };
+        match session::publish(&info) {
+            Ok(file) => {
+                *self.session_file.lock().unwrap_or_else(|p| p.into_inner()) = Some(file);
+            }
+            Err(error) => error!("could not publish the analyzer session: {error}"),
+        }
+    }
+
+    fn retire_session(&self) {
+        self.session_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        self.watcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
     }
 
     async fn take_gui_process(&self) -> Option<Child> {
@@ -908,6 +988,11 @@ impl Backend {
             result.output.as_ref(),
             self.state.position_encoding(),
         );
+        // Cells are shared, so this copy costs one pointer per cell.
+        let latest = result.output.clone().map(|output| agent::LatestCompile {
+            cell: identity.cell.clone(),
+            output,
+        });
         // The compiled GDS can contain millions of geometry values. Move it
         // into the RPC snapshot after diagnostics have borrowed it instead of
         // deep-cloning the complete layout immediately before serialization.
@@ -938,7 +1023,12 @@ impl Backend {
                 compiled.nav = Some(nav);
             }
             compiled.compiled_revision = identity.revision;
+            compiled.messages = result.messages.clone();
+            compiled.latest = latest;
         }
+        self.state
+            .compiled_revisions
+            .send_replace(identity.revision);
 
         for message in result.messages {
             if !self.state.is_latest_compile_request(&identity).await {
@@ -1128,7 +1218,12 @@ impl LanguageServer for Backend {
         let root_uri = root_uri.or(params.root_uri);
         let root_dir = root_uri.and_then(|root| root.to_file_path().map(|path| path.into_owned()));
         if let Some(root_dir) = root_dir {
-            let _ = self.state.root_dir.set(root_dir);
+            let _ = self.state.root_dir.set(root_dir.clone());
+            self.state.publish_session(&root_dir);
+            // A recursive watch walks the whole tree on some platforms.
+            let backend = self.clone();
+            let watched = root_dir.clone();
+            tokio::task::spawn_blocking(move || backend.start_watcher(&watched));
             let connection = self.state.gui_connection().await;
             self.state.publish_workspace_path(connection).await;
         }
@@ -1189,6 +1284,7 @@ impl LanguageServer for Backend {
         source.advance_revision();
         let identity = source.compile_identity();
         drop(source);
+        self.state.notify_source_changed();
         self.compile_after_debounce(identity);
     }
 
@@ -1242,6 +1338,7 @@ impl LanguageServer for Backend {
         }
         let identity = source.compile_identity();
         drop(source);
+        self.state.notify_source_changed();
         if analyzer_edit {
             self.update_cell(identity).await;
         } else {
@@ -1343,10 +1440,12 @@ impl LanguageServer for Backend {
         source.advance_revision();
         let identity = source.compile_identity();
         drop(source);
+        self.state.notify_source_changed();
         self.compile_after_debounce(identity);
     }
 
     async fn shutdown(&self) -> Result<()> {
+        self.state.retire_session();
         if let Some(mut gui) = self.state.take_gui_process().await {
             let _ = gui.kill().await;
         }
@@ -1442,6 +1541,7 @@ impl Backend {
             match Command::new("argone")
                 .arg("gui")
                 .arg(format!("{}", state.server_addr))
+                .env(transport::TOKEN_ENV, state.token.to_hex())
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -1927,22 +2027,77 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
     tokio::spawn(fut);
 }
 
+/// Most authenticated RPC connections served at once.
+const MAX_RPC_CONNECTIONS: usize = 10;
+
 #[cfg(unix)]
-fn announce_rpc_port(path: &Path, port: u16) -> io::Result<()> {
+fn announce_rpc_port(path: &Path, port: u16, token: &transport::SessionToken) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
 
     let mut stream = UnixStream::connect(path)?;
-    writeln!(stream, "{port}")?;
+    writeln!(stream, "{port} {}", token.to_hex())?;
     stream.flush()
 }
 
 #[cfg(not(unix))]
-fn announce_rpc_port(_: &Path, _: u16) -> io::Result<()> {
+fn announce_rpc_port(_: &Path, _: u16, _: &transport::SessionToken) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "relay requires a Unix-like remote host",
     ))
+}
+
+/// Accepts RPC connections, serving each one the service its role asked for
+/// once it has presented the session token.
+async fn serve_rpc(listener: tokio::net::TcpListener, state: State) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_RPC_CONNECTIONS));
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                error!("could not accept an RPC connection: {error}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let state = state.clone();
+        let slots = slots.clone();
+        tokio::spawn(async move {
+            let (role, stream) = match transport::accept(stream, &state.token).await {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    info!("rejected an RPC connection: {error}");
+                    return;
+                }
+            };
+            let Ok(_slot) = slots.acquire_owned().await else {
+                return;
+            };
+            match role {
+                transport::Role::Gui => {
+                    let transport = tarpc::serde_transport::new(stream, Bincode::default());
+                    tarpc::server::BaseChannel::with_defaults(transport)
+                        .execute(state.serve())
+                        .for_each(spawn)
+                        .await;
+                }
+                transport::Role::GuiCallback => {
+                    let transport = tarpc::serde_transport::new(stream, Bincode::default());
+                    let client =
+                        GuiClient::new(tarpc::client::Config::default(), transport).spawn();
+                    state.connect_gui(client).await;
+                }
+                transport::Role::Agent => {
+                    let transport = tarpc::serde_transport::new(stream, Bincode::default());
+                    tarpc::server::BaseChannel::with_defaults(transport)
+                        .execute(agent::Agent::serve(Backend { state }))
+                        .for_each(spawn)
+                        .await;
+                }
+            }
+        });
+    }
 }
 
 pub async fn main(rpc_port: Option<u16>, relay_socket: Option<PathBuf>) {
@@ -1977,15 +2132,23 @@ pub async fn main_with_io<I, O>(
             return;
         }
     };
-    main_with_io_on_listener(listener, relay_socket, stdin, stdout).await;
+    let token = match transport::SessionToken::generate() {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("failed to generate the analyzer session token: {error}");
+            return;
+        }
+    };
+    main_with_io_on_listener(listener, token, relay_socket, stdin, stdout).await;
 }
 
 /// Runs the analyzer using pre-bound GUI RPC and LSP transports.
 ///
-/// Supplying the listener lets tests reserve the RPC address without a
-/// bind-release-bind race.
+/// Supplying the listener and token lets tests reserve the RPC address
+/// without a bind-release-bind race and authenticate their own clients.
 pub async fn main_with_io_on_listener<I, O>(
     rpc_listener: tokio::net::TcpListener,
+    token: transport::SessionToken,
     relay_socket: Option<PathBuf>,
     stdin: I,
     stdout: O,
@@ -1993,17 +2156,15 @@ pub async fn main_with_io_on_listener<I, O>(
     I: AsyncRead + Unpin,
     O: AsyncWrite,
 {
-    let mut listener =
-        match tarpc::serde_transport::tcp::listen_on(rpc_listener, Bincode::default).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                eprintln!("failed to configure analyzer RPC listener: {error}");
-                return;
-            }
-        };
-    let server_addr = listener.local_addr();
+    let server_addr = match rpc_listener.local_addr() {
+        Ok(addr) => addr,
+        Err(error) => {
+            eprintln!("failed to read the analyzer RPC address: {error}");
+            return;
+        }
+    };
     if let Some(path) = relay_socket
-        && let Err(error) = announce_rpc_port(&path, server_addr.port())
+        && let Err(error) = announce_rpc_port(&path, server_addr.port(), &token)
     {
         eprintln!(
             "failed to announce analyzer RPC port through `{}`: {error}",
@@ -2014,7 +2175,7 @@ pub async fn main_with_io_on_listener<I, O>(
 
     let mut ext_state = None;
     let (service, socket) = LspService::build(|client| {
-        let state = State::new(server_addr, client);
+        let state = State::new(server_addr, client, token);
         ext_state = Some(state.clone());
         Backend { state }
     })
@@ -2028,26 +2189,13 @@ pub async fn main_with_io_on_listener<I, O>(
     .custom_method("custom/setConfig", Backend::set_config)
     .custom_method("custom/saveConfig", Backend::save_config)
     .custom_method("custom/workspaceModified", Backend::workspace_modified)
+    .custom_method("custom/followMode", Backend::follow_mode)
     .finish();
     let Some(state) = ext_state else {
         eprintln!("failed to initialize analyzer state");
         return;
     };
-    listener.config_mut().max_frame_length(usize::MAX);
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        listener
-            // Ignore accept errors.
-            .filter_map(|r| futures::future::ready(r.ok()))
-            .map(tarpc::server::BaseChannel::with_defaults)
-            // serve is generated by the service attribute. It takes as input any type implementing
-            // the generated World trait.
-            .map(|channel| channel.execute(state_clone.clone().serve()).for_each(spawn))
-            // Max 10 channels.
-            .buffer_unordered(10)
-            .for_each(|_| async {})
-            .await;
-    });
+    tokio::spawn(serve_rpc(rpc_listener, state.clone()));
 
     state
         .editor_client
@@ -2061,6 +2209,7 @@ pub async fn main_with_io_on_listener<I, O>(
 
     // Start actual LSP server.
     Server::new(stdin, stdout, socket).serve(service).await;
+    state.retire_session();
 }
 
 #[cfg(test)]
@@ -2294,7 +2443,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rpc_port_is_announced_through_a_unix_socket() {
+    fn rpc_port_and_token_are_announced_through_a_unix_socket() {
         use std::io::Read;
 
         let directory = tempfile::tempdir().unwrap();
@@ -2306,7 +2455,11 @@ mod tests {
             stream.read_to_string(&mut port).unwrap();
             port
         });
-        super::announce_rpc_port(&path, 43210).unwrap();
-        assert_eq!(receiver.join().unwrap(), "43210\n");
+        let token = super::transport::SessionToken::generate().unwrap();
+        super::announce_rpc_port(&path, 43210, &token).unwrap();
+        assert_eq!(
+            receiver.join().unwrap(),
+            format!("43210 {}\n", token.to_hex())
+        );
     }
 }

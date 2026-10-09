@@ -186,6 +186,10 @@ impl Document {
         }
     }
 
+    pub(crate) fn version(&self) -> i32 {
+        self.version
+    }
+
     pub(crate) fn contents(&self) -> &str {
         self.contents.text()
     }
