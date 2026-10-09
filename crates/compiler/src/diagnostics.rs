@@ -356,7 +356,10 @@ mod tests {
 
     use crate::{
         ast::Span,
-        parse::{STD_PATH, STD_SOURCE},
+        parse::{
+            STD_LAYOUT_PATH, STD_LAYOUT_SOURCE, STD_PATH, STD_SCHEMATIC_PATH, STD_SCHEMATIC_SOURCE,
+            STD_SOURCE,
+        },
     };
 
     use super::{
@@ -504,22 +507,31 @@ mod tests {
 
     #[test]
     fn renders_embedded_standard_library_source() {
-        let needle = "let first_rect = rect(r.layer);";
-        let start = STD_SOURCE
-            .find(needle)
-            .expect("standard-library source should contain array rectangle");
-        let diagnostic = Diagnostic::at(
-            Level::Error,
-            "test standard-library diagnostic",
-            &Span {
-                path: PathBuf::from(STD_PATH),
-                span: cfgrammar::Span::new(start, start + needle.len()),
-            },
-        );
-        let mut output = Vec::new();
-        render(&mut output, &diagnostic, false).expect("diagnostic should render");
-        let output = String::from_utf8(output).expect("diagnostic should be UTF-8");
-        assert!(output.contains(needle), "{output}");
-        assert!(!output.contains("<argon-std>/lib.ar:1:1"), "{output}");
+        for (path, source, needle) in [
+            (STD_PATH, STD_SOURCE, "Some(head(items))"),
+            (
+                STD_LAYOUT_PATH,
+                STD_LAYOUT_SOURCE,
+                "let first_rect = rect(r.layer);",
+            ),
+            (STD_SCHEMATIC_PATH, STD_SCHEMATIC_SOURCE, "enum DeviceKind"),
+        ] {
+            let start = source
+                .find(needle)
+                .expect("standard-library source should contain the needle");
+            let diagnostic = Diagnostic::at(
+                Level::Error,
+                "test standard-library diagnostic",
+                &Span {
+                    path: PathBuf::from(path),
+                    span: cfgrammar::Span::new(start, start + needle.len()),
+                },
+            );
+            let mut output = Vec::new();
+            render(&mut output, &diagnostic, false).expect("diagnostic should render");
+            let output = String::from_utf8(output).expect("diagnostic should be UTF-8");
+            assert!(output.contains(needle), "{output}");
+            assert!(!output.contains(&format!("{path}:1:1")), "{output}");
+        }
     }
 }

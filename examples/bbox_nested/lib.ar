@@ -1,3 +1,5 @@
+use std::layout::{bbox, inst, rect};
+
 cell leaf() {
     let met1 = rect("met1", x0=0., y0=0., x1=100., y1=100.);
 }

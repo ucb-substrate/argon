@@ -21,6 +21,7 @@ pub enum TokenKind {
     KwFn,
     KwElse,
     KwLet,
+    KwPub,
     KwFor,
     KwIn,
     KwAs,
@@ -30,6 +31,8 @@ pub enum TokenKind {
     // Names & literals.
     Ident,
     IntLit,
+    /// Digits with an exponent, such as `1e-12` or the `5e3` of `1.5e3`.
+    ExpLit,
     /// `"..."` — the span includes both quotes; the parser trims them.
     StrLit,
 
@@ -90,6 +93,7 @@ impl TokenKind {
             KwFn => "'fn'",
             KwElse => "'else'",
             KwLet => "'let'",
+            KwPub => "'pub'",
             KwFor => "'for'",
             KwIn => "'in'",
             KwAs => "'as'",
@@ -97,6 +101,7 @@ impl TokenKind {
             KwFalse => "'false'",
             Ident => "identifier",
             IntLit => "integer literal",
+            ExpLit => "float literal",
             StrLit => "string literal",
             PathSep => "'::'",
             FatArrow => "'=>'",
@@ -152,7 +157,7 @@ impl Token {
 }
 
 /// Classify a freshly scanned identifier slice as a keyword or a plain
-/// identifier. There are only 15 short, disjoint keywords, so a `match` on
+/// identifier. There are only a few short, disjoint keywords, so a `match` on
 /// `(len, bytes)` lowers to a jump table + `memcmp` and beats a hash map with
 /// zero setup cost.
 #[inline]
@@ -168,6 +173,7 @@ pub fn keyword_or_ident(s: &[u8]) -> TokenKind {
         },
         3 => match s {
             b"let" => KwLet,
+            b"pub" => KwPub,
             b"for" => KwFor,
             b"mod" => KwMod,
             b"use" => KwUse,

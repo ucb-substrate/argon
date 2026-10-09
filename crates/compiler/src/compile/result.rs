@@ -2,9 +2,11 @@ use enumify::enumify;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use std::sync::Arc;
+
 use crate::{ast::Span, solver::ConstraintId};
 
-use super::{CellId, CompiledData};
+use super::{CellId, CompiledData, Detached};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticError {
@@ -22,9 +24,10 @@ pub enum StaticErrorKind {
     /// parameter names, enum variants, and struct fields.
     #[error("duplicate name declaration")]
     DuplicateNameDeclaration,
-    /// Attempted to declare an object with the same name as a built-in object.
+    /// Attempted to declare or import an object with the same name as a
+    /// built-in object.
     ///
-    /// For example, users cannot declare cells or functions named `rect`.
+    /// For example, users cannot declare cells or functions named `eq`.
     #[error("redeclaration of built-in object")]
     RedeclarationOfBuiltin,
     /// A cell's top-level `let` shadows a field an instance already answers.
@@ -36,8 +39,17 @@ pub enum StaticErrorKind {
     #[error("`{name}` is reserved for instance position; a cell field cannot be named `x` or `y`")]
     ReservedCellField { name: String },
     /// Geometry of a cell was read before the cell was placed.
-    #[error("`{cell}` is a cell; place it with `inst(...)` before reading field `{field}`")]
+    #[error(
+        "`{cell}` is a cell; place it with `std::layout::inst(...)` before reading field `{field}`"
+    )]
     CellFieldBeforePlacement { cell: String, field: String },
+    /// A bare name or a `std::` path that does not resolve names an item of a
+    /// `std` submodule.
+    #[error("`{name}` moved to `{path}`; import it with `use {path};`")]
+    MovedItem { name: String, path: String },
+    /// A native item was used as a value rather than called.
+    #[error("`{name}` can only be called")]
+    NativeNotCallable { name: String },
     /// A field that holds a function was read through an instance.
     #[error(
         "field `{field}` of cell `{cell}` holds a {kind}, which cannot be read through an instance"
@@ -50,6 +62,31 @@ pub enum StaticErrorKind {
     /// A field was read from a cell function that was never called.
     #[error("`{cell}` is a cell function; call it as `{cell}(...)` before reading field `{field}`")]
     CellFnFieldAccess { cell: String, field: String },
+    /// A field that is not declared with `pub let` was read from outside its cell.
+    #[error("field `{field}` of cell `{cell}` is private; declare it with `pub let`")]
+    PrivateField { field: String, cell: String },
+    /// `pub` was applied to a `let` that is not at the top level of a cell body.
+    #[error("`pub` only applies to `let` statements at the top level of a cell body")]
+    MisplacedPub,
+    /// A keyword argument of `device` has a type a device parameter cannot have.
+    #[error("device parameter `{name}` has type {found}; expected Float, Int, or String")]
+    InvalidDeviceParamType { name: String, found: String },
+    /// A cell parameter, or a type argument of a generic cell, has a type that
+    /// can hold a signal or a schematic instance.
+    ///
+    /// `via` is the path from `ty` to the offending type within it, unless
+    /// `ty` is that type.
+    #[error("{}", signal_cell_param(.cell, .param, .ty, .found, .via.as_deref(), *.type_param))]
+    SignalCellParam {
+        cell: String,
+        param: String,
+        ty: String,
+        /// The signal or schematic instance type found.
+        found: String,
+        via: Option<String>,
+        /// Whether `param` is a type parameter.
+        type_param: bool,
+    },
     /// Attempted to treat a non-enum object like an enum using the `::` operator.
     #[error("expected an enum")]
     NotAnEnum,
@@ -355,6 +392,11 @@ pub enum ExecErrorKind {
     /// plain misspelling lands here.
     #[error("no field `{field}` on instance of cell `{cell}`")]
     NoFieldOnInstance { field: String, cell: String },
+    /// A field that is not declared with `pub let` was read from an instance.
+    ///
+    /// The type checker rejects this unless the instance arrived as `Any`.
+    #[error("field `{field}` of cell `{cell}` is private; declare it with `pub let`")]
+    PrivateField { field: String, cell: String },
     /// A field was read from an instance whose cell holds a value, such as a
     /// function, that cannot leave the cell.
     #[error(
@@ -417,6 +459,41 @@ pub enum ExecErrorKind {
     /// The tail of an empty list was requested.
     #[error("attempted to access the tail of an empty list")]
     TailEmptyList,
+    /// A device does not match the requirements of its kind.
+    #[error("invalid `DeviceKind::{kind}` device: {reason}")]
+    InvalidDevice { kind: String, reason: String },
+    /// A device model name contains whitespace or a control character.
+    #[error("device model {model:?} must not contain whitespace or control characters")]
+    InvalidDeviceModel { model: String },
+    /// A device parameter has a value no netlist can carry.
+    #[error("invalid device parameter `{name}`: {reason}")]
+    InvalidDeviceParam { name: String, reason: String },
+    /// A signal or schematic instance reached a cell parameter.
+    #[error("invalid cell argument: a {kind} cannot be passed to a cell")]
+    SignalCellArgument { kind: String },
+    /// A placeholder read through an instance was used.
+    #[error("{0}")]
+    DetachedValue(Arc<Detached>),
+}
+
+/// The message of [`StaticErrorKind::SignalCellParam`].
+fn signal_cell_param(
+    cell: &str,
+    param: &str,
+    ty: &str,
+    found: &str,
+    via: Option<&str>,
+    type_param: bool,
+) -> String {
+    let subject = if type_param {
+        format!("type parameter `{param}` of cell `{cell}` is `{ty}`")
+    } else {
+        format!("parameter `{param}` of cell `{cell}` has type `{ty}`")
+    };
+    let location = via
+        .map(|via| format!(", which holds a `{found}` at `{via}`"))
+        .unwrap_or_default();
+    format!("{subject}{location}; cells cannot take signals or schematic instances")
 }
 
 impl ExecErrorKind {

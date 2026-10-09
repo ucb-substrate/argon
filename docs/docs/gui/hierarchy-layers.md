@@ -9,7 +9,7 @@ description: The hierarchy and layer sidebars.
 
 The hierarchy sidebar shows the open cell, its scopes, and the instances nested inside it. Select a scope before placing an instance to choose where the new call goes in the source.
 
-The depth controls limit how many levels of hierarchy are drawn. When a child is collapsed to its bounding box, those edges are what [`bbox(instance)`](/language/builtins/hierarchy#bbox) refers to in the source.
+The depth controls limit how many levels of hierarchy are drawn. When a child is collapsed to its bounding box, those edges are what [`std::layout::bbox(instance)`](/language/std-layout#bbox) refers to in the source, and a dimension drawn to one of them is written with that call.
 
 Opening a child from the hierarchy opens it with the exact arguments of that instance.
 

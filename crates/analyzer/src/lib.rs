@@ -644,13 +644,13 @@ pub struct State {
     root_dir: Arc<OnceLock<PathBuf>>,
     /// Negotiated in `initialize`; UTF-16 until the client tells us otherwise.
     position_encoding: Arc<OnceLock<PositionEncoding>>,
-    /// The embedded standard library, written to disk on first use so the
-    /// editor can open it. `None` if it could not be written.
+    /// The directory the embedded standard library is written to on first
+    /// use, so the editor can open it. `None` if it could not be written.
     ///
     /// An async cell because writing it is filesystem work that has to happen
     /// off the runtime's worker threads, and because requests arriving while
     /// the write is in flight should await it rather than repeat it.
-    std_file: Arc<tokio::sync::OnceCell<Option<PathBuf>>>,
+    std_dir: Arc<tokio::sync::OnceCell<Option<PathBuf>>>,
     pub(crate) source_state: Arc<Mutex<SourceState>>,
     pub(crate) published_state: Arc<Mutex<PublishedState>>,
     compiler: CompilerWorker,
@@ -682,7 +682,7 @@ impl State {
             editor_client,
             root_dir: Default::default(),
             position_encoding: Default::default(),
-            std_file: Default::default(),
+            std_dir: Default::default(),
             source_state: Default::default(),
             published_state: Default::default(),
             compiler: CompilerWorker::new(),
@@ -1801,7 +1801,10 @@ impl Backend {
                     .all(|ast| !ast.text.contains(name.as_str()))
             })
             .expect("an unused preview binding always exists");
-        let statement = format!("let {preview_binding} = inst({});", params.cell);
+        let statement = format!(
+            "let {preview_binding} = std::layout::inst({});",
+            params.cell
+        );
         let insertion = insert_statement(
             &document,
             scope.span,
@@ -2371,7 +2374,8 @@ mod tests {
         let source_path = directory.path().join("lib.ar");
         std::fs::write(
             &source_path,
-            "fn double(x: Float) -> Float { 2. * x }\n\
+            "use std::layout::rect;\n\
+             fn double(x: Float) -> Float { 2. * x }\n\
              cell top(w: Float) {\n\
                  let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=10.);\n\
              }\n",
@@ -2398,6 +2402,8 @@ mod tests {
         assert_eq!(rect.x1.0, 50.);
     }
 
+    /// The preview binding is spelled as the analyzer inserts it, which needs
+    /// no `use` declaration.
     #[test]
     fn preview_instance_can_use_a_value_from_its_scope() {
         let directory = tempfile::tempdir().unwrap();
@@ -2406,7 +2412,7 @@ mod tests {
             &source_path,
             "cell child(width: Float) {}\n\
              cell top(width: Float) {\n\
-                 let preview_binding = inst(child(width));\n\
+                 let preview_binding = std::layout::inst(child(width));\n\
              }\n",
         )
         .unwrap();

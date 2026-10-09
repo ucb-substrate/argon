@@ -29,6 +29,7 @@ const sidebars: SidebarsConfig = {
     'language/control-flow',
     'language/geometry',
     'language/constraints',
+    'language/schematic',
     'language/modules-manifests',
     'language/technology',
     {
@@ -37,13 +38,17 @@ const sidebars: SidebarsConfig = {
       collapsed: false,
       link: {type: 'doc', id: 'language/builtins/index'},
       items: [
-        'language/builtins/geometry',
         'language/builtins/constraints',
-        'language/builtins/hierarchy',
         'language/builtins/collections',
       ],
     },
-    'language/std',
+    {
+      type: 'category',
+      label: 'Standard library',
+      collapsed: false,
+      link: {type: 'doc', id: 'language/std'},
+      items: ['language/std-layout', 'language/std-schematic'],
+    },
     {
       type: 'category',
       label: 'Types',

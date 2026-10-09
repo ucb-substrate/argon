@@ -20,6 +20,7 @@ use std::{
 };
 
 use arcstr::ArcStr;
+use indexmap::IndexMap;
 
 use crate::{
     ast::{
@@ -28,8 +29,9 @@ use crate::{
         VariantPayload, WorkspaceAst,
     },
     compile::{
-        AdtDef, BUILTINS, RESERVED_CELL_FIELDS, Ty, TyParamTy, TypeDefs, TypedWorkspace, VarId,
-        VarIdTyMetadata, VariantTys, module_prefix, param_map, subst, typed_let_bindings,
+        AdtDef, BUILTINS, CellTy, Native, RESERVED_CELL_FIELDS, Ty, TyParamTy, TypeDefs,
+        TypedWorkspace, VarId, VarIdTyMetadata, VariantTys, module_prefix, param_map, subst,
+        typed_let_bindings,
     },
 };
 
@@ -178,7 +180,7 @@ pub enum Builtin {
     Type(&'static str),
     /// A field of a primitive type, such as `Rect::x0`.
     Field(String),
-    /// A keyword argument of a builtin call.
+    /// A keyword argument of a builtin or native call.
     KwArg(String),
 }
 
@@ -215,9 +217,10 @@ pub struct NavIndex {
     scope_bindings: HashMap<PathBuf, Vec<ScopeBinding>>,
     expression_types: HashMap<PathBuf, Vec<(cfgrammar::Span, Ty)>>,
     hover_details: HashMap<PathBuf, Vec<(cfgrammar::Span, String)>>,
-    /// Cell `VarId` to the name and type of each of its fields, in declaration
-    /// order. Cell types are nominal and carry no fields of their own, so an
-    /// instance's completions come from the declaring cell's `let` bindings.
+    /// Cell `VarId` to the name and type of each of its public fields, in
+    /// declaration order. Cell types are nominal and carry no fields of their
+    /// own, so an instance's completions come from the declaring cell's
+    /// `pub let` bindings.
     cell_field_types: HashMap<VarId, Vec<(String, Ty)>>,
     /// Struct and enum definitions, for field completions on a struct.
     type_defs: Arc<TypeDefs>,
@@ -485,11 +488,16 @@ impl NavIndex {
                 .into_iter()
                 .map(|(name, ty)| (name.to_owned(), ty))
                 .collect(),
-            Ty::Inst(cell) => {
+            Ty::Inst(cell) | Ty::SchematicInst(cell) => {
                 let map = cell.param_map();
-                RESERVED_CELL_FIELDS
-                    .into_iter()
-                    .map(|name| (name.to_owned(), Ty::Float))
+                // A schematic instance has no position.
+                let reserved = match ty {
+                    Ty::Inst(_) => RESERVED_CELL_FIELDS.as_slice(),
+                    _ => &[],
+                };
+                reserved
+                    .iter()
+                    .map(|name| (name.to_string(), Ty::Float))
                     .chain(
                         cell.def
                             .and_then(|cell| self.cell_field_types.get(&cell))
@@ -717,9 +725,9 @@ const PRIMITIVE_TYPES: [&str; 9] = [
     "Any", "Bool", "Float", "Int", "Path", "Point", "Polygon", "Rect", "String",
 ];
 
-const KEYWORDS: [&str; 16] = [
+const KEYWORDS: [&str; 17] = [
     "_", "as", "cell", "else", "enum", "false", "fn", "for", "if", "in", "let", "match", "mod",
-    "true", "struct", "use",
+    "pub", "true", "struct", "use",
 ];
 
 fn completion_kind(kind: SymbolKind) -> CompletionKind {
@@ -747,7 +755,7 @@ fn builtin_type(name: &str) -> Option<&'static str> {
 fn declaring_cell(ty: &Ty) -> Option<VarId> {
     match ty {
         Ty::CellFn(cell_fn) => cell_fn.cell.def,
-        Ty::Cell(cell) | Ty::Inst(cell) => cell.def,
+        Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => cell.def,
         _ => None,
     }
 }
@@ -775,18 +783,6 @@ fn signature(label: &str, positional: &[&str], keywords: &[&str]) -> SignatureIn
 }
 
 fn builtin_signature(name: &str) -> Option<SignatureInfo> {
-    let rect_keywords = [
-        "x0: Float",
-        "x1: Float",
-        "y0: Float",
-        "y1: Float",
-        "x0i: Float",
-        "x1i: Float",
-        "y0i: Float",
-        "y1i: Float",
-        "w: Float",
-        "h: Float",
-    ];
     let result = match name {
         "cons" => signature(
             "fn cons(value: T, tail: [T]) -> [T]",
@@ -800,22 +796,48 @@ fn builtin_signature(name: &str) -> Option<SignatureInfo> {
             &["start: Int", "stop: Int", "step: Int"],
             &[],
         ),
-        "crect" => {
+        "float" => signature("fn float() -> Float", &[], &[]),
+        "eq" => signature(
+            "fn eq(left: Float, right: Float)",
+            &["left: Float", "right: Float"],
+            &[],
+        ),
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// Editor metadata for a native item.
+fn native_signature(native: Native) -> SignatureInfo {
+    let rect_keywords = [
+        "x0: Float",
+        "x1: Float",
+        "y0: Float",
+        "y1: Float",
+        "x0i: Float",
+        "x1i: Float",
+        "y0i: Float",
+        "y1i: Float",
+        "w: Float",
+        "h: Float",
+    ];
+    match native {
+        Native::Crect => {
             let mut keywords = rect_keywords.to_vec();
             keywords.push("layer: String");
             signature("fn crect(*, coordinates...) -> Rect", &[], &keywords)
         }
-        "rect" => signature(
+        Native::Rect => signature(
             "fn rect(layer: String, *, coordinates...) -> Rect",
             &["layer: String"],
             &rect_keywords,
         ),
-        "polygon" => signature(
+        Native::Polygon => signature(
             "fn polygon(layer: String, points: Int, *, xN/yN: Float) -> Polygon",
             &["layer: String", "points: Int"],
             &[],
         ),
-        "path" => signature(
+        Native::Path => signature(
             "fn path(layer: String, points: Int, *, coordinates...) -> Path",
             &["layer: String", "points: Int"],
             &[
@@ -827,18 +849,12 @@ fn builtin_signature(name: &str) -> Option<SignatureInfo> {
                 "end_extensioni: Float",
             ],
         ),
-        "text" => signature(
+        Native::Text => signature(
             "fn text(text: String, layer: String, x: Float, y: Float)",
             &["text: String", "layer: String", "x: Float", "y: Float"],
             &[],
         ),
-        "float" => signature("fn float() -> Float", &[], &[]),
-        "eq" => signature(
-            "fn eq(left: Float, right: Float)",
-            &["left: Float", "right: Float"],
-            &[],
-        ),
-        "dimension" => signature(
+        Native::Dimension => signature(
             "fn dimension(x0: Float, y0: Float, x1: Float, y1: Float, offset: Float, label_offset: Float, flip: Bool)",
             &[
                 "x0: Float",
@@ -851,7 +867,7 @@ fn builtin_signature(name: &str) -> Option<SignatureInfo> {
             ],
             &[],
         ),
-        "inst" => signature(
+        Native::LayoutInst => signature(
             "fn inst(cell: Cell, *, placement...) -> Inst",
             &["cell: Cell"],
             &[
@@ -864,14 +880,26 @@ fn builtin_signature(name: &str) -> Option<SignatureInfo> {
                 "construction: Bool",
             ],
         ),
-        "bbox" => signature(
+        Native::Bbox => signature(
             "fn bbox(value: Cell | Inst) -> Rect",
             &["value: Cell | Inst"],
             &[],
         ),
-        _ => return None,
-    };
-    Some(result)
+        Native::Signal => signature("fn Signal() -> Signal", &[], &[]),
+        Native::Connect => signature(
+            "fn connect(a: Signal, b: Signal)",
+            &["a: Signal", "b: Signal"],
+            &[],
+        ),
+        Native::Device => signature(
+            "fn device(kind: DeviceKind, terminals: [Signal], model: String, *, params...)",
+            &["kind: DeviceKind", "terminals: [Signal]", "model: String"],
+            &[],
+        ),
+        Native::SchematicInst => {
+            signature("fn inst(cell: Cell) -> SchematicInst", &["cell: Cell"], &[])
+        }
+    }
 }
 
 fn field_candidate(name: impl Into<String>, ty: &Ty) -> CompletionCandidate {
@@ -932,6 +960,8 @@ fn declared_signature(
 struct Builder<'a> {
     ast: &'a WorkspaceAst<VarIdTyMetadata>,
     defs: &'a TypeDefs,
+    /// The native item bound to each `VarId` that names one.
+    natives: &'a IndexMap<VarId, Native>,
     /// Each variant's enum and name, by the variant's own `VarId`.
     variants: HashMap<VarId, (VarId, String)>,
     /// Cell `VarId` to field name to the `VarId` of the `let` declaring it.
@@ -944,6 +974,9 @@ struct Builder<'a> {
     /// Length of the file's editor-visible source. Generated declarations are
     /// appended past this point.
     visible: usize,
+    /// The last prefix segment of the `use` walked last. The items of one
+    /// grouped `use` share their prefix, which is recorded only once.
+    use_prefix: Option<cfgrammar::Span>,
     index: NavIndex,
 }
 
@@ -975,7 +1008,9 @@ fn find_param(ty: &Ty, name: &str) -> Option<VarId> {
         Ty::Tuple(items) => items.iter().find_map(|item| find_param(item, name)),
         Ty::Struct(s) => s.args.iter().find_map(|arg| find_param(arg, name)),
         Ty::Enum(e) => e.args.iter().find_map(|arg| find_param(arg, name)),
-        Ty::Cell(cell) | Ty::Inst(cell) => cell.args.iter().find_map(|arg| find_param(arg, name)),
+        Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => {
+            cell.args.iter().find_map(|arg| find_param(arg, name))
+        }
         _ => None,
     }
 }
@@ -994,20 +1029,65 @@ impl<'a> Builder<'a> {
         let mut builder = Self {
             ast: &workspace.ast,
             defs: &workspace.defs,
+            natives: &workspace.natives,
             variants: HashMap::new(),
             cell_fields: HashMap::new(),
             params: HashMap::new(),
             current: const { &Vec::new() },
             path: Path::new(""),
             visible: 0,
+            use_prefix: None,
             index: NavIndex {
                 type_defs: workspace.defs.clone(),
                 ..NavIndex::default()
             },
         };
         builder.collect_declarations();
+        builder.collect_natives();
         builder.collect_prelude();
         builder
+    }
+
+    /// Records each native item as an item of its `std` module. A native has
+    /// no source, so it resolves without anywhere to jump to.
+    fn collect_natives(&mut self) {
+        for (&id, &native) in self.natives {
+            let module = native
+                .module()
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<ModPath>();
+            let signature = native_signature(native);
+            self.index.defs.insert(
+                DefKey::Var(id),
+                Definition {
+                    kind: SymbolKind::Function,
+                    name: native.name().to_owned(),
+                    location: DefLocation::Generated,
+                    detail: signature.label.clone(),
+                    ty: None,
+                    signature: Some(signature),
+                    full_span: None,
+                },
+            );
+            self.index
+                .module_items
+                .entry(module)
+                .or_default()
+                .push(ModuleItem {
+                    name: native.name().to_owned(),
+                    key: DefKey::Var(id),
+                    available_after: 0,
+                });
+        }
+    }
+
+    /// The `VarId` of the native bound as `name` in `module`, if any.
+    fn native_in(&self, module: &ModPath, name: &str) -> Option<VarId> {
+        self.natives
+            .iter()
+            .find(|(_, native)| native.name() == name && native.module().iter().eq(module))
+            .map(|(id, _)| *id)
     }
 
     /// Adds `Option`, `Some`, and `None` to the items of every module that
@@ -1137,9 +1217,19 @@ impl<'a> Builder<'a> {
                             .map(|(name, id, _)| (name.name.to_string(), *id))
                             .collect();
                         self.cell_fields.insert(decl.metadata.1, fields);
-                        let field_types = bindings
+                        // The last binding of a name is the field, and its
+                        // `pub` decides whether an instance can read it.
+                        let mut field_types = IndexMap::new();
+                        for stmt in &decl.scope.stmts {
+                            let public = stmt.public().is_some();
+                            for (name, _, ty) in typed_let_bindings(stmt) {
+                                field_types.insert(name.name.to_string(), (ty, public));
+                            }
+                        }
+                        let field_types = field_types
                             .into_iter()
-                            .map(|(name, _, ty)| (name.name.to_string(), ty))
+                            .filter(|(_, (_, public))| *public)
+                            .map(|(name, (ty, _))| (name, ty))
                             .collect();
                         self.index
                             .cell_field_types
@@ -1190,10 +1280,14 @@ impl<'a> Builder<'a> {
     }
 
     /// What a keyword argument names: a parameter of the callee bound to
-    /// `callee`, or a builtin's keyword when the callee is a builtin.
+    /// `callee`, or a builtin's keyword when the callee is a builtin or a
+    /// native.
     fn kwarg_target(&self, callee: Option<VarId>, name: &str) -> Target {
         match callee {
             None => Target::Builtin(Builtin::KwArg(name.to_owned())),
+            Some(callee) if self.natives.contains_key(&callee) => {
+                Target::Builtin(Builtin::KwArg(name.to_owned()))
+            }
             Some(callee) => self
                 .params
                 .get(&callee)
@@ -1210,6 +1304,7 @@ impl<'a> Builder<'a> {
             self.current = module;
             self.path = &ast.path;
             self.visible = ast.source_text.len();
+            self.use_prefix = None;
             if indexes_source(ast) {
                 self.index
                     .sources
@@ -1651,13 +1746,19 @@ impl<'a> Builder<'a> {
             decl.path.iter().map(|ident| ident.name.as_str()),
             1,
         );
+        // The items of a grouped `use` follow one another and share the
+        // prefix idents, spans included.
+        let prefix_span = prefix.last().map(|ident| ident.span);
+        let repeated = prefix_span.is_some() && self.use_prefix == prefix_span;
+        self.use_prefix = prefix_span;
         let target = if self.ast.contains_key(&module) {
-            self.module_path(prefix);
+            if !repeated {
+                self.module_path(prefix);
+            }
             self.exported(&module, &item.name)
                 .map_or(Target::Unresolved, Target::Def)
         } else {
             let (enum_ident, modules) = prefix.split_last().expect("use paths have two segments");
-            self.module_path(modules);
             let enum_module = module_prefix(
                 self.current,
                 decl.path.iter().map(|ident| ident.name.as_str()),
@@ -1667,10 +1768,13 @@ impl<'a> Builder<'a> {
                 Some(DefKey::Var(id)) => Some(id),
                 _ => None,
             };
-            self.record(
-                enum_ident.span,
-                enum_id.map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(id))),
-            );
+            if !repeated {
+                self.module_path(modules);
+                self.record(
+                    enum_ident.span,
+                    enum_id.map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(id))),
+                );
+            }
             let key = enum_id.map(|id| DefKey::Variant(id, item.name.to_string()));
             match key {
                 Some(key) if self.index.defs.contains_key(&key) => Target::Def(key),
@@ -1712,13 +1816,16 @@ impl<'a> Builder<'a> {
     fn exported_within(&self, module: &ModPath, name: &str, depth: usize) -> Option<DefKey> {
         const MAX_REEXPORT_DEPTH: usize = 16;
         let decls = &self.ast.get(module)?.ast.decls;
-        let declared = decls.iter().find_map(|decl| match decl {
-            Decl::Fn(decl) if decl.name.name == name => Some(decl.metadata.1),
-            Decl::Cell(decl) if decl.name.name == name => Some(decl.metadata.1),
-            Decl::Enum(decl) if decl.name.name == name => decl.metadata,
-            Decl::Struct(decl) if decl.name.name == name => decl.metadata,
-            _ => None,
-        });
+        let declared = decls
+            .iter()
+            .find_map(|decl| match decl {
+                Decl::Fn(decl) if decl.name.name == name => Some(decl.metadata.1),
+                Decl::Cell(decl) if decl.name.name == name => Some(decl.metadata.1),
+                Decl::Enum(decl) if decl.name.name == name => decl.metadata,
+                Decl::Struct(decl) if decl.name.name == name => decl.metadata,
+                _ => None,
+            })
+            .or_else(|| self.native_in(module, name));
         if declared.is_some() || depth == MAX_REEXPORT_DEPTH {
             return declared.map(DefKey::Var);
         }
@@ -2210,12 +2317,8 @@ impl<'a> Builder<'a> {
 
     /// What `name` refers to when read off a value of type `base`.
     fn field_target(&self, base: &Ty, name: &str) -> Target {
-        match base {
-            // An instance's fields are the cell's top-level `let` bindings.
-            // `x` and `y` are the instance's own placement, checked first by
-            // the type pass and shadowing any binding of the same name.
-            Ty::Inst(cell) if name != "x" && name != "y" => cell
-                .def
+        let cell_field = |cell: &CellTy| {
+            cell.def
                 .and_then(|cell_id| self.cell_fields.get(&cell_id))
                 .map_or(
                     // A GDS-backed cell declares no fields to trace back to:
@@ -2228,7 +2331,15 @@ impl<'a> Builder<'a> {
                             .get(name)
                             .map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(*id)))
                     },
-                ),
+                )
+        };
+        match base {
+            // An instance's fields are the cell's top-level `let` bindings.
+            // `x` and `y` are the instance's own placement, checked first by
+            // the type pass and shadowing any binding of the same name.
+            Ty::Inst(cell) if name != "x" && name != "y" => cell_field(cell),
+            // A schematic instance has no placement.
+            Ty::SchematicInst(cell) => cell_field(cell),
             Ty::Inst(_) | Ty::Rect | Ty::Polygon | Ty::Path | Ty::Point => {
                 Target::Builtin(Builtin::Field(name.to_string()))
             }
@@ -2247,7 +2358,10 @@ mod tests {
     use super::*;
     use crate::{
         compile::static_compile,
-        parse::{STD_PATH, STD_SOURCE, parse_source_text, parse_workspace_with_std},
+        parse::{
+            STD_LAYOUT_PATH, STD_LAYOUT_SOURCE, STD_PATH, STD_SOURCE, parse_source_text, parse_std,
+            parse_workspace_with_std, with_std,
+        },
     };
 
     const ROOT: &str = "/virtual/lib.ar";
@@ -2273,8 +2387,7 @@ mod tests {
     fn index(source: &str) -> (String, NavIndex, Vec<usize>) {
         let (source, offsets) = cursors(source);
         let root = parse_source_text(source.clone(), PathBuf::from(ROOT)).unwrap();
-        let std = parse_source_text(STD_SOURCE, PathBuf::from(STD_PATH)).unwrap();
-        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let ast = with_std(root);
         let (typed, _) = static_compile(&ast).unwrap();
         (source, NavIndex::build(&typed), offsets)
     }
@@ -2399,6 +2512,7 @@ fn same(wd: Float) -> Size {
     fn struct_typed_cell_parameters() {
         check(
             r#"
+use std::layout::rect;
 struct Params {
     layer: String,
 }
@@ -2433,6 +2547,7 @@ cell top() {
     fn functions_and_cells_resolve_from_their_call_sites() {
         check(
             r#"
+use std::layout::{inst, rect};
 fn dou$0ble(v: Float) -> Float { v * 2. }
 
 cell inner() {
@@ -2456,6 +2571,7 @@ cell top() {
     fn a_cell_used_before_its_declaration_resolves() {
         check(
             r#"
+use std::layout::{inst, rect};
 cell top() {
     let c = lat$0er();
     let i = inst(c);
@@ -2463,10 +2579,10 @@ cell top() {
 }
 
 cell later() {
-    let r = rect("met1");
+    pub let r = rect("met1");
 }
 "#,
-            &["later#1", "r#3"],
+            &["later#1", "r#4"],
         );
     }
 
@@ -2476,8 +2592,9 @@ cell later() {
     fn a_recursive_cell_resolves_its_own_fields() {
         check(
             r#"
+use std::layout::{inst, rect};
 cell tree(n: Int) {
-    let leaf = rect("met1", x0=0., y0=0., w=10., h=10.);
+    pub let leaf = rect("met1", x0=0., y0=0., w=10., h=10.);
     if n > 0 {
         let child = inst(tr$0ee(n - 1));
         eq(child.le$0af.x0, leaf.x1);
@@ -2493,6 +2610,7 @@ cell tree(n: Int) {
     fn enums_variants_annotations_and_match_arms() {
         check(
             r#"
+use std::layout::rect;
 enum Mo$0de { Fast, Slow, }
 
 fn pick(mode: Mo$0de) -> Float {
@@ -2609,6 +2727,7 @@ cell top() {
     fn struct_patterns_resolve() {
         check(
             r#"
+use std::layout::{inst, rect};
 struct Size { width: Float, height: Float, }
 
 fn area(s: Size) -> Float {
@@ -2623,7 +2742,7 @@ fn pick(s: Size) -> Float {
 }
 
 cell pad() {
-    let Size { width: wi$0de, .. } = Size { width: 1., height: 2. };
+    pub let Size { width: wi$0de, .. } = Size { width: 1., height: 2. };
     let r = rect("met1", x0=0., y0=0., w=wi$0de, h=1.);
 }
 
@@ -2691,6 +2810,7 @@ cell top() {
     fn a_type_annotation_naming_a_cell_resolves_to_it() {
         check(
             r#"
+use std::layout::rect;
 cell inn$0er() {
     let met = rect("met1");
 }
@@ -2709,8 +2829,9 @@ cell top() {
     fn a_cell_field_resolves_to_the_let_that_declares_it() {
         check(
             r#"
+use std::layout::{inst, rect};
 cell inner() {
-    let met = rect("met1");
+    pub let met = rect("met1");
 }
 
 cell top() {
@@ -2730,6 +2851,7 @@ cell top() {
     #[test]
     fn a_field_of_a_gds_backed_instance_is_a_builtin() {
         let source = "\
+use std::layout::inst;
 cell top() {
     let c = imported();
     let i = inst(c);
@@ -2744,8 +2866,7 @@ cell top() {
         root.promote_last_declarations(1);
         root.source_text = arcstr::ArcStr::from(source);
         root.generated_declarations = 1;
-        let std = parse_source_text(STD_SOURCE, PathBuf::from(STD_PATH)).unwrap();
-        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let ast = with_std(root);
         let (typed, _) = static_compile(&ast).unwrap();
         let index = NavIndex::build(&typed);
 
@@ -2769,8 +2890,7 @@ cell top() {
     /// which includes what that module itself imported.
     #[test]
     fn a_re_exported_item_resolves_to_its_original_declaration() {
-        let source =
-            "use lib::middle::thing;\n\ncell top() {\n    eq(rect(\"met1\").w, thing());\n}\n";
+        let source = "use lib::middle::thing;\nuse std::layout::rect;\n\ncell top() {\n    eq(rect(\"met1\").w, thing());\n}\n";
         let modules = [
             (Vec::new(), source, ROOT),
             (
@@ -2793,10 +2913,7 @@ cell top() {
                 )
             })
             .collect();
-        ast.insert(
-            vec!["std".to_owned()],
-            parse_source_text(STD_SOURCE, PathBuf::from(STD_PATH)).unwrap(),
-        );
+        ast.extend(parse_std());
         let (typed, _) = static_compile(&ast).unwrap();
         let index = NavIndex::build(&typed);
 
@@ -2815,7 +2932,7 @@ cell top() {
     /// is a place to send an editor.
     #[test]
     fn a_gds_only_module_is_not_a_file_to_jump_to() {
-        let source = "cell top() {\n    let c = macros::sram();\n    let i = inst(c);\n}\n";
+        let source = "use std::layout::inst;\ncell top() {\n    let c = macros::sram();\n    let i = inst(c);\n}\n";
         let root = parse_source_text(source.to_owned(), PathBuf::from(ROOT)).unwrap();
         // What `add_gds_imports` produces for a namespaced import: a module of
         // bare signatures whose path is the `.gds` file and whose
@@ -2827,12 +2944,8 @@ cell top() {
         .unwrap();
         macros.promote_last_declarations(1);
         macros.source_text = arcstr::ArcStr::from("");
-        let std = parse_source_text(STD_SOURCE, PathBuf::from(STD_PATH)).unwrap();
-        let ast = IndexMap::from([
-            (Vec::new(), root),
-            (vec!["macros".to_owned()], macros),
-            (vec!["std".to_owned()], std),
-        ]);
+        let mut ast = with_std(root);
+        ast.insert(vec!["macros".to_owned()], macros);
         let (typed, _) = static_compile(&ast).unwrap();
         let index = NavIndex::build(&typed);
 
@@ -2870,24 +2983,168 @@ cell top(alpha: Float, flag: Bool) {
     fn builtins_are_classified_but_have_no_definition() {
         check(
             r#"
+use std::layout::rect;
 cell top(w: Flo$0at) {
-    let r = re$0ct("met1", x$00=0., y0=0., x1=w, y1=w);
-    eq(r.x$00, 0.);
+    let r = rect("met1", x$00=0., y0=0., x1=w, y1=w);
+    e$0q(r.x$00, 0.);
 }
 "#,
             &[
                 r#"Builtin(Type("Float"))"#,
-                r#"Builtin(Function("rect"))"#,
                 r#"Builtin(KwArg("x0"))"#,
+                r#"Builtin(Function("eq"))"#,
                 r#"Builtin(Field("x0"))"#,
             ],
         );
+    }
+
+    /// A native is an item of its `std` module, reached by path or `use`
+    /// under any alias, with a signature but no source to jump to.
+    #[test]
+    fn natives_resolve_through_imports_and_paths() {
+        check(
+            r#"
+use std::layout::{in$0st, rect as r};
+cell child() {}
+cell top() {
+    let a = $0r("met1");
+    let b = std::layout::cr$0ect();
+    let i = in$0st(child());
+}
+"#,
+            &["generated", "generated", "generated", "generated"],
+        );
+        let (source, index, _) = index(
+            r#"
+use std::layout::rect as r;
+cell top() {
+    let a = r("met1", x0=0.);
+}
+"#,
+        );
+        let call = source.find("r(\"met1\"").unwrap();
+        let hover = index
+            .hover_at(Path::new(ROOT), call)
+            .expect("an aliased native has hover text");
+        assert_eq!(
+            hover.contents,
+            "fn rect(layer: String, *, coordinates...) -> Rect"
+        );
+        let signature = index
+            .signature_at(Path::new(ROOT), call)
+            .expect("an aliased native has a signature");
+        assert_eq!(signature.label, hover.contents);
+        let Some(Definition {
+            kind: SymbolKind::Function,
+            name,
+            ..
+        }) = index.definition_at(Path::new(ROOT), call)
+        else {
+            panic!("an aliased native resolves to a function");
+        };
+        assert_eq!(name, "rect");
+        let kwarg = source.find("x0").unwrap();
+        assert_eq!(
+            index.target_at(Path::new(ROOT), kwarg).unwrap().1,
+            &Target::Builtin(Builtin::KwArg("x0".to_owned()))
+        );
+        // Signature help for a name typed since the last index resolves
+        // through the module's imports.
+        let named = index
+            .signature_named_at(Path::new(ROOT), call, &["r".to_owned()])
+            .expect("the alias names the native");
+        assert_eq!(named.label, hover.contents);
+        let qualified = index
+            .signature_named_at(
+                Path::new(ROOT),
+                call,
+                &["std".to_owned(), "layout".to_owned(), "bbox".to_owned()],
+            )
+            .expect("a native resolves by full path");
+        assert_eq!(qualified.label, "fn bbox(value: Cell | Inst) -> Rect");
+    }
+
+    /// Natives complete as items of their module, and in a module only once
+    /// imported.
+    #[test]
+    fn natives_complete_as_module_items() {
+        let (_, index, offsets) = index(
+            r#"
+use std::layout::rect;
+cell top() {
+    $0
+}
+"#,
+        );
+        let in_scope = labels(index.completions_at(Path::new(ROOT), offsets[0]));
+        assert!(in_scope.iter().any(|label| label == "rect"), "{in_scope:?}");
+        assert!(
+            !in_scope.iter().any(|label| label == "crect"),
+            "{in_scope:?}"
+        );
+        let layout = labels(
+            index.qualified_completions(Path::new(ROOT), &["std".to_owned(), "layout".to_owned()]),
+        );
+        for expected in ["rect", "crect", "inst", "bbox", "array", "intersection"] {
+            assert!(layout.iter().any(|label| label == expected), "{layout:?}");
+        }
+    }
+
+    /// The schematic natives resolve, hover, and complete like the layout
+    /// ones, and a schematic instance completes its public fields only.
+    #[test]
+    fn schematic_natives_and_instances() {
+        let (source, index, _) = index(
+            r#"
+use std::schematic::{Signal, connect, device, DeviceKind};
+use std::schematic::inst as sinst;
+cell child() {
+    pub let a = Signal();
+    let hidden = Signal();
+}
+cell top() {
+    let i = sinst(child());
+    connect(i.a, Signal());
+    device(DeviceKind::Res, [i.a, Signal()], "", value=1.);
+}
+"#,
+        );
+        let hover = |needle: &str| {
+            let offset = source.find(needle).unwrap();
+            index
+                .hover_at(Path::new(ROOT), offset)
+                .unwrap_or_else(|| panic!("no hover at {needle}"))
+                .contents
+        };
+        assert_eq!(hover("connect(i"), "fn connect(a: Signal, b: Signal)");
+        assert_eq!(hover("sinst(child"), "fn inst(cell: Cell) -> SchematicInst");
+        assert_eq!(
+            hover("device(D"),
+            "fn device(kind: DeviceKind, terminals: [Signal], model: String, *, params...)"
+        );
+        let base_end = source.find("i.a,").unwrap() + 1;
+        assert_eq!(
+            labels(index.member_completions_at(Path::new(ROOT), base_end)),
+            ["a"]
+        );
+        let schematic =
+            labels(index.qualified_completions(
+                Path::new(ROOT),
+                &["std".to_owned(), "schematic".to_owned()],
+            ));
+        for expected in ["Signal", "connect", "device", "inst", "DeviceKind"] {
+            assert!(
+                schematic.iter().any(|label| label == expected),
+                "{schematic:?}"
+            );
+        }
     }
 
     #[test]
     fn keyword_arguments_resolve_to_parameters() {
         check(
             r#"
+use std::layout::rect;
 fn grow(base: Float, fac$0tor: Float = 2., shift: Float = ba$0se) -> Float {
     base * factor + shift
 }
@@ -2910,6 +3167,7 @@ cell top() {
     fn the_standard_library_is_navigable() {
         let (_, index, offsets) = index(
             r#"
+use std::layout::rect;
 cell top() {
     let r = rect("met1");
     eq(r.w, std::ma$0x(1., 2.));
@@ -2931,10 +3189,71 @@ cell top() {
         assert_eq!(definition.kind, SymbolKind::Function);
     }
 
+    /// The items of a grouped `use` share one prefix, which is one reference
+    /// to its module rather than one per item.
+    #[test]
+    fn a_grouped_use_references_its_module_once() {
+        let (_, index, _) = index(
+            r#"
+use std::layout::{array, inst, rect as r};
+cell top() {
+    let a = r("met1");
+}
+"#,
+        );
+        let module = DefKey::Module(vec!["std".to_owned(), "layout".to_owned()]);
+        let in_root = index
+            .references(&module, false)
+            .into_iter()
+            .filter(|span| span.path == Path::new(ROOT))
+            .count();
+        assert_eq!(in_root, 1);
+    }
+
+    #[test]
+    fn std_submodules_are_navigable() {
+        let (_, index, offsets) = index(
+            r#"
+use std::lay$0out::{arr$0ay, rect};
+cell top() {
+    let r = rect("met1");
+    let a = std::layout::inter$0section(r, ar$0ray(r, 2, 1., 0.));
+}
+"#,
+        );
+        let found = offsets
+            .iter()
+            .map(|offset| {
+                match &index
+                    .definition_at(Path::new(ROOT), *offset)
+                    .expect("the path resolves")
+                    .location
+                {
+                    DefLocation::Source(span) => {
+                        assert_eq!(span.path, Path::new(STD_LAYOUT_PATH));
+                        STD_LAYOUT_SOURCE[span.span.start()..span.span.end()].to_owned()
+                    }
+                    DefLocation::File(path) => format!("file:{}", path.display()),
+                    DefLocation::Generated => "generated".to_owned(),
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            [
+                &format!("file:{STD_LAYOUT_PATH}"),
+                "array",
+                "intersection",
+                "array"
+            ]
+        );
+    }
+
     #[test]
     fn references_cover_every_use_and_can_exclude_the_declaration() {
         let (source, index, offsets) = index(
             r#"
+use std::layout::rect;
 cell top() {
     let wid$0th = 1.;
     let a = width + 1.;
@@ -2967,6 +3286,7 @@ cell top() {
     fn navigation_survives_a_type_error_elsewhere() {
         check(
             r#"
+use std::layout::rect;
 cell top() {
     let good = 1.;
     let bad = "text" + 1;
@@ -3064,12 +3384,13 @@ cell top() {
     #[test]
     fn static_completion_does_not_require_an_indexed_file() {
         let labels = labels(NavIndex::default().completions_at(Path::new("new.ar"), 0));
-        for expected in ["cell", "struct", "rect", "Float"] {
+        for expected in ["cell", "struct", "eq", "Float"] {
             assert!(
                 labels.iter().any(|label| label == expected),
                 "missing {expected}: {labels:?}"
             );
         }
+        assert!(!labels.iter().any(|label| label == "rect"), "{labels:?}");
     }
 
     /// Declarations are visible throughout their module, wherever they sit,
@@ -3077,6 +3398,7 @@ cell top() {
     #[test]
     fn completion_respects_lexical_scope_but_not_declaration_order() {
         let source = r#"
+use std::layout::rect;
 struct Size { width: Float }
 fn helper(value: Float) -> Float { value }
 cell earlier_cell() {}
@@ -3116,9 +3438,34 @@ cell later_cell() {}
         );
     }
 
+    /// An instance completes only the fields it can read: the cell's
+    /// `pub let` bindings, decided by the last binding of each name.
+    #[test]
+    fn instance_member_completions_list_only_public_fields() {
+        let source = r#"
+use std::layout::{inst, rect};
+cell child() {
+    pub let shown = rect("met1");
+    let hidden = rect("met1");
+    pub let rebound = 1.;
+    let rebound = 2.;
+}
+cell top() {
+    let i = inst(child());
+    eq(i.x, 0.);
+}
+"#;
+        let (source, index, _) = index(source);
+        let base_end = source.find("i.x").unwrap() + 1;
+        let mut fields = labels(index.member_completions_at(Path::new(ROOT), base_end));
+        fields.sort();
+        assert_eq!(fields, ["shown", "x", "y"]);
+    }
+
     #[test]
     fn completion_is_type_aware_for_members_and_enum_paths() {
         let source = r#"
+use std::layout::rect;
 enum Mode { Fast, Small }
 cell top() {
     let shape = rect("met1");

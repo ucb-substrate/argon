@@ -34,6 +34,11 @@ pub enum CompletionSite {
     /// At the start of a statement that could instead be an `else`
     /// continuing the `if` just closed. Both sets of candidates apply.
     StatementOrElse,
+    /// Like [`Self::Statement`], at the top level of a cell body, where a
+    /// statement may also be a `pub let`.
+    CellStatement,
+    /// Like [`Self::StatementOrElse`], at the top level of a cell body.
+    CellStatementOrElse,
     /// Somewhere an expression is expected.
     Expression,
     /// Somewhere a type specification is expected.
@@ -59,10 +64,10 @@ impl CompletionSite {
             // descending into a direct expression. First-wins preserves that
             // distinction, while a nested expression recorded later is not
             // overwritten when the scope closes at the same cursor.
-            Self::Statement | Self::Expression => 2,
+            Self::Statement | Self::CellStatement | Self::Expression => 2,
             // Outranks `Statement`, which the statement loop records at the
             // same offset.
-            Self::StatementOrElse => 3,
+            Self::StatementOrElse | Self::CellStatementOrElse => 3,
             Self::Type | Self::Pattern | Self::ImportPath | Self::Keyword(_) => 3,
             Self::NewIdentifier => 4,
             Self::Suppressed => 5,
@@ -239,15 +244,25 @@ mod tests {
             ("use |", ImportPath),
             ("use lib::shape |;", Keyword("as")),
             ("use lib::shape as |;", NewIdentifier),
+            ("use lib::{|}", ImportPath),
+            ("use lib::{shape, |}", ImportPath),
+            ("use lib::{shape |};", Keyword("as")),
+            ("use lib::{shape as |};", NewIdentifier),
             ("cell top() { let | = 1.; }", NewIdentifier),
             ("cell top() { for | in [] {} }", NewIdentifier),
             ("cell top() { let value = re|; }", Expression),
-            ("cell top() { re|; }", Statement),
+            ("cell top() { re|; }", CellStatement),
+            ("fn f() { re|; }", Statement),
+            ("cell top() { for i in [] { re|; } }", Statement),
+            ("cell top() { { re|; } }", Statement),
+            ("cell top() { pub | }", Keyword("let")),
             ("cell top() { rect(|); }", Expression),
             ("cell top() { for item | [] {} }", Keyword("in")),
             // The `else` is optional in statement position, required in
             // expression position.
-            ("cell top() { if true {} | {} }", StatementOrElse),
+            ("cell top() { if true {} | {} }", CellStatementOrElse),
+            ("fn f() { if true {} | {} }", StatementOrElse),
+            ("cell top() { if true { if true {} | } }", StatementOrElse),
             ("cell top() { let x = if true {} | ; }", Keyword("else")),
             ("cell top() { match m { | } }", Pattern),
             ("cell top() { match m { Some(|) => 1, } }", Pattern),
@@ -623,6 +638,66 @@ mod tests {
         assert!(matches!(&cell.scope.stmts[1], Statement::LetBinding(_)));
     }
 
+    /// `pub` prefixes a `let` or a `let` pattern, and its span is recorded
+    /// as part of the statement.
+    #[test]
+    fn pub_let_parses() {
+        use crate::ast::{Decl, Statement};
+
+        let src = "cell c() { pub let a = 1.; pub let Size { w, h } = s; let b = 2.; }";
+        let ast = parse(src).unwrap();
+        let Decl::Cell(cell) = &ast.ast.decls[0] else {
+            panic!("expected a cell");
+        };
+        let text = |span: cfgrammar::Span| &src[span.start()..span.end()];
+        let Statement::LetBinding(a) = &cell.scope.stmts[0] else {
+            panic!("expected a let");
+        };
+        assert_eq!(text(a.public.expect("public")), "pub");
+        assert_eq!(text(a.span), "pub let a = 1.");
+        let Statement::LetPattern(size) = &cell.scope.stmts[1] else {
+            panic!("expected a let pattern");
+        };
+        assert_eq!(text(size.public.expect("public")), "pub");
+        assert_eq!(text(size.span), "pub let Size { w, h } = s");
+        let Statement::LetBinding(b) = &cell.scope.stmts[2] else {
+            panic!("expected a let");
+        };
+        assert!(b.public.is_none());
+
+        // Placement inside a cell is checked by the type checker, not here.
+        assert!(parse("fn f() { pub let a = 1.; }").is_ok());
+    }
+
+    #[test]
+    fn misplaced_pub_is_a_parse_error() {
+        for (src, message) in [
+            ("cell c() { pub a = 1.; }", "expected `let` after `pub`"),
+            (
+                "cell c() { pub for i in [] {} }",
+                "expected `let` after `pub`",
+            ),
+            (
+                "pub fn f() {}",
+                "`pub` only applies to `let` statements in a cell",
+            ),
+            (
+                "pub cell c() {}",
+                "`pub` only applies to `let` statements in a cell",
+            ),
+            (
+                "pub let a = 1.;",
+                "`pub` only applies to `let` statements in a cell",
+            ),
+        ] {
+            let errors = parse(src).expect_err("a misplaced `pub` should be rejected");
+            assert!(
+                errors.iter().any(|error| error.message == message),
+                "`{src}` should report `{message}`, got {errors:?}"
+            );
+        }
+    }
+
     /// A struct variant's fields keep their declared order and spans, and a
     /// shorthand field pattern binds the field's own name.
     #[test]
@@ -844,6 +919,7 @@ mod tests {
                 .join("::"),
             Expr::BoolLiteral(b) => b.value.to_string(),
             Expr::IntLiteral(i) => i.value.to_string(),
+            Expr::FloatLiteral(f) => format!("{:?}", f.value),
             other => panic!(
                 "shape() does not render this expression kind (span {:?})",
                 other.span()
@@ -939,6 +1015,82 @@ mod tests {
     }
 
     #[test]
+    fn exponents_lex_with_their_digits() {
+        use super::lexer::Lexer;
+        use super::token::TokenKind::{Dot, Eof, ExpLit, Ident, IntLit, Minus, Plus};
+
+        // An exponent joins the digits it follows. An `e` without exponent
+        // digits starts an identifier, and a `.` is always its own token.
+        for (src, expected) in [
+            ("1e3", &[(ExpLit, "1e3")][..]),
+            ("1E3", &[(ExpLit, "1E3")]),
+            ("1e-12", &[(ExpLit, "1e-12")]),
+            ("10E+6", &[(ExpLit, "10E+6")]),
+            ("2.5e3", &[(IntLit, "2"), (Dot, "."), (ExpLit, "5e3")]),
+            ("1.0E+6", &[(IntLit, "1"), (Dot, "."), (ExpLit, "0E+6")]),
+            ("1.e3", &[(IntLit, "1"), (Dot, "."), (Ident, "e3")]),
+            ("2em", &[(IntLit, "2"), (Ident, "em")]),
+            ("1e", &[(IntLit, "1"), (Ident, "e")]),
+            ("1e+", &[(IntLit, "1"), (Ident, "e"), (Plus, "+")]),
+            (
+                "1e-x",
+                &[(IntLit, "1"), (Ident, "e"), (Minus, "-"), (Ident, "x")],
+            ),
+            ("1e 3", &[(IntLit, "1"), (Ident, "e"), (IntLit, "3")]),
+            (
+                "t.0.1",
+                &[
+                    (Ident, "t"),
+                    (Dot, "."),
+                    (IntLit, "0"),
+                    (Dot, "."),
+                    (IntLit, "1"),
+                ],
+            ),
+        ] {
+            let mut lexer = Lexer::new(src, 0);
+            let mut tokens = Vec::new();
+            loop {
+                let token = lexer.next_token();
+                if token.kind == Eof {
+                    break;
+                }
+                tokens.push((token.kind, &src[token.start as usize..token.end as usize]));
+            }
+            assert_eq!(tokens, expected, "lexing `{src}`");
+        }
+    }
+
+    #[test]
+    fn exponent_literals_are_floats() {
+        for (expr, expected) in [
+            ("1e3", "1000.0"),
+            ("1E3", "1000.0"),
+            ("1e-12", "1e-12"),
+            ("2.5e3", "2500.0"),
+            ("1.0E+6", "1000000.0"),
+            ("1.5e+3", "1500.0"),
+            ("-1e-12", "(-1e-12)"),
+            ("2e3 * x", "(2000.0 * x)"),
+            // `1.e3` is field `e3` of `1`, as `1.foo` is, and tuple indices
+            // stay separate accesses.
+            ("1.e3", "(1.e3)"),
+            ("t.0.1", "((t.0).1)"),
+        ] {
+            assert_eq!(expr_shape(expr), expected, "parsing `{expr}`");
+        }
+
+        // A tuple index can't carry an exponent.
+        let errors = parse("cell c() { let x = t.1e3; }").expect_err("not a tuple index");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message == "expected field name or index, found float literal"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
     fn unparsable_numeric_literals_are_reported() {
         // These used to silently evaluate to 0, compiling to wrong geometry.
         for (body, message) in [
@@ -947,6 +1099,12 @@ mod tests {
                 "invalid integer literal `99999999999999999999`",
             ),
             ("let x = 1 . 5;", "invalid float literal `1 . 5`"),
+            ("let x = 1. 5e3;", "invalid float literal `1. 5e3`"),
+            ("let x = 1e400;", "float literal `1e400` is out of range"),
+            (
+                "let x = 1.5E+999;",
+                "float literal `1.5E+999` is out of range",
+            ),
         ] {
             let errors = parse(&format!("cell c() {{ {body} }}"))
                 .expect_err("an unparsable literal should be rejected");
@@ -1006,13 +1164,57 @@ mod tests {
     }
 
     #[test]
+    fn grouped_use_declarations_desugar_per_item() {
+        use crate::ast::Decl;
+
+        let src = "use lib::geometry::{width, height as h,};\nfn f() {}";
+        let ast = parse(src).expect("a grouped use should parse");
+        let uses = ast
+            .ast
+            .decls
+            .iter()
+            .filter_map(|decl| match decl {
+                Decl::Use(decl) => Some(decl),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(uses.len(), 2);
+        for (decl, item, alias, text) in [
+            (uses[0], "width", None, "width"),
+            (uses[1], "height", Some("h"), "height as h"),
+        ] {
+            assert_eq!(
+                decl.path
+                    .iter()
+                    .map(|part| part.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["lib", "geometry", item]
+            );
+            assert_eq!(decl.alias.as_ref().map(|alias| alias.name.as_str()), alias);
+            assert_eq!(&src[decl.span.start()..decl.span.end()], text);
+        }
+        assert_eq!(uses[0].path[0].span, uses[1].path[0].span);
+        assert!(matches!(ast.ast.decls[2], Decl::Fn(_)));
+
+        assert!(parse("use std::layout::{rect};").is_ok());
+        let error = parse("use std::layout::{};").expect_err("an empty group is an error");
+        assert!(
+            error
+                .iter()
+                .any(|error| error.message.contains("at least one item"))
+        );
+        assert!(parse("use {rect};").is_err());
+        assert!(parse("use std::layout::{rect, crect}").is_err());
+    }
+
+    #[test]
     fn literal_values_and_spans() {
         use crate::ast::{Decl, Expr, Statement};
 
         // Assert the concrete AST variant *and* that each node's span re-slices
         // to exactly the source text it covers, rather than fuzzy-matching a
         // `{:#?}` dump.
-        let src = "cell c() {\n  let f = 100.;\n  let s = rect(\"met1\");\n}\n";
+        let src = "cell c() {\n  let f = 100.;\n  let s = rect(\"met1\");\n  let e = 2.5e-3;\n}\n";
         let mut parser = super::grammar::Parser::new(src, 0);
         let ast = parser.parse_root();
         assert!(parser.errors.is_empty(), "{:?}", parser.errors);
@@ -1045,13 +1247,23 @@ mod tests {
         assert_eq!(s.value, "met1");
         assert_eq!(&src[s.span.start()..s.span.end()], "\"met1\"");
         assert_eq!(call.scope_order, 0);
+
+        // `let e = 2.5e-3;` — one FloatLiteral spans the fraction and exponent.
+        let Statement::LetBinding(let_e) = &cell.scope.stmts[2] else {
+            panic!("expected a let binding, got {:?}", cell.scope.stmts[2]);
+        };
+        let Expr::FloatLiteral(e) = &let_e.value else {
+            panic!("expected a FloatLiteral, got {:?}", let_e.value);
+        };
+        assert_eq!(e.value, 2.5e-3);
+        assert_eq!(&src[e.span.start()..e.span.end()], "2.5e-3");
     }
 
     #[test]
     fn scope_orders_are_lexical_and_reset_in_nested_scopes() {
         use crate::ast::{Decl, Expr, Statement};
 
-        let src = "cell c() { rect(); alpha(); if true { beta(); } else {}; for i in range_full(0, 2) { gamma(); } { delta(); }; }";
+        let src = "cell c() { float(); alpha(); if true { beta(); } else {}; for i in range_full(0, 2) { gamma(); } { delta(); }; }";
         let mut parser = super::grammar::Parser::new(src, 0);
         let ast = parser.parse_root();
         assert!(parser.errors.is_empty(), "{:?}", parser.errors);
@@ -1060,11 +1272,11 @@ mod tests {
         };
 
         let Statement::Expr {
-            value: Expr::Call(rect),
+            value: Expr::Call(float),
             ..
         } = &cell.scope.stmts[0]
         else {
-            panic!("expected rect call");
+            panic!("expected float call");
         };
         let Statement::Expr {
             value: Expr::Call(alpha),
@@ -1092,7 +1304,7 @@ mod tests {
         };
 
         // Builtins do not consume ordinals because they do not produce scopes.
-        assert_eq!(rect.scope_order, 0);
+        assert_eq!(float.scope_order, 0);
         assert_eq!(alpha.scope_order, 0);
         assert_eq!(if_.scope_order, 1);
         assert_eq!(for_.scope_order, 2);

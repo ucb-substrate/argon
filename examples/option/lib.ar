@@ -1,5 +1,7 @@
 // `Option`, `Some`, and `None` are available in every module without a `use`.
 
+use std::layout::{inst, rect};
+
 // A `None` keyword parameter makes the parameter optional.
 cell via(layer: String, w: Float, n: Option<Int> = None) {
     let count = std::unwrap_or(n, 1);

@@ -345,6 +345,7 @@ pub(super) mod tests {
         std::fs::write(
             &source,
             r#"
+use std::layout::{inst, rect};
 cell leaf(width: Float) { let r = rect("met1", x0=0., y0=0., x1=width, y1=5.); }
 cell shared() {
     for i in std::range(8) {
@@ -404,6 +405,7 @@ cell top() {
                 .join("../../examples/tech/basic.tech.toml"),
         ));
         let base = r#"
+use std::layout::{inst, rect};
 cell leaf() { let r = rect("met1", x0=0., y0=0., x1=10., y1=5.); }
 cell branch() { for i in std::range(4) { let child = inst(leaf(), x=(i as Float)*20., y=0.); } }
 cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., y=0.); }

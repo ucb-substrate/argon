@@ -23,7 +23,7 @@ use argonc::{
         CompletionCandidate, CompletionKind as ArgonCompletionKind, DefLocation, NavIndex,
         OutlineSymbol, SignatureInfo, SymbolKind as ArgonSymbolKind,
     },
-    parse::{CompletionSite, STD_PATH, completion_site, virtual_source},
+    parse::{CompletionSite, STD_MODULES, completion_site, virtual_source},
 };
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, DocumentHighlight,
@@ -34,35 +34,49 @@ use tower_lsp_server::ls_types::{
 
 use crate::{State, argon_cache_dir, document::Document};
 
-/// Writes the embedded standard library into `cache`.
+/// Writes every module of the embedded standard library into `cache`, and
+/// returns the directory holding them.
 ///
-/// The directory is keyed by a hash of the source, so upgrading the analyzer
+/// The directory is keyed by a hash of the sources, so upgrading the analyzer
 /// serves the new standard library rather than a stale cached copy, and two
-/// installed versions can coexist. Returns `None` if the write fails:
-/// navigation into the standard library is a convenience, not something worth
-/// surfacing an error for.
+/// installed versions can coexist. Each module is written under the file name
+/// of its virtual path. Returns `None` if a write fails: navigation into the
+/// standard library is a convenience, not something worth surfacing an error
+/// for.
 fn materialize_std_in(cache: &Path) -> Option<PathBuf> {
-    let source = virtual_source(Path::new(STD_PATH))?;
-    let directory = cache.join(format!("std/{:016x}", source_digest(source)));
-    let target = directory.join("lib.ar");
-    if target.is_file() {
-        return Some(target);
+    let directory = cache.join(format!("std/{:016x}", std_digest()));
+    for module in &STD_MODULES {
+        let target = directory.join(Path::new(module.path).file_name()?);
+        if target.is_file() {
+            continue;
+        }
+        fs::create_dir_all(&directory).ok()?;
+        // Write and rename so a second analyzer starting concurrently never
+        // sees a half-written file.
+        let mut temporary = tempfile::NamedTempFile::new_in(&directory).ok()?;
+        temporary.write_all(module.source.as_bytes()).ok()?;
+        temporary.flush().ok()?;
+        temporary.persist(&target).ok()?;
+        // The file exists from here on. Marking it read-only says "this is not
+        // yours to edit"; failing to do so is not a reason to discard it.
+        if let Ok(metadata) = fs::metadata(&target) {
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(true);
+            let _ = fs::set_permissions(&target, permissions);
+        }
     }
-    fs::create_dir_all(&directory).ok()?;
-    // Write and rename so a second analyzer starting concurrently never sees a
-    // half-written file.
-    let mut temporary = tempfile::NamedTempFile::new_in(&directory).ok()?;
-    temporary.write_all(source.as_bytes()).ok()?;
-    temporary.flush().ok()?;
-    temporary.persist(&target).ok()?;
-    // The file exists from here on. Marking it read-only says "this is not
-    // yours to edit"; failing to do so is not a reason to discard it.
-    if let Ok(metadata) = fs::metadata(&target) {
-        let mut permissions = metadata.permissions();
-        permissions.set_readonly(true);
-        let _ = fs::set_permissions(&target, permissions);
+    Some(directory)
+}
+
+/// A digest of every standard library module's virtual path and source.
+fn std_digest() -> u64 {
+    let mut text = String::new();
+    for module in &STD_MODULES {
+        for part in [module.path, module.source] {
+            text.push_str(&format!("{}:{part}", part.len()));
+        }
     }
-    Some(target)
+    source_digest(&text)
 }
 
 /// FNV-1a, spelled out rather than taken from `DefaultHasher`, whose algorithm
@@ -577,8 +591,11 @@ fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> 
                 )
         }
         // `StatementOrElse` also accepts an `else` continuing the `if` just
-        // closed.
-        CompletionSite::Statement | CompletionSite::StatementOrElse => match candidate.kind {
+        // closed, and a cell body's statements also accept `pub`.
+        CompletionSite::Statement
+        | CompletionSite::StatementOrElse
+        | CompletionSite::CellStatement
+        | CompletionSite::CellStatementOrElse => match candidate.kind {
             Kind::Function
             | Kind::Cell
             | Kind::Variable
@@ -587,12 +604,18 @@ fn completion_allowed(candidate: &CompletionCandidate, site: CompletionSite) -> 
             | Kind::Variant
             | Kind::Struct
             | Kind::Module => true,
-            Kind::Keyword => {
-                matches!(
-                    candidate.label.as_str(),
-                    "false" | "for" | "if" | "let" | "match" | "true"
-                ) || (site == CompletionSite::StatementOrElse && candidate.label == "else")
-            }
+            Kind::Keyword => match candidate.label.as_str() {
+                "false" | "for" | "if" | "let" | "match" | "true" => true,
+                "else" => matches!(
+                    site,
+                    CompletionSite::StatementOrElse | CompletionSite::CellStatementOrElse
+                ),
+                "pub" => matches!(
+                    site,
+                    CompletionSite::CellStatement | CompletionSite::CellStatementOrElse
+                ),
+                _ => false,
+            },
             Kind::Field | Kind::Type => false,
         },
         CompletionSite::Expression => match candidate.kind {
@@ -652,12 +675,12 @@ fn lsp_symbol_kind(kind: ArgonSymbolKind) -> SymbolKind {
 }
 
 impl State {
-    /// Path of the materialized standard library, written on first use.
+    /// Directory of the materialized standard library, written on first use.
     ///
     /// The write runs on a blocking thread, and only ever once: later callers
     /// read the cell rather than touching the filesystem.
-    async fn std_file(&self) -> Option<&Path> {
-        self.std_file
+    async fn std_dir(&self) -> Option<&Path> {
+        self.std_dir
             .get_or_init(|| async {
                 match tokio::task::spawn_blocking(materialize_std).await {
                     Ok(Some(path)) => Some(path),
@@ -690,9 +713,13 @@ impl State {
         // standard library, and only that comparison needs it on disk. Every
         // other request therefore never waits on the write.
         if std_cache_root().is_some_and(|root| path.starts_with(root))
-            && self.std_file().await == Some(path.as_path())
+            && let Some(directory) = self.std_dir().await
+            && path.parent() == Some(directory)
+            && let Some(module) = STD_MODULES
+                .iter()
+                .find(|module| Path::new(module.path).file_name() == path.file_name())
         {
-            return Some(PathBuf::from(STD_PATH));
+            return Some(PathBuf::from(module.path));
         }
         Some(path)
     }
@@ -719,7 +746,7 @@ impl State {
     /// The URI a compiler path should be shown under.
     async fn client_uri(&self, path: &Path) -> Option<Uri> {
         if virtual_source(path).is_some() {
-            return Uri::from_file_path(self.std_file().await?);
+            return Uri::from_file_path(self.std_dir().await?.join(path.file_name()?));
         }
         Uri::from_file_path(path)
     }
@@ -988,12 +1015,7 @@ mod tests {
     /// the analyzer actually performs rather than a stand-in for it.
     fn index_of(source: &str) -> NavIndex {
         let root = argonc::parse::parse_source_text(source, PathBuf::from(FILE)).unwrap();
-        let std = argonc::parse::parse_source_text(
-            argonc::parse::STD_SOURCE,
-            PathBuf::from(argonc::parse::STD_PATH),
-        )
-        .unwrap();
-        let ast = indexmap::IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let ast = argonc::parse::with_std(root);
         let (typed, _) = argonc::compile::static_compile(&ast).expect("a root module");
         NavIndex::build(&typed)
     }
@@ -1068,11 +1090,13 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
 
         let first = materialize_std_in(cache.path()).expect("a cache directory is available");
-        let expected = virtual_source(Path::new(STD_PATH)).unwrap();
-        assert_eq!(fs::read_to_string(&first).unwrap(), expected);
-        assert!(fs::metadata(&first).unwrap().permissions().readonly());
+        for module in &STD_MODULES {
+            let file = first.join(Path::new(module.path).file_name().unwrap());
+            assert_eq!(fs::read_to_string(&file).unwrap(), module.source);
+            assert!(fs::metadata(&file).unwrap().permissions().readonly());
+        }
 
-        // A second call reuses the file rather than rewriting a read-only one.
+        // A second call reuses the files rather than rewriting read-only ones.
         assert_eq!(
             materialize_std_in(cache.path()).as_deref(),
             Some(first.as_path())
@@ -1205,8 +1229,9 @@ mod tests {
             candidate("struct", Kind::Keyword),
             candidate("else", Kind::Keyword),
             candidate("let", Kind::Keyword),
+            candidate("pub", Kind::Keyword),
             candidate("true", Kind::Keyword),
-            candidate("rect", Kind::Function),
+            candidate("eq", Kind::Function),
             candidate("Widget", Kind::Cell),
             candidate("Mode", Kind::Enum),
             candidate("Size", Kind::Struct),
@@ -1232,13 +1257,13 @@ mod tests {
         assert_eq!(
             labels(CompletionSite::Expression),
             [
-                "true", "rect", "Widget", "Mode", "Size", "lib", "width", "Some"
+                "true", "eq", "Widget", "Mode", "Size", "lib", "width", "Some"
             ]
         );
         assert_eq!(
             labels(CompletionSite::Statement),
             [
-                "let", "true", "rect", "Widget", "Mode", "Size", "lib", "width", "Some"
+                "let", "true", "eq", "Widget", "Mode", "Size", "lib", "width", "Some"
             ]
         );
         assert_eq!(labels(CompletionSite::ImportPath), ["lib"]);
@@ -1250,7 +1275,21 @@ mod tests {
         assert_eq!(
             labels(CompletionSite::StatementOrElse),
             [
-                "else", "let", "true", "rect", "Widget", "Mode", "Size", "lib", "width", "Some"
+                "else", "let", "true", "eq", "Widget", "Mode", "Size", "lib", "width", "Some"
+            ]
+        );
+        // A cell body's statements also accept `pub`.
+        assert_eq!(
+            labels(CompletionSite::CellStatement),
+            [
+                "let", "pub", "true", "eq", "Widget", "Mode", "Size", "lib", "width", "Some"
+            ]
+        );
+        assert_eq!(
+            labels(CompletionSite::CellStatementOrElse),
+            [
+                "else", "let", "pub", "true", "eq", "Widget", "Mode", "Size", "lib", "width",
+                "Some"
             ]
         );
         assert_eq!(labels(CompletionSite::Keyword("else")), ["else"]);

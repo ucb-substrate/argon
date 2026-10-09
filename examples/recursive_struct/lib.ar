@@ -1,3 +1,5 @@
+use std::layout::rect;
+
 // A struct may contain itself through an `Option`, since `None` ends the
 // recursion; `struct Node { next: Node }` has no finite value and is rejected.
 struct Node {

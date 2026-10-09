@@ -1,3 +1,5 @@
+use std::layout::rect;
+
 enum Shape {
     Circle(Float),
     Box(Float, Float),

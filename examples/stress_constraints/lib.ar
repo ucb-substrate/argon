@@ -1,3 +1,5 @@
+use std::layout::crect;
+
 fn coupled_ring(prev: Rect, first: Rect, n: Int) {
     // Build a *ring* of rectangles whose left edges are mutually coupled.
     // Each step adds a rectangle `cur` and a two-variable difference

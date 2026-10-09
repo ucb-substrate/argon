@@ -7,7 +7,7 @@ import {FieldTable} from '@site/src/components/ApiReference';
 
 # `Rect`
 
-`Rect` is an axis-aligned rectangle. Drawn rectangles from [`rect`](/language/builtins/geometry#rect) and construction rectangles from [`crect`](/language/builtins/geometry#crect) both have this type.
+`Rect` is an axis-aligned rectangle. Drawn rectangles from [`std::layout::rect`](/language/std-layout#rect) and construction rectangles from [`std::layout::crect`](/language/std-layout#crect) both have this type.
 
 ## Fields
 
@@ -26,7 +26,7 @@ import {FieldTable} from '@site/src/components/ApiReference';
 Give any combination of edges and sizes that pins the rectangle down, and the solver derives the rest:
 
 ```argon
-let r = rect("met1", x0=10., y0=20., w=100., h=80.);
+let r = std::layout::rect("met1", x0=10., y0=20., w=100., h=80.);
 eq(r.x1, 110.);
 eq(r.y1, 100.);
 ```
@@ -35,6 +35,6 @@ Arguments such as `x0` are constraints. Arguments such as `x0i` are initial valu
 
 ## Related
 
-- [`rect`](/language/builtins/geometry#rect) and [`crect`](/language/builtins/geometry#crect)
-- [`bbox`](/language/builtins/hierarchy#bbox)
-- [`std::intersection`](/language/std#intersection) and [`std::union`](/language/std#union)
+- [`rect`](/language/std-layout#rect) and [`crect`](/language/std-layout#crect)
+- [`bbox`](/language/std-layout#bbox)
+- [`intersection`](/language/std-layout#intersection) and [`union`](/language/std-layout#union)

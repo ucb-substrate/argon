@@ -26,6 +26,8 @@ fn choose_pitch(dense: Bool) -> Float {
 When the point of an `if` is to build something rather than to produce a value, the `else` may be left off:
 
 ```argon
+use std::layout::rect;
+
 cell strap(w: Float, h: Float, dummy: Bool) {
     let met1 = rect("met1", x0=0., y0=0., x1=w, y1=h)!;
 
@@ -60,6 +62,8 @@ fn width(dense: Bool, wide: Bool) -> Float {
 A chain used for its value must end in an `else` block, since one of the branches has to run. A chain used as a statement need not — and then nothing is built when no condition holds:
 
 ```argon
+use std::layout::rect;
+
 cell band(n: Int) {
     if n == 0 {
         rect("met1", x0=0., y0=0., x1=100., y1=20.);
@@ -117,6 +121,8 @@ every field must be given. A pattern must name every field too, unless it ends
 in `..`; `field: name` renames a binding and `field: _` drops one.
 
 ```argon
+use std::layout::rect;
+
 enum Shape {
     Circle { r: Float },
     Box { w: Float, h: Float },
@@ -169,7 +175,7 @@ A `for` loop walks a sequence, usually to emit geometry or instances:
 
 ```argon
 for i in std::range(4) {
-    rect("met1", x0=(i as Float) * 100., y0=0., w=60., h=60.);
+    std::layout::rect("met1", x0=(i as Float) * 100., y0=0., w=60., h=60.);
 }
 ```
 

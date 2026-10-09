@@ -1037,7 +1037,7 @@ mod tests {
         let source = directory.path().join("lib.ar");
         std::fs::write(
             &source,
-            "cell bot() {\n    let met1 = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n}\n\
+            "use std::layout::{inst, rect};\ncell bot() {\n    pub let met1 = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n}\n\
              cell top() {\n    let left = inst(bot());\n    eq(left.x, 0.);\n    eq(left.y, 0.);\n    \
              let strap = rect(\"met2\", x0=left.met1.x0, y0=0., x1=left.met1.x1, y1=left.met1.y1 / 2.);\n}\n",
         )

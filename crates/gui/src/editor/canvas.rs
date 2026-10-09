@@ -11526,10 +11526,18 @@ pub(crate) fn find_obj_path(
     if path.is_empty() {
         panic!("need non-empty object path");
     }
+    // Past the first hop, the path reads a child cell's objects through an
+    // instance, which sees only its public fields.
+    let mut in_child = false;
+    let name_of = |scope: ScopeAddress, in_child: bool, obj: ObjectId| {
+        if in_child {
+            cell.output.reachable_field_name(scope.cell, obj)
+        } else {
+            cell.output.reachable_obj_name(scope.cell, scope.scope, obj)
+        }
+    };
     for obj in &path[0..path.len() - 1] {
-        if let Some(name) =
-            cell.output
-                .reachable_obj_name(current_scope.cell, current_scope.scope, *obj)
+        if let Some(name) = name_of(current_scope, in_child, *obj)
             && let Some(inst) = cell.output.cells[&current_scope.cell].objects[obj].get_instance()
         {
             string_path.push(name);
@@ -11537,23 +11545,21 @@ pub(crate) fn find_obj_path(
                 cell: inst.cell,
                 scope: cell.output.cells[&inst.cell].root,
             };
+            in_child = true;
         } else {
             reachable = false;
             break;
         }
     }
     let obj = path.last().unwrap();
-    if let Some(name) =
-        cell.output
-            .reachable_obj_name(current_scope.cell, current_scope.scope, *obj)
-    {
+    if let Some(name) = name_of(current_scope, in_child, *obj) {
         match &cell.output.cells[&current_scope.cell].objects[obj] {
             SolvedValue::Rect(_) | SolvedValue::Polygon(_) | SolvedValue::Path(_) => {
                 string_path.push(name)
             }
             SolvedValue::Instance(_) => {
                 string_path.push(name);
-                string_path = vec![format!("bbox({})", string_path.join("."))];
+                string_path = vec![format!("std::layout::bbox({})", string_path.join("."))];
             }
             _ => reachable = false,
         }
@@ -12004,7 +12010,8 @@ mod tests {
         let source_path = directory.path().join("lib.ar");
         std::fs::write(
             &source_path,
-            r#"cell top() {
+            r#"use std::layout::rect;
+cell top() {
     rect("met1", x0=0., y0=0., x1=100., y1=1.);
 }
 "#,
@@ -12063,6 +12070,7 @@ mod tests {
         std::fs::write(
             &source_path,
             r#"
+use std::layout::rect;
 cell top() {
     rect("met1", x0=0., y0=0., x1=1., y1=1.);
     rect("met1", x0=2., y0=0., x1=3., y1=1.);
@@ -12103,6 +12111,7 @@ cell top() {
         std::fs::write(
             &source_path,
             r#"
+use std::layout::{inst, path, rect};
 cell bit() {
     let body = rect("met1", x0=0., y0=0., x1=8., y1=20.);
     let route = path("met1", 3,
@@ -13049,6 +13058,7 @@ cell top() {
         std::fs::write(
             &source,
             r#"
+use std::layout::{inst, rect};
 cell free() { let r = rect("met1", x0i=10., y0i=10., x1i=90., y1i=90.)!; }
 cell partial() { let r = rect("met1", x0i=10., y0i=10., x1=90., y1=90.)!; }
 cell fixed() { let r = rect("met1", x0=10., y0=10., x1=90., y1=90.); }
@@ -14234,7 +14244,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         let source_path = directory.path().join("lib.ar");
         std::fs::write(
             &source_path,
-            "cell top() {\n    let shape = rect(\"met1\", x0i=1.2, y0i=0., x1i=10.3, y1i=10.)!;\n}\n",
+            "use std::layout::rect;\ncell top() {\n    let shape = rect(\"met1\", x0i=1.2, y0i=0., x1i=10.3, y1i=10.)!;\n}\n",
         )
         .unwrap();
         let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
@@ -14360,6 +14370,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         std::fs::write(
             &source_path,
             r#"
+use std::layout::{inst, rect};
 cell leaf(width: Float) {
     let shape = rect("met1", x0=0., y0=0., x1=width, y1=5.)!;
 }
@@ -14407,8 +14418,10 @@ cell top() {
         std::fs::write(
             &source_path,
             r#"
+use std::layout::{inst, rect};
 cell child() {
-    let shape = rect("met1", x0=0., y0=0., x1=10., y1=5.);
+    pub let shape = rect("met1", x0=0., y0=0., x1=10., y1=5.);
+    let hidden = rect("met1", x0=20., y0=0., x1=30., y1=5.);
 }
 cell top() {
     let child_instance = inst(child(), x=3., y=4.);
@@ -14435,11 +14448,16 @@ cell top() {
             .unwrap();
         let instance_id = instance.id;
         let child_cell = &output.cells[&instance.cell];
-        let child_rect_id = child_cell
-            .objects
-            .values()
-            .find_map(|object| object.get_rect().map(|rect| rect.id))
-            .unwrap();
+        let child_rect_at = |x0: f64| {
+            child_cell
+                .objects
+                .values()
+                .find_map(|object| object.get_rect().filter(|rect| rect.x0.0 == x0))
+                .map(|rect| rect.id)
+                .unwrap()
+        };
+        let child_rect_id = child_rect_at(0.);
+        let hidden_rect_id = child_rect_at(20.);
         let state = CompileOutputState {
             output: Arc::new(output),
             selected_scope: Vec::new(),
@@ -14454,12 +14472,15 @@ cell top() {
 
         assert_eq!(
             find_obj_path(&[instance_id], &state, scope),
-            (true, vec!["bbox(child_instance)".to_owned()])
+            (true, vec!["std::layout::bbox(child_instance)".to_owned()])
         );
         assert_eq!(
             find_obj_path(&[instance_id, child_rect_id], &state, scope),
             (true, vec!["child_instance".to_owned(), "shape".to_owned()])
         );
+        // An instance reads only public fields, so a private one is not a
+        // path the GUI may write into source.
+        assert!(!find_obj_path(&[instance_id, hidden_rect_id], &state, scope).0);
         assert_eq!(
             exact_object_bounds(&[instance_id, child_rect_id], &state, scope),
             Some(ExactLayoutBounds {

@@ -1,3 +1,5 @@
+use std::layout::path;
+
 cell top() {
     let route = path("met1", 4,
         width=20.,

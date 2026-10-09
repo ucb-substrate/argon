@@ -35,7 +35,7 @@ use crate::{
         ArgDecl, Decl, Expr, IdentPath, ModPath, Pattern, Scope, Statement, WorkspaceAst,
         annotated::AnnotatedAst,
     },
-    compile::{Ty, TypeDefs, TypedWorkspace, VarId, VarIdTyMetadata},
+    compile::{Native, Ty, TypeDefs, TypedWorkspace, VarId, VarIdTyMetadata},
 };
 
 /// A declaration's content fingerprint.
@@ -90,6 +90,7 @@ impl ItemIndex {
             items: IndexMap::new(),
             variants: HashMap::new(),
             defs: &workspace.defs,
+            natives: &workspace.natives,
         };
         builder.collect_declarations(&workspace.ast);
         builder.collect_dependencies(&workspace.ast);
@@ -135,6 +136,8 @@ struct Builder<'a> {
     variants: HashMap<VarId, VarId>,
     /// Struct and enum definitions, for the payload types an enum depends on.
     defs: &'a TypeDefs,
+    /// The native item bound to each `VarId` that names one.
+    natives: &'a IndexMap<VarId, Native>,
 }
 
 fn hasher() -> fnv::FnvHasher {
@@ -304,9 +307,28 @@ impl Builder<'_> {
                     Decl::Constant(_) | Decl::Mod(_) | Decl::Use(_) => continue,
                 };
                 deps.shift_remove(&var);
+                // A native has no declaration to depend on, so the natives a
+                // declaration calls are folded into its own hash by path: an
+                // alias re-pointed at another native must change it.
+                let mut natives = deps
+                    .iter()
+                    .filter_map(|dep| self.natives.get(dep))
+                    .map(|native| native.path())
+                    .collect::<Vec<_>>();
+                natives.sort_unstable();
+                natives.dedup();
                 deps.retain(|dep| self.items.contains_key(dep));
                 if let Some(item) = self.items.get_mut(&var) {
                     item.deps = deps;
+                    if !natives.is_empty() {
+                        let mut hasher = hasher();
+                        hasher.write_u64(item.self_hash);
+                        hasher.write_usize(natives.len());
+                        for native in &natives {
+                            write_str(&mut hasher, native);
+                        }
+                        item.self_hash = hasher.finish();
+                    }
                 }
             }
         }
@@ -345,7 +367,7 @@ impl Builder<'_> {
                 out.insert(ctor.def);
                 self.tys(&ctor.args, out);
             }
-            Ty::Cell(cell) | Ty::Inst(cell) => {
+            Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => {
                 if let Some(def) = cell.def {
                     out.insert(def);
                 }
@@ -369,8 +391,10 @@ impl Builder<'_> {
                 }
                 self.ty(&fn_ty.ret, out);
             }
-            // A type parameter is covered by the declaring item's own text.
+            // A type parameter is covered by the declaring item's own text,
+            // and a native by the `VarId` of the path that names it.
             Ty::Param(_)
+            | Ty::Native(_)
             | Ty::Infer(_)
             | Ty::Unknown
             | Ty::Any
@@ -382,6 +406,7 @@ impl Builder<'_> {
             | Ty::Path
             | Ty::Point
             | Ty::String
+            | Ty::Signal
             | Ty::Nil => {}
         }
     }
@@ -757,15 +782,14 @@ mod tests {
     use super::*;
     use crate::{
         compile::static_compile,
-        parse::{STD_PATH, STD_SOURCE, parse_source_text},
+        parse::{parse_source_text, with_std},
     };
 
     /// Fingerprints for one virtual workspace, keyed by declaration name so a
     /// test can talk about `shapes` rather than about whatever `VarId` it drew.
     fn fingerprints(source: &str) -> HashMap<String, Fingerprint> {
         let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
-        let std = parse_source_text(STD_SOURCE, PathBuf::from(STD_PATH)).unwrap();
-        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let ast = with_std(root);
         let (typed, output) = static_compile(&ast).expect("a root module");
         assert!(output.errors.is_empty(), "{:?}", output.errors);
 
@@ -808,6 +832,7 @@ mod tests {
     }
 
     const BASE: &str = "\
+use std::layout::rect;
 fn helper() -> Float { 1. }
 fn unrelated() -> Float { 2. }
 fn middle() -> Float { helper() }
@@ -851,6 +876,7 @@ cell uses_unrelated() { let r = rect(\"met1\", x0 = unrelated(), y0 = 0., x1 = 1
     #[test]
     fn a_default_value_is_part_of_the_fingerprint() {
         const SOURCE: &str = "\
+use std::layout::rect;
 fn helper() -> Float { 1. }
 fn scaled(x: Float, scale: Float = helper()) -> Float { x * scale }
 cell uses_scaled() { let r = rect(\"met1\", x0 = scaled(1.), y0 = 0., x1 = 1., y1 = 1.); }
@@ -883,6 +909,7 @@ cell uses_scaled() { let r = rect(\"met1\", x0 = scaled(1.), y0 = 0., x1 = 1., y
     #[test]
     fn a_recursive_fn_is_fingerprinted_and_invalidates_its_callers() {
         let base = "\
+use std::layout::rect;
 fn countdown(n: Int) -> Int { if n <= 0 { 0 } else { countdown(n - 1) } }
 fn other(n: Int) -> Int { n }
 cell top() { let r = rect(\"met1\", x0 = countdown(3) as Float, y0 = 0., x1 = 1., y1 = 1.); }
@@ -1034,6 +1061,37 @@ fn untouched<T>(v: T) -> T { v }
     /// Two declarations with byte-identical bodies in different modules must
     /// not share a fingerprint, since `CompiledCell::name` becomes the exported
     /// GDS structure name.
+    /// A native has no declaration to depend on, so a `use` re-pointed from
+    /// one native to another under the same alias must still change the
+    /// fingerprint of every declaration that calls it.
+    #[test]
+    fn re_pointing_an_alias_at_another_native_changes_callers() {
+        let body = "\ncell top() {\n    let p = shape(\"met1\", 3);\n}\n\nfn unrelated() -> Float { 1. }\n";
+        assert_eq!(
+            changed(
+                &format!("use std::layout::polygon as shape;{body}"),
+                &format!("use std::layout::path as shape;{body}"),
+            ),
+            ["top"]
+        );
+        assert_eq!(
+            changed(
+                &format!("use std::layout::polygon as shape;{body}"),
+                &format!("use std::layout::{{polygon as shape}};{body}"),
+            ),
+            Vec::<String>::new()
+        );
+        // The two `inst` natives share a name but not a module.
+        let body = "\ncell child() {}\n\ncell top() {\n    let i = place(child());\n}\n";
+        assert_eq!(
+            changed(
+                &format!("use std::layout::inst as place;{body}"),
+                &format!("use std::schematic::inst as place;{body}"),
+            ),
+            ["top"]
+        );
+    }
+
     #[test]
     fn identical_bodies_in_different_modules_differ() {
         let root = parse_source_text(
@@ -1046,12 +1104,8 @@ fn untouched<T>(v: T) -> T { v }
             PathBuf::from("/virtual/other.ar"),
         )
         .unwrap();
-        let std = parse_source_text(STD_SOURCE, PathBuf::from(STD_PATH)).unwrap();
-        let ast = IndexMap::from([
-            (Vec::new(), root),
-            (vec!["other".to_owned()], other),
-            (vec!["std".to_owned()], std),
-        ]);
+        let mut ast = with_std(root);
+        ast.insert(vec!["other".to_owned()], other);
         let (typed, output) = static_compile(&ast).expect("a root module");
         assert!(output.errors.is_empty(), "{:?}", output.errors);
         let index = ItemIndex::build(&typed);
@@ -1131,8 +1185,7 @@ fn untouched<T>(v: T) -> T { v }
     #[test]
     fn declaration_extents_are_disjoint_and_ordered() {
         let root = parse_source_text(BASE, PathBuf::from("/virtual/lib.ar")).unwrap();
-        let std = parse_source_text(STD_SOURCE, PathBuf::from(STD_PATH)).unwrap();
-        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let ast = with_std(root);
         let (typed, _) = static_compile(&ast).expect("a root module");
         let index = ItemIndex::build(&typed);
         let sites = index.sites_in(Path::new("/virtual/lib.ar"));

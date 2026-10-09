@@ -28,11 +28,11 @@ export default function prismIncludeLanguages(PrismObject) {
       {pattern: /(^|[^\\:])\/\/.*/, lookbehind: true, greedy: true},
     ],
     string: {pattern: /"(?:\\[\s\S]|[^\\"])*"/, greedy: true},
-    keyword: /\b(?:as|cell|const|else|enum|fn|for|if|in|let|match|mod|struct|use)\b/,
+    keyword: /\b(?:as|cell|const|else|enum|fn|for|if|in|let|match|mod|pub|struct|use)\b/,
     boolean: /\b(?:true|false)\b/,
     'class-name': /\b[A-Z][A-Za-z0-9_]*\b/,
     function: /\b[a-z_][a-z0-9_]*(?=\s*\()/,
-    number: /\b\d[\d_]*(?:\.\d*)?(?:e[+-]?\d+)?/i,
+    number: /\b\d+(?:\.(?![\w.])|(?:\.\d+)?(?:e[+-]?\d+)?)/i,
     operator: /->|=>|::|&&|\|\||[+\-*\/%<>=!]=?/,
     punctuation: /[{}[\]();,.:?]/,
   };

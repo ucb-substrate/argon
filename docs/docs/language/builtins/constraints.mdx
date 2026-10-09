@@ -1,6 +1,6 @@
 ---
 title: Constraint built-ins
-description: Create solver values, equality constraints, and visual dimensions.
+description: Create solver values and equality constraints.
 sidebar_label: Constraints
 ---
 
@@ -8,7 +8,7 @@ import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReferenc
 
 # Constraint built-ins
 
-Constraints relate [`Float`](/language/types/scalars#float) expressions; the solver finds geometry that satisfies them.
+Constraints relate [`Float`](/language/types/scalars#float) expressions; the solver finds geometry that satisfies them. For an equality constraint with a label the GUI draws, see [`std::layout::dimension`](/language/std-layout#dimension).
 
 ## `float`
 
@@ -42,27 +42,5 @@ eq(inner.w, outer.w - 2. * inset);
 ```
 
 Conflicting constraints are reported when the cell runs.
-
-</ApiItem>
-
-## `dimension`
-
-<ApiItem id="dimension" name="dimension" signature={'dimension(p: Float, n: Float, value: Float, coord: Float, pstop: Float, nstop: Float, horizontal: Bool) -> ()'} summary={<>Adds an equality constraint together with the dimension label the GUI draws for it.</>}>
-
-<ParameterTable rows={[
-  {name: 'p', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required, positional', description: 'Coordinate on the positive side of the measurement.'},
-  {name: 'n', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required, positional', description: 'Coordinate on the negative side.'},
-  {name: 'value', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required, positional', description: 'The constraint: p - n must equal this.'},
-  {name: 'coord', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required, positional', description: 'Where the dimension line sits, on the perpendicular axis.'},
-  {name: 'pstop', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required, positional', description: 'Where the extension line on the positive side ends.'},
-  {name: 'nstop', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required, positional', description: 'Where the extension line on the negative side ends.'},
-  {name: 'horizontal', type: 'Bool', typeHref: '/language/types/scalars#bool', requirement: 'Required, positional', description: 'true for a horizontal measurement, false for vertical.'},
-]} />
-
-<Returns type="()">Nothing; the constraint and its label are added to the current cell.</Returns>
-
-:::tip Prefer the GUI for dimensions
-The Dimension tool fills in the orientation and label-placement arguments from the edges you click. In hand-written source, use `eq` unless you want a visible dimension.
-:::
 
 </ApiItem>

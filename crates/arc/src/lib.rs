@@ -14,7 +14,9 @@ const MANIFEST_FILE: &str = "Argon.toml";
 const SOURCE_FILE: &str = "lib.ar";
 const TECH_FILE: &str = "tech.toml";
 
-const STARTER_SOURCE: &str = r#"cell top() {
+const STARTER_SOURCE: &str = r#"use std::layout::text;
+
+cell top() {
     text("Hello world!", "text.label", 0., 0.);
 }
 "#;
@@ -607,6 +609,18 @@ fn width(s: Shape) -> Float {
     }
 
     #[test]
+    fn grouped_use_round_trips() {
+        let source = "use a::{b, c as d};\nuse std::layout::{\n    crect,\n    rect as r,\n};\n";
+        assert_eq!(format_source(source), source);
+    }
+
+    #[test]
+    fn exponent_literals_round_trip() {
+        let source = "cell top() {\n    let c = 1.0E+6;\n    let d = 1e-12;\n}\n";
+        assert_eq!(format_source(source), source);
+    }
+
+    #[test]
     fn formatting_check_does_not_write_files() {
         let directory = tempfile::tempdir().unwrap();
         let source_path = directory.path().join("lib.ar");
@@ -689,7 +703,7 @@ fn width(s: Shape) -> Float {
         );
         assert_eq!(
             fs::read_to_string(&library.root).unwrap(),
-            "cell top() {\n    text(\"Hello world!\", \"text.label\", 0., 0.);\n}\n"
+            "use std::layout::text;\n\ncell top() {\n    text(\"Hello world!\", \"text.label\", 0., 0.);\n}\n"
         );
 
         let tech = library

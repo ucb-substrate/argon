@@ -17,7 +17,7 @@ use crate::document::{Document, PositionEncoding};
 
 const KEYWORDS: &[&str] = &[
     "as", "cell", "const", "else", "enum", "false", "fn", "for", "if", "in", "let", "match", "mod",
-    "struct", "true", "use",
+    "pub", "struct", "true", "use",
 ];
 
 pub(crate) struct RenameCellEdit {
@@ -111,21 +111,11 @@ pub(crate) fn new_cell_edit(
 }
 
 fn use_module_path(current_path: &ModPath, use_decl: &UseDecl<Substr, ParseMetadata>) -> ModPath {
-    let module_parts = &use_decl.path[..use_decl.path.len().saturating_sub(1)];
-    match use_decl.path.first().map(|ident| ident.name.as_str()) {
-        Some("std") => vec!["std".to_owned()],
-        Some("lib") => module_parts
-            .iter()
-            .skip(1)
-            .map(|ident| ident.name.to_string())
-            .collect(),
-        Some(_) => current_path
-            .iter()
-            .cloned()
-            .chain(module_parts.iter().map(|ident| ident.name.to_string()))
-            .collect(),
-        None => current_path.clone(),
-    }
+    compile::module_prefix(
+        current_path,
+        use_decl.path.iter().map(|ident| ident.name.as_str()),
+        1,
+    )
 }
 
 fn reference_module_path<S, M>(current_path: &ModPath, path: &[Ident<S, M>]) -> ModPath
@@ -136,24 +126,11 @@ where
     if path.len() <= 1 {
         return current_path.clone();
     }
-    match path[0].name.as_ref() {
-        "std" => vec!["std".to_owned()],
-        "lib" => path
-            .iter()
-            .skip(1)
-            .take(path.len() - 2)
-            .map(|ident| ident.name.as_ref().to_owned())
-            .collect(),
-        _ => current_path
-            .iter()
-            .cloned()
-            .chain(
-                path.iter()
-                    .take(path.len() - 1)
-                    .map(|ident| ident.name.as_ref().to_owned()),
-            )
-            .collect(),
-    }
+    compile::module_prefix(
+        current_path,
+        path.iter().map(|ident| ident.name.as_ref()),
+        1,
+    )
 }
 
 /// Names in each module that resolve to the renamed cell, mapped to the name
@@ -401,7 +378,8 @@ mod tests {
         assert!(validate_cell_name("2guard").is_err());
         assert!(validate_cell_name("guard-ring").is_err());
         assert!(validate_cell_name("cell").is_err());
-        assert!(validate_cell_name("rect").is_err());
+        assert!(validate_cell_name("eq").is_err());
+        assert!(validate_cell_name("rect").is_ok());
     }
 
     #[test]

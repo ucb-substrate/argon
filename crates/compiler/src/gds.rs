@@ -7,8 +7,6 @@ use ::gds::{
 use anyhow::{Context, Result, anyhow, bail};
 use arcstr::ArcStr;
 use indexmap::IndexMap;
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use tracing::trace;
 use uniquify::Names;
 
@@ -711,25 +709,12 @@ impl CompileOutput {
         {
             let mut exporter = GdsExporter::new("TOP", &output.tech);
             output.cell_to_gds(&mut exporter, output.top)?;
-            let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
-            std::fs::create_dir_all(parent)?;
-            // Write through a sibling temporary file and rename on success.
             // `GdsLibrary::save` streams records, so a write that fails partway
-            // -- an over-long record, a full disk -- otherwise leaves a
-            // truncated `.gds` at the real path, next to a `.bin` that was
-            // written earlier in the run and looks perfectly valid.
-            let mut builder = tempfile::Builder::new();
-            builder.prefix(".argon-gds").suffix(".tmp");
-            // A temporary file is created 0600 so its contents are never
-            // briefly world-readable. That is the wrong mode for a build
-            // artifact, so give the finished file the permissions
-            // `File::create` would have.
-            #[cfg(unix)]
-            builder.permissions(std::fs::Permissions::from_mode(0o644));
-            let temp = builder.tempfile_in(parent)?;
-            exporter.lib.save(temp.path()).map_err(describe_gds_error)?;
-            temp.persist(out_path)
-                .map_err(|e| anyhow!("could not finalize `{}`: {e}", out_path.display()))?;
+            // -- an over-long record, a full disk -- would otherwise leave a
+            // truncated `.gds` next to a `.bin` that looks perfectly valid.
+            crate::write_atomically(out_path, ".argon-gds", |temp| {
+                exporter.lib.save(temp).map_err(describe_gds_error)
+            })?;
         }
 
         Ok(())
