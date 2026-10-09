@@ -1,0 +1,49 @@
+use sky130::{fet1v8, tap};
+use std::layout::{array, center_rects, crect, rect};
+
+cell inv(nw: Float, pw: Float, nf: Int) {
+    pub let nmos = std::layout::inst(fet1v8(true, nw, nf), xi=0.0, yi=0.0);
+    pub let pmos = std::layout::inst(fet1v8(false, pw, nf), xi=0.0, yi=3000.0);
+    pub let ptap = std::layout::inst(tap(0, nmos.sdm.w - 260., 800.), xi=-355.0, yi=-1500.0);
+    pub let ntap = std::layout::inst(tap(1, pmos.sdm.w - 260., 800.), xi=-355.0, yi=5500.0);
+    eq(nmos.x, 0.);
+    eq(nmos.y, 0.);
+    eq(pmos.x, 0.);
+    eq(ptap.sdm.x0, nmos.sdm.x0);
+    eq(ntap.sdm.x0, pmos.sdm.x0);
+    eq(nmos.sdm.y0 - ptap.sdm.y1, 100.);
+    eq(pmos.sdm.y0 - nmos.sdm.y1, 1130.);
+    eq(ntap.sdm.y0 - pmos.sdm.y1, 70.);
+
+    rect("nwell.drawing", x0=pmos.sdm.x0 - 180., x1=pmos.sdm.x1 + 180., y0=pmos.sdm.y0 - 180., y1=ntap.sdm.y1 + 180.);
+
+    pub let a = rect("li1.drawing", x0=nmos.poly_bbox.x0 - 90., x1=nmos.poly_bbox.x1 + 90., h=170.);
+    eq(a.y0 - nmos.li1_bbox.y1, pmos.li1_bbox.y0 - a.y1);
+    let finger = crect(layer="poly.drawing", x0=0., y0=0., w=150., h=pmos.poly_bbox.y1 - nmos.poly_bbox.y0);
+    let fingers = array(finger, nf, 430., 0.);
+    eq(fingers.x0, nmos.poly_bbox.x0);
+    eq(fingers.y0, nmos.poly_bbox.y0);
+    center_rects(rect("poly.drawing", w=a.w, h=270.), a);
+    center_rects(rect("npc.drawing", w=a.w + 40., h=370.), a);
+    let licon = crect(layer="licon1.drawing", x0=0., y0=0., w=170., h=170.);
+    center_rects(array(licon, nf, 430., 0.), a);
+
+    let out_n = rect("li1.drawing", x0=nmos.li1_bbox.x0 + 430., x1=a.x1 + 340., y1=a.y0 - 170., h=170.);
+    let out_p = rect("li1.drawing", x0=out_n.x0, x1=out_n.x1, y0=a.y1 + 170., h=170.);
+    pub let out = rect("li1.drawing", x1=out_n.x1, w=170., y0=out_n.y0, y1=out_p.y1);
+    let drains = (nf + 1) / 2;
+    straps(drains, out_n.x0, nmos.li1_bbox.y0, out_n.y1);
+    straps(drains, out_p.x0, out_p.y0, pmos.li1_bbox.y1);
+
+    let sources = nf / 2 + 1;
+    straps(sources, nmos.li1_bbox.x0, ptap.li1.y0, nmos.li1_bbox.y1);
+    straps(sources, pmos.li1_bbox.x0, pmos.li1_bbox.y0, ntap.li1.y1);
+}
+
+/// Draws `n` li1 straps from `y0` to `y1` on every other device column, starting at `x0`.
+fn straps(n: Int, x0: Float, y0: Float, y1: Float) {
+    let strap = crect(layer="li1.drawing", x0=0., y0=0., w=170., h=y1 - y0);
+    let bbox = array(strap, n, 860., 0.);
+    eq(bbox.x0, x0);
+    eq(bbox.y0, y0);
+}
