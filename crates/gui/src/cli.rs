@@ -2,15 +2,16 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs,
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, ExitCode, ExitStatus, Stdio},
+    process::{Child, Command, ExitCode, ExitStatus, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
 
+use analyzer::transport::{SessionToken, TOKEN_ENV};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 
@@ -70,32 +71,12 @@ struct SshArgs {
     /// Analyzer RPC port on the remote host.
     #[arg(long)]
     remote_analyzer_port: Option<u16>,
-
-    /// Local GUI callback port.
-    #[arg(long)]
-    local_gui_port: Option<u16>,
-
-    /// GUI callback port exposed on the remote host.
-    #[arg(long)]
-    remote_gui_port: Option<u16>,
 }
 
 #[derive(Debug, Args)]
 struct GuiArgs {
     /// Analyzer RPC address to connect to.
-    lang_server_addr: Option<SocketAddr>,
-
-    /// Local callback port. Omit to let the operating system allocate one.
-    #[arg(long)]
-    listen_port: Option<u16>,
-
-    /// Callback address advertised to the analyzer, for example through an SSH tunnel.
-    #[arg(long)]
-    register_addr: Option<SocketAddr>,
-
-    /// Coordinate an SSH launch through stdin and stdout.
-    #[arg(long)]
-    ssh_control: bool,
+    lang_server_addr: SocketAddr,
 }
 
 pub fn run() -> ExitCode {
@@ -123,31 +104,29 @@ fn execute(cli: Cli) -> Result<ExitStatus> {
     }
 }
 
-fn run_gui(args: GuiArgs) -> Result<ExitStatus> {
-    if args.ssh_control {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, args.listen_port.unwrap_or(0)))
-            .context("failed to bind the GUI callback listener")?;
-        let listen_addr = listener.local_addr()?;
-        println!("ARGON_GUI 1 {}", listen_addr.port());
-        io_flush_stdout()?;
-        let mut forwarding = String::new();
-        std::io::stdin()
-            .lock()
-            .read_line(&mut forwarding)
-            .context("failed to read SSH forwarding configuration")?;
-        let (lang_server_addr, register_addr) = parse_address_pair(&forwarding)?;
-        crate::run_with_listener(lang_server_addr, listener, register_addr);
-    } else {
-        let lang_server_addr = args.lang_server_addr.ok_or_else(|| {
-            anyhow!("an analyzer address is required unless --ssh-control is used")
-        })?;
-        crate::run_gui(lang_server_addr, args.listen_port, args.register_addr);
-    }
-    Ok(success_status())
+/// The analyzer's session token, from the environment or, for a local
+/// analyzer, from its session record.
+fn session_token(lang_server_addr: SocketAddr) -> Result<SessionToken> {
+    SessionToken::from_env()
+        .or_else(|| {
+            lang_server_addr
+                .ip()
+                .is_loopback()
+                .then(|| analyzer::session::find_by_port(lang_server_addr.port()))
+                .flatten()
+                .and_then(|session| session.token())
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "no session token for the analyzer at {lang_server_addr}; set {TOKEN_ENV}, or start the GUI from Neovim with `:Argon gui`"
+            )
+        })
 }
 
-fn io_flush_stdout() -> Result<()> {
-    std::io::stdout().flush().context("failed to flush stdout")
+fn run_gui(args: GuiArgs) -> Result<ExitStatus> {
+    let token = session_token(args.lang_server_addr)?;
+    crate::run_gui(args.lang_server_addr, token);
+    Ok(success_status())
 }
 
 fn run_nvim(nvim: &OsStr, path: &Path, focus_target: Option<&str>) -> Result<ExitStatus> {
@@ -247,47 +226,27 @@ fn start_forwarded_session(
     relay: &mut Relay,
     focus_target: Option<&str>,
 ) -> Result<(Child, Child)> {
-    let remote_analyzer_port = wait_for_remote_analyzer(nvim_ssh, relay)?;
-    let mut gui = launch_forwarded_gui(args.local_gui_port, focus_target)?;
-    let local_gui_port = gui.port;
-
-    let tunnel = match start_tunnel(args, control, remote_analyzer_port, local_gui_port) {
-        Ok(tunnel) => tunnel,
-        Err(error) => {
-            gui.stop();
-            return Err(error);
-        }
-    };
+    let (remote_analyzer_port, token) = wait_for_remote_analyzer(nvim_ssh, relay)?;
+    let mut tunnel = start_tunnel(args, control, remote_analyzer_port)?;
     let analyzer_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, tunnel.local_analyzer_port);
-    let gui_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, tunnel.remote_gui_port);
-    if let Err(error) =
-        writeln!(gui.input, "{analyzer_addr} {gui_addr}").and_then(|_| gui.input.flush())
-    {
-        let mut child = tunnel.child;
-        let _ = child.kill();
-        let _ = child.wait();
-        gui.stop();
-        return Err(error).context("failed to send forwarding configuration to the GUI");
+    match launch_forwarded_gui(analyzer_addr.into(), &token, focus_target) {
+        Ok(gui) => Ok((tunnel.child, gui)),
+        Err(error) => {
+            let _ = tunnel.child.kill();
+            let _ = tunnel.child.wait();
+            Err(error)
+        }
     }
-    Ok((tunnel.child, gui.child))
 }
 
 fn validate_port_overrides(args: &SshArgs) -> Result<()> {
     for (name, port) in [
         ("--local-analyzer-port", args.local_analyzer_port),
         ("--remote-analyzer-port", args.remote_analyzer_port),
-        ("--local-gui-port", args.local_gui_port),
-        ("--remote-gui-port", args.remote_gui_port),
     ] {
         if port == Some(0) {
             bail!("{name} must be nonzero; omit it to allocate a port automatically");
         }
-    }
-    if args.local_analyzer_port.is_some() && args.local_analyzer_port == args.local_gui_port {
-        bail!("local analyzer and GUI ports must be different");
-    }
-    if args.remote_analyzer_port.is_some() && args.remote_analyzer_port == args.remote_gui_port {
-        bail!("remote analyzer and GUI ports must be different");
     }
     Ok(())
 }
@@ -399,10 +358,12 @@ fn parse_relay_announcement(line: &str) -> Option<&str> {
         .filter(|path| !path.is_empty())
 }
 
-fn parse_analyzer_announcement(line: &str) -> Option<u16> {
-    line.strip_prefix("ARGON_ANALYZER 1 ")
-        .and_then(|port| port.trim().parse().ok())
-        .filter(|port| *port != 0)
+/// The remote analyzer's port and session token, reported over SSH.
+fn parse_analyzer_announcement(line: &str) -> Option<(u16, SessionToken)> {
+    let mut fields = line.strip_prefix("ARGON_ANALYZER 2 ")?.split_whitespace();
+    let port = fields.next()?.parse().ok().filter(|port| *port != 0)?;
+    let token = SessionToken::from_hex(fields.next()?)?;
+    fields.next().is_none().then_some((port, token))
 }
 
 fn ssh_command(args: &SshArgs) -> Command {
@@ -525,14 +486,17 @@ fn remote_nvim_command(
     )
 }
 
-fn wait_for_remote_analyzer(nvim_ssh: &mut Child, relay: &mut Relay) -> Result<u16> {
+fn wait_for_remote_analyzer(
+    nvim_ssh: &mut Child,
+    relay: &mut Relay,
+) -> Result<(u16, SessionToken)> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
         match relay.lines.recv_timeout(STARTUP_POLL_INTERVAL) {
             Ok(Ok(line)) => {
-                if let Some(port) = parse_analyzer_announcement(&line) {
+                if let Some(announcement) = parse_analyzer_announcement(&line) {
                     let _ = relay.child.wait();
-                    return Ok(port);
+                    return Ok(announcement);
                 }
             }
             Ok(Err(error)) => return Err(error.into()),
@@ -558,95 +522,34 @@ fn wait_for_remote_analyzer(nvim_ssh: &mut Child, relay: &mut Relay) -> Result<u
     }
 }
 
-struct GuiLaunch {
-    child: Child,
-    input: ChildStdin,
-    port: u16,
-}
-
-impl GuiLaunch {
-    fn stop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-fn launch_forwarded_gui(gui_port: Option<u16>, focus_target: Option<&str>) -> Result<GuiLaunch> {
+/// Starts the local GUI against the forwarded analyzer port.
+fn launch_forwarded_gui(
+    analyzer_addr: SocketAddr,
+    token: &SessionToken,
+    focus_target: Option<&str>,
+) -> Result<Child> {
     let mut command = Command::new(env::current_exe()?);
-    command.arg("gui").arg("--ssh-control");
-    if let Some(port) = gui_port {
-        command.arg("--listen-port").arg(port.to_string());
-    }
+    command
+        .arg("gui")
+        .arg(analyzer_addr.to_string())
+        .env(TOKEN_ENV, token.to_hex())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
     if let Some(focus_target) = focus_target {
         command.env(crate::focus::TARGET_ENV, focus_target);
     }
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+    command
         .spawn()
-        .context("failed to start the local Argon GUI")?;
-    let input = child.stdin.take().expect("GUI stdin was piped");
-    let stdout = child.stdout.take().expect("GUI stdout was piped");
-    let (line_tx, line_rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut stdout = BufReader::new(stdout);
-        let mut line = String::new();
-        let result = stdout.read_line(&mut line).map(|_| line);
-        if line_tx.send(result).is_ok() {
-            let _ = io::copy(&mut stdout, &mut io::sink());
-        }
-    });
-
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    loop {
-        match line_rx.recv_timeout(STARTUP_POLL_INTERVAL) {
-            Ok(Ok(line)) => {
-                let port = match parse_gui_announcement(&line) {
-                    Ok(port) => port,
-                    Err(error) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(error).context("the GUI reported an invalid callback port");
-                    }
-                };
-                return Ok(GuiLaunch { child, input, port });
-            }
-            Ok(Err(error)) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.into());
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                bail!("GUI closed stdout before reporting its callback port");
-            }
-        }
-        if let Some(status) = child.try_wait()? {
-            bail!("GUI exited before startup completed ({status})");
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("timed out waiting for the GUI to start");
-        }
-    }
+        .context("failed to start the local Argon GUI")
 }
 
 struct Tunnel {
     child: Child,
     local_analyzer_port: u16,
-    remote_gui_port: u16,
 }
 
-fn start_tunnel(
-    args: &SshArgs,
-    control: &SshControl,
-    remote_analyzer_port: u16,
-    local_gui_port: u16,
-) -> Result<Tunnel> {
+fn start_tunnel(args: &SshArgs, control: &SshControl, remote_analyzer_port: u16) -> Result<Tunnel> {
     let attempts = if args.local_analyzer_port.is_some() {
         1
     } else {
@@ -658,13 +561,7 @@ fn start_tunnel(
             Some(port) => port,
             None => available_local_port()?,
         };
-        match start_tunnel_once(
-            args,
-            control,
-            local_analyzer_port,
-            remote_analyzer_port,
-            local_gui_port,
-        ) {
+        match start_tunnel_once(args, control, local_analyzer_port, remote_analyzer_port) {
             Ok(tunnel) => return Ok(tunnel),
             Err(error) if args.local_analyzer_port.is_none() && error.local_collision => {
                 last_collision = Some(error.message);
@@ -690,12 +587,11 @@ fn start_tunnel_once(
     control: &SshControl,
     local_analyzer_port: u16,
     remote_analyzer_port: u16,
-    local_gui_port: u16,
 ) -> std::result::Result<Tunnel, TunnelStartError> {
     let local_analyzer_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, local_analyzer_port);
     let mut command = control.command(args);
     command
-        // A multiplex control operation does not report the port allocated for `-R 0`.
+        // Owning the forward in this process removes it when the tunnel stops.
         .arg("-S")
         .arg("none")
         .arg("-o")
@@ -705,11 +601,6 @@ fn start_tunnel_once(
         .arg("-L")
         .arg(format!(
             "{local_analyzer_addr}:127.0.0.1:{remote_analyzer_port}"
-        ))
-        .arg("-R")
-        .arg(format!(
-            "127.0.0.1:{}:127.0.0.1:{local_gui_port}",
-            args.remote_gui_port.unwrap_or(0)
         ))
         .arg("-N")
         .arg(&args.host)
@@ -732,16 +623,10 @@ fn start_tunnel_once(
 
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     let mut lines = Vec::new();
-    let mut remote_gui_port = args.remote_gui_port;
     loop {
         while let Ok(line) = line_rx.try_recv() {
             match line {
-                Ok(line) => {
-                    if remote_gui_port.is_none() {
-                        remote_gui_port = parse_allocated_remote_port(&line);
-                    }
-                    lines.push(line);
-                }
+                Ok(line) => lines.push(line),
                 Err(error) => lines.push(error.to_string()),
             }
         }
@@ -774,9 +659,7 @@ fn start_tunnel_once(
                 message: format!("SSH could not establish forwarding: {detail}"),
             });
         }
-        if let Some(remote_gui_port) = remote_gui_port.filter(|_| {
-            TcpStream::connect_timeout(&local_analyzer_addr.into(), STARTUP_POLL_INTERVAL).is_ok()
-        }) {
+        if TcpStream::connect_timeout(&local_analyzer_addr.into(), STARTUP_POLL_INTERVAL).is_ok() {
             thread::spawn(move || {
                 while let Ok(line) = line_rx.recv() {
                     if let Ok(line) = line {
@@ -787,7 +670,6 @@ fn start_tunnel_once(
             return Ok(Tunnel {
                 child,
                 local_analyzer_port,
-                remote_gui_port,
             });
         }
         if Instant::now() >= deadline {
@@ -807,50 +689,12 @@ fn available_local_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-fn parse_allocated_remote_port(line: &str) -> Option<u16> {
-    let rest = line
-        .find("Allocated port ")
-        .map(|start| &line[start + "Allocated port ".len()..])?;
-    rest.split_whitespace().next()?.parse().ok()
-}
-
 fn local_forward_collision(stderr: &str, port: u16) -> bool {
     let mentions_port = stderr.contains(&port.to_string());
     mentions_port
         && (stderr.contains("Address already in use")
             || stderr.contains("cannot listen to port")
             || stderr.contains("Could not request local forwarding"))
-}
-
-fn parse_port(value: &str) -> Result<u16> {
-    let port = value.trim().parse::<u16>()?;
-    if port == 0 {
-        bail!("port must be nonzero");
-    }
-    Ok(port)
-}
-
-fn parse_gui_announcement(value: &str) -> Result<u16> {
-    let port = value
-        .strip_prefix("ARGON_GUI 1 ")
-        .ok_or_else(|| anyhow!("unexpected GUI startup response"))?;
-    parse_port(port)
-}
-
-fn parse_address_pair(value: &str) -> Result<(SocketAddr, SocketAddr)> {
-    let mut fields = value.split_whitespace();
-    let analyzer = fields
-        .next()
-        .ok_or_else(|| anyhow!("missing analyzer forwarding address"))?
-        .parse()?;
-    let gui = fields
-        .next()
-        .ok_or_else(|| anyhow!("missing GUI forwarding address"))?
-        .parse()?;
-    if fields.next().is_some() {
-        bail!("forwarding configuration contains extra fields");
-    }
-    Ok((analyzer, gui))
 }
 
 fn shell_quote(value: &str) -> String {
@@ -896,8 +740,6 @@ mod tests {
             ssh_options: Vec::new(),
             local_analyzer_port: None,
             remote_analyzer_port: None,
-            local_gui_port: None,
-            remote_gui_port: None,
         }
     }
 
@@ -916,48 +758,32 @@ mod tests {
     }
 
     #[test]
-    fn parses_forwarding_addresses() {
-        assert_eq!(
-            parse_address_pair("127.0.0.1:1234 127.0.0.1:5678\n").unwrap(),
-            (
-                "127.0.0.1:1234".parse().unwrap(),
-                "127.0.0.1:5678".parse().unwrap()
-            )
-        );
-        assert!(parse_address_pair("127.0.0.1:1234").is_err());
-        assert!(parse_address_pair("127.0.0.1:1 127.0.0.1:2 extra").is_err());
-    }
-
-    #[test]
     fn parses_startup_protocol_messages() {
-        assert_eq!(parse_gui_announcement("ARGON_GUI 1 1234\n").unwrap(), 1234);
         assert_eq!(
             parse_relay_announcement("ARGON_RELAY 1 /tmp/session/rpc.sock\n"),
             Some("/tmp/session/rpc.sock")
         );
+        let token = SessionToken::generate().unwrap();
         assert_eq!(
-            parse_analyzer_announcement("ARGON_ANALYZER 1 5678\n"),
-            Some(5678)
+            parse_analyzer_announcement(&format!("ARGON_ANALYZER 2 5678 {}\n", token.to_hex())),
+            Some((5678, token.clone()))
         );
-        assert!(parse_gui_announcement("1234").is_err());
+        // The first protocol carried no token, which this GUI cannot use.
+        assert_eq!(parse_analyzer_announcement("ARGON_ANALYZER 1 5678"), None);
         assert_eq!(parse_analyzer_announcement("ARGON_ANALYZER 2 5678"), None);
+        assert_eq!(
+            parse_analyzer_announcement(&format!("ARGON_ANALYZER 2 0 {}", token.to_hex())),
+            None
+        );
     }
 
     #[test]
-    fn parses_openssh_allocated_port_message() {
-        assert_eq!(
-            parse_allocated_remote_port(
-                "Allocated port 45678 for remote forward to 127.0.0.1:1234"
-            ),
-            Some(45678)
-        );
-        assert_eq!(
-            parse_allocated_remote_port(
-                "debug1: Allocated port 45678 for remote forward to 127.0.0.1:1234"
-            ),
-            Some(45678)
-        );
-        assert_eq!(parse_allocated_remote_port("Permission denied"), None);
+    fn rejects_zero_port_overrides() {
+        let mut args = ssh_args("ssh");
+        args.local_analyzer_port = Some(0);
+        assert!(validate_port_overrides(&args).is_err());
+        args.local_analyzer_port = Some(1234);
+        assert!(validate_port_overrides(&args).is_ok());
     }
 
     #[test]

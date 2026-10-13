@@ -104,6 +104,18 @@ impl RootStep {
     }
 }
 
+/// How long objects an agent edit changed stay outlined.
+const AGENT_HIGHLIGHT_DURATION: Duration = Duration::from_millis(2000);
+
+/// Source spans an agent edit changed, outlined once the GUI shows
+/// `revision`.
+#[derive(Clone, Debug)]
+pub struct AgentHighlight {
+    pub revision: u64,
+    pub spans: Vec<argonc::ast::Span>,
+    generation: u64,
+}
+
 #[derive(Clone)]
 pub struct LayerState {
     pub name: SharedString,
@@ -162,6 +174,10 @@ pub struct EditorState {
     pub fatal_error: Option<EditorMessage>,
     pub message: Option<EditorMessage>,
     pub connection_error: Option<SharedString>,
+    /// What an agent is doing right now, if anything.
+    pub agent_activity: Option<SharedString>,
+    pub agent_highlight: Option<AgentHighlight>,
+    agent_highlight_generation: u64,
     pub solved_cell: Entity<Option<CompileOutputState>>,
     pub hide_external_geometry: bool,
     pub layers: Entity<Layers>,
@@ -317,6 +333,12 @@ impl EditorState {
         } else {
             &LIGHT_THEME
         }
+    }
+
+    /// The agent highlight to draw, once the layout it describes is shown.
+    pub(crate) fn visible_agent_highlight(&self) -> Option<&[argonc::ast::Span]> {
+        let highlight = self.agent_highlight.as_ref()?;
+        (self.compilation_revision? >= highlight.revision).then_some(highlight.spans.as_slice())
     }
 
     pub fn show_message(&mut self, typ: MessageType, message: impl Into<SharedString>) {
@@ -634,12 +656,10 @@ impl Editor {
         cx: &mut Context<Self>,
         window: &mut Window,
         lang_server_addr: SocketAddr,
-        gui_listen_port: Option<u16>,
-        gui_listener: Option<std::net::TcpListener>,
-        gui_register_addr: Option<SocketAddr>,
+        token: analyzer::transport::SessionToken,
     ) -> Self {
         let (lang_server_client, mut rx) =
-            SyncLangServerClient::new(cx.to_async(), lang_server_addr);
+            SyncLangServerClient::new(cx.to_async(), lang_server_addr, token);
         let solved_cell = cx.new(|_cx| None);
         let tool = cx.new(|_cx| ToolState::default());
         let layers = cx.new(|_cx| Layers {
@@ -667,6 +687,9 @@ impl Editor {
                 fatal_error: None,
                 message: None,
                 connection_error: None,
+                agent_activity: None,
+                agent_highlight: None,
+                agent_highlight_generation: 0,
                 solved_cell,
                 hide_external_geometry: false,
                 tool,
@@ -733,7 +756,7 @@ impl Editor {
                 }
             })
             .detach();
-        lang_server_client.register_server(gui_listen_port, gui_listener, gui_register_addr);
+        lang_server_client.serve_callbacks();
 
         editor
     }
@@ -757,6 +780,14 @@ impl Editor {
         self.state.update(cx, |state, cx| {
             state.connection_error = None;
             state.compilation_revision = Some(snapshot.revision);
+            // A later revision may have moved the source the highlight names.
+            if state
+                .agent_highlight
+                .as_ref()
+                .is_some_and(|highlight| highlight.revision < snapshot.revision)
+            {
+                state.agent_highlight = None;
+            }
             if snapshot.prepared_output.is_some() {
                 // Keep the status animation alive between hierarchy preparation
                 // and the first raster worker started by the next paint.
@@ -903,6 +934,47 @@ impl Editor {
                 });
                 state.context_menu = None;
             });
+            cx.notify();
+        });
+    }
+
+    pub fn highlight_agent_edit(&self, cx: &mut App, revision: u64, spans: Vec<argonc::ast::Span>) {
+        let generation = self.state.update(cx, |state, cx| {
+            state.agent_highlight_generation += 1;
+            let generation = state.agent_highlight_generation;
+            state.agent_highlight = Some(AgentHighlight {
+                revision,
+                spans,
+                generation,
+            });
+            cx.notify();
+            generation
+        });
+        self.canvas.update(cx, |_, cx| cx.notify());
+        let state = self.state.clone();
+        let canvas = self.canvas.clone();
+        cx.spawn(async move |cx| {
+            cx.background_executor()
+                .timer(AGENT_HIGHLIGHT_DURATION)
+                .await;
+            let _ = state.update(cx, |state, cx| {
+                if state
+                    .agent_highlight
+                    .as_ref()
+                    .is_some_and(|highlight| highlight.generation == generation)
+                {
+                    state.agent_highlight = None;
+                    cx.notify();
+                }
+            });
+            let _ = canvas.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+
+    pub fn set_agent_activity(&self, cx: &mut App, label: Option<String>) {
+        self.state.update(cx, |state, cx| {
+            state.agent_activity = label.map(SharedString::from);
             cx.notify();
         });
     }
@@ -1247,6 +1319,7 @@ impl Render for Editor {
                 })
                 .map(|_| "No layout yet: press r to draw a rectangle, or v for the schematic")
         };
+        let agent_activity = self.state.read(cx).agent_activity.clone();
         let (displayed_status, activity_label) = {
             let state = self.state.read(cx);
             (
@@ -1357,6 +1430,18 @@ impl Render for Editor {
         }
         if !status_fills_space {
             status_bar = status_bar.child(div().flex_1());
+        }
+        if let Some(agent_activity) = agent_activity {
+            status_bar = status_bar.child(
+                div()
+                    .id("agent_activity")
+                    .flex_shrink()
+                    .min_w_0()
+                    .overflow_x_hidden()
+                    .text_ellipsis()
+                    .text_color(theme.subtext)
+                    .child(SharedString::from(format!("Agent: {agent_activity}"))),
+            );
         }
         // Keep the activity row's intrinsic height even while idle. Adding
         // the label used to shrink the canvas, invalidating every raster tile;

@@ -12,6 +12,7 @@ workspace = true
 analyzer = { package = "argon-analyzer", path = "../analyzer" }
 argonc = { path = "../compiler" }
 futures = { workspace = true }
+serde_json = { workspace = true }
 tarpc = { workspace = true }
 tempfile = { workspace = true }
 tokio = { version = "1", features = ["full"] }

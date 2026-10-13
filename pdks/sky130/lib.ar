@@ -1,5 +1,12 @@
 use std::layout::{crect, inst, rect};
 
+/// A 1.8 V transistor with `nf` gate fingers over one diffusion, contacted
+/// with local interconnect between and beside the fingers.
+///
+/// # Arguments
+/// - `nfet`: draws an NMOS device (N+ implant) if true, PMOS (P+ implant) if false.
+/// - `w`: width of each finger, which is the height of the diffusion.
+/// - `nf`: number of gate fingers.
 cell fet1v8(nfet: Bool, w: Float, nf: Int) {
     let poly = crect(layer="poly.drawing", x0=0., y0=0., w=150., h = w + 260.);
     pub let poly_bbox = std::layout::array(poly, nf, 430., 0.);
@@ -23,6 +30,13 @@ cell fet1v8(nfet: Bool, w: Float, nf: Int) {
     std::layout::center_rects(li1_bbox, std::layout::array2(licon, nf + 1, ny, 430., 340.));
 }
 
+/// A well or substrate tap: a `w` by `h` tap diffusion covered with local
+/// interconnect and as many contacts as fit on a 340 pitch.
+///
+/// # Arguments
+/// - `ntap`: 1 for an N+ tap, which contacts an n-well; any other value for a P+ tap, which contacts the substrate.
+/// - `w`: width of the tap diffusion.
+/// - `h`: height of the tap diffusion.
 cell tap(ntap: Int, w: Float, h: Float) {
     pub let tap = rect("tap.drawing", x0=0., y0=0., w=w, h=h);
     pub let li1 = rect("li1.drawing", x0=tap.x0 + 40., y0=tap.y0 + 40., x1 = tap.x1 - 40., y1 = tap.y1 - 40.);
@@ -98,6 +112,9 @@ cell vco_elem(nw: Float, pw: Float, nf_main: Int, nf_xcoupled: Int) {
     let xcoupled_n = inst(inv(nw, pw, nf_xcoupled), x=xcoupled_p.x, reflect=true);
     eq(xcoupled_p.ntap.tap.x0, xcoupled_n.ntap.tap.x0);
     eq(xcoupled_p.ntap.tap.y0, xcoupled_n.ntap.tap.y0);
+    // One n-well across both inverter pairs, which sit closer than the well
+    // spacing rule allows.
+    rect("nwell.drawing", x0=main_p.nwell.x0, x1=xcoupled_p.nwell.x1, y0=main_p.nwell.y0, y1=main_n.nwell.y1);
     let m2p = rect("met2.drawing", w=300.)!;
     let m2n = rect("met2.drawing", w=300.)!;
     eq(m2p.x1 + 300., m2n.x0);

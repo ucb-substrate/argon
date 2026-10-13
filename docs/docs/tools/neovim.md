@@ -20,6 +20,7 @@ The Neovim plugin starts `argon-analyzer` for `.ar` buffers and adds the `:Argon
 | `:Argon sinst <EXPR>` | Place a schematic instance of a cell from the GUI, in the schematic view. |
 | `:Argon device <KIND> [<COUNT>] [<ARGS>]` | Place a device from the GUI, such as `:Argon device Nmos "nch", w=1., l=0.15`. |
 | `:Argon diagnostics` | Open the diagnostics panel and fill the quickfix list. |
+| `:Argon follow [on\|off]` | Make the current window follow [agent edits](./agents), or stop. |
 | `:Argon reload` | Reload the configuration file and apply it to the GUI. |
 | `:Argon set <KEY> [VALUE]` | Set or unset a configuration key for this session. Values use TOML syntax. |
 | `:Argon saveConfig [PATH]` | Write the current configuration to `PATH`, or to the default location. |
@@ -67,7 +68,9 @@ are the ones that can be named at a call site.
 
 ## How edits flow
 
-Neovim owns the source. The analyzer receives each change, recompiles the open cell, and publishes diagnostics. Edits made from the GUI arrive as ordinary buffer edits, so they mark the buffer modified and can be undone.
+Neovim owns the source. The analyzer receives each change, recompiles the open cell, and publishes diagnostics. Edits made from the GUI or by an [agent](./agents) arrive as ordinary buffer edits, so they mark the buffer modified and can be undone.
+
+When a file changes on disk, the analyzer reloads its buffer if the buffer has no unsaved changes, and warns you if it does.
 
 Compilation progress is available to Fidget and other LSP progress plugins. Argon does not add a second spinner or completion message to Neovim's message area.
 

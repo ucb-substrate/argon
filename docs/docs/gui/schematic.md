@@ -1,6 +1,6 @@
 ---
 title: Schematic view
-description: Viewing a cell's schematic in the GUI: symbols, wires, flylines, and navigation.
+description: "Viewing a cell's schematic in the GUI: symbols, wires, flylines, and navigation."
 ---
 
 # Schematic view

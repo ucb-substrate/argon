@@ -34,6 +34,9 @@ fn test_state(cx: &mut TestAppContext, view: View) -> Entity<EditorState> {
             fatal_error: None,
             message: None,
             connection_error: None,
+            agent_activity: None,
+            agent_highlight: None,
+            agent_highlight_generation: 0,
             subscriptions: vec![
                 cx.observe(&solved_cell, |_, _, cx| cx.notify()),
                 cx.observe(&layers, |_, _, cx| cx.notify()),

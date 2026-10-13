@@ -11,6 +11,7 @@ local diagnostics = require('argon.diagnostics')
 --- The variants of `std::schematic::DeviceKind`, for `:Argon device`.
 local device_kinds = { 'Mos', 'Nmos', 'Pmos', 'Res', 'Cap', 'Diode', 'Bjt', 'Npn', 'Pnp', 'Subckt' }
 local config_keys = {
+  'agent.approval',
   'analyzer.compile_debounce_ms',
   'gui.dark_mode',
   'gui.font_size',
@@ -124,6 +125,23 @@ local argon_command_tbl = {
   diagnostics = {
     impl = function()
       diagnostics.open()
+    end,
+  },
+  follow = {
+    impl = function(args)
+      local agent = require('argon.agent')
+      if #args == 0 or args[1] == 'on' then
+        agent.set_follow(true)
+      elseif args[1] == 'off' and #args == 1 then
+        agent.set_follow(false)
+      else
+        vim.notify('Argon follow: expected `on` or `off`', vim.log.levels.ERROR)
+      end
+    end,
+    complete = function(args)
+      return vim.tbl_filter(function(value)
+        return vim.startswith(value, args)
+      end, { 'on', 'off' })
     end,
   },
   log = {
