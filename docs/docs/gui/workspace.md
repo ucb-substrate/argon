@@ -6,17 +6,25 @@ sidebar_label: Workspace
 
 # GUI workspace
 
-The GUI shows the cell compiled from your current Neovim buffers. It's built for looking at layout and editing it spatially; the source stays the single source of truth.
+The GUI shows the cell compiled from your current Neovim buffers. It's built for looking at a cell and editing it spatially; the source stays the single source of truth.
+
+## Views
+
+A cell has three views, shown one at a time in the same window: its layout, its [schematic](/gui/schematic), and its [symbol](/gui/symbol). Switch with the control at the right end of the tool strip, the View menu, <kbd>V</kbd> (the next view, in that order and around to the layout), or <kbd>Shift</kbd>+<kbd>V</kbd> (the previous one). Each view has its own camera, selection, and tools; the sidebars follow the view.
 
 ## Regions
 
 | Region | Purpose |
 | --- | --- |
-| Canvas | Solved geometry, selection, dimensions, and placement previews. |
-| Tool strip | Select, rectangle, polygon, path, dimension, and instance tools. |
-| Hierarchy sidebar | Scopes and nested instances. Selecting one sets where new geometry is inserted. |
-| Layer sidebar | The drawing layer and per-layer visibility. |
+| Canvas | The active view: solved geometry with selection, dimensions, and placement previews; or the schematic's symbols and wires; or the cell's symbol. |
+| Tool strip | The active view's tools, and the view control. In the layout view: select, rectangle, polygon, path, dimension, and instance. |
+| Left sidebar | In the layout view, scopes and nested instances; selecting one sets where new geometry is inserted. In the schematic view, the instances, devices, and nets. In the symbol view, the ports. |
+| Right sidebar | In the layout view, the drawing layer and per-layer visibility. In the other views, the properties of the selection. |
 | Neovim command line | Where the GUI asks for text, such as a cell invocation or a name. Cell invocations complete with <kbd>Tab</kbd>. |
+
+## Start screen
+
+Until a cell is open, the window shows a start screen in place of the tool strip and sidebars. It has buttons to open a cell or [create one](/gui/cell-management#create-a-cell), and lists the cells of your library, including those in its modules. Click a cell to open it. If the cell has a parameter without a default, the Neovim command line opens with `Argon openCell` and the cell's name filled in, so you can type the arguments.
 
 ## Open a cell
 

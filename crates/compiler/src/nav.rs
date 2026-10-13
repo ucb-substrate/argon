@@ -29,9 +29,9 @@ use crate::{
         VariantPayload, WorkspaceAst,
     },
     compile::{
-        AdtDef, BUILTINS, CellTy, Native, RESERVED_CELL_FIELDS, Ty, TyParamTy, TypeDefs,
-        TypedWorkspace, VarId, VarIdTyMetadata, VariantTys, module_prefix, param_map, subst,
-        typed_let_bindings,
+        AdtDef, BUILTINS, CellTy, DeviceKind, Native, RESERVED_CELL_FIELDS, Ty, TyParamTy,
+        TypeDefs, TypedWorkspace, VarId, VarIdTyMetadata, VariantTys, module_prefix, param_map,
+        subst, typed_let_bindings,
     },
 };
 
@@ -488,6 +488,11 @@ impl NavIndex {
                 .into_iter()
                 .map(|(name, ty)| (name.to_owned(), ty))
                 .collect(),
+            Ty::Device => DeviceKind::TERMINAL_FIELDS
+                .iter()
+                .map(|name| ((*name).to_owned(), Ty::Signal))
+                .chain([("terminals".to_owned(), Ty::Seq(Box::new(Ty::Signal)))])
+                .collect(),
             Ty::Inst(cell) | Ty::SchematicInst(cell) => {
                 let map = cell.param_map();
                 // A schematic instance has no position.
@@ -885,20 +890,84 @@ fn native_signature(native: Native) -> SignatureInfo {
             &["value: Cell | Inst"],
             &[],
         ),
-        Native::Signal => signature("fn Signal() -> Signal", &[], &[]),
-        Native::Connect => signature(
-            "fn connect(a: Signal, b: Signal)",
-            &["a: Signal", "b: Signal"],
+        Native::Signal => signature(
+            "fn Signal(*, placement...) -> Signal",
             &[],
+            &["x: Int", "y: Int", "angle: Int"],
+        ),
+        Native::Connect => signature(
+            "fn connect(a: Signal, b: Signal, *, route: [(Int, Int)])",
+            &["a: Signal", "b: Signal"],
+            &["route: [(Int, Int)]"],
         ),
         Native::Device => signature(
-            "fn device(kind: DeviceKind, terminals: [Signal], model: String, *, params...)",
+            "fn device(kind: DeviceKind, terminals: [Signal], model: String, *, placement..., params...) -> Device",
             &["kind: DeviceKind", "terminals: [Signal]", "model: String"],
+            &["x: Int", "y: Int", "angle: Int", "reflect: Bool"],
+        ),
+        Native::SchematicInst => signature(
+            "fn inst(cell: Cell, *, placement...) -> SchematicInst",
+            &["cell: Cell"],
+            &["x: Int", "y: Int", "angle: Int", "reflect: Bool"],
+        ),
+        Native::DeviceTy => signature("type Device", &[], &[]),
+        Native::SymbolLine => signature(
+            "fn line(points: [(Float, Float)])",
+            &["points: [(Float, Float)]"],
             &[],
         ),
-        Native::SchematicInst => {
-            signature("fn inst(cell: Cell) -> SchematicInst", &["cell: Cell"], &[])
-        }
+        Native::SymbolPolygon => signature(
+            "fn polygon(points: [(Float, Float)], *, fill: Bool)",
+            &["points: [(Float, Float)]"],
+            &["fill: Bool"],
+        ),
+        Native::SymbolRect => signature(
+            "fn rect(*, x0: Float, y0: Float, x1: Float, y1: Float, fill: Bool)",
+            &[],
+            &[
+                "x0: Float",
+                "y0: Float",
+                "x1: Float",
+                "y1: Float",
+                "fill: Bool",
+            ],
+        ),
+        Native::SymbolCircle => signature(
+            "fn circle(*, x: Float, y: Float, r: Float, fill: Bool)",
+            &[],
+            &["x: Float", "y: Float", "r: Float", "fill: Bool"],
+        ),
+        Native::SymbolArc => signature(
+            "fn arc(*, x: Float, y: Float, r: Float, start: Float, end: Float)",
+            &[],
+            &[
+                "x: Float",
+                "y: Float",
+                "r: Float",
+                "start: Float",
+                "end: Float",
+            ],
+        ),
+        Native::SymbolText => signature(
+            "fn text(value: String, *, x: Float, y: Float, size: Float, align: Align)",
+            &["value: String"],
+            &["x: Float", "y: Float", "size: Float", "align: Align"],
+        ),
+        Native::SymbolInstName => signature(
+            "fn inst_name(*, x: Float, y: Float, size: Float, align: Align)",
+            &[],
+            &["x: Float", "y: Float", "size: Float", "align: Align"],
+        ),
+        Native::SymbolParam => signature(
+            "fn param(name: String, value: Float | Int | String, *, x: Float, y: Float, size: Float, align: Align)",
+            &["name: String", "value: Float | Int | String"],
+            &["x: Float", "y: Float", "size: Float", "align: Align"],
+        ),
+        Native::SymbolPin => signature(
+            "fn pin(signal: Signal, *, x: Int, y: Int, label: Bool)",
+            &["signal: Signal"],
+            &["x: Int", "y: Int", "label: Bool"],
+        ),
     }
 }
 
@@ -3116,11 +3185,18 @@ cell top() {
                 .unwrap_or_else(|| panic!("no hover at {needle}"))
                 .contents
         };
-        assert_eq!(hover("connect(i"), "fn connect(a: Signal, b: Signal)");
-        assert_eq!(hover("sinst(child"), "fn inst(cell: Cell) -> SchematicInst");
+        assert_eq!(
+            hover("connect(i"),
+            "fn connect(a: Signal, b: Signal, *, route: [(Int, Int)])"
+        );
+        assert_eq!(
+            hover("sinst(child"),
+            "fn inst(cell: Cell, *, placement...) -> SchematicInst"
+        );
         assert_eq!(
             hover("device(D"),
-            "fn device(kind: DeviceKind, terminals: [Signal], model: String, *, params...)"
+            "fn device(kind: DeviceKind, terminals: [Signal], model: String, *, placement..., \
+             params...) -> Device"
         );
         let base_end = source.find("i.a,").unwrap() + 1;
         assert_eq!(
@@ -3132,7 +3208,15 @@ cell top() {
                 Path::new(ROOT),
                 &["std".to_owned(), "schematic".to_owned()],
             ));
-        for expected in ["Signal", "connect", "device", "inst", "DeviceKind"] {
+        for expected in [
+            "Signal",
+            "connect",
+            "device",
+            "inst",
+            "DeviceKind",
+            "Device",
+            "signals",
+        ] {
             assert!(
                 schematic.iter().any(|label| label == expected),
                 "{schematic:?}"

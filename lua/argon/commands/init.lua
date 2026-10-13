@@ -8,6 +8,8 @@ local completion_group = 'argon_command_completion'
 local completion = require('argon.commands.completion')
 local gui = require('argon.commands.gui')
 local diagnostics = require('argon.diagnostics')
+--- The variants of `std::schematic::DeviceKind`, for `:Argon device`.
+local device_kinds = { 'Mos', 'Nmos', 'Pmos', 'Res', 'Cap', 'Diode', 'Bjt', 'Npn', 'Pnp', 'Subckt' }
 local config_keys = {
   'analyzer.compile_debounce_ms',
   'gui.dark_mode',
@@ -58,6 +60,30 @@ local argon_command_tbl = {
       gui.instantiate(table.concat(args, " "))
     end,
     complete = completion.cell_expression('inst'),
+  },
+  sinst = {
+    impl = function(args, opts)
+      gui.schematic_instantiate(table.concat(args, " "))
+    end,
+    complete = completion.cell_expression('sinst'),
+  },
+  device = {
+    impl = function(args)
+      if #args == 0 then
+        vim.notify('Argon device: expected a device kind, such as `Nmos`', vim.log.levels.ERROR)
+        return
+      end
+      gui.place_device(table.concat(args, " "))
+    end,
+    complete = function(args)
+      local kind_lead = args:match('^%s*(%S*)$')
+      if not kind_lead then
+        return {}
+      end
+      return vim.tbl_filter(function(kind)
+        return vim.startswith(kind, kind_lead)
+      end, device_kinds)
+    end,
   },
   reload = {
     impl = function()

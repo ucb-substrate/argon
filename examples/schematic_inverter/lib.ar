@@ -1,12 +1,13 @@
 use std::schematic::{DeviceKind, Signal};
-use std::schematic::{device, connect};
+use std::schematic::{device, connect, signals};
 use std::schematic::inst as sinst;
+use std::symbol::{circle, inst_name, line, param, pin, polygon};
 
 cell mos(nfet: Bool, w: Float, nf: Int) {
-    pub let d = Signal();
-    pub let g = Signal();
-    pub let s = Signal();
-    pub let b = Signal();
+    pub let d = Signal(x=0, y=4);
+    pub let g = Signal(x=-4, y=0);
+    pub let s = Signal(x=0, y=-4);
+    pub let b = Signal(x=4, y=0);
 
     let model = if nfet {
         "sky130_fd_pr__nfet_01v8"
@@ -14,17 +15,24 @@ cell mos(nfet: Bool, w: Float, nf: Int) {
         "sky130_fd_pr__pfet_01v8"
     };
 
-    device(DeviceKind::Subckt, [d, g, s, b], model, l=0.15, w=w, nf=nf);
+    device(DeviceKind::Subckt, [d, g, s, b], model, l=0.15, w=w, nf=nf, x=0, y=0);
+
+    // Drawn as the transistor it wraps.
+    if nfet {
+        std::symbol::nmos(d, g, s, b);
+    } else {
+        std::symbol::pmos(d, g, s, b);
+    };
 }
 
 cell inv(pw: Float, nw: Float, nf: Int) {
-    pub let a = Signal();
-    pub let out = Signal();
-    pub let vdd = Signal();
-    pub let vss = Signal();
+    pub let a = Signal(x=-8, y=0);
+    pub let out = Signal(x=8, y=0);
+    pub let vdd = Signal(x=0, y=10);
+    pub let vss = Signal(x=0, y=-10);
 
-    let nmos = sinst(mos(true, nw, nf));
-    let pmos = sinst(mos(false, pw, nf));
+    let nmos = sinst(mos(true, nw, nf), x=0, y=-4);
+    let pmos = sinst(mos(false, pw, nf), x=0, y=4);
     connect(a, nmos.g);
     connect(a, pmos.g);
     connect(out, nmos.d);
@@ -33,4 +41,41 @@ cell inv(pw: Float, nw: Float, nf: Int) {
     connect(vdd, pmos.b);
     connect(vss, nmos.s);
     connect(vss, nmos.b);
+}
+
+// An inverter built from devices, placed and wired.
+cell device_inv(pw: Float, nw: Float) {
+    pub let a = Signal(x=-6, y=0);
+    pub let out = Signal(x=4, y=0);
+    pub let vdd = Signal(x=0, y=8);
+    pub let vss = Signal(x=0, y=-8);
+
+    let mp = device(DeviceKind::Pmos, signals(4), "sky130_fd_pr__pfet_01v8", w=pw, l=0.15, x=0, y=4);
+    let mn = device(DeviceKind::Nmos, signals(4), "sky130_fd_pr__nfet_01v8", w=nw, l=0.15, x=0, y=-4);
+
+    connect(a, mp.g, route=[(-4, 0), (-4, 4)]);
+    connect(a, mn.g, route=[(-4, 0), (-4, -4)]);
+    connect(out, mp.d, route=[(0, 0)]);
+    connect(out, mn.d, route=[(0, 0)]);
+    connect(vdd, mp.s, route=[]);
+    connect(vdd, mp.b, route=[(2, 8)]);
+    connect(vss, mn.s, route=[]);
+    connect(vss, mn.b, route=[(2, -8)]);
+
+    // Its symbol: a triangle with a bubble, supply stubs, and its parameters.
+    polygon([(-2., 2.), (-2., -2.), (2., 0.)]);
+    circle(x=2.25, y=0., r=0.25);
+    line([(-4., 0.), (-2., 0.)]);
+    line([(2.5, 0.), (4., 0.)]);
+    line([(0., 1.), (0., 4.)]);
+    line([(0., -1.), (0., -4.)]);
+
+    pin(a, x=-4, y=0);
+    pin(out, x=4, y=0);
+    pin(vdd, x=0, y=4, label=true);
+    pin(vss, x=0, y=-4, label=true);
+
+    inst_name(x=2., y=2.);
+    param("pw", pw, x=2., y=-2.);
+    param("nw", nw, x=2., y=-3.);
 }

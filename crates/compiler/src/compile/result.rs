@@ -71,6 +71,27 @@ pub enum StaticErrorKind {
     /// A keyword argument of `device` has a type a device parameter cannot have.
     #[error("device parameter `{name}` has type {found}; expected Float, Int, or String")]
     InvalidDeviceParamType { name: String, found: String },
+    /// A `device` parameter spelled like a placement keyword in another case,
+    /// which netlists would read as that keyword.
+    #[error(
+        "`{name}` is reserved for placement; device parameters cannot be named `{lower}` in any case"
+    )]
+    ReservedDeviceParam { name: String, lower: String },
+    /// A schematic placement or route was given a `Float` coordinate.
+    #[error("schematic coordinates are grid units; write `{hint}`")]
+    GridUnits { hint: String },
+    /// A schematic placement gave `x` without `y`, or `y` without `x`.
+    #[error("`{given}` is given without `{missing}`; a placement needs both")]
+    UnpairedCoordinate { given: String, missing: String },
+    /// A type bound in `std` was used as a value or called.
+    #[error("`{name}` is a type and cannot be used as a value")]
+    TypeNotValue { name: String },
+    /// A call left out a keyword argument the callee requires.
+    #[error("missing keyword argument `{name}`")]
+    MissingKwArg { name: String },
+    /// The value of a symbol `param` has a type a parameter cannot have.
+    #[error("a `param` value has type {found}; expected Float, Int, or String")]
+    InvalidParamValueType { found: String },
     /// A cell parameter, or a type argument of a generic cell, has a type that
     /// can hold a signal or a schematic instance.
     ///
@@ -385,6 +406,24 @@ pub enum ExecErrorKind {
     /// A cell or instance has no bounding box.
     #[error("empty bbox")]
     EmptyBbox,
+    /// A field of a device handle names a terminal its kind does not have.
+    #[error("no terminal `{field}` on a `{kind}` device")]
+    NoDeviceTerminal { field: String, kind: String },
+    /// A symbol shape or text cannot be drawn as given.
+    #[error("invalid symbol item: {0}")]
+    InvalidSymbol(String),
+    /// A symbol pin is on a net that is not a port of the cell.
+    #[error("a symbol pin must be on a port of the cell")]
+    PinNotOnPort,
+    /// A port has two symbol pins, but a parent's wire has to end at one.
+    #[error("port `{port}` already has a symbol pin")]
+    DuplicatePin { port: String },
+    /// Two symbol pins sit at one point.
+    #[error("another symbol pin is already at ({x}, {y})")]
+    CoincidentPins { x: i64, y: i64 },
+    /// A cell that draws a symbol has a port without a pin.
+    #[error("port `{port}` has no pin in the cell's symbol")]
+    PortWithoutPin { port: String },
     /// A field was read from an instance whose cell does not declare it.
     ///
     /// Reaches the evaluator rather than the type checker whenever the
@@ -493,7 +532,7 @@ fn signal_cell_param(
     let location = via
         .map(|via| format!(", which holds a `{found}` at `{via}`"))
         .unwrap_or_default();
-    format!("{subject}{location}; cells cannot take signals or schematic instances")
+    format!("{subject}{location}; cells cannot take signals, schematic instances, or devices")
 }
 
 impl ExecErrorKind {

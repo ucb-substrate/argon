@@ -1,0 +1,149 @@
+use std::schematic::Signal;
+
+// How text is anchored to its `x`: at its left end, its center, or its right
+// end.
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+// The gate, channel, and terminal stubs of a MOS transistor whose terminals
+// sit at (0, 2), (-2, 0), (0, -2), and (2, 0).
+fn mos_body(bubble: Bool) {
+    if bubble {
+        line([(-2., 0.), (-1.6, 0.)]);
+        circle(x=-1.3, y=0., r=0.3);
+    } else {
+        line([(-2., 0.), (-1., 0.)]);
+    }
+    line([(-1., -1.), (-1., 1.)]);
+    line([(-0.5, -1.), (-0.5, 1.)]);
+    line([(-0.5, 0.75), (0., 0.75), (0., 2.)]);
+    line([(-0.5, -0.75), (0., -0.75), (0., -2.)]);
+    line([(-0.5, 0.), (2., 0.)]);
+}
+
+// A MOS transistor of either polarity, drain on top.
+fn mos(d: Signal, g: Signal, s: Signal, b: Signal) {
+    mos_body(false);
+    pin(d, x=0, y=2);
+    pin(g, x=-2, y=0);
+    pin(s, x=0, y=-2);
+    pin(b, x=2, y=0);
+    inst_name(x=0.5, y=1.5);
+}
+
+// An n-channel transistor, drain on top, with the source arrow pointing out.
+fn nmos(d: Signal, g: Signal, s: Signal, b: Signal) {
+    mos_body(false);
+    polygon([(0.1, -0.75), (-0.4, -0.5), (-0.4, -1.)], fill=true);
+    pin(d, x=0, y=2);
+    pin(g, x=-2, y=0);
+    pin(s, x=0, y=-2);
+    pin(b, x=2, y=0);
+    inst_name(x=0.5, y=1.5);
+}
+
+// A p-channel transistor, source on top, with a bubble on the gate and the
+// source arrow pointing in.
+fn pmos(d: Signal, g: Signal, s: Signal, b: Signal) {
+    mos_body(true);
+    polygon([(-0.4, 0.75), (0.1, 0.5), (0.1, 1.)], fill=true);
+    pin(s, x=0, y=2);
+    pin(g, x=-2, y=0);
+    pin(d, x=0, y=-2);
+    pin(b, x=2, y=0);
+    inst_name(x=0.5, y=1.5);
+}
+
+// A resistor, `p` on top.
+fn res(p: Signal, n: Signal) {
+    rect(x0=-0.5, y0=-1., x1=0.5, y1=1.);
+    line([(0., 1.), (0., 2.)]);
+    line([(0., -1.), (0., -2.)]);
+    pin(p, x=0, y=2);
+    pin(n, x=0, y=-2);
+    inst_name(x=0.75, y=0.5);
+}
+
+// A capacitor, `p` on top.
+fn cap(p: Signal, n: Signal) {
+    line([(-1., 0.25), (1., 0.25)]);
+    line([(-1., -0.25), (1., -0.25)]);
+    line([(0., 0.25), (0., 2.)]);
+    line([(0., -0.25), (0., -2.)]);
+    pin(p, x=0, y=2);
+    pin(n, x=0, y=-2);
+    inst_name(x=1.25, y=0.5);
+}
+
+// A diode, anode `p` on top.
+fn diode(p: Signal, n: Signal) {
+    polygon([(-1., 0.5), (1., 0.5), (0., -0.5)]);
+    line([(-1., -0.5), (1., -0.5)]);
+    line([(0., 0.5), (0., 2.)]);
+    line([(0., -0.5), (0., -2.)]);
+    pin(p, x=0, y=2);
+    pin(n, x=0, y=-2);
+    inst_name(x=1.25, y=0.5);
+}
+
+// The base and the two slanted terminals of a bipolar transistor.
+fn bjt_body() {
+    line([(-2., 0.), (-0.5, 0.)]);
+    line([(-0.5, -1.), (-0.5, 1.)]);
+    line([(-0.5, 0.5), (0., 1.), (0., 2.)]);
+    line([(-0.5, -0.5), (0., -1.), (0., -2.)]);
+}
+
+// The substrate stub of a four-terminal bipolar transistor.
+fn bjt_substrate(sub: Signal) {
+    line([(0.5, -0.5), (0.5, 0.5)]);
+    line([(0.5, 0.), (2., 0.)]);
+    pin(sub, x=2, y=0);
+}
+
+// A bipolar transistor of either polarity, collector on top.
+fn bjt(c: Signal, b: Signal, e: Signal) {
+    bjt_body();
+    pin(c, x=0, y=2);
+    pin(b, x=-2, y=0);
+    pin(e, x=0, y=-2);
+    inst_name(x=0.5, y=1.5);
+}
+
+// An NPN transistor, collector on top, with the emitter arrow pointing out.
+fn npn(c: Signal, b: Signal, e: Signal) {
+    bjt_body();
+    polygon([(0., -1.), (-0.45, -0.85), (-0.15, -0.55)], fill=true);
+    pin(c, x=0, y=2);
+    pin(b, x=-2, y=0);
+    pin(e, x=0, y=-2);
+    inst_name(x=0.5, y=1.5);
+}
+
+// A PNP transistor, emitter on top, with the emitter arrow pointing in.
+fn pnp(c: Signal, b: Signal, e: Signal) {
+    bjt_body();
+    polygon([(-0.5, 0.5), (-0.05, 0.65), (-0.35, 0.95)], fill=true);
+    pin(e, x=0, y=2);
+    pin(b, x=-2, y=0);
+    pin(c, x=0, y=-2);
+    inst_name(x=0.5, y=1.5);
+}
+
+fn bjt4(c: Signal, b: Signal, e: Signal, sub: Signal) {
+    bjt(c, b, e);
+    bjt_substrate(sub);
+}
+
+fn npn4(c: Signal, b: Signal, e: Signal, sub: Signal) {
+    npn(c, b, e);
+    bjt_substrate(sub);
+}
+
+fn pnp4(c: Signal, b: Signal, e: Signal, sub: Signal) {
+    pnp(c, b, e);
+    bjt_substrate(sub);
+}

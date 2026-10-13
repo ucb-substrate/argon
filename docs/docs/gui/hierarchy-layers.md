@@ -13,6 +13,8 @@ The depth controls limit how many levels of hierarchy are drawn. When a child is
 
 Opening a child from the hierarchy opens it with the exact arguments of that instance.
 
+Set as Top Cell shows that child in every view, and lasts until you return with <kbd>Shift</kbd>+<kbd>E</kbd> in the schematic view, or descend elsewhere. The step is kept by its scope across compiles, so editing the source does not undo it.
+
 ## Layers
 
 The layer sidebar lists the layers in the active [technology file](/language/technology). Pick a visible, valid layer before drawing.

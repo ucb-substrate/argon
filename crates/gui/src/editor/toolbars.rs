@@ -10,13 +10,16 @@ use itertools::Itertools;
 
 use crate::{
     actions::{
-        DrawDim, DrawPath, DrawPolygon, DrawRect, InstantiateCommand, NewCellCommand,
-        OpenCellCommand, Redo, RenameCellCommand, SelectMode, Undo,
+        DeviceCommand, DrawDim, DrawPath, DrawPolygon, DrawRect, InstantiateCommand,
+        NewCellCommand, OpenCellCommand, PlaceLabel, PlacePort, Redo, RenameCellCommand,
+        SelectMode, SymbolArc, SymbolCircle, SymbolLine, SymbolPin, SymbolText, Undo, ViewLayout,
+        ViewSchematic, ViewSymbol, Wire,
     },
     editor::{
-        CompileOutputState, Layers, ScopeAddress, ScopePath,
+        CompileOutputState, Layers, ScopeAddress, ScopePath, View,
         canvas::{EditDimToolState, LayoutCanvas, ToolState},
         input::TextInput,
+        schematic::{SymbolToolKind, ToolKind},
     },
     theme::Theme,
 };
@@ -504,9 +507,20 @@ impl ToolTip {
 ///
 /// Bindings are resolved in the layout canvas context, since that is where the tool
 /// hotkeys are bound regardless of what currently holds focus.
-fn hotkey_text(action: &dyn Action, window: &Window) -> Option<SharedString> {
+/// The hotkey of `action` in the canvas of `view`.
+fn hotkey_text(action: &dyn Action, window: &Window, view: View) -> Option<SharedString> {
     let mut context = KeyContext::new_with_defaults();
-    context.add("LayoutCanvas");
+    context.add("Canvas");
+    context.add(view.key_context());
+    binding_text(action, window, context)
+}
+
+/// The keystrokes bound to `action` in `context`, formatted for display.
+pub(crate) fn binding_text(
+    action: &dyn Action,
+    window: &Window,
+    context: KeyContext,
+) -> Option<SharedString> {
     let binding = window.highest_precedence_binding_for_action_in_context(action, context)?;
     Some(
         binding
@@ -571,6 +585,9 @@ impl Render for ToolBar {
         let theme = editor_state.theme();
         let icon_size = editor_state.icon_size;
         let font_size = editor_state.font_size;
+        let view = editor_state.view;
+        let schematic_tool = editor_state.schematic_tool;
+        let symbol_tool = editor_state.symbol_tool;
         div()
             .border_color(theme.divider)
             .p_2()
@@ -578,7 +595,7 @@ impl Render for ToolBar {
             .flex()
             .flex_row()
             .children({
-                type HighlightFn = Box<dyn Fn(&ToolState) -> bool>;
+                type HighlightFn = Box<dyn Fn(&ToolState, ToolKind, SymbolToolKind) -> bool>;
                 type OnClickFn = Arc<dyn Fn(Entity<EditorState>, &mut App)>;
                 enum ToolbarItem {
                     Button {
@@ -593,14 +610,20 @@ impl Render for ToolBar {
                     },
                     Divider(&'static str),
                     Spacer,
+                    /// One part of the view control at the right end.
+                    ViewButton {
+                        id: &'static str,
+                        label: &'static str,
+                        view: View,
+                    },
                 }
-                let tools: [ToolbarItem; _] = [
+                let history_and_files = [
                     ToolbarItem::Button {
                         id: "btn_undo",
                         icon: "icons/arrow-rotate-left-solid-full.svg",
                         label: "Undo",
                         action: Box::new(Undo),
-                        highlighted: Box::new(|_| false),
+                        highlighted: Box::new(|_, _, _| false),
                         on_click: Arc::new(|state, cx| {
                             let _ = state
                                 .read(cx)
@@ -613,7 +636,7 @@ impl Render for ToolBar {
                         icon: "icons/arrow-rotate-right-solid-full.svg",
                         label: "Redo",
                         action: Box::new(Redo),
-                        highlighted: Box::new(|_| false),
+                        highlighted: Box::new(|_, _, _| false),
                         on_click: Arc::new(|state, cx| {
                             let _ = state
                                 .read(cx)
@@ -626,7 +649,7 @@ impl Render for ToolBar {
                         icon: "icons/file-circle-plus.svg",
                         label: "New cell",
                         action: Box::new(NewCellCommand),
-                        highlighted: Box::new(|_| false),
+                        highlighted: Box::new(|_, _, _| false),
                         on_click: Arc::new(|_state, cx| {
                             cx.defer(move |cx| {
                                 cx.dispatch_action(&NewCellCommand);
@@ -638,7 +661,7 @@ impl Render for ToolBar {
                         icon: "icons/folder-open.svg",
                         label: "Open cell",
                         action: Box::new(OpenCellCommand),
-                        highlighted: Box::new(|_| false),
+                        highlighted: Box::new(|_, _, _| false),
                         on_click: Arc::new(|_state, cx| {
                             cx.defer(move |cx| {
                                 cx.dispatch_action(&OpenCellCommand);
@@ -650,7 +673,7 @@ impl Render for ToolBar {
                         icon: "icons/file-pen.svg",
                         label: "Rename cell",
                         action: Box::new(RenameCellCommand),
-                        highlighted: Box::new(|_| false),
+                        highlighted: Box::new(|_, _, _| false),
                         on_click: Arc::new(|_state, cx| {
                             cx.defer(move |cx| {
                                 cx.dispatch_action(&RenameCellCommand);
@@ -658,34 +681,110 @@ impl Render for ToolBar {
                         }),
                     },
                     ToolbarItem::Divider("divider_history_select"),
+                ];
+                let select = || ToolbarItem::Button {
+                    id: "btn_select",
+                    icon: "icons/arrow-pointer-solid-full.svg",
+                    label: "Select",
+                    action: Box::new(SelectMode),
+                    highlighted: Box::new(|tool, _, _| {
+                        matches!(
+                            tool,
+                            ToolState::Select(_)
+                                | ToolState::EditDim(EditDimToolState {
+                                    dim_mode: false,
+                                    ..
+                                })
+                        )
+                    }),
+                    on_click: Arc::new(|_state, cx| {
+                        cx.defer(move |cx| {
+                            cx.dispatch_action(&SelectMode);
+                        });
+                    }),
+                };
+                let instance = || ToolbarItem::Button {
+                    id: "btn_instance",
+                    icon: "icons/instance.svg",
+                    label: "Place instance",
+                    action: Box::new(InstantiateCommand),
+                    highlighted: Box::new(|tool, _, _| matches!(tool, ToolState::PlaceInstance(_))),
+                    on_click: Arc::new(|_state, cx| {
+                        cx.defer(move |cx| {
+                            cx.dispatch_action(&InstantiateCommand);
+                        });
+                    }),
+                };
+                // The schematic view's tools, highlighted by its canvas's tool.
+                fn schematic_button(
+                    id: &'static str,
+                    icon: &'static str,
+                    label: &'static str,
+                    action: impl Action + Clone + 'static,
+                    kind: ToolKind,
+                ) -> ToolbarItem {
                     ToolbarItem::Button {
-                        id: "btn_select",
-                        icon: "icons/arrow-pointer-solid-full.svg",
-                        label: "Select",
-                        action: Box::new(SelectMode),
-                        highlighted: Box::new(|tool| {
-                            matches!(
-                                tool,
-                                ToolState::Select(_)
-                                    | ToolState::EditDim(EditDimToolState {
-                                        dim_mode: false,
-                                        ..
-                                    })
-                            )
-                        }),
-                        on_click: Arc::new(|_state, cx| {
+                        id,
+                        icon,
+                        label,
+                        action: Box::new(action.clone()),
+                        highlighted: Box::new(move |_, active, _| active == kind),
+                        on_click: Arc::new(move |_state, cx| {
+                            let action = action.clone();
                             cx.defer(move |cx| {
-                                cx.dispatch_action(&SelectMode);
+                                cx.dispatch_action(&action);
                             });
                         }),
-                    },
+                    }
+                }
+                let schematic_tools = [
+                    schematic_button(
+                        "btn_select",
+                        "icons/arrow-pointer-solid-full.svg",
+                        "Select",
+                        SelectMode,
+                        ToolKind::Select,
+                    ),
+                    ToolbarItem::Divider("divider_select_draw"),
+                    schematic_button(
+                        "btn_instance",
+                        "icons/instance.svg",
+                        "Place instance",
+                        InstantiateCommand,
+                        ToolKind::Instance,
+                    ),
+                    schematic_button(
+                        "btn_device",
+                        "icons/device.svg",
+                        "Place device",
+                        DeviceCommand,
+                        ToolKind::Device,
+                    ),
+                    schematic_button("btn_wire", "icons/wire.svg", "Wire", Wire, ToolKind::Wire),
+                    schematic_button(
+                        "btn_port",
+                        "icons/port.svg",
+                        "Port",
+                        PlacePort,
+                        ToolKind::Port,
+                    ),
+                    schematic_button(
+                        "btn_label",
+                        "icons/label.svg",
+                        "Net label",
+                        PlaceLabel,
+                        ToolKind::Label,
+                    ),
+                ];
+                let layout_tools = [
+                    select(),
                     ToolbarItem::Divider("divider_select_draw"),
                     ToolbarItem::Button {
                         id: "btn_rect",
                         icon: "icons/rect.svg",
                         label: "Rectangle",
                         action: Box::new(DrawRect),
-                        highlighted: Box::new(|tool| matches!(tool, ToolState::DrawRect(_))),
+                        highlighted: Box::new(|tool, _, _| matches!(tool, ToolState::DrawRect(_))),
                         on_click: Arc::new(|_state, cx| {
                             cx.defer(move |cx| {
                                 cx.dispatch_action(&DrawRect);
@@ -697,7 +796,9 @@ impl Render for ToolBar {
                         icon: "icons/polygon.svg",
                         label: "Polygon",
                         action: Box::new(DrawPolygon),
-                        highlighted: Box::new(|tool| matches!(tool, ToolState::DrawPolygon(_))),
+                        highlighted: Box::new(|tool, _, _| {
+                            matches!(tool, ToolState::DrawPolygon(_))
+                        }),
                         on_click: Arc::new(|_state, cx| {
                             cx.defer(move |cx| {
                                 cx.dispatch_action(&DrawPolygon);
@@ -709,32 +810,21 @@ impl Render for ToolBar {
                         icon: "icons/path.svg",
                         label: "Path",
                         action: Box::new(DrawPath),
-                        highlighted: Box::new(|tool| matches!(tool, ToolState::DrawPath(_))),
+                        highlighted: Box::new(|tool, _, _| matches!(tool, ToolState::DrawPath(_))),
                         on_click: Arc::new(|_state, cx| {
                             cx.defer(move |cx| {
                                 cx.dispatch_action(&DrawPath);
                             })
                         }),
                     },
-                    ToolbarItem::Button {
-                        id: "btn_instance",
-                        icon: "icons/instance.svg",
-                        label: "Place instance",
-                        action: Box::new(InstantiateCommand),
-                        highlighted: Box::new(|tool| matches!(tool, ToolState::PlaceInstance(_))),
-                        on_click: Arc::new(|_state, cx| {
-                            cx.defer(move |cx| {
-                                cx.dispatch_action(&InstantiateCommand);
-                            });
-                        }),
-                    },
+                    instance(),
                     ToolbarItem::Divider("divider_draw_constraints"),
                     ToolbarItem::Button {
                         id: "btn_dim",
                         icon: "icons/arrows-left-right-to-line-solid-full.svg",
                         label: "Dimension",
                         action: Box::new(DrawDim),
-                        highlighted: Box::new(|tool| {
+                        highlighted: Box::new(|tool, _, _| {
                             matches!(
                                 tool,
                                 ToolState::DrawDim(_)
@@ -747,8 +837,112 @@ impl Render for ToolBar {
                             });
                         }),
                     },
-                    ToolbarItem::Spacer,
                 ];
+                // The symbol view's tools, highlighted by its canvas's tool.
+                fn symbol_button(
+                    id: &'static str,
+                    icon: &'static str,
+                    label: &'static str,
+                    action: impl Action + Clone + 'static,
+                    kind: SymbolToolKind,
+                ) -> ToolbarItem {
+                    ToolbarItem::Button {
+                        id,
+                        icon,
+                        label,
+                        action: Box::new(action.clone()),
+                        highlighted: Box::new(move |_, _, active| active == kind),
+                        on_click: Arc::new(move |_state, cx| {
+                            let action = action.clone();
+                            cx.defer(move |cx| {
+                                cx.dispatch_action(&action);
+                            });
+                        }),
+                    }
+                }
+                let symbol_tools = [
+                    symbol_button(
+                        "btn_select",
+                        "icons/arrow-pointer-solid-full.svg",
+                        "Select",
+                        SelectMode,
+                        SymbolToolKind::Select,
+                    ),
+                    ToolbarItem::Divider("divider_select_draw"),
+                    symbol_button(
+                        "btn_line",
+                        "icons/wire.svg",
+                        "Line",
+                        SymbolLine,
+                        SymbolToolKind::Line,
+                    ),
+                    symbol_button(
+                        "btn_polygon",
+                        "icons/polygon.svg",
+                        "Polygon",
+                        DrawPolygon,
+                        SymbolToolKind::Polygon,
+                    ),
+                    symbol_button(
+                        "btn_rect",
+                        "icons/rect.svg",
+                        "Rectangle",
+                        DrawRect,
+                        SymbolToolKind::Rect,
+                    ),
+                    symbol_button(
+                        "btn_circle",
+                        "icons/circle.svg",
+                        "Circle",
+                        SymbolCircle,
+                        SymbolToolKind::Circle,
+                    ),
+                    symbol_button(
+                        "btn_arc",
+                        "icons/arc.svg",
+                        "Arc",
+                        SymbolArc,
+                        SymbolToolKind::Arc,
+                    ),
+                    symbol_button(
+                        "btn_text",
+                        "icons/text.svg",
+                        "Text",
+                        SymbolText,
+                        SymbolToolKind::Text,
+                    ),
+                    symbol_button(
+                        "btn_pin",
+                        "icons/port.svg",
+                        "Pin",
+                        SymbolPin,
+                        SymbolToolKind::Pin,
+                    ),
+                ];
+                let mut tools = Vec::from(history_and_files);
+                match view {
+                    View::Layout => tools.extend(layout_tools),
+                    View::Schematic => tools.extend(schematic_tools),
+                    View::Symbol => tools.extend(symbol_tools),
+                }
+                tools.push(ToolbarItem::Spacer);
+                tools.extend([
+                    ToolbarItem::ViewButton {
+                        id: "view_layout",
+                        label: "Layout",
+                        view: View::Layout,
+                    },
+                    ToolbarItem::ViewButton {
+                        id: "view_schematic",
+                        label: "Schematic",
+                        view: View::Schematic,
+                    },
+                    ToolbarItem::ViewButton {
+                        id: "view_symbol",
+                        label: "Symbol",
+                        view: View::Symbol,
+                    },
+                ]);
                 let wh = icon_size.unwrap_or(20.);
                 tools
                     .iter()
@@ -762,7 +956,7 @@ impl Render for ToolBar {
                             on_click,
                         } => {
                             let on_click = on_click.clone();
-                            let hotkey = hotkey_text(action.as_ref(), window);
+                            let hotkey = hotkey_text(action.as_ref(), window, view);
                             div()
                                 .w(px(wh + 8.))
                                 .h(px(wh + 8.))
@@ -772,11 +966,17 @@ impl Render for ToolBar {
                                 .child(div().flex_1())
                                 .child(svg().path(*icon).w(px(wh)).h_auto().text_color(theme.text))
                                 .child(div().flex_1())
-                                .bg(if highlighted(self.state.read(cx).tool.read(cx)) {
-                                    theme.selection
-                                } else {
-                                    rgba(0)
-                                })
+                                .bg(
+                                    if highlighted(
+                                        self.state.read(cx).tool.read(cx),
+                                        schematic_tool,
+                                        symbol_tool,
+                                    ) {
+                                        theme.selection
+                                    } else {
+                                        rgba(0)
+                                    },
+                                )
                                 .id(*id)
                                 .tooltip({
                                     let label = *label;
@@ -804,6 +1004,32 @@ impl Render for ToolBar {
                             .child(div().w_2())
                             .id(*id),
                         ToolbarItem::Spacer => div().flex_1().id("toolbar_spacer"),
+                        ToolbarItem::ViewButton {
+                            id,
+                            label,
+                            view: button_view,
+                        } => {
+                            let button_view = *button_view;
+                            let active = button_view == view;
+                            div()
+                                .h(px(wh + 8.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .border_1()
+                                .border_color(theme.divider)
+                                .bg(if active { theme.selection } else { rgba(0) })
+                                .cursor_pointer()
+                                .child(*label)
+                                .id(*id)
+                                .on_click(move |_, _, cx| {
+                                    cx.defer(move |cx| match button_view {
+                                        View::Layout => cx.dispatch_action(&ViewLayout),
+                                        View::Schematic => cx.dispatch_action(&ViewSchematic),
+                                        View::Symbol => cx.dispatch_action(&ViewSymbol),
+                                    });
+                                })
+                        }
                     })
                     .collect_vec()
             })
@@ -820,6 +1046,7 @@ mod tool_bar_tests {
             DrawDim, DrawPath, DrawPolygon, DrawRect, InstantiateCommand, NewCellCommand,
             RenameCellCommand, SelectMode, Undo,
         },
+        editor::View,
         key_bindings,
     };
 
@@ -843,16 +1070,28 @@ mod tool_bar_tests {
             .update(cx, |_, window, _| {
                 // Only modifier-free hotkeys are asserted verbatim, since modifiers render
                 // differently per platform.
-                assert_eq!(hotkey_text(&DrawRect, window), Some("R".into()));
-                assert_eq!(hotkey_text(&DrawPolygon, window), Some("P".into()));
-                assert_eq!(hotkey_text(&SelectMode, window), Some("S".into()));
-                assert_eq!(hotkey_text(&DrawDim, window), Some("D".into()));
-                assert_eq!(hotkey_text(&InstantiateCommand, window), Some("I".into()));
-                assert!(hotkey_text(&NewCellCommand, window).is_some());
-                assert!(hotkey_text(&RenameCellCommand, window).is_some());
-                assert_eq!(hotkey_text(&Undo, window), Some("U".into()));
+                let layout = View::Layout;
+                assert_eq!(hotkey_text(&DrawRect, window, layout), Some("R".into()));
+                assert_eq!(hotkey_text(&DrawPolygon, window, layout), Some("P".into()));
+                assert_eq!(hotkey_text(&SelectMode, window, layout), Some("S".into()));
+                assert_eq!(hotkey_text(&DrawDim, window, layout), Some("D".into()));
+                assert_eq!(
+                    hotkey_text(&InstantiateCommand, window, layout),
+                    Some("I".into())
+                );
+                assert!(hotkey_text(&NewCellCommand, window, layout).is_some());
+                assert!(hotkey_text(&RenameCellCommand, window, layout).is_some());
+                assert_eq!(hotkey_text(&Undo, window, layout), Some("U".into()));
                 // The path tool has no binding, so its tooltip shows the label alone.
-                assert_eq!(hotkey_text(&DrawPath, window), None);
+                assert_eq!(hotkey_text(&DrawPath, window, layout), None);
+                // The schematic view binds its own letters.
+                let schematic = View::Schematic;
+                assert_eq!(
+                    hotkey_text(&SelectMode, window, schematic),
+                    Some("S".into())
+                );
+                assert_eq!(hotkey_text(&DrawRect, window, schematic), None);
+                assert_eq!(hotkey_text(&Undo, window, schematic), Some("U".into()));
             })
             .unwrap();
     }
@@ -891,8 +1130,13 @@ impl LayerSideBar {
         canvas: &Entity<LayoutCanvas>,
     ) -> Self {
         let layers = editor_state.read(cx).layers.clone();
-        let name_filter =
-            cx.new(|cx| TextInput::new_filter(cx, cx.focus_handle(), editor_state, canvas));
+        let name_filter = cx.new(|cx| {
+            TextInput::new_filter(
+                cx.focus_handle(),
+                canvas.read(cx).focus_handle(cx),
+                editor_state,
+            )
+        });
         let state = cx.new(|_cx| LayerSideBarState::default());
         let scroll_state = cx.new(|_cx| SidebarScrollState::default());
         let list_scroll_handle = UniformListScrollHandle::new();
@@ -1247,8 +1491,13 @@ impl HierarchySideBar {
     ) -> Self {
         let solved_cell = editor_state.read(cx).solved_cell.clone();
         let tool = editor_state.read(cx).tool.clone();
-        let name_filter =
-            cx.new(|cx| TextInput::new_filter(cx, cx.focus_handle(), editor_state, canvas));
+        let name_filter = cx.new(|cx| {
+            TextInput::new_filter(
+                cx.focus_handle(),
+                canvas.read(cx).focus_handle(cx),
+                editor_state,
+            )
+        });
         let subscriptions = vec![
             cx.observe(&solved_cell, |_, _, cx| cx.notify()),
             cx.observe(canvas, |_, _, cx| cx.notify()),
@@ -1633,7 +1882,7 @@ impl HierarchySideBar {
                             cx.notify();
                         });
                         let changed =
-                            editor_state.update(cx, |state, cx| state.set_top_cell(cell, cx));
+                            editor_state.update(cx, |state, cx| state.descend_layout(cell, cx));
                         if changed {
                             canvas.update(cx, |canvas, cx| {
                                 canvas.fit_to_screen(cx);

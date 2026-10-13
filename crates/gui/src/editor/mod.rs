@@ -6,20 +6,29 @@ use std::{
     time::Duration,
 };
 
-use analyzer::rpc::{CompilationSnapshot, InstancePreview, LangServerAction};
+use analyzer::rpc::{
+    CellEntry, CompilationSnapshot, DevicePreview, InstancePreview, LangServerAction,
+    SchematicInstancePreview,
+};
 use argonc::compile::{CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId};
 use canvas::{LayoutCanvas, ShapeFill, StipplePattern};
 use futures::StreamExt;
 use gpui::{prelude::FluentBuilder, *};
 use indexmap::{IndexMap, IndexSet};
 use rgb::Rgb;
+use schematic::{
+    SchematicCanvas,
+    sidebar::{PropertiesSideBar, SchematicSideBar},
+};
+use start_screen::START_SCREEN_CONTEXT;
 use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
 use tower_lsp_server::ls_types::MessageType;
 
 use crate::{
     actions::{
-        FocusInvoker, FocusInvokerCommandBar, InstantiateCommand, NewCellCommand, OpenCellCommand,
-        Redo, RenameCellCommand, Save, ShowDiagnostics, ShowMessages, Undo,
+        DeviceCommand, ExportNetlist, FocusInvoker, FocusInvokerCommandBar, InstantiateCommand,
+        NewCellCommand, NextView, OpenCellCommand, PreviousView, Redo, RenameCellCommand, Save,
+        ShowDiagnostics, ShowMessages, Undo, ViewLayout, ViewSchematic, ViewSymbol,
     },
     editor::{canvas::ToolState, input::TextInput},
     rpc::SyncLangServerClient,
@@ -29,10 +38,71 @@ use crate::{
 pub mod canvas;
 mod hierarchy;
 pub mod input;
+pub mod schematic;
+pub(crate) mod start_screen;
 pub mod toolbars;
+pub mod viewport;
 
 pub(crate) const SOURCE_EDIT_REJECTED_MESSAGE: &str =
     "Could not apply the source edit. Press Ctrl-Shift-M to view the detailed error in Neovim.";
+
+/// The view of the cell on screen that the window shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum View {
+    #[default]
+    Layout,
+    Schematic,
+    Symbol,
+}
+
+impl View {
+    /// The identifier the view's canvas adds to its key context.
+    pub fn key_context(self) -> &'static str {
+        match self {
+            View::Layout => "LayoutCanvas",
+            View::Schematic => "SchematicCanvas",
+            View::Symbol => "SymbolCanvas",
+        }
+    }
+
+    /// `v`: the next view around the cycle layout, schematic, symbol.
+    pub fn next(self) -> Self {
+        match self {
+            View::Layout => View::Schematic,
+            View::Schematic => View::Symbol,
+            View::Symbol => View::Layout,
+        }
+    }
+
+    /// `shift-v`: the previous view around the same cycle.
+    pub fn previous(self) -> Self {
+        match self {
+            View::Layout => View::Symbol,
+            View::Schematic => View::Layout,
+            View::Symbol => View::Schematic,
+        }
+    }
+}
+
+/// One step from the open cell to the cell on screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RootStep {
+    /// A schematic instance, by its element name.
+    Schematic(String),
+    /// A layout instance, by its scope path in the cell above it.
+    Layout(ScopePath),
+}
+
+impl RootStep {
+    fn describe(&self) -> String {
+        match self {
+            RootStep::Schematic(name) => format!("instance `{name}`"),
+            RootStep::Layout(path) => {
+                format!("scope `{}`", path.last().map(String::as_str).unwrap_or(""))
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct LayerState {
@@ -98,6 +168,20 @@ pub struct EditorState {
     pub lang_server_client: SyncLangServerClient,
     pub subscriptions: Vec<Subscription>,
     pub(crate) tool: Entity<ToolState>,
+    pub view: View,
+    /// Which schematic tool is active, for the toolbar.
+    pub schematic_tool: schematic::ToolKind,
+    /// Which symbol tool is active, for the toolbar.
+    pub symbol_tool: schematic::SymbolToolKind,
+    pub show_flylines: bool,
+    /// The steps from the open cell to the cell on screen, kept across
+    /// snapshots by name.
+    pub root_path: Vec<RootStep>,
+    /// The open cell, which the root path descends from.
+    pub(crate) base_top: Option<CellId>,
+    /// The library's cells, offered on the start screen. `None` until the
+    /// analyzer sends them.
+    pub cells: Option<Vec<CellEntry>>,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +223,9 @@ pub struct Editor {
     pub hierarchy_sidebar: Entity<HierarchySideBar>,
     pub layer_sidebar: Entity<LayerSideBar>,
     pub canvas: Entity<LayoutCanvas>,
+    pub schematic_canvas: Entity<SchematicCanvas>,
+    pub schematic_sidebar: Entity<SchematicSideBar>,
+    pub properties_sidebar: Entity<PropertiesSideBar>,
 }
 
 fn rgb_to_rgba(color: Rgb<u8>) -> Rgba {
@@ -259,6 +346,127 @@ impl EditorState {
         }
         output.top = cell;
         self.update(cx, CompileOutput::Valid(output));
+        true
+    }
+
+    /// The instance name the symbol view shows: the last descend step's, or
+    /// `X?` at the open cell.
+    pub(crate) fn symbol_inst_name(&self) -> String {
+        match self.root_path.last() {
+            Some(RootStep::Schematic(name)) => name.clone(),
+            Some(RootStep::Layout(path)) => path.last().cloned().unwrap_or_else(|| "X?".into()),
+            None => "X?".into(),
+        }
+    }
+
+    /// The cell `step` reaches from `from`, which must be the cell on screen
+    /// for a layout step.
+    fn resolve_step(&self, cx: &App, step: &RootStep, from: CellId) -> Option<CellId> {
+        let solved = self.solved_cell.read(cx);
+        let solved = solved.as_ref()?;
+        match step {
+            RootStep::Schematic(name) => solved
+                .output
+                .cells
+                .get(&from)?
+                .schematic
+                .instances
+                .iter()
+                .find(|instance| instance.name == *name)
+                .map(|instance| instance.cell),
+            RootStep::Layout(path) => {
+                if solved.output.top != from {
+                    return None;
+                }
+                solved
+                    .scope_paths
+                    .iter()
+                    .find(|(_, scope_path)| *scope_path == path)
+                    .map(|(address, _)| address.cell)
+            }
+        }
+    }
+
+    /// Re-roots the compiled hierarchy at the end of the root path, dropping
+    /// the steps that no longer resolve.
+    pub(crate) fn apply_root_path(&mut self, cx: &mut App) {
+        let Some(mut cell) = self.base_top else {
+            return;
+        };
+        let steps = self.root_path.clone();
+        let mut failed = None;
+        for (index, step) in steps.iter().enumerate() {
+            self.set_top_cell(cell, cx);
+            match self.resolve_step(cx, step, cell) {
+                Some(next) => cell = next,
+                None => {
+                    failed = Some(index);
+                    break;
+                }
+            }
+        }
+        self.set_top_cell(cell, cx);
+        if let Some(index) = failed {
+            let step = self.root_path[index].describe();
+            self.root_path.truncate(index);
+            self.show_message(
+                MessageType::WARNING,
+                format!("{step} is gone; showing the cell above it"),
+            );
+        }
+    }
+
+    /// Descends into the schematic instance `name` of the cell on screen.
+    pub(crate) fn descend_schematic(&mut self, name: &str, cx: &mut App) -> bool {
+        let Some(top) = self
+            .solved_cell
+            .read(cx)
+            .as_ref()
+            .map(|solved| solved.output.top)
+        else {
+            return false;
+        };
+        let step = RootStep::Schematic(name.to_owned());
+        let Some(cell) = self.resolve_step(cx, &step, top) else {
+            return false;
+        };
+        self.root_path.push(step);
+        self.set_top_cell(cell, cx);
+        true
+    }
+
+    /// Descends into the layout instance of `cell` in the cell on screen.
+    pub(crate) fn descend_layout(&mut self, cell: CellId, cx: &mut App) -> bool {
+        let path = {
+            let solved = self.solved_cell.read(cx);
+            let Some(solved) = solved.as_ref() else {
+                return false;
+            };
+            let Some(compiled) = solved.output.cells.get(&cell) else {
+                return false;
+            };
+            let address = ScopeAddress {
+                cell,
+                scope: compiled.root,
+            };
+            solved.scope_paths.get(&address).cloned()
+        };
+        let Some(path) = path else {
+            return false;
+        };
+        if !self.set_top_cell(cell, cx) {
+            return false;
+        }
+        self.root_path.push(RootStep::Layout(path));
+        true
+    }
+
+    /// Returns to the cell above the cell on screen.
+    pub(crate) fn return_up(&mut self, cx: &mut App) -> bool {
+        if self.root_path.pop().is_none() {
+            return false;
+        }
+        self.apply_root_path(cx);
         true
     }
 
@@ -465,6 +673,13 @@ impl Editor {
                 layers,
                 subscriptions,
                 lang_server_client: lang_server_client.clone(),
+                view: View::Layout,
+                schematic_tool: schematic::ToolKind::Select,
+                symbol_tool: schematic::SymbolToolKind::Select,
+                show_flylines: true,
+                root_path: Vec::new(),
+                base_top: None,
+                cells: None,
             }
         });
         let title_bar = cx.new(|_cx| TitleBar::new(&state));
@@ -491,6 +706,11 @@ impl Editor {
         });
         let hierarchy_sidebar = cx.new(|cx| HierarchySideBar::new(cx, &state, &canvas));
         let layer_sidebar = cx.new(|cx| LayerSideBar::new(cx, &state, &canvas));
+        let schematic_focus_handle = cx.focus_handle();
+        let schematic_canvas =
+            cx.new(|cx| SchematicCanvas::new(cx, &state, schematic_focus_handle));
+        let schematic_sidebar = cx.new(|cx| SchematicSideBar::new(cx, &state, &schematic_canvas));
+        let properties_sidebar = cx.new(|cx| PropertiesSideBar::new(cx, &state, &schematic_canvas));
 
         let editor = Self {
             state,
@@ -499,6 +719,9 @@ impl Editor {
             hierarchy_sidebar,
             layer_sidebar,
             canvas,
+            schematic_canvas,
+            schematic_sidebar,
+            properties_sidebar,
         };
         cx.to_async()
             .spawn({
@@ -524,6 +747,13 @@ impl Editor {
         {
             return false;
         }
+        let base_top = match &snapshot.output {
+            CompileOutput::Valid(data) => Some(data.top),
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                output: Some(data), ..
+            }) => Some(data.top),
+            _ => None,
+        };
         self.state.update(cx, |state, cx| {
             state.connection_error = None;
             state.compilation_revision = Some(snapshot.revision);
@@ -533,6 +763,10 @@ impl Editor {
                 state.rendering = true;
             }
             state.apply_prepared_output(cx, snapshot);
+            if base_top.is_some() {
+                state.base_top = base_top;
+                state.apply_root_path(cx);
+            }
             cx.notify();
         });
         self.canvas
@@ -540,11 +774,57 @@ impl Editor {
         true
     }
 
+    /// Fits the active view.
     pub fn fit_to_screen(&self, cx: &mut App) {
-        self.canvas.update(cx, |canvas, cx| {
-            canvas.fit_to_screen(cx);
+        match self.state.read(cx).view {
+            View::Layout => self.canvas.update(cx, |canvas, cx| {
+                canvas.fit_to_screen(cx);
+                cx.notify();
+            }),
+            View::Schematic | View::Symbol => self
+                .schematic_canvas
+                .update(cx, |canvas, cx| canvas.fit_to_screen(cx)),
+        }
+    }
+
+    /// The focus handle of the active view's canvas.
+    fn active_focus_handle(&self, cx: &App) -> FocusHandle {
+        match self.state.read(cx).view {
+            View::Layout => self.canvas.focus_handle(cx),
+            View::Schematic | View::Symbol => self.schematic_canvas.focus_handle(cx),
+        }
+    }
+
+    fn set_view(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.view = view;
             cx.notify();
         });
+        let focus = self.active_focus_handle(cx);
+        window.focus(&focus);
+        cx.notify();
+    }
+
+    fn view_layout(&mut self, _: &ViewLayout, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_view(View::Layout, window, cx);
+    }
+
+    fn view_schematic(&mut self, _: &ViewSchematic, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_view(View::Schematic, window, cx);
+    }
+
+    fn view_symbol(&mut self, _: &ViewSymbol, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_view(View::Symbol, window, cx);
+    }
+
+    fn next_view(&mut self, _: &NextView, window: &mut Window, cx: &mut Context<Self>) {
+        let view = self.state.read(cx).view.next();
+        self.set_view(view, window, cx);
+    }
+
+    fn previous_view(&mut self, _: &PreviousView, window: &mut Window, cx: &mut Context<Self>) {
+        let view = self.state.read(cx).view.previous();
+        self.set_view(view, window, cx);
     }
 
     pub fn set_compilation_active(&self, cx: &mut App, activity_id: u64, active: bool) {
@@ -648,6 +928,38 @@ impl Editor {
             .update(cx, |canvas, cx| canvas.place_instance(preview, cx));
     }
 
+    /// Starts placing a schematic instance, in the schematic view.
+    pub fn place_schematic_instance(&self, cx: &mut App, preview: SchematicInstancePreview) {
+        self.show_schematic_view(cx);
+        self.schematic_canvas
+            .update(cx, |canvas, cx| canvas.place_instance(preview, cx));
+    }
+
+    /// Starts placing a device, in the schematic view.
+    pub fn place_device(&self, cx: &mut App, preview: DevicePreview) {
+        self.show_schematic_view(cx);
+        self.schematic_canvas
+            .update(cx, |canvas, cx| canvas.place_device(preview, cx));
+    }
+
+    fn show_schematic_view(&self, cx: &mut App) {
+        self.state.update(cx, |state, cx| {
+            if state.view != View::Schematic {
+                state.view = View::Schematic;
+                cx.notify();
+            }
+        });
+    }
+
+    /// The body of the cell the schematic view shows.
+    pub fn schematic_target(&self, cx: &App) -> Option<argonc::ast::Span> {
+        let state = self.state.read(cx);
+        let solved = state.solved_cell.read(cx);
+        let solved = solved.as_ref()?;
+        let cell = solved.output.cells.get(&solved.output.top)?;
+        Some(cell.scopes.get(&cell.root)?.span.clone())
+    }
+
     pub fn selected_scope_span(&self, cx: &App) -> Option<argonc::ast::Span> {
         let state = self.state.read(cx);
         let solved = state.solved_cell.read(cx);
@@ -671,8 +983,12 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // This root listener keeps drags alive after the pointer leaves the
-        // canvas, but toolbar/sidebar motion must not enter layout hit testing.
+        // This root listener keeps layout drags alive after the pointer leaves
+        // the canvas, but toolbar/sidebar motion must not enter layout hit
+        // testing.
+        if self.state.read(cx).view != View::Layout {
+            return;
+        }
         if !self
             .canvas
             .read(cx)
@@ -685,6 +1001,9 @@ impl Editor {
     }
 
     fn on_left_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.read(cx).view != View::Layout {
+            return;
+        }
         let deferred = self
             .canvas
             .update(cx, |canvas, _| canvas.take_deferred_snapshot());
@@ -723,7 +1042,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.focus_invoker(cx);
+        focus_invoker(&self.state, cx);
     }
 
     fn focus_invoking_app_command_bar(
@@ -754,7 +1073,81 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(Some("Argon inst "), true, cx);
+        let command = match self.state.read(cx).view {
+            View::Layout => "Argon inst ",
+            View::Schematic | View::Symbol => "Argon sinst ",
+        };
+        self.open_invoking_command(Some(command), true, cx);
+    }
+
+    fn device_command(&mut self, _: &DeviceCommand, _window: &mut Window, cx: &mut Context<Self>) {
+        self.open_invoking_command(Some("Argon device Nmos "), true, cx);
+    }
+
+    /// Writes the netlist of the cell on screen where the user says; a
+    /// `.scs` file gets Spectre, anything else SPICE.
+    fn export_netlist(&mut self, _: &ExportNetlist, _window: &mut Window, cx: &mut Context<Self>) {
+        let (data, name) = {
+            let state = self.state.read(cx);
+            let solved = state.solved_cell.read(cx);
+            match solved.as_ref() {
+                Some(solved) => (
+                    solved.output.clone(),
+                    solved
+                        .output
+                        .cells
+                        .get(&solved.output.top)
+                        .map(|cell| cell.name.clone())
+                        .unwrap_or_else(|| "netlist".into()),
+                ),
+                None => {
+                    self.state.update(cx, |state, cx| {
+                        state.show_message(
+                            MessageType::ERROR,
+                            "Open a cell before exporting its netlist",
+                        );
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
+        };
+        let directory = self
+            .state
+            .read(cx)
+            .workspace_path
+            .as_ref()
+            .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let receiver = cx.prompt_for_new_path(&directory, Some(&format!("{name}.sp")));
+        let state = self.state.clone();
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(path))) = receiver.await else {
+                return;
+            };
+            let format = if path.extension().is_some_and(|extension| extension == "scs") {
+                argonc::netlist::NetlistFormat::Spectre
+            } else {
+                argonc::netlist::NetlistFormat::Spice
+            };
+            let netlist = argonc::netlist::netlist(
+                &data,
+                format,
+                &argonc::netlist::NetlistOptions::default(),
+            );
+            let message = match std::fs::write(&path, netlist) {
+                Ok(()) => (MessageType::INFO, format!("Wrote {}", path.display())),
+                Err(error) => (
+                    MessageType::ERROR,
+                    format!("Could not write {}: {error}", path.display()),
+                ),
+            };
+            let _ = state.update(cx, |state, cx| {
+                state.show_message(message.0, message.1);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn open_cell_command(
@@ -790,44 +1183,70 @@ impl Editor {
         return_to_gui: bool,
         cx: &mut Context<Self>,
     ) {
-        // A returning workflow may be blocked at a hit-enter or error prompt.
-        // Focus Neovim first so the user can clear it before the notification.
-        if return_to_gui {
-            self.focus_invoker(cx);
-        }
-        let _ = self
-            .state
-            .read(cx)
-            .lang_server_client
-            .open_command_bar(command.map(str::to_owned), return_to_gui);
-        if !return_to_gui {
-            // Leave the final activation request pointed at Neovim. Commands
-            // configured this way intentionally do not bounce back to Argon.
-            self.focus_invoker(cx);
-        }
+        open_command(&self.state, command.map(str::to_owned), return_to_gui, cx);
     }
+}
 
-    fn focus_invoker(&mut self, cx: &mut Context<Self>) {
-        if !crate::focus::activate_invoker() {
-            self.state.update(cx, |state, _cx| {
-                state.fatal_error = Some(EditorMessage {
-                    typ: MessageType::ERROR,
-                    text: "could not identify the application that invoked Argone".into(),
-                    details: MessageDetails::Messages,
-                });
+/// Opens `command` at the invoking editor's command line, returning focus
+/// to the GUI afterward when `return_to_gui`.
+pub(crate) fn open_command(
+    state: &Entity<EditorState>,
+    command: Option<String>,
+    return_to_gui: bool,
+    cx: &mut App,
+) {
+    // A returning workflow may be blocked at a hit-enter or error prompt.
+    // Focus Neovim first so the user can clear it before the notification.
+    if return_to_gui {
+        focus_invoker(state, cx);
+    }
+    let _ = state
+        .read(cx)
+        .lang_server_client
+        .open_command_bar(command, return_to_gui);
+    if !return_to_gui {
+        // Leave the final activation request pointed at Neovim. Commands
+        // configured this way intentionally do not bounce back to Argon.
+        focus_invoker(state, cx);
+    }
+}
+
+fn focus_invoker(state: &Entity<EditorState>, cx: &mut App) {
+    if !crate::focus::activate_invoker() {
+        state.update(cx, |state, _cx| {
+            state.fatal_error = Some(EditorMessage {
+                typ: MessageType::ERROR,
+                text: "could not identify the application that invoked Argone".into(),
+                details: MessageDetails::Messages,
             });
-        }
+        });
     }
+}
 
+impl Editor {
     fn theme(&self, cx: &mut Context<Self>) -> &'static Theme {
         self.state.read(cx).theme()
     }
 }
 
 impl Render for Editor {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme(cx);
         let font_size = self.state.read(cx).font_size;
+        let view = self.state.read(cx).view;
+        // A schematic-only cell has nothing to show in the layout view.
+        let layout_hint = {
+            let state = self.state.read(cx);
+            let solved = state.solved_cell.read(cx);
+            solved
+                .as_ref()
+                .and_then(|solved| solved.output.cells.get(&solved.output.top))
+                .filter(|cell| {
+                    cell.objects.is_empty()
+                        && !(cell.schematic.nodes.is_empty() && cell.schematic.instances.is_empty())
+                })
+                .map(|_| "No layout yet: press r to draw a rectangle, or v for the schematic")
+        };
         let (displayed_status, activity_label) = {
             let state = self.state.read(cx);
             (
@@ -927,6 +1346,15 @@ impl Render for Editor {
                         })),
                 );
         }
+        if let Some(hint) = self.schematic_canvas.read(cx).hint() {
+            status_bar = status_bar.child(
+                div()
+                    .id("schematic_tool_hint")
+                    .text_color(theme.subtext)
+                    .text_ellipsis()
+                    .child(hint),
+            );
+        }
         if !status_fills_space {
             status_bar = status_bar.child(div().flex_1());
         }
@@ -965,9 +1393,64 @@ impl Render for Editor {
                 .child(activity_icon)
                 .child(activity_label.unwrap_or("Rendering")),
         );
+        // Until a cell opens, there is nothing for the tools or sidebars to act on.
+        let start_screen = self.state.read(cx).solved_cell.read(cx).is_none();
+        let body = if start_screen {
+            self.render_start_screen(window, cx)
+        } else {
+            match view {
+                View::Layout => div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.hierarchy_sidebar.clone())
+                    .child(
+                        div()
+                            .flex_1()
+                            .relative()
+                            .overflow_hidden()
+                            .child(self.canvas.clone())
+                            .children(layout_hint.map(|hint| {
+                                div()
+                                    .absolute()
+                                    .top_2()
+                                    .left_0()
+                                    .right_0()
+                                    .flex()
+                                    .justify_center()
+                                    .text_color(theme.subtext)
+                                    .child(hint)
+                            })),
+                    )
+                    .child(self.layer_sidebar.clone()),
+                View::Schematic | View::Symbol => div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.schematic_sidebar.clone())
+                    .child(
+                        div()
+                            .flex_1()
+                            .relative()
+                            .overflow_hidden()
+                            .child(self.schematic_canvas.clone()),
+                    )
+                    .child(self.properties_sidebar.clone()),
+            }
+            .into_any_element()
+        };
+        let active_focus = self.active_focus_handle(cx);
         let mut root = div()
             .id("top")
-            .track_focus(&self.canvas.focus_handle(cx))
+            .track_focus(&active_focus)
+            .when(start_screen, |root| root.key_context(START_SCREEN_CONTEXT))
+            .on_action(cx.listener(Self::view_layout))
+            .on_action(cx.listener(Self::view_schematic))
+            .on_action(cx.listener(Self::view_symbol))
+            .on_action(cx.listener(Self::next_view))
+            .on_action(cx.listener(Self::previous_view))
             .on_action(cx.listener(Self::on_undo))
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_redo))
@@ -976,6 +1459,8 @@ impl Render for Editor {
             .on_action(cx.listener(Self::show_diagnostics))
             .on_action(cx.listener(Self::show_messages))
             .on_action(cx.listener(Self::instantiate_command))
+            .on_action(cx.listener(Self::device_command))
+            .on_action(cx.listener(Self::export_netlist))
             .on_action(cx.listener(Self::open_cell_command))
             .on_action(cx.listener(Self::new_cell_command))
             .on_action(cx.listener(Self::rename_cell_command))
@@ -994,23 +1479,8 @@ impl Render for Editor {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_left_mouse_up))
             .child(self.title_bar.clone())
-            .child(self.tool_bar.clone())
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.hierarchy_sidebar.clone())
-                    .child(
-                        div()
-                            .flex_1()
-                            .relative()
-                            .overflow_hidden()
-                            .child(self.canvas.clone()),
-                    )
-                    .child(self.layer_sidebar.clone()),
-            )
+            .when(!start_screen, |root| root.child(self.tool_bar.clone()))
+            .child(body)
             .child(status_bar);
         root = if let Some(font_size) = font_size {
             root.text_size(px(font_size))
@@ -1036,8 +1506,19 @@ mod tests {
     use argonc::tech::CustomDitherPattern;
 
     use super::{
-        MessageDetails, ShapeFill, activity_status_label, compilation_error_message, shape_fill,
+        MessageDetails, ShapeFill, View, activity_status_label, compilation_error_message,
+        shape_fill,
     };
+
+    #[test]
+    fn v_cycles_the_views_and_shift_v_cycles_back() {
+        let cycle = [View::Layout, View::Schematic, View::Symbol];
+        for (i, view) in cycle.iter().enumerate() {
+            assert_eq!(view.next(), cycle[(i + 1) % 3]);
+            assert_eq!(view.previous(), cycle[(i + 2) % 3]);
+            assert_eq!(view.next().previous(), *view);
+        }
+    }
 
     #[test]
     fn compilation_status_hands_off_to_rendering_without_an_idle_state() {

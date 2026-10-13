@@ -33,6 +33,13 @@ fn test_canvas(cx: &mut gpui::TestAppContext) -> Entity<LayoutCanvas> {
             layers,
             lang_server_client: crate::rpc::SyncLangServerClient::for_render_test(cx.to_async()),
             tool: cx.new(|_| ToolState::default()),
+            view: editor::View::Layout,
+            schematic_tool: Default::default(),
+            symbol_tool: Default::default(),
+            show_flylines: true,
+            root_path: Vec::new(),
+            base_top: None,
+            cells: None,
         }
     });
     cx.new(|cx| {
@@ -661,19 +668,126 @@ fn test_editor(
     cx: &mut gpui::TestAppContext,
 ) -> Entity<editor::Editor> {
     let state = canvas.read_with(cx, |canvas, _| canvas.state.clone());
-    cx.new(|cx| editor::Editor {
-        title_bar: cx.new(|_| editor::TitleBar::new(&state)),
-        tool_bar: cx.new(|_| editor::ToolBar::new(&state)),
-        hierarchy_sidebar: cx.new(|cx| editor::HierarchySideBar::new(cx, &state, canvas)),
-        layer_sidebar: cx.new(|cx| editor::LayerSideBar::new(cx, &state, canvas)),
-        state,
-        canvas: canvas.clone(),
+    cx.new(|cx| {
+        let schematic_canvas = cx.new(|cx| {
+            let focus = cx.focus_handle();
+            editor::schematic::SchematicCanvas::new(cx, &state, focus)
+        });
+        editor::Editor {
+            title_bar: cx.new(|_| editor::TitleBar::new(&state)),
+            tool_bar: cx.new(|_| editor::ToolBar::new(&state)),
+            hierarchy_sidebar: cx.new(|cx| editor::HierarchySideBar::new(cx, &state, canvas)),
+            layer_sidebar: cx.new(|cx| editor::LayerSideBar::new(cx, &state, canvas)),
+            schematic_sidebar: cx.new(|cx| {
+                editor::schematic::sidebar::SchematicSideBar::new(cx, &state, &schematic_canvas)
+            }),
+            properties_sidebar: cx.new(|cx| {
+                editor::schematic::sidebar::PropertiesSideBar::new(cx, &state, &schematic_canvas)
+            }),
+            schematic_canvas,
+            state,
+            canvas: canvas.clone(),
+        }
     })
 }
 
 #[gpui::test]
-fn rendering_indicator_does_not_resize_the_canvas(cx: &mut gpui::TestAppContext) {
+fn the_start_screen_offers_the_library_until_a_cell_opens(cx: &mut gpui::TestAppContext) {
+    use analyzer::rpc::{CellEntry, LangServerRequest, LangServerResponse};
+    use futures::{FutureExt, SinkExt, StreamExt};
+
+    struct Host(Entity<editor::Editor>);
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.0.clone())
+        }
+    }
+
     let canvas = test_canvas(cx);
+    let (client, mut server) = crate::rpc::SyncLangServerClient::for_rpc_test(cx.to_async());
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.update(cx, |state, _| {
+            state.lang_server_client = client;
+            state.cells = Some(vec![CellEntry {
+                path: "top".to_owned(),
+                parameters: Vec::new(),
+                requires_arguments: false,
+            }]);
+        })
+    });
+    let editor = test_editor(&canvas, cx);
+    let (_, cx) = cx.add_window_view(|_, _| Host(editor.clone()));
+
+    assert!(cx.debug_bounds("start_screen").is_some());
+    assert_eq!(
+        canvas.read_with(cx, |canvas, _| canvas.screen_bounds),
+        Bounds::default(),
+        "the canvas is not laid out before a cell opens"
+    );
+    // Opening blocks on the analyzer's reply, so answer from the background.
+    let analyzer = cx.background_executor.spawn(async move {
+        let Some(Ok(tarpc::ClientMessage::Request(request))) = server.next().await else {
+            panic!("expected a request")
+        };
+        server
+            .send(tarpc::Response {
+                request_id: request.id,
+                message: Ok(LangServerResponse::OpenCell(())),
+            })
+            .await
+            .unwrap();
+        request.message
+    });
+    let row = cx
+        .debug_bounds("start_cell_0")
+        .expect("the library's cell should be listed");
+    cx.simulate_click(row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let LangServerRequest::OpenCell { cell } = analyzer.now_or_never().unwrap() else {
+        panic!("expected the cell to open")
+    };
+    assert_eq!(cell, "top()");
+
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    std::fs::write(
+        &source,
+        "use std::layout::rect;\ncell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }",
+    )
+    .unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml"),
+    ));
+    let (solved, layers) = prepare(&source, &config);
+    load_canvas(&canvas, solved, layers, cx);
+    cx.run_until_parked();
+    canvas.read_with(cx, |canvas, _| {
+        assert_ne!(
+            canvas.screen_bounds.size,
+            Size::default(),
+            "the canvas replaces the start screen"
+        );
+        assert!(!canvas.pending_init, "the first paint fits the cell");
+    });
+}
+
+#[gpui::test]
+fn rendering_indicator_does_not_resize_the_canvas(cx: &mut gpui::TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    std::fs::write(
+        &source,
+        "use std::layout::rect;\ncell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }",
+    )
+    .unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml"),
+    ));
+    let (solved, layers) = prepare(&source, &config);
+    let canvas = test_canvas(cx);
+    load_canvas(&canvas, solved, layers, cx);
     let editor = test_editor(&canvas, cx);
     canvas.update(cx, |canvas, _| canvas.pending_init = false);
     let cx = cx.add_empty_window();

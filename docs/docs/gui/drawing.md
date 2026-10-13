@@ -41,6 +41,8 @@ Dimensions also work on rectangles imported from GDS. If the technology file con
 
 Select the target scope in the hierarchy sidebar, press <kbd>I</kbd>, and type a cell invocation. Move the preview and click to place it. Placement stays active so you can drop more copies; press <kbd>Esc</kbd> to stop.
 
+In the [schematic view](/gui/schematic), <kbd>I</kbd> places a schematic instance with `std::schematic::inst` instead, and <kbd>M</kbd> places a device. The [schematic view's tools](/gui/schematic#entering-a-schematic) add ports, net labels, and wires.
+
 ## Reading the canvas
 
 - Solid edges are fixed by constraints.

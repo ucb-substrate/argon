@@ -238,7 +238,7 @@ impl Builder<'_> {
                     let device = &schematic.devices[index];
                     Element::Device {
                         name: device.name.clone(),
-                        kind: device.kind,
+                        kind: device.kind.base(),
                         nets: nets_of(&device.terminals),
                         value: device.value.as_ref().map(format_param),
                         model: device.model.clone(),
@@ -299,7 +299,7 @@ fn base_name(name: &str) -> String {
 }
 
 /// `value` as both formats write it.
-fn format_param(value: &ParamValue) -> String {
+pub fn format_param(value: &ParamValue) -> String {
     match value {
         ParamValue::Float(value) => format_float(*value),
         ParamValue::Int(value) => value.to_string(),

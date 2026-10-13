@@ -11,9 +11,12 @@ use std::{
 
 use analyzer::ArgonConfig;
 use analyzer::rpc::{
-    CompilationSnapshot, CompilationUpdate, DimensionParams, FocusEditorParams, Gui,
-    InitialConditionEdit, InstancePreview, LangServerAction, LangServerClient, PathParams,
-    PolygonParams, RectangleEditResult, ValueEdit,
+    AddSignalRequest, AddSymbolItemsRequest, CallArguments, CellEntry, ClipboardItem,
+    CompilationSnapshot, CompilationUpdate, ConnectRequest, CreateSymbolRequest, DeleteOutcome,
+    DeleteRequest, DevicePreview, DimensionParams, EditReceipt, FocusEditorParams, Gui,
+    InitialConditionEdit, InstancePreview, LangServerAction, LangServerClient, PasteRequest,
+    PathParams, PlaceDeviceRequest, PlaceRequest, PlaceSchematicInstanceRequest, PolygonParams,
+    RectangleEditResult, RenameRequest, SchematicInstancePreview, SetArgumentRequest, ValueEdit,
 };
 use anyhow::{Result, anyhow};
 use argonc::{ast::Span, compile::BasicRect};
@@ -178,7 +181,7 @@ impl SyncLangServerClient {
 
     /// Source placement must yield while Neovim accepts the edit, so painting
     /// and navigation continue throughout the request and reconnect timeout.
-    async fn call_async<T, F, Fut>(&self, request: F) -> Result<T>
+    pub(crate) async fn call_async<T, F, Fut>(&self, request: F) -> Result<T>
     where
         T: Send + 'static,
         F: Fn(LangServerClient) -> Fut,
@@ -402,10 +405,11 @@ impl SyncLangServerClient {
         .await
     }
 
-    pub fn select_rect(&self, span: Span) -> Result<()> {
+    /// Reveals `span` in the editor.
+    pub fn select_span(&self, span: Span) -> Result<()> {
         self.call(move |client| {
             let span = span.clone();
-            async move { client.select_rect(context::current(), span).await }
+            async move { client.select_span(context::current(), span).await }
         })
     }
 
@@ -522,6 +526,153 @@ impl SyncLangServerClient {
         })
     }
 
+    /// Applies a schematic placement or route gesture, off the UI thread.
+    pub async fn place(&self, request: PlaceRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.place(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn add_signal(&self, request: AddSignalRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.add_signal(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn place_schematic_instance(
+        &self,
+        request: PlaceSchematicInstanceRequest,
+    ) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move {
+                client
+                    .place_schematic_instance(context::current(), request)
+                    .await
+            }
+        })
+        .await
+    }
+
+    pub async fn place_device(&self, request: PlaceDeviceRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.place_device(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn connect(&self, request: ConnectRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.connect(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn delete(&self, request: DeleteRequest) -> Result<Option<DeleteOutcome>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.delete(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn set_argument(&self, request: SetArgumentRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.set_argument(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn add_symbol_items(
+        &self,
+        request: AddSymbolItemsRequest,
+    ) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.add_symbol_items(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn create_symbol(&self, request: CreateSymbolRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.create_symbol(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn rename(&self, request: RenameRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.rename(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn copy_statements(
+        &self,
+        base_revision: u64,
+        targets: Vec<Span>,
+    ) -> Result<Option<Vec<ClipboardItem>>> {
+        self.call_async(move |client| {
+            let targets = targets.clone();
+            async move {
+                client
+                    .copy_statements(context::current(), base_revision, targets)
+                    .await
+            }
+        })
+        .await
+    }
+
+    pub async fn paste(&self, request: PasteRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.paste(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn cell_parameters(
+        &self,
+        base_revision: u64,
+        cell: Span,
+    ) -> Result<Option<Vec<String>>> {
+        self.call_async(move |client| {
+            let cell = cell.clone();
+            async move {
+                client
+                    .cell_parameters(context::current(), base_revision, cell)
+                    .await
+            }
+        })
+        .await
+    }
+
+    pub async fn call_arguments(
+        &self,
+        base_revision: u64,
+        call: Span,
+    ) -> Result<Option<CallArguments>> {
+        self.call_async(move |client| {
+            let call = call.clone();
+            async move {
+                client
+                    .call_arguments(context::current(), base_revision, call)
+                    .await
+            }
+        })
+        .await
+    }
+
     pub fn add_eq_constraint(&self, scope_span: Span, lhs: String, rhs: String) -> Result<()> {
         self.call(move |client| {
             let scope_span = scope_span.clone();
@@ -548,6 +699,14 @@ impl SyncLangServerClient {
         self.call(move |client| {
             let action = action.clone();
             async move { client.dispatch_action(context::current(), action).await }
+        })
+    }
+
+    /// Opens the cell invocation `cell`, such as `inverter()`.
+    pub fn open_cell(&self, cell: String) -> Result<()> {
+        self.call(move |client| {
+            let cell = cell.clone();
+            async move { client.open_cell(context::current(), cell).await }
         })
     }
 
@@ -695,6 +854,46 @@ impl Gui for GuiServer {
             .await
             .unwrap();
     }
+
+    async fn schematic_target(mut self, _: context::Context) -> Option<Span> {
+        let (sender, receiver) = oneshot::channel();
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let target = cx.update(|cx| editor.schematic_target(cx)).ok().flatten();
+                let _ = sender.send(target);
+            }))
+            .await
+            .ok()?;
+        receiver.await.ok().flatten()
+    }
+
+    async fn place_schematic_instance(
+        mut self,
+        _: context::Context,
+        preview: SchematicInstancePreview,
+    ) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| {
+                    editor.place_schematic_instance(cx, preview);
+                    focus::activate_gui(cx);
+                });
+            }))
+            .await
+            .unwrap();
+    }
+
+    async fn place_device(mut self, _: context::Context, preview: DevicePreview) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| {
+                    editor.place_device(cx, preview);
+                    focus::activate_gui(cx);
+                });
+            }))
+            .await
+            .unwrap();
+    }
     async fn configure(mut self, _: tarpc::context::Context, config: ArgonConfig) -> () {
         let _ = analyzer::reload_log_filter(&config.log.level);
         self.to_exec
@@ -729,6 +928,18 @@ impl Gui for GuiServer {
             }))
             .await
             .unwrap();
+    }
+
+    async fn set_cells(mut self, _: context::Context, cells: Vec<CellEntry>) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = editor.state.update(cx, |state, cx| {
+                    state.cells = Some(cells);
+                    cx.notify();
+                });
+            }))
+            .await
+            .ok();
     }
 }
 
