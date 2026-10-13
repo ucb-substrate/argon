@@ -1,9 +1,24 @@
-// The kind of a device placed with `device`, which picks its netlist element.
+// The kind of a device placed with `device`, which picks its netlist element
+// and its symbol. `Nmos` and `Pmos` are `Mos` devices, and `Npn` and `Pnp`
+// are `Bjt` devices, drawn with a polarity symbol.
 enum DeviceKind {
     Mos,
+    Nmos,
+    Pmos,
     Res,
     Cap,
     Diode,
     Bjt,
+    Npn,
+    Pnp,
     Subckt,
+}
+
+// `n` fresh signals, for the terminals of a new device.
+fn signals(n: Int) -> [Signal] {
+    if n == 0 {
+        []
+    } else {
+        cons(Signal(), signals(n - 1))
+    }
 }

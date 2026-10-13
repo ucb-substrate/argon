@@ -1,11 +1,11 @@
 ---
 title: Schematics
-description: Signals, nets, ports, devices, and schematic instances.
+description: Signals, nets, ports, devices, schematic instances, placement, and symbols.
 ---
 
 # Schematics
 
-A cell can describe a schematic as well as a layout. Its schematic is a set of signals joined into nets, the devices and child cells connected to those nets, and the ports an instance of the cell connects to. The schematic items live in [`std::schematic`](/language/std-schematic).
+A cell can describe a schematic as well as a layout. Its schematic is a set of signals joined into nets, the devices and child cells connected to those nets, and the ports an instance of the cell connects to. The schematic items live in [`std::schematic`](/language/std-schematic), and a cell draws the [symbol](#symbols) a parent's schematic shows it with using [`std::symbol`](/language/std-symbol).
 
 ```argon
 use std::schematic::{DeviceKind, Signal, connect, device};
@@ -45,7 +45,7 @@ cell inv(pw: Float, nw: Float, nf: Int) {
 }
 ```
 
-`mos` has four ports, `d`, `g`, `s`, and `b`, and one device. `inv` has the ports `a`, `out`, `vdd`, and `vss`, and two instances of `mos`, named `Xnmos` and `Xpmos`.
+`mos` has four ports, `d`, `g`, `s`, and `b`, and one device. `inv` has the ports `a`, `out`, `vdd`, and `vss`, and two instances of `mos`, named `Xnmos` and `Xpmos`. The [schematic_inverter example](https://github.com/ucb-substrate/argon/tree/main/examples/schematic_inverter) adds [placement](#placement-and-routes) to these cells and an inverter built from devices.
 
 ## Views
 
@@ -105,30 +105,32 @@ A path through a value is joined with `_`: the field name, then the index of a s
 **Other nets** take the first of these that exists, preferring the shortest within each:
 
 1. a path from a top-level `let` that ends at a signal the cell created;
-2. a path that ends at an instance terminal, with the child's port name as its last segment, such as `nmos_b`;
-3. the name of the `let`, at any depth, that first bound the signal, or for a terminal, the instance's name and the port name;
+2. a path that ends at an instance or device terminal, with the port or terminal name as its last segment, such as `nmos_b` or `m0_d`;
+3. the name of the `let`, at any depth, that first bound the signal, or for a terminal, the element's name and the port or terminal name;
 4. `net` followed by the net's index.
 
 A name bound to a signal beats an instance terminal's path even when the terminal's path is shorter: a net reached as `bus_0` and as `m_g` is named `bus_0`.
 
-**Instances** are named `X` followed by the path of the first top-level `let` that holds them, by the name of the `let` that bound them, or by `inst` and their index. **Devices** are named by their element letter and their index among the cell's devices, in creation order: `M0`, `R1`, `X2`.
+**Instances** are named `X` followed by the path of the first top-level `let` that holds them, by the name of the `let` that bound them, or by `inst` and their index. **Devices** are named by their element letter followed by the same kind of name: `let mp = device(…)` is `Mmp`. A device that no binding reaches is named by its letter and its index among the cell's devices, in creation order: `M0`, `R1`, `X2`.
 
 Names are unique within a cell, compared without regard to case. A repeated name gets the first free suffix `_1`, `_2`, …, with ports named first. Instance and device names are unique together.
 
 ## Devices
 
-`device(kind, terminals, model, ..params)` adds a primitive device to the cell. `kind` is a [`DeviceKind`](/language/std-schematic#devicekind), which decides how many terminals the device takes and whether it needs a model.
+`device(kind, terminals, model, ..params)` adds a primitive device to the cell and returns a `Device` handle. `kind` is a [`DeviceKind`](/language/std-schematic#devicekind), which decides how many terminals the device takes, what they are called, and whether it needs a model.
 
 | Kind | Element | Terminals | Model | `value` |
 | --- | --- | --- | --- | --- |
-| `Mos` | `M` | 4 (d, g, s, b) | Required | Not allowed |
-| `Res` | `R` | 2 | Optional | Optional |
-| `Cap` | `C` | 2 | Optional | Optional |
-| `Diode` | `D` | 2 (anode, cathode) | Required | Not allowed |
-| `Bjt` | `Q` | 3 or 4 (c, b, e, and an optional substrate) | Required | Not allowed |
-| `Subckt` | `X` | 1 or more | Required | Not allowed |
+| `Mos`, `Nmos`, `Pmos` | `M` | 4 (`d`, `g`, `s`, `b`) | Required | Not allowed |
+| `Res` | `R` | 2 (`p`, `n`) | Optional | Optional |
+| `Cap` | `C` | 2 (`p`, `n`) | Optional | Optional |
+| `Diode` | `D` | 2 (`p`, `n`; `p` is the anode) | Required | Not allowed |
+| `Bjt`, `Npn`, `Pnp` | `Q` | 3 or 4 (`c`, `b`, `e`, and an optional `sub`) | Required | Not allowed |
+| `Subckt` | `X` | 1 or more, numbered | Required | Not allowed |
 
-A resistor or capacitor needs a model, a `value`, or both. The model is a name without whitespace; `""` means no model. Every keyword argument is a device parameter, which must be a `Float`, `Int`, or `String`. Netlists ignore case, so two parameters may not differ only in case, and `VALUE` is the same as `value`. A `Float` parameter may depend on constraints, and the device waits until it is solved.
+`Nmos` and `Pmos` are `Mos` devices, and `Npn` and `Pnp` are `Bjt` devices. Each takes the same terminals and writes the same netlist element as its base kind, and differs only in the symbol the GUI draws it with. Cells whose netlists differ only in polarity kind share one subcircuit.
+
+A resistor or capacitor needs a model, a `value`, or both. The model is a name without whitespace; `""` means no model. Every other keyword argument is a device parameter, which must be a `Float`, `Int`, or `String`. Netlists ignore case, so two parameters may not differ only in case, and `VALUE` is the same as `value`. A `Float` parameter may depend on constraints, and the device's parameters wait until it is solved. `x`, `y`, `angle`, and `reflect` [place the device](#placement-and-routes) instead of parameterizing it, and are reserved in every case: `X=1` is an error rather than a parameter.
 
 ```argon
 device(DeviceKind::Res, [a, b], "", value=1000.);
@@ -137,6 +139,22 @@ device(DeviceKind::Mos, [d, g, s, b], "nch", w=2., l=0.15);
 ```
 
 Values far from 1, such as a capacitance in farads, are easiest to write with an exponent: `1e-12`, `4.7e-15`.
+
+### Device handles
+
+The fields of a `Device` are its terminals, named as in the table above, plus `terminals`, every terminal in order. A terminal is a signal of the cell that sits on the device's pin and is joined to the signal passed at that position, so connecting to it joins that net:
+
+```argon
+let m0 = device(DeviceKind::Nmos, signals(4), "nch", w=1., l=0.15);
+connect(m0.g, a);
+connect(m0.d, out);
+```
+
+[`signals(n)`](/language/std-schematic#signals) makes `n` fresh signals, so a device need not name its terminals up front. Reading a terminal the kind lacks, such as `g` on a resistor, is an error when the cell runs. `terminals[i]` reaches the numbered terminals of a `Subckt`.
+
+The handle is ready as soon as the kind and terminals are, so a parameter that waits on the solver never delays a `connect` through a terminal. Nets reached through a handle are named like nets reached through an instance: the drain of `let m0 = device(…)` is `m0_d` unless a shorter name exists.
+
+Otherwise a device behaves like a [schematic instance](#schematic-instances). Its terminals are never ports by themselves, even when a `pub let` holds the device. A parent that reads a device through `std::schematic::inst` gets the terminals on ports as its own signals and the other terminals detached; through `std::layout::inst`, the whole device is detached. A device can't be a cell argument, compared, emitted with `!`, or used in arithmetic. The type can be written in source once imported: `use std::schematic::Device;`.
 
 ## Schematic instances
 
@@ -150,6 +168,137 @@ connect(input, r1.p);
 A terminal that nothing connects to becomes a net of its own.
 
 A parent can read a `pub` schematic instance of a child, and its terminals through it. When `x` holds `pub let m = sinst(mos(..));`, `x.m.g` is the parent's signal on that net if the net is a port of `x`, and detached otherwise. Holding `m` does not make its terminals ports of `x`.
+
+## Placement and routes
+
+A schematic can carry its drawing in source, as keywords on the calls that create its elements and connections. They only say where the GUI draws things. Nothing in a cell can read them back, and deleting every one of them leaves netlists byte-identical.
+
+```argon
+pub let a = Signal(x=-8, y=0);
+let nmos = std::schematic::inst(mos(true, nw, nf), x=0, y=-4);
+let m0 = device(DeviceKind::Mos, signals(4), "nch", w=1., l=0.15, x=6, y=0, angle=90);
+connect(a, nmos.g, route=[(-4, 0), (-4, -4)]);
+```
+
+| Keyword | Type | Accepted by | Meaning |
+| --- | --- | --- | --- |
+| `x`, `y` | `Int` | `inst`, `Signal`, `device` | The position of the element's origin, in grid units, with y pointing up. |
+| `angle` | `Int` | `inst`, `Signal`, `device` | Counterclockwise rotation in degrees, a multiple of 90. |
+| `reflect` | `Bool` | `inst`, `device` | Mirror about the x axis before rotating, as `std::layout::inst` does. |
+| `route` | `[(Int, Int)]` | `connect` | The corners of the wire that draws the connection. |
+
+- `x` and `y` come together; one without the other is an error. `angle` and `reflect` may come alone, and then orient the element wherever the GUI places it.
+- Coordinates are `Int` grid units, so `x=4 * i` works in a loop and a placement never waits on the solver. A `Float` such as `x=0.` is reported as a grid-unit mistake.
+- `angle` is normalized as `std::layout::inst` normalizes it: `450` means `90`, and `-90` means `270`. A value that isn't a multiple of 90 is an error.
+- A placed signal is drawn as a port pin when a `pub` field reaches it, and as a net label showing its net's name otherwise.
+- A wire runs from the pin of the first signal, through the corners of `route` in order, to the pin of the second, so it follows its elements when they move. `route=[]` is a straight wire between the two pins, and a `connect` without `route` draws no wire: the GUI shows such a connection as a flyline. Only `connect` draws wires; a device's terminal list joins its pins to signals without drawing anything.
+- A `Signal(x=…, y=…)` inside a function places the signal of every call at the same point, so a function that creates signals should take positions as parameters or leave them out.
+
+An inverter built from devices, placed and wired:
+
+```argon
+use std::schematic::{DeviceKind, Signal, connect, device, signals};
+
+cell device_inv(pw: Float, nw: Float) {
+    pub let a = Signal(x=-6, y=0);
+    pub let out = Signal(x=4, y=0);
+    pub let vdd = Signal(x=0, y=8);
+    pub let vss = Signal(x=0, y=-8);
+
+    let mp = device(DeviceKind::Pmos, signals(4), "pch", w=pw, l=0.15, x=0, y=4);
+    let mn = device(DeviceKind::Nmos, signals(4), "nch", w=nw, l=0.15, x=0, y=-4);
+
+    connect(a, mp.g, route=[(-4, 0), (-4, 4)]);
+    connect(a, mn.g, route=[(-4, 0), (-4, -4)]);
+    connect(out, mp.d, route=[(0, 0)]);
+    connect(out, mn.d, route=[(0, 0)]);
+    connect(vdd, mp.s, route=[]);
+    connect(vdd, mp.b, route=[(2, 8)]);
+    connect(vss, mn.s, route=[]);
+    connect(vss, mn.b, route=[(2, -8)]);
+}
+```
+
+The two `a` wires share the segment from the port to (-4, 0), which is drawn once with a junction where they part. Its netlist names the devices after their bindings:
+
+```text
+.subckt device_inv a out vdd vss
+Mmp out a vdd vdd pch w=2 l=0.15
+Mmn out a vss vss nch w=1 l=0.15
+.ends device_inv
+```
+
+## Symbols
+
+A cell draws its symbol with [`std::symbol`](/language/std-symbol) calls in its body, next to its layout and schematic statements. One run of the body produces all three views, so a symbol can depend on the cell's parameters. A parent's schematic draws each instance of the cell with this symbol.
+
+```argon
+use std::symbol::{circle, inst_name, line, param, pin, polygon};
+
+cell device_inv(pw: Float, nw: Float) {
+    // Ports, devices, and connections as above.
+
+    polygon([(-2., 2.), (-2., -2.), (2., 0.)]);
+    circle(x=2.25, y=0., r=0.25);
+    line([(-4., 0.), (-2., 0.)]);
+    line([(2.5, 0.), (4., 0.)]);
+    line([(0., 1.), (0., 4.)]);
+    line([(0., -1.), (0., -4.)]);
+
+    pin(a, x=-4, y=0);
+    pin(out, x=4, y=0);
+    pin(vdd, x=0, y=4, label=true);
+    pin(vss, x=0, y=-4, label=true);
+
+    inst_name(x=2., y=2.);
+    param("pw", pw, x=2., y=-2.);
+    param("nw", nw, x=2., y=-3.);
+}
+```
+
+- **Units.** Everything is in grid units. Shapes and text take `Float` coordinates, so arrows and bubbles can fall between grid points. Pins take `Int` coordinates, so they sit on the grid and a parent's wires end on grid points; a `Float` pin coordinate is reported as a grid-unit mistake.
+- **Values.** A `Float` that depends on constraints waits until it is solved, as a device parameter does. A value that isn't a finite number is an error, and so are a `line` with fewer than two points, a `polygon` with fewer than three, and a radius or text size that isn't positive.
+- **Text.** `text` draws literal text, `inst_name` the instance's name in the parent, such as `Xinv` or `Mmp`, and `param` a parameter as `name=value`, formatted as netlists format parameters. Text is centered vertically on `y`; `align` says whether `x` is its left end, its center, or its right end, and `size` is its height, 1 by default. The GUI keeps text upright under every placement.
+- **Which cells have symbols.** A cell draws a symbol when it makes at least one `std::symbol` call, directly or through a function. A cell that makes none is drawn as a generated box: its ports as pins along the sides, supplies on top and grounds on the bottom, with the instance name above and the cell name below.
+- **Functions.** A `std::symbol` call inside a function draws in the cell that called the function, as `Signal()` creates a signal there. So symbols can be shared as functions, and the device helpers are ordinary Argon.
+- **Names.** `rect`, `polygon`, and `text` also exist in `std::layout`. Import one set under aliases, or call it by path.
+- **Can't be read back.** A symbol is only presentation. Nothing in evaluation reads it, it isn't reachable through an instance, and a parent's symbol doesn't include its children's. Deleting every `std::symbol` call leaves netlists byte-identical.
+
+### Pins
+
+A pin names a port through any signal on that port's net, the way `connect` names a net: once `connect(a, m.g)` has joined them, `pin(a, …)` and `pin(m.g, …)` name the same port. Pins are checked once the body has run and the ports are known. Each of these is an error:
+
+- a `pin` on a net that isn't a port;
+- two pins for one port, since a parent's wire has to end at one pin;
+- two pins at one point;
+- a port without a pin, in a cell that draws a symbol. The error points at the `pub let` that made the port.
+
+A cell with errors still has the rest of its symbol drawn. A symbol pin is separate from a [placed signal](#placement-and-routes) in the cell's own schematic: one says where the port is on the symbol, and the other where the port is drawn inside the cell.
+
+With `label=true`, the port's name is drawn at size 1 beside the pin, clear of a stub of any length. The pin's side is the edge of the symbol's shapes it is nearest to or farthest beyond, with left and right winning ties; a symbol without shapes uses its pins instead. The name goes here:
+
+| Side | Position | Alignment |
+| --- | --- | --- |
+| Top | (x + 0.5, y - 1) | `Left` |
+| Bottom | (x + 0.5, y + 1) | `Left` |
+| Left | (x + 0.5, y + 1) | `Left` |
+| Right | (x - 0.5, y + 1) | `Right` |
+
+In the inverter above, `vdd`'s name is at (0.5, 3). A label follows the shapes, so a shape that changes which edge is nearest moves it to another side.
+
+### Device symbols
+
+`std::symbol` draws the device symbols as Argon functions over the natives, listed under [device helpers](/language/std-symbol#device-helpers). A cell that wraps one device can draw itself as that device; the `mos` cell at the top of this page does it with:
+
+```argon
+if nfet {
+    std::symbol::nmos(d, g, s, b);
+} else {
+    std::symbol::pmos(d, g, s, b);
+};
+```
+
+A raw `device` is drawn with the helper for its kind and terminal count, so a wrapper cell and the device it wraps look the same.
 
 ## Reading across views
 

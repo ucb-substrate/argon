@@ -122,6 +122,20 @@ pub struct CustomLineStyle {
 }
 
 impl Technology {
+    /// A technology with no layers, for compiling cells that have no layout.
+    pub fn empty() -> Self {
+        Self {
+            dbu: 1e-9,
+            display_unit: 1,
+            grid: 1,
+            style_name: None,
+            layers: Vec::new(),
+            custom_dither_patterns: Vec::new(),
+            custom_line_styles: Vec::new(),
+            pin_layers: IndexMap::new(),
+        }
+    }
+
     /// Snap-grid spacing in Argon source/display coordinate units.
     pub fn grid_step(&self) -> f64 {
         self.grid as f64 / self.display_unit as f64

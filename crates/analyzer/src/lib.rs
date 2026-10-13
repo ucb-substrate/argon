@@ -1,5 +1,6 @@
 pub mod agent;
 mod cell_edit;
+mod cell_list;
 mod command_completion;
 mod compiler_worker;
 pub mod document;
@@ -7,6 +8,7 @@ pub mod hook;
 pub mod mcp;
 mod navigation;
 pub mod rpc;
+mod schematic_edit;
 pub mod session;
 pub mod transport;
 mod watcher;
@@ -31,7 +33,7 @@ use argonc::{
     WorkspaceConfig,
     ast::Span,
     compile::{
-        self, Arrayed, CompileOutput, ExecErrorCompileOutput, StaticErrorCompileOutput,
+        self, Arrayed, CompileOutput, DeviceKind, ExecErrorCompileOutput, StaticErrorCompileOutput,
         TypedWorkspace,
     },
     diagnostics,
@@ -40,7 +42,10 @@ use argonc::{
 };
 use futures::prelude::*;
 use indexmap::IndexMap;
-use rpc::{CompilationSnapshot, GuiClient, InstancePreview, LangServer, insert_statement};
+use rpc::{
+    CompilationSnapshot, DevicePreview, GuiClient, InstancePreview, LangServer,
+    SchematicInstancePreview, insert_statement,
+};
 use serde::{Deserialize, Serialize};
 use tarpc::{context, server::Channel, tokio_serde::formats::Bincode};
 use tokio::{
@@ -441,6 +446,8 @@ struct GuiConnection {
     id: u64,
     client: GuiClient,
     snapshot: Arc<tokio::sync::Mutex<Option<CompilationSnapshot>>>,
+    /// The library's cells as last sent to this GUI.
+    cells: Arc<tokio::sync::Mutex<Option<Vec<rpc::CellEntry>>>>,
 }
 
 #[derive(Debug, Default)]
@@ -812,6 +819,7 @@ impl State {
             id: gui.next_connection_id,
             client,
             snapshot: Arc::default(),
+            cells: Arc::default(),
         };
         gui.connection = Some(connection.clone());
         connection
@@ -891,6 +899,33 @@ impl State {
                 .await;
             if is_gui_disconnected(&error) {
                 self.clear_gui_connection(connection.id).await;
+            }
+        }
+    }
+
+    /// Sends the library's cells to the GUI if they changed since the last send.
+    async fn publish_cells(&self, connection: Option<GuiConnection>) {
+        let Some(connection) = connection else {
+            return;
+        };
+        let mut sent = connection.cells.lock().await;
+        let cells = {
+            let compiled = self.published_state.lock().await;
+            cell_list::library_cells(&compiled.ast, &compiled.config, sent.as_deref())
+        };
+        let Some(cells) = cells.filter(|cells| sent.as_ref() != Some(cells)) else {
+            return;
+        };
+        match connection
+            .client
+            .set_cells(context::current(), cells.clone())
+            .await
+        {
+            Ok(()) => *sent = Some(cells),
+            Err(error) => {
+                if is_gui_disconnected(&error) {
+                    self.clear_gui_connection(connection.id).await;
+                }
             }
         }
     }
@@ -1047,6 +1082,9 @@ impl Backend {
         self.state
             .compiled_revisions
             .send_replace(identity.revision);
+        self.state
+            .publish_cells(self.state.gui_connection().await)
+            .await;
 
         for message in result.messages {
             if !self.state.is_latest_compile_request(&identity).await {
@@ -1482,12 +1520,100 @@ struct InstantiateParams {
 }
 
 #[derive(Serialize, Deserialize)]
+struct DeviceCommandParams {
+    /// The command's argument text: `<Kind> [<count>] <model and parameters>`.
+    args: String,
+}
+
+#[derive(Serialize, Deserialize)]
 struct CellNameParams {
     name: String,
     uri: Uri,
 }
 
 const PREVIEW_BINDING_PREFIX: &str = "__argon_preview_instance";
+
+/// The instance the schematic preview placed at `call`, with what the GUI
+/// draws for it.
+fn schematic_instance_preview(
+    output: &compile::CompiledData,
+    call: &Span,
+    invocation: String,
+) -> Option<SchematicInstancePreview> {
+    let instance = output.cells.values().find_map(|cell| {
+        cell.schematic
+            .instances
+            .iter()
+            .find(|instance| instance.span.as_ref() == Some(call))
+    })?;
+    let child = output.cells.get(&instance.cell)?;
+    let symbol = child
+        .symbol
+        .clone()
+        .unwrap_or_else(|| compile::generated_box(&child.schematic, &child.name));
+    let pin_names = (0..child.schematic.ports.len())
+        .map(|port| child.schematic.port_name(port).to_owned())
+        .collect();
+    Some(SchematicInstancePreview {
+        invocation,
+        cell_name: child.name.clone(),
+        symbol,
+        pin_names,
+    })
+}
+
+/// Reads `<Kind> [<count>] <model and parameters>`: the kind by its
+/// variant name in any case, the terminal count when the kind needs one,
+/// and the rest as argument text.
+fn parse_device_command(text: &str) -> std::result::Result<(DeviceKind, usize, String), String> {
+    let text = text.trim();
+    let (kind_name, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    if kind_name.is_empty() {
+        return Err("expected a device kind, such as `Nmos`".to_owned());
+    }
+    let kind = DeviceKind::ALL
+        .into_iter()
+        .find(|kind| kind.name().eq_ignore_ascii_case(kind_name))
+        .ok_or_else(|| {
+            format!(
+                "`{kind_name}` is not a device kind; expected one of {}",
+                DeviceKind::ALL
+                    .iter()
+                    .map(|kind| kind.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+    let rest = rest.trim_start();
+    let (count, args) = match rest.split_once(char::is_whitespace).unwrap_or((rest, "")) {
+        (first, args) if first.parse::<usize>().is_ok() => {
+            (Some(first.parse::<usize>().expect("checked")), args)
+        }
+        _ => (None, rest),
+    };
+    let terminals = match (count, kind.base()) {
+        (Some(count), _) => count,
+        (None, DeviceKind::Mos) => 4,
+        (None, DeviceKind::Res | DeviceKind::Cap | DeviceKind::Diode) => 2,
+        (None, DeviceKind::Bjt) => 3,
+        (None, _) => {
+            return Err(format!(
+                "a `{}` device needs a terminal count: `:Argon device {} 3 \"model\"`",
+                kind.name(),
+                kind.name()
+            ));
+        }
+    };
+    kind.check_terminals(terminals)
+        .map_err(|error| format!("a `{}` device {error}", kind.name()))?;
+    let args = schematic_edit::device_args(args);
+    let call = format!(
+        "std::schematic::device(std::schematic::DeviceKind::{}, std::schematic::signals({terminals}), {args})",
+        kind.name()
+    );
+    parse::parse_cell(&call).map_err(|error| format!("the arguments do not parse: {error}"))?;
+    Ok((kind, terminals, args))
+}
 
 fn preview_instance_cell(
     output: &compile::CompiledData,
@@ -1719,6 +1845,350 @@ impl Backend {
         Ok(())
     }
 
+    /// Compiles the open cell with `expression` bound to a fresh name at the
+    /// end of `scope_span`, which must be the body of a cell or a scope in
+    /// one. Returns the output, the binding, and the span of the expression
+    /// in the preview source, or reports why the preview failed.
+    async fn compile_preview(
+        &self,
+        workspace_ast: &Arc<WorkspaceParseAst>,
+        workspace: &WorkspaceConfig,
+        open_cell: Option<String>,
+        scope_span: &Span,
+        expression: &str,
+        describe: &str,
+    ) -> Option<(compile::CompiledData, String, cfgrammar::Span)> {
+        let Some((module_path, ast)) = workspace_ast
+            .iter()
+            .find(|(_, ast)| ast.path == scope_span.path)
+            .map(|(module_path, ast)| (module_path.clone(), ast.clone()))
+        else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "The selected scope is not part of this Argon workspace",
+                )
+                .await;
+            return None;
+        };
+        let Some(scope) = ast.span2scope.get(scope_span) else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "The scope selected in the Argon GUI is not part of the current workspace",
+                )
+                .await;
+            return None;
+        };
+        let document = self.state.document(&ast.source_text);
+        let preview_binding = (0..)
+            .map(|index| format!("{PREVIEW_BINDING_PREFIX}{index}"))
+            .find(|name| {
+                workspace_ast
+                    .values()
+                    .all(|ast| !ast.text.contains(name.as_str()))
+            })
+            .expect("an unused preview binding always exists");
+        let statement = format!("let {preview_binding} = {expression};");
+        let tracked = statement.len() - expression.len() - 1..statement.len() - 1;
+        let insertion = insert_statement(
+            &document,
+            scope.span,
+            scope.tail.as_ref().map(|tail| tail.span().start()),
+            &statement,
+            tracked,
+        );
+        let mut preview_source = ast.text.to_string();
+        preview_source.insert_str(insertion.offset, &insertion.edit.new_text);
+        let mut preview_module =
+            match parse::parse_source_text(preview_source, scope_span.path.clone()) {
+                Ok(ast) => ast,
+                Err(error) => {
+                    self.state
+                        .editor_client
+                        .show_message(MessageType::ERROR, format!("Could not {describe}: {error}"))
+                        .await;
+                    return None;
+                }
+            };
+        preview_module.promote_last_declarations(ast.generated_declarations);
+        let mut preview_ast = (**workspace_ast).clone();
+        preview_ast.insert(module_path, preview_module);
+        let Some(open_cell) = open_cell else {
+            self.state
+                .editor_client
+                .show_message(MessageType::ERROR, "Open a cell before placing an instance")
+                .await;
+            return None;
+        };
+        // Recompile the open cell against the preview. Splicing its invocation
+        // before static analysis lets argument expressions use normal name
+        // resolution and type checking.
+        let invocation = match parse::splice_cell_invocation(&mut preview_ast, &open_cell) {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                self.state
+                    .editor_client
+                    .show_message(MessageType::ERROR, format!("Open cell is invalid: {error}"))
+                    .await;
+                return None;
+            }
+        };
+        let Some((typed_ast, static_output)) = compile::static_compile(&preview_ast) else {
+            self.state
+                .editor_client
+                .show_message(MessageType::ERROR, "Could not analyze the preview")
+                .await;
+            return None;
+        };
+        if !static_output.errors.is_empty() {
+            let message = static_output
+                .errors
+                .iter()
+                .map(|error| error.kind.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    format!("Could not {describe}: {message}"),
+                )
+                .await;
+            return None;
+        }
+        if workspace.tech.is_none() {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "The Argon library does not configure a technology file",
+                )
+                .await;
+            return None;
+        }
+        let compiled = compile_open_cell(&typed_ast, &invocation, workspace);
+        let output = match compiled {
+            CompileOutput::Valid(output) => output,
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                output: Some(output),
+                errors,
+            }) if !errors.iter().any(|error| error.kind.is_invalid_cell()) => output,
+            output => {
+                let messages = blocking_compile_error_messages(&output).join("\n");
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        format!("Could not {describe}: {messages}"),
+                    )
+                    .await;
+                return None;
+            }
+        };
+        Some((output, preview_binding, insertion.tracked_span))
+    }
+
+    /// The body of the cell the schematic view shows, from the GUI.
+    async fn schematic_target(&self, connection: &GuiConnection, action: &str) -> Option<Span> {
+        match connection.client.schematic_target(context::current()).await {
+            Ok(Some(target)) => Some(target),
+            Ok(None) => {
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        format!("Open a cell in the Argon GUI before {action}"),
+                    )
+                    .await;
+                None
+            }
+            Err(error) => {
+                let disconnected = is_gui_disconnected(&error);
+                if disconnected {
+                    self.state.clear_gui_connection(connection.id).await;
+                }
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        if disconnected {
+                            format!(
+                                "The Argon GUI is not connected; start it before {action} ({error})"
+                            )
+                        } else {
+                            format!("Could not query the GUI's schematic: {error}")
+                        },
+                    )
+                    .await;
+                None
+            }
+        }
+    }
+
+    /// The published workspace, open cell, and configuration, when the editor
+    /// buffers match what was compiled.
+    async fn preview_sources(
+        &self,
+    ) -> Option<(Arc<WorkspaceParseAst>, Option<String>, WorkspaceConfig)> {
+        let source = self.state.source_state.lock().await;
+        let compiled = self.state.published_state.lock().await;
+        if !rpc::editor_buffers_are_current(&source, &compiled) {
+            drop(compiled);
+            drop(source);
+            self.state
+                .editor_client
+                .show_message(MessageType::ERROR, rpc::OUT_OF_SYNC_MESSAGE)
+                .await;
+            return None;
+        }
+        Some((
+            compiled.ast.clone(),
+            source.cell.clone(),
+            compiled.config.clone(),
+        ))
+    }
+
+    /// `:Argon sinst <invocation>`: previews a schematic instance of a cell
+    /// in the cell on screen.
+    async fn schematic_instantiate(&self, params: InstantiateParams) -> Result<()> {
+        let Some(connection) = self.state.gui_connection().await else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "Start the Argon GUI before placing an instance",
+                )
+                .await;
+            return Ok(());
+        };
+        let Some(target) = self
+            .schematic_target(&connection, "placing an instance")
+            .await
+        else {
+            return Ok(());
+        };
+        let Some((workspace_ast, open_cell, workspace)) = self.preview_sources().await else {
+            return Ok(());
+        };
+        let Some((output, _, tracked)) = self
+            .compile_preview(
+                &workspace_ast,
+                &workspace,
+                open_cell,
+                &target,
+                &format!("std::schematic::inst({})", params.cell),
+                &format!("instantiate `{}`", params.cell),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+        let tracked = Span {
+            path: target.path.clone(),
+            span: tracked,
+        };
+        let Some(preview) = schematic_instance_preview(&output, &tracked, params.cell) else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "The preview instance did not execute while compiling the open cell",
+                )
+                .await;
+            return Ok(());
+        };
+        let result = connection
+            .client
+            .place_schematic_instance(context::current(), preview)
+            .await;
+        self.handle_gui_result(&connection, result).await;
+        Ok(())
+    }
+
+    /// `:Argon device <Kind> [<count>] <model and parameters>`: previews a
+    /// device in the cell on screen.
+    async fn device(&self, params: DeviceCommandParams) -> Result<()> {
+        let (kind, terminals, args) = match parse_device_command(&params.args) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.state
+                    .editor_client
+                    .show_message(MessageType::ERROR, format!("Argon device: {error}"))
+                    .await;
+                return Ok(());
+            }
+        };
+        let Some(connection) = self.state.gui_connection().await else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "Start the Argon GUI before placing a device",
+                )
+                .await;
+            return Ok(());
+        };
+        let Some(target) = self.schematic_target(&connection, "placing a device").await else {
+            return Ok(());
+        };
+        let Some((workspace_ast, open_cell, workspace)) = self.preview_sources().await else {
+            return Ok(());
+        };
+        let expression = format!(
+            "std::schematic::device(std::schematic::DeviceKind::{}, std::schematic::signals({terminals}), {args})",
+            kind.name()
+        );
+        let Some((output, _, tracked)) = self
+            .compile_preview(
+                &workspace_ast,
+                &workspace,
+                open_cell,
+                &target,
+                &expression,
+                &format!("place a `{}` device", kind.name()),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+        let tracked = Span {
+            path: target.path.clone(),
+            span: tracked,
+        };
+        let evaluated = output.cells.values().any(|cell| {
+            cell.schematic
+                .devices
+                .iter()
+                .any(|device| device.span.as_ref() == Some(&tracked))
+        });
+        if !evaluated {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "The preview device did not execute while compiling the open cell",
+                )
+                .await;
+            return Ok(());
+        }
+        let result = connection
+            .client
+            .place_device(
+                context::current(),
+                DevicePreview {
+                    kind,
+                    terminals,
+                    args,
+                },
+            )
+            .await;
+        self.handle_gui_result(&connection, result).await;
+        Ok(())
+    }
+
     async fn instantiate(&self, params: InstantiateParams) -> Result<()> {
         let Some(connection) = self.state.gui_connection().await else {
             self.state
@@ -1795,131 +2265,18 @@ impl Backend {
                 .await;
             return Ok(());
         };
-        let Some((module_path, ast)) = workspace_ast
-            .iter()
-            .find(|(_, ast)| ast.path == scope_span.path)
-            .map(|(module_path, ast)| (module_path.clone(), ast.clone()))
+        let Some((output, preview_binding, _)) = self
+            .compile_preview(
+                &workspace_ast,
+                &workspace,
+                open_cell,
+                &scope_span,
+                &format!("std::layout::inst({})", params.cell),
+                &format!("instantiate `{}`", params.cell),
+            )
+            .await
         else {
-            self.state
-                .editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    "The selected scope is not part of this Argon workspace",
-                )
-                .await;
             return Ok(());
-        };
-        let document = self.state.document(&ast.source_text);
-        let scope = &ast.span2scope[&scope_span];
-        let preview_binding = (0..)
-            .map(|index| format!("{PREVIEW_BINDING_PREFIX}{index}"))
-            .find(|name| {
-                workspace_ast
-                    .values()
-                    .all(|ast| !ast.text.contains(name.as_str()))
-            })
-            .expect("an unused preview binding always exists");
-        let statement = format!(
-            "let {preview_binding} = std::layout::inst({});",
-            params.cell
-        );
-        let insertion = insert_statement(
-            &document,
-            scope.span,
-            scope.tail.as_ref().map(|tail| tail.span().start()),
-            &statement,
-            0..statement.len(),
-        );
-        let mut preview_source = ast.text.to_string();
-        preview_source.insert_str(insertion.offset, &insertion.edit.new_text);
-        let mut preview_module =
-            match parse::parse_source_text(preview_source, scope_span.path.clone()) {
-                Ok(ast) => ast,
-                Err(error) => {
-                    self.state
-                        .editor_client
-                        .show_message(
-                            MessageType::ERROR,
-                            format!("Could not instantiate `{}`: {error}", params.cell),
-                        )
-                        .await;
-                    return Ok(());
-                }
-            };
-        preview_module.promote_last_declarations(ast.generated_declarations);
-        let mut preview_ast = (*workspace_ast).clone();
-        preview_ast.insert(module_path, preview_module);
-        let Some(open_cell) = open_cell else {
-            self.state
-                .editor_client
-                .show_message(MessageType::ERROR, "Open a cell before placing an instance")
-                .await;
-            return Ok(());
-        };
-        // Recompile the open cell against the preview. Splicing its invocation
-        // before static analysis lets argument expressions use normal name
-        // resolution and type checking.
-        let invocation = match parse::splice_cell_invocation(&mut preview_ast, &open_cell) {
-            Ok(invocation) => invocation,
-            Err(error) => {
-                self.state
-                    .editor_client
-                    .show_message(MessageType::ERROR, format!("Open cell is invalid: {error}"))
-                    .await;
-                return Ok(());
-            }
-        };
-        let Some((typed_ast, static_output)) = compile::static_compile(&preview_ast) else {
-            self.state
-                .editor_client
-                .show_message(MessageType::ERROR, "Could not analyze the preview instance")
-                .await;
-            return Ok(());
-        };
-        if !static_output.errors.is_empty() {
-            let message = static_output
-                .errors
-                .iter()
-                .map(|error| error.kind.to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            self.state
-                .editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    format!("Could not instantiate `{}`: {message}", params.cell),
-                )
-                .await;
-            return Ok(());
-        }
-        if workspace.tech.is_none() {
-            self.state
-                .editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    "The Argon library does not configure a technology file",
-                )
-                .await;
-            return Ok(());
-        }
-        let compiled = compile_open_cell(&typed_ast, &invocation, &workspace);
-        let output = match compiled {
-            CompileOutput::Valid(output) => output,
-            CompileOutput::ExecErrors(ExecErrorCompileOutput {
-                output: Some(output),
-                errors,
-            }) if !errors.iter().any(|error| error.kind.is_invalid_cell()) => output,
-            output => {
-                let messages = blocking_compile_error_messages(&output).join("\n");
-                self.state
-                    .editor_client
-                    .show_message(
-                        MessageType::ERROR,
-                        format!("Could not instantiate `{}`: {messages}", params.cell),
-                    )
-                    .await;
-                return Ok(());
-            }
         };
         let Some(cell) = preview_instance_cell(&output, &preview_binding) else {
             self.state
@@ -2202,6 +2559,8 @@ pub async fn main_with_io_on_listener<I, O>(
     .custom_method("custom/newCell", Backend::new_cell)
     .custom_method("custom/renameCell", Backend::rename_cell)
     .custom_method("custom/inst", Backend::instantiate)
+    .custom_method("custom/sinst", Backend::schematic_instantiate)
+    .custom_method("custom/device", Backend::device)
     .custom_method("custom/commandCompletion", Backend::command_completion)
     .custom_method("custom/reloadConfig", Backend::reload_config)
     .custom_method("custom/setConfig", Backend::set_config)
@@ -2242,7 +2601,7 @@ mod tests {
     };
 
     use super::{
-        ArgonConfig, DEFAULT_LOG_LEVEL, GuiConfig, SourceState, config_with_key,
+        ArgonConfig, DEFAULT_LOG_LEVEL, DeviceKind, GuiConfig, SourceState, config_with_key,
         is_gui_disconnected, parse_config, preview_instance_cell, read_unpoisoned, write_config,
         write_unpoisoned,
     };
@@ -2418,6 +2777,35 @@ mod tests {
             .find_map(|object| object.get_rect())
             .expect("top should emit a rect");
         assert_eq!(rect.x1.0, 50.);
+    }
+
+    #[test]
+    fn the_device_command_reads_its_kind_count_and_arguments() {
+        let (kind, terminals, args) =
+            super::parse_device_command("Nmos \"nch\", w=1., l=0.15").unwrap();
+        assert_eq!(kind, DeviceKind::Nmos);
+        assert_eq!(terminals, 4);
+        assert_eq!(args, "\"nch\", w=1., l=0.15");
+        let (kind, terminals, args) = super::parse_device_command("subckt 3 \"opamp\"").unwrap();
+        assert_eq!(kind, DeviceKind::Subckt);
+        assert_eq!(terminals, 3);
+        assert_eq!(args, "\"opamp\"");
+        let (kind, terminals, args) = super::parse_device_command("Res value=1.").unwrap();
+        assert_eq!((kind, terminals), (DeviceKind::Res, 2));
+        assert_eq!(args, "\"\", value=1.", "a missing model is empty");
+        let (_, terminals, _) = super::parse_device_command("Npn 4 \"q\"").unwrap();
+        assert_eq!(terminals, 4);
+        assert!(super::parse_device_command("").is_err());
+        assert!(super::parse_device_command("Triode").is_err());
+        assert!(
+            super::parse_device_command("Subckt \"x\"").is_err(),
+            "needs a count"
+        );
+        assert!(
+            super::parse_device_command("Nmos 3 \"nch\"").is_err(),
+            "four terminals"
+        );
+        assert!(super::parse_device_command("Nmos \"nch\", w=").is_err());
     }
 
     /// The preview binding is spelled as the analyzer inserts it, which needs

@@ -26,6 +26,11 @@ pub(crate) struct RenameCellEdit {
 }
 
 pub(crate) fn validate_cell_name(name: &str) -> Result<(), String> {
+    validate_identifier(name, "a cell")
+}
+
+/// Checks that `name` can declare `what`, such as "a cell" or "a signal".
+pub(crate) fn validate_identifier(name: &str, what: &str) -> Result<(), String> {
     let mut bytes = name.bytes();
     if !bytes
         .next()
@@ -39,7 +44,7 @@ pub(crate) fn validate_cell_name(name: &str) -> Result<(), String> {
     }
     if BUILTINS.contains(&name) {
         return Err(format!(
-            "`{name}` is an Argon built-in and cannot name a cell"
+            "`{name}` is an Argon built-in and cannot name {what}"
         ));
     }
     Ok(())

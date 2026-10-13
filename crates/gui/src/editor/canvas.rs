@@ -8388,7 +8388,7 @@ impl Render for LayoutCanvas {
             .flex()
             .flex_1()
             .relative()
-            .key_context("LayoutCanvas")
+            .key_context("Canvas LayoutCanvas")
             .track_focus(&self.focus_handle(cx))
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_mouse_down))
@@ -10634,7 +10634,7 @@ impl LayoutCanvas {
                                 .state
                                 .read(cx)
                                 .lang_server_client
-                                .select_rect(span.clone());
+                                .select_span(span.clone());
                         } else {
                             select_tool.selected_obj = None;
                         }

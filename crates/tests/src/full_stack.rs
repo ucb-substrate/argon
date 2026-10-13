@@ -5,7 +5,10 @@ use std::{net::Ipv4Addr, path::PathBuf, sync::Arc};
 use analyzer::{
     ArgonConfig,
     agent::AgentClient,
-    rpc::{CompilationSnapshot, CompilationUpdate, Gui, InstancePreview, LangServerClient},
+    rpc::{
+        CellEntry, CompilationSnapshot, CompilationUpdate, DevicePreview, Gui, InstancePreview,
+        LangServerClient, SchematicInstancePreview,
+    },
     transport::{self, Role, SessionToken},
 };
 use argonc::{
@@ -26,6 +29,39 @@ pub enum OutputKind {
     FatalParseErrors,
 }
 
+/// An element's name, placement, and the span of its call.
+pub type ElementSummary = (String, Option<(i64, i64)>, Option<Span>);
+/// A connection's route and the span of its call.
+pub type ConnectionSummary = (Option<Vec<(i64, i64)>>, Span);
+/// A signal's net name and the span of its call.
+pub type SignalSummary = (String, Span);
+/// A pin of a cell's symbol: its port's name, its position, and the span
+/// of its `pin` call.
+pub type PinSummary = (String, (i64, i64), Option<Span>);
+
+/// A compiled cell's symbol: whether the cell draws one, and its pins.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CellSummary {
+    pub name: String,
+    /// The cell body.
+    pub body: Span,
+    pub has_symbol: bool,
+    pub pins: Vec<PinSummary>,
+}
+
+/// What the top cell's schematic shows: its nets, each element with its
+/// placement and the span of its call, each connection's route and span,
+/// and each signal's net and span.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SchematicSummary {
+    pub nets: Vec<String>,
+    pub elements: Vec<ElementSummary>,
+    pub connections: Vec<ConnectionSummary>,
+    pub signals: Vec<SignalSummary>,
+    /// Every compiled cell, the top one included.
+    pub cells: Vec<CellSummary>,
+}
+
 #[derive(Debug)]
 pub enum GuiEvent {
     CompilationStarted(u64),
@@ -36,6 +72,7 @@ pub enum GuiEvent {
         scope: Option<Span>,
         rect_count: usize,
         object_count: usize,
+        schematic: SchematicSummary,
     },
     Message {
         typ: tower_lsp_server::ls_types::MessageType,
@@ -44,6 +81,12 @@ pub enum GuiEvent {
     Fit,
     WorkspacePath(Option<PathBuf>),
     WorkspaceModified(bool),
+    /// A schematic instance the `sinst` command prepared for placement.
+    SchematicInstancePreview(SchematicInstancePreview),
+    /// A device the `device` command prepared for placement.
+    DevicePreview(DevicePreview),
+    /// The library's cells.
+    Cells(Vec<CellEntry>),
     Highlight {
         revision: u64,
         spans: Vec<Span>,
@@ -74,14 +117,22 @@ impl Gui for HeadlessGui {
     }
 
     async fn update_cell(self, _: context::Context, update: CompilationUpdate) -> bool {
-        let (kind, scope, rect_count, object_count, revision) = {
+        let (kind, scope, rect_count, object_count, schematic, revision) = {
             let mut previous = self.snapshot.lock().unwrap();
             let Some(snapshot) = update.materialize(previous.as_ref()) else {
                 return false;
             };
             *previous = Some(snapshot.clone());
-            let (kind, scope, rect_count, object_count) = snapshot_details(&snapshot.output);
-            (kind, scope, rect_count, object_count, snapshot.revision)
+            let (kind, scope, rect_count, object_count, schematic) =
+                snapshot_details(&snapshot.output);
+            (
+                kind,
+                scope,
+                rect_count,
+                object_count,
+                schematic,
+                snapshot.revision,
+            )
         };
         if let Some(scope) = scope.clone() {
             *self.selected_scope.lock().expect("selected scope") = Some(scope);
@@ -94,6 +145,7 @@ impl Gui for HeadlessGui {
                 scope,
                 rect_count,
                 object_count,
+                schematic,
             })
             .expect("full-stack test should still be receiving GUI events");
         let _permit = self.update_gate.acquire().await.unwrap();
@@ -135,9 +187,35 @@ impl Gui for HeadlessGui {
 
     async fn place_instance(self, _: context::Context, _: InstancePreview) {}
 
+    async fn schematic_target(self, _: context::Context) -> Option<Span> {
+        self.selected_scope.lock().expect("selected scope").clone()
+    }
+
+    async fn place_schematic_instance(
+        self,
+        _: context::Context,
+        preview: SchematicInstancePreview,
+    ) {
+        self.events
+            .send(GuiEvent::SchematicInstancePreview(preview))
+            .expect("full-stack test should still be receiving GUI events");
+    }
+
+    async fn place_device(self, _: context::Context, preview: DevicePreview) {
+        self.events
+            .send(GuiEvent::DevicePreview(preview))
+            .expect("full-stack test should still be receiving GUI events");
+    }
+
     async fn configure(self, _: context::Context, _: ArgonConfig) {}
 
     async fn activate(self, _: context::Context) {}
+
+    async fn set_cells(self, _: context::Context, cells: Vec<CellEntry>) {
+        self.events
+            .send(GuiEvent::Cells(cells))
+            .expect("full-stack test should still be receiving GUI events");
+    }
 
     async fn highlight_spans(self, _: context::Context, revision: u64, spans: Vec<Span>) {
         self.events
@@ -152,7 +230,9 @@ impl Gui for HeadlessGui {
     }
 }
 
-fn snapshot_details(output: &CompileOutput) -> (OutputKind, Option<Span>, usize, usize) {
+fn snapshot_details(
+    output: &CompileOutput,
+) -> (OutputKind, Option<Span>, usize, usize, SchematicSummary) {
     let (kind, data) = match output {
         CompileOutput::Valid(data) => (OutputKind::Data, Some(data)),
         CompileOutput::ExecErrors(output) => (OutputKind::Data, output.output.as_ref()),
@@ -160,7 +240,87 @@ fn snapshot_details(output: &CompileOutput) -> (OutputKind, Option<Span>, usize,
         CompileOutput::FatalParseErrors => (OutputKind::FatalParseErrors, None),
     };
     let (scope, rect_count, object_count) = data.map(gui_snapshot).unwrap_or((None, 0, 0));
-    (kind, scope, rect_count, object_count)
+    let schematic = data.map(schematic_summary).unwrap_or_default();
+    (kind, scope, rect_count, object_count, schematic)
+}
+
+/// The top cell's schematic, as the GUI would draw it.
+fn schematic_summary(data: &CompiledData) -> SchematicSummary {
+    let Some(cell) = data.cells.get(&data.top) else {
+        return SchematicSummary::default();
+    };
+    let schematic = &cell.schematic;
+    let position = |placement: Option<argonc::compile::Placement>| {
+        placement.and_then(|placement| placement.position)
+    };
+    SchematicSummary {
+        nets: schematic.nets.iter().map(|net| net.name.clone()).collect(),
+        elements: schematic
+            .elements
+            .iter()
+            .map(|element| match *element {
+                argonc::compile::Element::Instance(index) => {
+                    let instance = &schematic.instances[index];
+                    (
+                        instance.name.clone(),
+                        position(instance.placement),
+                        instance.span.clone(),
+                    )
+                }
+                argonc::compile::Element::Device(index) => {
+                    let device = &schematic.devices[index];
+                    (
+                        device.name.clone(),
+                        position(device.placement),
+                        device.span.clone(),
+                    )
+                }
+            })
+            .collect(),
+        connections: schematic
+            .connections
+            .iter()
+            .map(|connection| (connection.route.clone(), connection.span.clone()))
+            .collect(),
+        signals: schematic
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.source {
+                argonc::compile::NodeSource::Signal { span, .. } => {
+                    Some((schematic.nets[node.net as usize].name.clone(), span.clone()))
+                }
+                _ => None,
+            })
+            .collect(),
+        cells: data
+            .cells
+            .values()
+            .map(|cell| {
+                let symbol = cell
+                    .symbol
+                    .clone()
+                    .unwrap_or_else(|| argonc::compile::generated_box(&cell.schematic, &cell.name));
+                CellSummary {
+                    name: cell.name.clone(),
+                    body: cell.scopes[&cell.root].span.clone(),
+                    has_symbol: cell.symbol.is_some(),
+                    pins: symbol
+                        .pins
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(port, pin)| {
+                            let pin = pin.as_ref()?;
+                            Some((
+                                cell.schematic.port_name(port).to_owned(),
+                                (pin.x, pin.y),
+                                pin.site.as_ref().map(|site| site.span.clone()),
+                            ))
+                        })
+                        .collect(),
+                }
+            })
+            .collect(),
+    }
 }
 
 /// The top cell's root scope, its rect count, and its total object count.
@@ -588,6 +748,466 @@ mod tests {
         .await;
     }
 
+    const SCHEMATIC_SOURCE: &str = "use std::schematic::{DeviceKind, Signal, connect, device, signals};
+                                     cell top() {
+                                             pub let a = Signal(x=-6, y=0);
+                                             pub let vdd = Signal(x=0, y=8);
+                                             let mp = device(DeviceKind::Pmos, signals(4), \"pch\", w=1., l=0.15, x=0, y=4);
+                                             connect(a, mp.g, route=[(-4, 0), (-4, 4)]);
+                                             connect(vdd, mp.s, route=[]);
+                                     }
+";
+
+    /// Moving a device through the `place` RPC writes its placement and its
+    /// wires' routes as one edit, which one undo in Neovim reverts whole, and
+    /// a gesture drawn on a stale snapshot is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn schematic_move_roundtrip() {
+        use analyzer::rpc::{KeywordEdit, PlaceRequest, PlacementEdit};
+
+        assert_completes("moving a schematic device and undoing it", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new(SCHEMATIC_SOURCE).await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("schematic_move");
+            let analyzer = session.connect_analyzer().await;
+            session.connect_gui().await;
+
+            let mut moved = false;
+            let mut saw_move = false;
+            let mut saw_revert = false;
+            let mut stale_refused = false;
+            while !(saw_move && saw_revert && stale_refused) {
+                match session.next_event().await {
+                    GuiEvent::UpdateCell {
+                        revision,
+                        kind: OutputKind::Data,
+                        schematic,
+                        ..
+                    } if !moved => {
+                        let (name, position, span) = schematic.elements[0].clone();
+                        assert_eq!(name, "Mmp");
+                        assert_eq!(position, Some((0, 4)));
+                        let span = span.expect("a device placed in source has a span");
+                        let keyword = |name: &str, value: Option<&str>| KeywordEdit {
+                            name: name.to_owned(),
+                            value: value.map(str::to_owned),
+                        };
+                        let edits = vec![
+                            PlacementEdit {
+                                call: span,
+                                keywords: vec![keyword("x", Some("2")), keyword("y", Some("4"))],
+                            },
+                            PlacementEdit {
+                                call: schematic.connections[1].1.clone(),
+                                keywords: vec![keyword("route", Some("[(2, 8)]"))],
+                            },
+                        ];
+                        // Drawn on an older snapshot: refused, and the GUI is told.
+                        let stale = analyzer
+                            .place(
+                                context::current(),
+                                PlaceRequest {
+                                    base_revision: revision.wrapping_sub(1),
+                                    edits: edits.clone(),
+                                },
+                            )
+                            .await
+                            .expect("place request should reach analyzer");
+                        assert!(stale.is_none(), "a stale gesture must be refused");
+                        let receipt = analyzer
+                            .place(
+                                context::current(),
+                                PlaceRequest {
+                                    base_revision: revision,
+                                    edits,
+                                },
+                            )
+                            .await
+                            .expect("place request should reach analyzer")
+                            .expect("the move should be applied");
+                        assert_eq!(receipt.spans.len(), 2);
+                        moved = true;
+                    }
+                    GuiEvent::UpdateCell {
+                        kind: OutputKind::Data,
+                        schematic,
+                        ..
+                    } if moved && !saw_move => {
+                        if schematic.elements[0].1 == Some((2, 4)) {
+                            assert_eq!(schematic.connections[1].0, Some(vec![(2, 8)]));
+                            assert_eq!(schematic.connections[0].0, Some(vec![(-4, 0), (-4, 4)]));
+                            saw_move = true;
+                            std::fs::write(
+                                &session.gui_edit_ack,
+                                "ok
+",
+                            )
+                            .expect("acknowledge compiled GUI edit");
+                        }
+                    }
+                    GuiEvent::UpdateCell {
+                        kind: OutputKind::Data,
+                        schematic,
+                        ..
+                    } if saw_move && !saw_revert => {
+                        if schematic.elements[0].1 == Some((0, 4)) {
+                            assert_eq!(schematic.connections[1].0, Some(vec![]));
+                            saw_revert = true;
+                        }
+                    }
+                    GuiEvent::Message { message, .. }
+                        if message.contains("changed since this gesture began") =>
+                    {
+                        stale_refused = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            std::fs::write(
+                &session.ack,
+                "ok
+",
+            )
+            .expect("acknowledge GUI observations");
+            finish_nvim(child).await;
+            let source = std::fs::read_to_string(session.project.join("lib.ar"))
+                .expect("read round-tripped source");
+            assert_eq!(source, SCHEMATIC_SOURCE, "one undo reverts the whole move");
+        })
+        .await;
+    }
+
+    const ENTRY_SOURCE: &str = "cell child() {
+    pub let p = std::schematic::Signal(x=0, y=0);
+}
+cell top() {
+    pub let b = std::schematic::Signal(x=4, y=0);
+    let c = b;
+}
+";
+
+    /// Placing a device, adding ports, wiring them, and deleting the device
+    /// through the entry RPCs each write one edit that Neovim undoes whole;
+    /// a deletion that another statement blocks is refused with that
+    /// reference; and `:Argon device` and `:Argon sinst` preview in the GUI.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn schematic_entry_roundtrip() {
+        use analyzer::rpc::{
+            AddSignalRequest, ConnectRequest, DeleteOutcome, DeleteRequest, ElementPlacement,
+            PlaceDeviceRequest, SchematicTarget,
+        };
+
+        assert_completes("entering a schematic and undoing it", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new(ENTRY_SOURCE).await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("schematic_entry");
+            let analyzer = session.connect_analyzer().await;
+            session.connect_gui().await;
+
+            let mut step = 0;
+            let mut device_preview = None;
+            let mut instance_preview = None;
+            while !(step == 6 && device_preview.is_some() && instance_preview.is_some()) {
+                match session.next_event().await {
+                    GuiEvent::UpdateCell {
+                        revision,
+                        kind: OutputKind::Data,
+                        scope: Some(scope),
+                        schematic,
+                        ..
+                    } => {
+                        let target = SchematicTarget {
+                            base_revision: revision,
+                            cell: scope,
+                        };
+                        match step {
+                            0 => {
+                                // `b` is read by `let c = b;`, so it cannot go.
+                                let b = schematic
+                                    .signals
+                                    .iter()
+                                    .find(|(net, _)| net == "b")
+                                    .expect("b is a signal")
+                                    .1
+                                    .clone();
+                                let outcome = analyzer
+                                    .delete(
+                                        context::current(),
+                                        DeleteRequest {
+                                            base_revision: revision,
+                                            targets: vec![b],
+                                        },
+                                    )
+                                    .await
+                                    .expect("delete request should reach analyzer")
+                                    .expect("a blocked deletion still answers");
+                                let DeleteOutcome::Blocked(references) = outcome else {
+                                    panic!("deleting `b` must be blocked");
+                                };
+                                assert_eq!(references.len(), 1);
+                                assert_eq!(references[0].text, "let c = b;");
+                                analyzer
+                                    .place_device(
+                                        context::current(),
+                                        PlaceDeviceRequest {
+                                            target,
+                                            kind: "Nmos".into(),
+                                            terminals: 4,
+                                            args: "\"nch\", w=1., l=0.15".into(),
+                                            placement: ElementPlacement {
+                                                at: (0, -4),
+                                                angle: 0,
+                                                reflect: false,
+                                            },
+                                        },
+                                    )
+                                    .await
+                                    .expect("place request should reach analyzer")
+                                    .expect("the device should be placed");
+                                step = 1;
+                            }
+                            1 if schematic.elements.len() == 1 => {
+                                assert_eq!(schematic.elements[0].0, "Mnmos0");
+                                assert_eq!(schematic.elements[0].1, Some((0, -4)));
+                                analyzer
+                                    .add_signal(
+                                        context::current(),
+                                        AddSignalRequest {
+                                            target,
+                                            name: "a".into(),
+                                            port: true,
+                                            at: (-6, 0),
+                                            connect_to: Some("nmos0.g".into()),
+                                            route: Some(vec![(-6, -4)]),
+                                            placements: Vec::new(),
+                                        },
+                                    )
+                                    .await
+                                    .expect("add_signal request should reach analyzer")
+                                    .expect("the port should be added");
+                                step = 2;
+                            }
+                            2 if schematic.nets.iter().any(|net| net == "a") => {
+                                assert_eq!(schematic.connections.len(), 1);
+                                assert_eq!(schematic.connections[0].0, Some(vec![(-6, -4)]));
+                                analyzer
+                                    .add_signal(
+                                        context::current(),
+                                        AddSignalRequest {
+                                            target,
+                                            name: "vss".into(),
+                                            port: true,
+                                            at: (0, -8),
+                                            connect_to: None,
+                                            route: None,
+                                            placements: Vec::new(),
+                                        },
+                                    )
+                                    .await
+                                    .expect("add_signal request should reach analyzer")
+                                    .expect("the port should be added");
+                                step = 3;
+                            }
+                            3 if schematic.nets.iter().any(|net| net == "vss") => {
+                                analyzer
+                                    .connect(
+                                        context::current(),
+                                        ConnectRequest {
+                                            target,
+                                            a: "vss".into(),
+                                            b: "nmos0.s".into(),
+                                            route: Some(Vec::new()),
+                                            placements: Vec::new(),
+                                        },
+                                    )
+                                    .await
+                                    .expect("connect request should reach analyzer")
+                                    .expect("the wire should be written");
+                                step = 4;
+                            }
+                            4 if schematic.connections.len() == 2 => {
+                                assert_eq!(schematic.connections[1].0, Some(Vec::new()));
+                                let device = schematic.elements[0].2.clone().expect("placed");
+                                let outcome = analyzer
+                                    .delete(
+                                        context::current(),
+                                        DeleteRequest {
+                                            base_revision: revision,
+                                            targets: vec![device],
+                                        },
+                                    )
+                                    .await
+                                    .expect("delete request should reach analyzer")
+                                    .expect("the device should be deleted");
+                                assert!(matches!(outcome, DeleteOutcome::Applied(_)));
+                                step = 5;
+                            }
+                            5 if schematic.elements.is_empty() => {
+                                assert!(schematic.connections.is_empty());
+                                assert_eq!(schematic.nets, ["b", "a", "vss"]);
+                                std::fs::write(&session.gui_edit_ack, "ok\n")
+                                    .expect("acknowledge compiled GUI edits");
+                                step = 6;
+                            }
+                            _ => {}
+                        }
+                    }
+                    GuiEvent::DevicePreview(preview) => {
+                        assert_eq!(preview.kind, argonc::compile::DeviceKind::Nmos);
+                        assert_eq!(preview.terminals, 4);
+                        assert_eq!(preview.args, "\"nch\", w=1., l=0.15");
+                        device_preview = Some(preview);
+                    }
+                    GuiEvent::SchematicInstancePreview(preview) => {
+                        assert_eq!(preview.cell_name, "child");
+                        assert_eq!(preview.pin_names, ["p"]);
+                        assert_eq!(preview.invocation, "child()");
+                        instance_preview = Some(preview);
+                    }
+                    _ => {}
+                }
+            }
+            std::fs::write(&session.diagnostic_ack, "ok\n").expect("acknowledge previews");
+            std::fs::write(&session.ack, "ok\n").expect("acknowledge GUI observations");
+            finish_nvim(child).await;
+            let source = std::fs::read_to_string(session.project.join("lib.ar"))
+                .expect("read round-tripped source");
+            assert_eq!(
+                source, ENTRY_SOURCE,
+                "one undo per gesture restores the source"
+            );
+        })
+        .await;
+    }
+
+    const SYMBOL_SOURCE: &str = "cell inv() {
+    pub let a = std::schematic::Signal(x=-6, y=0);
+    pub let out = std::schematic::Signal(x=6, y=0);
+}
+cell top() {
+    pub let a = std::schematic::Signal(x=-6, y=-2);
+    pub let out = std::schematic::Signal(x=12, y=-2);
+    pub let u = std::schematic::inst(inv(), x=0, y=0);
+    std::schematic::connect(a, u.a, route=[]);
+    std::schematic::connect(out, u.out, route=[]);
+}
+";
+
+    /// Create Symbol in a child writes its generated box with the same pins,
+    /// so the parent's wires end where they did; moving a pin then moves
+    /// the parent's wire end with it; and each edit is one undo step.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn symbol_edit_roundtrip() {
+        use analyzer::rpc::{
+            CreateSymbolRequest, KeywordEdit, PlaceRequest, PlacementEdit, SchematicTarget,
+        };
+
+        assert_completes("creating and editing a symbol", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new(SYMBOL_SOURCE).await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("symbol_edit");
+            let analyzer = session.connect_analyzer().await;
+            session.connect_gui().await;
+
+            let mut step = 0;
+            let mut generated_pins = Vec::new();
+            while step < 3 {
+                let GuiEvent::UpdateCell {
+                    revision,
+                    kind: OutputKind::Data,
+                    schematic,
+                    ..
+                } = session.next_event().await
+                else {
+                    continue;
+                };
+                let inv = schematic.cells.iter().find(|cell| cell.name == "inv");
+                let Some(inv) = inv else {
+                    continue;
+                };
+                match step {
+                    0 => {
+                        assert!(!inv.has_symbol);
+                        generated_pins = inv
+                            .pins
+                            .iter()
+                            .map(|(name, at, _)| (name.clone(), *at))
+                            .collect();
+                        assert_eq!(
+                            generated_pins,
+                            [("a".to_owned(), (0, -2)), ("out".to_owned(), (4, -2))]
+                        );
+                        assert_eq!(schematic.connections.len(), 2);
+                        analyzer
+                            .create_symbol(
+                                context::current(),
+                                CreateSymbolRequest {
+                                    target: SchematicTarget {
+                                        base_revision: revision,
+                                        cell: inv.body.clone(),
+                                    },
+                                },
+                            )
+                            .await
+                            .expect("create_symbol request should reach analyzer")
+                            .expect("the symbol should be written");
+                        step = 1;
+                    }
+                    1 if inv.has_symbol => {
+                        let pins = inv
+                            .pins
+                            .iter()
+                            .map(|(name, at, _)| (name.clone(), *at))
+                            .collect::<Vec<_>>();
+                        assert_eq!(pins, generated_pins, "the drawn pins are the box's");
+                        assert_eq!(schematic.connections.len(), 2, "the parent's wires stay");
+                        let pin_a = inv.pins[0].2.clone().expect("a drawn pin has a call");
+                        analyzer
+                            .place(
+                                context::current(),
+                                PlaceRequest {
+                                    base_revision: revision,
+                                    edits: vec![PlacementEdit {
+                                        call: pin_a,
+                                        keywords: vec![KeywordEdit {
+                                            name: "y".into(),
+                                            value: Some("-3".into()),
+                                        }],
+                                    }],
+                                },
+                            )
+                            .await
+                            .expect("place request should reach analyzer")
+                            .expect("the pin should move");
+                        step = 2;
+                    }
+                    2 if inv.pins[0].1 == (0, -3) => {
+                        // The parent's routes are untouched; its wire end
+                        // follows the pin because routes end at pins.
+                        assert_eq!(schematic.connections[0].0, Some(Vec::new()));
+                        std::fs::write(&session.gui_edit_ack, "ok\n")
+                            .expect("acknowledge compiled GUI edits");
+                        step = 3;
+                    }
+                    _ => {}
+                }
+            }
+            std::fs::write(&session.ack, "ok\n").expect("acknowledge GUI observations");
+            finish_nvim(child).await;
+            let source = std::fs::read_to_string(session.project.join("lib.ar"))
+                .expect("read round-tripped source");
+            assert_eq!(
+                source, SYMBOL_SOURCE,
+                "one undo per gesture restores the source"
+            );
+        })
+        .await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn gui_connection_does_not_wait_for_initial_error_presentation() {
         assert_completes("registering GUI with initial source errors", async {
@@ -830,6 +1450,57 @@ mod tests {
             }
 
             std::fs::write(&session.ack, "ok\n").expect("acknowledge mirrored GUI error");
+            finish_nvim(child).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn library_cells_reach_the_gui_before_a_cell_is_open() {
+        assert_completes("waiting for the library's cells in the GUI", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new("cell top() {\n}\n\ncell inv(w: Float) {\n}\n").await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("cells");
+            let analyzer = session.connect_analyzer().await;
+            session.connect_gui().await;
+
+            let expected = vec![
+                CellEntry {
+                    path: "top".to_owned(),
+                    parameters: Vec::new(),
+                    requires_arguments: false,
+                },
+                CellEntry {
+                    path: "inv".to_owned(),
+                    parameters: vec!["w".to_owned()],
+                    requires_arguments: true,
+                },
+            ];
+            loop {
+                if let GuiEvent::Cells(cells) = session.next_event().await
+                    && cells == expected
+                {
+                    break;
+                }
+            }
+
+            analyzer
+                .open_cell(context::current(), "top()".to_owned())
+                .await
+                .expect("open-cell request should reach analyzer");
+            loop {
+                if let GuiEvent::UpdateCell {
+                    kind: OutputKind::Data,
+                    scope: Some(_),
+                    ..
+                } = session.next_event().await
+                {
+                    break;
+                }
+            }
+
+            std::fs::write(&session.ack, "ok\n").expect("acknowledge the opened cell");
             finish_nvim(child).await;
         })
         .await;

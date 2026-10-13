@@ -146,12 +146,15 @@ static BENCH_ALLOC: bench_alloc::Tracking = bench_alloc::Tracking;
 mod tests {
 
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use crate::{
         compile::{
-            CellId, CompiledCell, CompiledData, DetachedReason, DeviceKind, Element, ExecErrorKind,
-            MAX_TEXT_LEN, NetIdx, ParamValue, RESERVED_CELL_FIELDS, RectInitialCondition,
-            Schematic, SolvedValue, StaticErrorKind, static_compile,
+            Align, CellId, CompiledCell, CompiledData, DetachedReason, DeviceKind, Element,
+            ExecErrorKind, MAX_TEXT_LEN, NetIdx, NodeIdx, NodeSource, ParamValue, PathSegment,
+            PinLabel, Placement, RESERVED_CELL_FIELDS, RectInitialCondition, Schematic,
+            SolvedValue, StaticErrorKind, Symbol, SymbolItemKind, SymbolText, box_symbol,
+            device_symbol, generated_box, static_compile,
         },
         parse::{parse_source_text, parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
@@ -159,7 +162,9 @@ mod tests {
     use approx::assert_relative_eq;
     use approx::relative_eq;
     use const_format::concatcp;
+    use geometry::transform::Rotation;
     use indexmap::IndexMap;
+    use itertools::Itertools;
     use pegasus::drc::{DrcParams, run_drc};
 
     use crate::{
@@ -7653,12 +7658,12 @@ cell inv(pw: Float, nw: Float, nf: Int) {
         assert_eq!(
             errors[4].to_string(),
             "parameter `p` of cell `c5` has type `Pin`, which holds a `Signal` at `Pin.net`; \
-             cells cannot take signals or schematic instances"
+             cells cannot take signals, schematic instances, or devices"
         );
         assert_eq!(
             errors[0].to_string(),
-            "parameter `p` of cell `c1` has type `Signal`; cells cannot take signals or \
-             schematic instances"
+            "parameter `p` of cell `c1` has type `Signal`; cells cannot take signals, \
+             schematic instances, or devices"
         );
     }
 
@@ -7724,8 +7729,8 @@ cell inv(pw: Float, nw: Float, nf: Int) {
         );
         assert_eq!(
             errors[0].to_string(),
-            "type parameter `T` of cell `c` is `Signal`; cells cannot take signals or \
-             schematic instances"
+            "type parameter `T` of cell `c` is `Signal`; cells cannot take signals, \
+             schematic instances, or devices"
         );
     }
 
@@ -8264,6 +8269,1668 @@ cell inv(pw: Float, nw: Float, nf: Int) {
             digest("cell top() { device(DeviceKind::Res, [Signal(), Signal()], \"\", value=1.); }"),
             digest("cell top() { device(DeviceKind::Res, [Signal(), Signal()], \"\", value=2.); }")
         );
+    }
+
+    /// The path text of each node of `schematic`, in node order.
+    fn node_paths(schematic: &Schematic) -> Vec<Option<String>> {
+        schematic
+            .nodes
+            .iter()
+            .map(|node| node.path.map(|path| schematic.path_text(path)))
+            .collect()
+    }
+
+    /// The path text of every port of `schematic`.
+    fn port_paths(schematic: &Schematic) -> Vec<Option<String>> {
+        schematic
+            .port_paths
+            .iter()
+            .map(|path| path.map(|path| schematic.path_text(path)))
+            .collect()
+    }
+
+    fn some_paths<const N: usize>(paths: [Option<&str>; N]) -> Vec<Option<String>> {
+        paths.iter().map(|path| path.map(str::to_owned)).collect()
+    }
+
+    /// The text `span` selects in `source`.
+    fn span_text<'s>(source: &'s str, span: &crate::ast::Span) -> &'s str {
+        &source[span.span.start()..span.span.end()]
+    }
+
+    #[test]
+    fn the_graph_records_nodes_connections_and_terminals() {
+        let data = compile_source(
+            SCHEMATIC_INVERTER,
+            "inv",
+            vec![CellArg::Float(2.), CellArg::Float(1.), CellArg::Int(2)],
+        )
+        .unwrap_valid();
+        let inv = top_schematic(&data);
+        assert_eq!(
+            node_paths(inv),
+            some_paths([
+                Some("a"),
+                Some("out"),
+                Some("vdd"),
+                Some("vss"),
+                Some("nmos.d"),
+                Some("nmos.g"),
+                Some("nmos.s"),
+                Some("nmos.b"),
+                Some("pmos.d"),
+                Some("pmos.g"),
+                Some("pmos.s"),
+                Some("pmos.b"),
+            ])
+        );
+        assert_eq!(
+            port_paths(inv),
+            some_paths([Some("a"), Some("out"), Some("vdd"), Some("vss")])
+        );
+        for (index, node) in inv.nodes.iter().enumerate() {
+            match &node.source {
+                NodeSource::Signal {
+                    span,
+                    placement,
+                    editable,
+                } if index < 4 => {
+                    assert_eq!(span_text(SCHEMATIC_INVERTER, span), "Signal()");
+                    assert_eq!(*placement, None);
+                    assert!(*editable);
+                }
+                NodeSource::Terminal { instance, port } if index >= 4 => {
+                    assert_eq!((*instance, *port), ((index - 4) / 4, (index - 4) % 4));
+                }
+                other => panic!("node {index}: {other:?}"),
+            }
+        }
+        assert_eq!(inv.instances[0].terminal_nodes, [4, 5, 6, 7]);
+        assert_eq!(inv.instances[1].terminal_nodes, [8, 9, 10, 11]);
+        assert_eq!(
+            inv.nodes.iter().map(|node| node.public).collect_vec(),
+            [
+                true, true, true, true, false, false, false, false, false, false, false, false
+            ]
+        );
+        for instance in &inv.instances {
+            assert!(instance.editable);
+            assert_eq!(instance.placement, None);
+            assert_eq!(
+                span_text(SCHEMATIC_INVERTER, instance.span.as_ref().unwrap())[..6],
+                *"sinst("
+            );
+        }
+        assert_eq!(
+            inv.instances
+                .iter()
+                .map(|instance| inv.path_text(instance.path.unwrap()))
+                .collect_vec(),
+            ["nmos", "pmos"]
+        );
+
+        let ends = inv
+            .connections
+            .iter()
+            .map(|connection| {
+                connection
+                    .nodes
+                    .map(|node| inv.path_text(inv.nodes[node as usize].path.unwrap()))
+            })
+            .collect_vec();
+        assert_eq!(
+            ends,
+            [
+                ["a", "nmos.g"],
+                ["a", "pmos.g"],
+                ["out", "nmos.d"],
+                ["out", "pmos.d"],
+                ["vdd", "pmos.s"],
+                ["vdd", "pmos.b"],
+                ["vss", "nmos.s"],
+                ["vss", "nmos.b"],
+            ]
+            .map(|ends| ends.map(str::to_owned))
+        );
+        for connection in &inv.connections {
+            let [a, b] = connection.nodes;
+            assert_eq!(inv.nodes[a as usize].net, inv.nodes[b as usize].net);
+            assert!(span_text(SCHEMATIC_INVERTER, &connection.span).starts_with("connect("));
+            assert_eq!(connection.route, None);
+            assert!(connection.editable);
+        }
+
+        // A device joins its own terminal nodes to the signals passed for them.
+        let mos = &data.cells[&inv.instances[0].cell].schematic;
+        assert_eq!(
+            node_paths(mos),
+            some_paths([
+                Some("d"),
+                Some("g"),
+                Some("s"),
+                Some("b"),
+                None,
+                None,
+                None,
+                None
+            ])
+        );
+        let [device] = mos.devices.as_slice() else {
+            panic!("{:?}", mos.devices);
+        };
+        assert_eq!(device.terminal_nodes, [4, 5, 6, 7]);
+        assert_eq!(device.attached_nodes, [0, 1, 2, 3]);
+        assert!(device.editable);
+        assert_eq!(device.placement, None);
+        for (terminal, (own, attached)) in device
+            .terminal_nodes
+            .iter()
+            .zip(&device.attached_nodes)
+            .enumerate()
+        {
+            assert_eq!(
+                mos.nodes[*own as usize].source,
+                NodeSource::DeviceTerminal {
+                    device: 0,
+                    terminal
+                }
+            );
+            assert_eq!(
+                mos.nodes[*own as usize].net,
+                mos.nodes[*attached as usize].net
+            );
+        }
+        assert_eq!(
+            device
+                .terminal_spans
+                .iter()
+                .map(|span| span_text(SCHEMATIC_INVERTER, span.as_ref().unwrap()))
+                .collect_vec(),
+            ["d", "g", "s", "b"]
+        );
+        assert!(mos.connections.is_empty());
+    }
+
+    #[test]
+    fn paths_name_nodes_through_bindings_sequences_tuples_structs_and_instances() {
+        let data = compile_schematic(
+            "struct Pair { p: Signal, q: Signal }\n\
+             enum Wrap { W(Signal) }\n\
+             cell x() { pub let p = Signal(); pub let m = sinst(r()); connect(p, m.a); }\n\
+             cell y() { pub let bus = [Signal(), Signal()]; }\n\
+             cell top() {\n\
+                 pub let a = Signal();\n\
+                 pub let data = [a, Signal()];\n\
+                 let pair = (Signal(), a);\n\
+                 let s = Pair { p: Signal(), q: data[1] };\n\
+                 let w = Wrap::W(Signal());\n\
+                 pub let m = sinst(r());\n\
+                 let held = m.b;\n\
+                 let xi = sinst(x());\n\
+                 let yi = sinst(y());\n\
+             }",
+        );
+        let schematic = top_schematic(&data);
+        // `data[1]` is also `s.q`, which is shorter; the signal in the enum
+        // payload has no path at all.
+        assert_eq!(
+            node_paths(schematic),
+            some_paths([
+                Some("a"),
+                Some("s.q"),
+                Some("pair.0"),
+                Some("s.p"),
+                None,
+                Some("m.a"),
+                Some("held"),
+                Some("xi.p"),
+                Some("yi.bus[0]"),
+                Some("yi.bus[1]"),
+            ])
+        );
+        assert_eq!(port_names(schematic), ["a", "data_1"]);
+        assert_eq!(
+            port_paths(schematic),
+            some_paths([Some("a"), Some("data[1]")])
+        );
+        assert_eq!(
+            schematic
+                .instances
+                .iter()
+                .map(|instance| schematic.path_text(instance.path.unwrap()))
+                .collect_vec(),
+            ["m", "xi", "yi"]
+        );
+        // Paths share their prefixes.
+        let s_bindings = schematic
+            .paths
+            .iter()
+            .filter(|node| node.segment == PathSegment::Binding("s".to_owned()))
+            .count();
+        assert_eq!(s_bindings, 1);
+        let y = cell_named(&data, "y");
+        assert_eq!(
+            port_paths(&y.schematic),
+            some_paths([Some("bus[0]"), Some("bus[1]")])
+        );
+    }
+
+    #[test]
+    fn only_calls_in_the_cell_body_are_editable() {
+        let body = "fn make() -> Signal { Signal() }\n\
+                    fn wire(a: Signal, b: Signal) { connect(a, b); }\n\
+                    cell top() {\n\
+                        let a = Signal();\n\
+                        let f = make();\n\
+                        for i in std::range(1) {\n\
+                            let l = Signal();\n\
+                            let li = sinst(r());\n\
+                            connect(l, li.a);\n\
+                        }\n\
+                        if true {\n\
+                            let c = Signal();\n\
+                        }\n\
+                        let m = sinst(r());\n\
+                        connect(a, m.a);\n\
+                        wire(f, m.b);\n\
+                    }";
+        let source = format!("{SCHEMATIC_PRELUDE}{body}");
+        let data = compile_top(&source);
+        let schematic = top_schematic(&data);
+        let start_after =
+            |prefix: &str| SCHEMATIC_PRELUDE.len() + body.find(prefix).unwrap() + prefix.len();
+        let signal_after = |prefix: &str| {
+            let start = start_after(prefix);
+            schematic
+                .nodes
+                .iter()
+                .find_map(|node| match &node.source {
+                    NodeSource::Signal { span, editable, .. } if span.span.start() == start => {
+                        Some(*editable)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no signal after `{prefix}`"))
+        };
+        assert!(signal_after("let a = "));
+        assert!(
+            !signal_after("fn make() -> Signal { "),
+            "created in a function"
+        );
+        assert!(
+            !signal_after("let l = "),
+            "created in a loop, even one that ran once"
+        );
+        assert!(signal_after("let c = "), "an `if` branch runs at most once");
+        let instance_after = |prefix: &str| {
+            let start = start_after(prefix);
+            schematic
+                .instances
+                .iter()
+                .find(|instance| instance.span.as_ref().unwrap().span.start() == start)
+                .unwrap_or_else(|| panic!("no instance after `{prefix}`"))
+                .editable
+        };
+        assert!(instance_after("let m = "));
+        assert!(!instance_after("let li = "));
+        let connection_at = |text: &str| {
+            let start = SCHEMATIC_PRELUDE.len() + body.find(text).unwrap();
+            schematic
+                .connections
+                .iter()
+                .find(|connection| connection.span.span.start() == start)
+                .unwrap_or_else(|| panic!("no connection at `{text}`"))
+                .editable
+        };
+        assert!(connection_at("connect(a, m.a)"));
+        assert!(!connection_at("connect(l, li.a)"));
+        assert!(!connection_at("connect(a, b)"), "ran inside `wire`");
+    }
+
+    /// The device-level inverter, placed and wired.
+    const DEVICE_INVERTER: &str =
+        "use std::schematic::{DeviceKind, Signal, connect, device, signals};
+
+cell device_inv(pw: Float, nw: Float) {
+    pub let a = Signal(x=-6, y=0);
+    pub let out = Signal(x=4, y=0);
+    pub let vdd = Signal(x=0, y=8);
+    pub let vss = Signal(x=0, y=-8);
+
+    let mp = device(DeviceKind::Pmos, signals(4), \"pch\", w=pw, l=0.15, x=0, y=4);
+    let mn = device(DeviceKind::Nmos, signals(4), \"nch\", w=nw, l=0.15, x=0, y=-4);
+
+    connect(a, mp.g, route=[(-4, 0), (-4, 4)]);
+    connect(a, mn.g, route=[(-4, 0), (-4, -4)]);
+    connect(out, mp.d, route=[(0, 0)]);
+    connect(out, mn.d, route=[(0, 0)]);
+    connect(vdd, mp.s, route=[]);
+    connect(vdd, mp.b, route=[(2, 8)]);
+    connect(vss, mn.s, route=[]);
+    connect(vss, mn.b, route=[(2, -8)]);
+}
+";
+
+    /// `device_inv(2., 1.)` of `source`.
+    fn compile_device_inverter(source: &str) -> CompiledData {
+        compile_source(
+            source,
+            "device_inv",
+            vec![CellArg::Float(2.), CellArg::Float(1.)],
+        )
+        .unwrap_valid()
+    }
+
+    /// `source` without its placement and route keywords, and with `Mos` in
+    /// place of the MOS polarity kinds.
+    fn without_drawing(source: &str) -> String {
+        let signals = regex::Regex::new(r"Signal\(x=-?\d+, y=-?\d+\)").unwrap();
+        let keywords = regex::Regex::new(r", (x|y|angle)=-?\d+").unwrap();
+        let routes = regex::Regex::new(r", route=\[[^\]]*\]").unwrap();
+        let source = signals.replace_all(source, "Signal()");
+        let source = keywords.replace_all(&source, "");
+        let source = routes.replace_all(&source, "");
+        source.replace("Pmos", "Mos").replace("Nmos", "Mos")
+    }
+
+    fn spice(data: &CompiledData) -> String {
+        crate::netlist::netlist(
+            data,
+            crate::netlist::NetlistFormat::Spice,
+            &crate::netlist::NetlistOptions::default(),
+        )
+    }
+
+    fn spectre(data: &CompiledData) -> String {
+        crate::netlist::netlist(
+            data,
+            crate::netlist::NetlistFormat::Spectre,
+            &crate::netlist::NetlistOptions::default(),
+        )
+    }
+
+    #[test]
+    fn placement_coordinates_come_in_pairs_of_grid_units() {
+        let errors = schematic_static_errors(
+            "cell top() {\n\
+                 let a = Signal(x=1);\n\
+                 let m = sinst(r(), y=2);\n\
+                 device(DeviceKind::Res, [a, m.a], \"\", value=1., x=3);\n\
+             }",
+        );
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [
+                    StaticErrorKind::UnpairedCoordinate { given: a, missing: b },
+                    StaticErrorKind::UnpairedCoordinate { given: c, missing: d },
+                    StaticErrorKind::UnpairedCoordinate { given: e, missing: f },
+                ] if [a, b, c, d, e, f].map(String::as_str) == ["x", "y", "y", "x", "x", "y"]
+            ),
+            "{errors:?}"
+        );
+
+        let errors = schematic_static_errors(
+            "cell top() {\n\
+                 let a = Signal(x=0., y=1);\n\
+                 let m = sinst(r(), x=1, y=2, angle=90.);\n\
+                 connect(a, m.a, route=[(0., 1.)]);\n\
+                 device(DeviceKind::Res, [a, m.b], \"\", value=1., x=2., y=0);\n\
+                 let b = Signal(x=0, y=0, reflect=true);\n\
+                 let n = sinst(r(), x=0, y=0, reflect=1);\n\
+             }",
+        );
+        let hints = errors
+            .iter()
+            .map(|error| match error {
+                StaticErrorKind::GridUnits { hint } => hint.as_str(),
+                StaticErrorKind::InvalidKwArg => "<invalid keyword>",
+                StaticErrorKind::IncorrectTy { expected, .. } => expected.as_str(),
+                other => panic!("{other:?}"),
+            })
+            .collect_vec();
+        assert_eq!(
+            hints,
+            [
+                "x=0",
+                "angle=0",
+                "route=[(0, 0)]",
+                "x=0",
+                "<invalid keyword>",
+                "Bool"
+            ]
+        );
+    }
+
+    #[test]
+    fn reserved_device_keywords_are_rejected_in_any_case() {
+        let errors = schematic_static_errors(
+            "cell top() {\n\
+                 let a = Signal();\n\
+                 device(DeviceKind::Res, [a, a], \"\", value=1., X=1, ANGLE=2, Reflect=true);\n\
+             }",
+        );
+        let reserved = errors
+            .iter()
+            .map(|error| match error {
+                StaticErrorKind::ReservedDeviceParam { name, lower } => {
+                    (name.as_str(), lower.as_str())
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect_vec();
+        assert_eq!(
+            reserved,
+            [("X", "x"), ("ANGLE", "angle"), ("Reflect", "reflect")]
+        );
+
+        // In lower case, they place the device instead of parameterizing it.
+        let data = compile_schematic(
+            "cell top() {\n\
+                 let a = Signal();\n\
+                 device(DeviceKind::Res, [a, a], \"\", value=1., x=1, y=2, angle=90, reflect=true);\n\
+             }",
+        );
+        let [device] = top_schematic(&data).devices.as_slice() else {
+            panic!("{:?}", top_schematic(&data).devices);
+        };
+        assert!(device.params.is_empty());
+        assert_eq!(device.value, Some(ParamValue::Float(1.)));
+        assert_eq!(
+            device.placement,
+            Some(Placement {
+                position: Some((1, 2)),
+                angle: Rotation::R90,
+                reflect: true,
+            })
+        );
+    }
+
+    #[test]
+    fn placements_are_recorded_with_normalized_angles() {
+        let data = compile_schematic(
+            "cell top() {\n\
+                 pub let a = Signal(x=-8, y=0);\n\
+                 let b = Signal(angle=450);\n\
+                 let m = sinst(r(), x=4, y=-4, angle=-90, reflect=true);\n\
+                 let d = device(DeviceKind::Res, [a, b], \"\", value=1., x=6, y=0);\n\
+                 let unplaced = Signal();\n\
+             }",
+        );
+        let schematic = top_schematic(&data);
+        let placement_of =
+            |path: &str| match &schematic.nodes[node_at(schematic, path) as usize].source {
+                NodeSource::Signal { placement, .. } => *placement,
+                other => panic!("{other:?}"),
+            };
+        assert_eq!(
+            placement_of("a"),
+            Some(Placement {
+                position: Some((-8, 0)),
+                angle: Rotation::R0,
+                reflect: false,
+            })
+        );
+        assert_eq!(
+            placement_of("b"),
+            Some(Placement {
+                position: None,
+                angle: Rotation::R90,
+                reflect: false,
+            })
+        );
+        assert_eq!(placement_of("unplaced"), None);
+        assert_eq!(
+            schematic.instances[0].placement,
+            Some(Placement {
+                position: Some((4, -4)),
+                angle: Rotation::R270,
+                reflect: true,
+            })
+        );
+        assert_eq!(
+            schematic.devices[0].placement,
+            Some(Placement {
+                position: Some((6, 0)),
+                angle: Rotation::R0,
+                reflect: false,
+            })
+        );
+
+        let errors = run_schematic("cell top() { let a = Signal(x=0, y=0, angle=45); }");
+        assert!(
+            matches!(errors.as_slice(), [ExecErrorKind::InvalidRotation]),
+            "{errors:?}"
+        );
+    }
+
+    /// The index of the node of `schematic` whose path is `path`.
+    fn node_at(schematic: &Schematic, path: &str) -> NodeIdx {
+        node_paths(schematic)
+            .iter()
+            .position(|found| found.as_deref() == Some(path))
+            .unwrap_or_else(|| panic!("no node at `{path}`")) as NodeIdx
+    }
+
+    #[test]
+    fn routes_are_recorded_on_their_connections() {
+        let data = compile_schematic(
+            "cell top() {\n\
+                 let a = Signal();\n\
+                 let m = sinst(r());\n\
+                 connect(a, m.a, route=[(-4, 0), (-4, 4)]);\n\
+                 connect(a, m.b, route=[]);\n\
+                 connect(m.a, m.b);\n\
+                 for i in std::range(2) {\n\
+                     connect(a, m.a, route=[(4 * i, 6)]);\n\
+                 }\n\
+             }",
+        );
+        let schematic = top_schematic(&data);
+        let routes = schematic
+            .connections
+            .iter()
+            .map(|connection| connection.route.clone())
+            .collect_vec();
+        assert_eq!(
+            routes,
+            [
+                Some(vec![(-4, 0), (-4, 4)]),
+                Some(vec![]),
+                None,
+                Some(vec![(0, 6)]),
+                Some(vec![(4, 6)]),
+            ]
+        );
+        assert_eq!(
+            schematic
+                .connections
+                .iter()
+                .map(|connection| connection.editable)
+                .collect_vec(),
+            [true, true, true, false, false]
+        );
+    }
+
+    #[test]
+    fn placement_and_routes_change_the_digest_but_not_the_netlist() {
+        let placed = compile_device_inverter(DEVICE_INVERTER);
+        let bare_source = without_drawing(DEVICE_INVERTER);
+        assert!(!bare_source.contains("x=") && !bare_source.contains("route="));
+        let bare = compile_device_inverter(&bare_source);
+        assert_eq!(spice(&placed), spice(&bare));
+        assert_eq!(spectre(&placed), spectre(&bare));
+        assert_ne!(placed.geometry_digest(), bare.geometry_digest());
+        assert_eq!(
+            spice(&placed).lines().skip(3).collect_vec(),
+            [
+                ".subckt device_inv a out vdd vss",
+                "Mmp out a vdd vdd pch w=2 l=0.15",
+                "Mmn out a vss vss nch w=1 l=0.15",
+                ".ends device_inv",
+            ]
+        );
+
+        let schematic = top_schematic(&placed);
+        assert_eq!(
+            schematic.devices.iter().map(|d| d.kind).collect_vec(),
+            [DeviceKind::Pmos, DeviceKind::Nmos]
+        );
+        assert_eq!(
+            top_schematic(&bare)
+                .devices
+                .iter()
+                .map(|d| d.kind)
+                .collect_vec(),
+            [DeviceKind::Mos, DeviceKind::Mos]
+        );
+        // Every connection is routed, between the nodes its source names.
+        assert!(schematic.connections.iter().all(|c| c.route.is_some()));
+        assert_eq!(
+            schematic
+                .connections
+                .iter()
+                .map(|c| c
+                    .nodes
+                    .map(|n| schematic.path_text(schematic.nodes[n as usize].path.unwrap())))
+                .collect_vec()[..2],
+            [["a", "mp.g"], ["a", "mn.g"]].map(|ends| ends.map(str::to_owned))
+        );
+    }
+
+    #[test]
+    fn device_handles_read_their_terminals() {
+        let body = "use std::schematic::signals;\n\
+             cell top() {\n\
+                 let a = Signal();\n\
+                 let b = Signal();\n\
+                 let m = device(DeviceKind::Mos, signals(4), \"nch\", w=1., l=1.);\n\
+                 let d = device(DeviceKind::Diode, [a, b], \"dio\");\n\
+                 let q = device(DeviceKind::Bjt, signals(4), \"npn\");\n\
+                 let k = device(DeviceKind::Subckt, signals(2), \"sub\");\n\
+                 connect(m.g, a);\n\
+                 connect(m.d, b);\n\
+                 connect(q.sub, d.n);\n\
+                 connect(k.terminals[0], m.s);\n\
+                 connect(k.terminals[1], m.b);\n\
+             }";
+        let errors = run_schematic(body);
+        assert!(errors.is_empty(), "{errors:?}");
+        let data = compile_schematic(body);
+        let schematic = top_schematic(&data);
+        let names = schematic
+            .devices
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect_vec();
+        assert_eq!(names, ["Mm", "Dd", "Qq", "Xk"]);
+        let [m, d, q, k] = schematic.devices.as_slice() else {
+            panic!("{:?}", schematic.devices);
+        };
+        assert_eq!(names_of(schematic, &m.terminals), ["b", "a", "m_s", "m_b"]);
+        assert_eq!(names_of(schematic, &d.terminals), ["a", "b"]);
+        assert_eq!(
+            names_of(schematic, &q.terminals),
+            ["q_c", "q_b", "q_e", "b"]
+        );
+        assert_eq!(names_of(schematic, &k.terminals), ["m_s", "m_b"]);
+        assert_eq!(
+            schematic
+                .devices
+                .iter()
+                .map(|d| schematic.path_text(d.path.unwrap()))
+                .collect_vec(),
+            ["m", "d", "q", "k"]
+        );
+        for path in [
+            "m.d",
+            "m.g",
+            "m.s",
+            "m.b",
+            "d.p",
+            "d.n",
+            "q.sub",
+            "k.terminals[0]",
+            "k.terminals[1]",
+        ] {
+            node_at(schematic, path);
+        }
+        // A terminal is a node of the device's own, joined to the signal
+        // passed for it.
+        for device in &schematic.devices {
+            for (own, attached) in device.terminal_nodes.iter().zip(&device.attached_nodes) {
+                assert_ne!(own, attached);
+                assert_eq!(
+                    schematic.nodes[*own as usize].net,
+                    schematic.nodes[*attached as usize].net
+                );
+            }
+        }
+        // The fresh signals of `signals` were made in `std`, so they have no
+        // path and cannot be edited.
+        for attached in &m.attached_nodes {
+            let node = &schematic.nodes[*attached as usize];
+            assert_eq!(node.path, None);
+            assert!(matches!(
+                node.source,
+                NodeSource::Signal {
+                    editable: false,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(
+            d.attached_nodes,
+            [node_at(schematic, "a"), node_at(schematic, "b")]
+        );
+    }
+
+    #[test]
+    fn a_terminal_the_kind_lacks_is_an_error() {
+        let errors = run_schematic(
+            "cell top() {\n\
+                 let r = device(DeviceKind::Res, [Signal(), Signal()], \"\", value=1.);\n\
+                 connect(r.g, Signal());\n\
+             }",
+        );
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ExecErrorKind::NoDeviceTerminal { field, kind }] if field == "g" && kind == "Res"
+            ),
+            "{errors:?}"
+        );
+        let errors = schematic_static_errors(
+            "cell top() {\n\
+                 let r = device(DeviceKind::Res, [Signal(), Signal()], \"\", value=1.);\n\
+                 connect(r.gate, Signal());\n\
+             }",
+        );
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [StaticErrorKind::NoFieldOnTy { field, ty }] if field == "gate" && ty == "Device"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn the_handle_is_ready_before_parameters_that_wait_for_the_solver() {
+        let data = compile_schematic(
+            "use std::schematic::signals;\n\
+             cell top() {\n\
+                 let w = float();\n\
+                 pub let a = Signal();\n\
+                 let m = device(DeviceKind::Nmos, signals(4), \"nch\", w=w);\n\
+                 connect(a, m.g);\n\
+                 eq(w * 2., 5.);\n\
+             }",
+        );
+        let schematic = top_schematic(&data);
+        let [m] = schematic.devices.as_slice() else {
+            panic!("{:?}", schematic.devices);
+        };
+        assert_eq!(m.params, [("w".to_owned(), ParamValue::Float(2.5))]);
+        assert_eq!(m.model.as_deref(), Some("nch"));
+        assert_eq!(
+            names_of(schematic, &m.terminals),
+            ["m_d", "a", "m_s", "m_b"]
+        );
+        assert_eq!(schematic.connections.len(), 1);
+    }
+
+    #[test]
+    fn devices_are_named_by_their_bindings() {
+        let data = compile_schematic(
+            "use std::schematic::signals;\n\
+             cell top() {\n\
+                 let single = device(DeviceKind::Res, signals(2), \"\", value=1.);\n\
+                 let row = [\n\
+                     device(DeviceKind::Cap, signals(2), \"\", value=1.),\n\
+                     device(DeviceKind::Cap, signals(2), \"\", value=2.),\n\
+                 ];\n\
+                 device(DeviceKind::Res, signals(2), \"\", value=3.);\n\
+                 for i in std::range(2) {\n\
+                     let looped = device(DeviceKind::Res, signals(2), \"\", value=4.);\n\
+                 }\n\
+             }",
+        );
+        let schematic = top_schematic(&data);
+        assert_eq!(
+            schematic
+                .devices
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect_vec(),
+            ["Rsingle", "Crow_0", "Crow_1", "R3", "Rlooped", "Rlooped_1"]
+        );
+        assert_eq!(
+            net_names(schematic),
+            [
+                "single_p",
+                "single_n",
+                "row_0_p",
+                "row_0_n",
+                "row_1_p",
+                "row_1_n",
+                "R3_p",
+                "R3_n",
+                "looped_p",
+                "looped_n",
+                "looped_1_p",
+                "looped_1_n",
+            ]
+        );
+        assert!(schematic.ports.is_empty());
+    }
+
+    #[test]
+    fn a_device_terminal_is_never_a_port() {
+        let data = compile_schematic(
+            "use std::schematic::signals;\n\
+             cell top() {\n\
+                 pub let m = device(DeviceKind::Res, signals(2), \"\", value=1.);\n\
+                 pub let p = m.p;\n\
+                 pub let s = Signal();\n\
+                 connect(s, m.n);\n\
+             }",
+        );
+        let schematic = top_schematic(&data);
+        assert_eq!(port_names(schematic), ["s"]);
+    }
+
+    #[test]
+    fn devices_read_through_instances() {
+        let child = "cell x() {\n\
+                         pub let p = Signal();\n\
+                         pub let m = device(DeviceKind::Res, [p, Signal()], \"\", value=1.);\n\
+                     }\n";
+        let data = compile_schematic(&format!(
+            "{child}cell top() {{\n\
+                 let xi = sinst(x());\n\
+                 let net = Signal();\n\
+                 connect(net, xi.m.p);\n\
+                 let held = xi.m.n;\n\
+             }}"
+        ));
+        let schematic = top_schematic(&data);
+        assert_eq!(
+            names_of(schematic, &schematic.instances[0].terminals),
+            ["net"]
+        );
+
+        let errors = run_schematic(&format!(
+            "{child}cell top() {{\n\
+                 let xi = sinst(x());\n\
+                 connect(Signal(), xi.m.n);\n\
+                 let li = std::layout::inst(x(), x=0., y=0.);\n\
+                 connect(Signal(), li.m.p);\n\
+             }}"
+        ));
+        let mut reads = detached_reads(&errors);
+        reads.sort_by_key(|(reason, _, _)| *reason != DetachedReason::InternalNet);
+        assert_eq!(
+            reads,
+            [
+                (DetachedReason::InternalNet, "x", "m.n"),
+                (DetachedReason::ThroughLayoutInstance, "x", "m"),
+            ]
+        );
+    }
+
+    #[test]
+    fn devices_cannot_be_cell_arguments() {
+        let errors = schematic_static_errors(
+            "use std::schematic::Device;\n\
+             cell c(d: Device) {}\n\
+             cell g<T>(x: T) {}\n\
+             cell top() {\n\
+                 let m = device(DeviceKind::Res, [Signal(), Signal()], \"\", value=1.);\n\
+                 let bad = g(m);\n\
+             }",
+        );
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [
+                    StaticErrorKind::SignalCellParam { param: a, found: b, type_param: false, .. },
+                    StaticErrorKind::SignalCellParam { param: c, found: d, type_param: true, .. },
+                ] if (a.as_str(), b.as_str(), c.as_str(), d.as_str()) == ("d", "Device", "T", "Device")
+            ),
+            "{errors:?}"
+        );
+        let errors = run_schematic(
+            "cell c(x: Any) {}\n\
+             cell top() {\n\
+                 let m = device(DeviceKind::Res, [Signal(), Signal()], \"\", value=1.);\n\
+                 let k = c(m);\n\
+             }",
+        );
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ExecErrorKind::SignalCellArgument { kind }] if kind == "device"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn the_device_type_is_only_a_name() {
+        let errors = schematic_static_errors(
+            "use std::schematic::Device;\n\
+             fn pass(d: Device) -> Device { d }\n\
+             cell top() {\n\
+                 let m = device(DeviceKind::Res, [Signal(), Signal()], \"\", value=1.);\n\
+                 let n = pass(m);\n\
+                 let g: Signal = n.p;\n\
+                 let ts: [Signal] = n.terminals;\n\
+                 let value = Device;\n\
+                 let call = Device();\n\
+                 let same = m == n;\n\
+                 m!;\n\
+             }",
+        );
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [
+                    StaticErrorKind::TypeNotValue { name: a },
+                    StaticErrorKind::TypeNotValue { name: b },
+                    StaticErrorKind::ComparisonInvalidType,
+                    StaticErrorKind::ComparisonInvalidType,
+                    StaticErrorKind::CannotEmit(c),
+                ] if a == "Device" && b == "Device" && c == "Device"
+            ),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn polarity_kinds_netlist_as_their_base_kind() {
+        let data = compile_schematic(
+            "cell w(polar: Bool) {\n\
+                 pub let a = Signal();\n\
+                 pub let b = Signal();\n\
+                 pub let c = Signal();\n\
+                 pub let d = Signal();\n\
+                 let kind = if polar { DeviceKind::Nmos } else { DeviceKind::Mos };\n\
+                 device(kind, [a, b, c, d], \"nch\", w=1.);\n\
+             }\n\
+             cell top() {\n\
+                 let a = Signal();\n\
+                 let n = device(DeviceKind::Nmos, [a, a, a, a], \"nch\", w=1.);\n\
+                 let p = device(DeviceKind::Pmos, [a, a, a, a], \"pch\", w=1.);\n\
+                 let q = device(DeviceKind::Npn, [a, a, a], \"npn\");\n\
+                 let r = device(DeviceKind::Pnp, [a, a, a, a], \"pnp\");\n\
+                 let polar = sinst(w(true));\n\
+                 let plain = sinst(w(false));\n\
+                 connect(n.s, p.s);\n\
+                 connect(q.e, r.sub);\n\
+             }",
+        );
+        let schematic = top_schematic(&data);
+        assert_eq!(
+            schematic
+                .devices
+                .iter()
+                .map(|d| (d.kind, d.kind.base(), d.kind.letter()))
+                .collect_vec(),
+            [
+                (DeviceKind::Nmos, DeviceKind::Mos, 'M'),
+                (DeviceKind::Pmos, DeviceKind::Mos, 'M'),
+                (DeviceKind::Npn, DeviceKind::Bjt, 'Q'),
+                (DeviceKind::Pnp, DeviceKind::Bjt, 'Q'),
+            ]
+        );
+        let body = spice(&data);
+        let lines = body.lines().collect_vec();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with(".subckt w"))
+                .count(),
+            1
+        );
+        assert!(lines.contains(&"Mn a a a a nch w=1"), "{body}");
+        assert!(lines.contains(&"Mp a a a a pch w=1"), "{body}");
+        assert!(lines.contains(&"Qq a a a npn"), "{body}");
+        assert!(lines.contains(&"Qr a a a a pnp"), "{body}");
+        assert!(
+            lines.contains(&"Xpolar polar_a polar_b polar_c polar_d w"),
+            "{body}"
+        );
+        assert!(
+            lines.contains(&"Xplain plain_a plain_b plain_c plain_d w"),
+            "{body}"
+        );
+    }
+
+    /// The symbol imports every symbol test starts with.
+    const SYMBOL_PRELUDE: &str = "use std::symbol::{Align, arc, circle, inst_name, line, param, pin, polygon, rect, text};\n";
+
+    /// `top` of `body` after the schematic and symbol imports.
+    fn compile_symbol(body: &str) -> CompiledData {
+        compile_top(&format!("{SCHEMATIC_PRELUDE}{SYMBOL_PRELUDE}{body}"))
+    }
+
+    /// The execution errors of `top` in `body`, with their spans, and the
+    /// partial output.
+    fn symbol_errors(body: &str) -> (Vec<crate::compile::ExecError>, Option<CompiledData>) {
+        let source = format!("{SCHEMATIC_PRELUDE}{SYMBOL_PRELUDE}{body}");
+        match compile_source(&source, "top", Vec::new()) {
+            CompileOutput::ExecErrors(output) => (output.errors, output.output),
+            CompileOutput::Valid(data) => (Vec::new(), Some(data)),
+            other => panic!("{other:#?}"),
+        }
+    }
+
+    fn top_symbol(data: &CompiledData) -> &Symbol {
+        data.cells[&data.top]
+            .symbol
+            .as_ref()
+            .expect("the cell draws a symbol")
+    }
+
+    fn item_kinds(symbol: &Symbol) -> Vec<&SymbolItemKind> {
+        symbol.items.iter().map(|item| &item.kind).collect()
+    }
+
+    /// The position of each pin of `symbol`, in port order.
+    fn pin_positions(symbol: &Symbol) -> Vec<Option<(i64, i64)>> {
+        symbol
+            .pins
+            .iter()
+            .map(|pin| pin.as_ref().map(|pin| (pin.x, pin.y)))
+            .collect()
+    }
+
+    fn label(x: f64, y: f64, align: Align) -> Option<PinLabel> {
+        Some(PinLabel { x, y, align })
+    }
+
+    #[test]
+    fn symbol_items_are_recorded_in_call_order_with_defaults() {
+        let data = compile_symbol(
+            "cell top() {\n\
+                 pub let a = Signal();\n\
+                 line([(-4., 0.), (-2., 0.)]);\n\
+                 polygon([(-2., 2.), (-2., -2.), (2., 0.)]);\n\
+                 polygon([(0., 0.), (1., 0.), (0., 1.)], fill=true);\n\
+                 rect(x0=0., y0=-4., x1=4., y1=0.);\n\
+                 circle(x=2.25, y=0., r=0.25, fill=true);\n\
+                 arc(x=0., y=0., r=1., start=0., end=90.);\n\
+                 text(\"VDD\", x=1., y=3.);\n\
+                 text(\"out\", x=4., y=0., size=0.5, align=Align::Right);\n\
+                 inst_name(x=2., y=2., align=Align::Center);\n\
+                 param(\"w\", 0.15, x=2., y=-2.);\n\
+                 param(\"n\", 3, x=2., y=-3.);\n\
+                 param(\"m\", \"x2\", x=2., y=-4.);\n\
+                 pin(a, x=-4, y=0, label=true);\n\
+             }",
+        );
+        let symbol = top_symbol(&data);
+        let text =
+            |text: SymbolText, x: f64, y: f64, size: f64, align: Align| SymbolItemKind::Text {
+                text,
+                x,
+                y,
+                size,
+                align,
+            };
+        assert_eq!(
+            item_kinds(symbol),
+            [
+                &SymbolItemKind::Line {
+                    points: vec![(-4., 0.), (-2., 0.)]
+                },
+                &SymbolItemKind::Polygon {
+                    points: vec![(-2., 2.), (-2., -2.), (2., 0.)],
+                    fill: false
+                },
+                &SymbolItemKind::Polygon {
+                    points: vec![(0., 0.), (1., 0.), (0., 1.)],
+                    fill: true
+                },
+                &SymbolItemKind::Rect {
+                    x0: 0.,
+                    y0: -4.,
+                    x1: 4.,
+                    y1: 0.,
+                    fill: false
+                },
+                &SymbolItemKind::Circle {
+                    x: 2.25,
+                    y: 0.,
+                    r: 0.25,
+                    fill: true
+                },
+                &SymbolItemKind::Arc {
+                    x: 0.,
+                    y: 0.,
+                    r: 1.,
+                    start: 0.,
+                    end: 90.
+                },
+                &text(SymbolText::Literal("VDD".into()), 1., 3., 1., Align::Left),
+                &text(SymbolText::Literal("out".into()), 4., 0., 0.5, Align::Right),
+                &text(SymbolText::InstName, 2., 2., 1., Align::Center),
+                &text(
+                    SymbolText::Param {
+                        name: "w".into(),
+                        value: ParamValue::Float(0.15)
+                    },
+                    2.,
+                    -2.,
+                    1.,
+                    Align::Left
+                ),
+                &text(
+                    SymbolText::Param {
+                        name: "n".into(),
+                        value: ParamValue::Int(3)
+                    },
+                    2.,
+                    -3.,
+                    1.,
+                    Align::Left
+                ),
+                &text(
+                    SymbolText::Param {
+                        name: "m".into(),
+                        value: ParamValue::String("x2".into())
+                    },
+                    2.,
+                    -4.,
+                    1.,
+                    Align::Left
+                ),
+            ]
+        );
+        assert!(
+            symbol
+                .items
+                .iter()
+                .all(|item| item.site.as_ref().is_some_and(|s| s.editable))
+        );
+        // The shapes span x from -4 to 4, so the pin at (-4, 0) is on the left.
+        let [Some(pin)] = symbol.pins.as_slice() else {
+            panic!("{:?}", symbol.pins);
+        };
+        assert_eq!((pin.x, pin.y), (-4, 0));
+        assert_eq!(pin.label, label(-3.5, 1., Align::Left));
+        assert!(
+            pin.site
+                .as_ref()
+                .is_some_and(|s| s.editable && s.origin.is_none())
+        );
+        // Text is left out of the size.
+        assert_eq!(symbol.bounds(), Some((-4., -4., 4., 2.)));
+    }
+
+    #[test]
+    fn symbol_arguments_are_checked() {
+        let errors = static_errors_of(&format!(
+            "{SCHEMATIC_PRELUDE}{SYMBOL_PRELUDE}\
+             cell top() {{\n\
+                 pub let a = Signal();\n\
+                 pin(a, x=0., y=0);\n\
+                 rect(x0=0., y0=0.);\n\
+                 text(\"a\");\n\
+                 param(\"w\", true, x=0., y=0.);\n\
+                 line(1);\n\
+             }}"
+        ));
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [
+                    StaticErrorKind::GridUnits { hint },
+                    StaticErrorKind::MissingKwArg { name: x1 },
+                    StaticErrorKind::MissingKwArg { name: y1 },
+                    StaticErrorKind::MissingKwArg { name: x },
+                    StaticErrorKind::MissingKwArg { name: y },
+                    StaticErrorKind::InvalidParamValueType { found },
+                    StaticErrorKind::IncorrectTy { .. },
+                ] if hint == "x=0" && x1 == "x1" && y1 == "y1" && x == "x" && y == "y" && found == "Bool"
+            ),
+            "{errors:?}"
+        );
+
+        let (errors, output) = symbol_errors(
+            "cell top() {\n\
+                 line([(0., 0.)]);\n\
+                 polygon([(0., 0.), (1., 1.)]);\n\
+                 circle(x=0., y=0., r=0.);\n\
+                 text(\"a\", x=0., y=0., size=0.);\n\
+                 rect(x0=0., y0=0., x1=1., y1=1.);\n\
+             }",
+        );
+        let mut reasons = errors
+            .iter()
+            .map(|error| match &error.kind {
+                ExecErrorKind::InvalidSymbol(reason) => reason.as_str(),
+                other => panic!("{other:?}"),
+            })
+            .collect_vec();
+        reasons.sort_unstable();
+        assert_eq!(
+            reasons,
+            [
+                "a circle's radius must be positive",
+                "a line needs at least two points",
+                "a polygon needs at least three points",
+                "a text size must be positive",
+            ]
+        );
+        // The rest of the symbol is still drawn.
+        let output = output.expect("a partial output");
+        assert_eq!(top_symbol(&output).items.len(), 1);
+
+        // A coordinate may wait for the solver.
+        let data = compile_symbol(
+            "cell top() {\n\
+                 let w = float();\n\
+                 rect(x0=0., y0=0., x1=w, y1=1.);\n\
+                 eq(w * 2., 6.);\n\
+             }",
+        );
+        assert!(matches!(
+            item_kinds(top_symbol(&data)).as_slice(),
+            [SymbolItemKind::Rect { x1, .. }] if *x1 == 3.
+        ));
+    }
+
+    #[test]
+    fn pins_name_ports_through_terminals_and_connected_signals() {
+        let data = compile_symbol(
+            "use std::schematic::signals;\n\
+             cell top() {\n\
+                 pub let a = Signal();\n\
+                 pub let b = Signal();\n\
+                 pub let c = Signal();\n\
+                 let m = sinst(r());\n\
+                 connect(a, m.a);\n\
+                 let d = device(DeviceKind::Res, signals(2), \"\", value=1.);\n\
+                 connect(b, d.p);\n\
+                 pin(m.a, x=-2, y=0);\n\
+                 pin(d.p, x=2, y=0);\n\
+                 pin(c, x=0, y=2);\n\
+             }",
+        );
+        let symbol = top_symbol(&data);
+        assert_eq!(port_names(top_schematic(&data)), ["a", "b", "c"]);
+        assert_eq!(
+            pin_positions(symbol),
+            [Some((-2, 0)), Some((2, 0)), Some((0, 2))]
+        );
+        // Without shapes, the pins' own bounds place the labels; none asked
+        // for one here.
+        assert!(symbol.pins.iter().flatten().all(|pin| pin.label.is_none()));
+    }
+
+    #[test]
+    fn each_pin_error_is_reported() {
+        let body = "cell top() {\n\
+                        pub let a = Signal();\n\
+                        pub let b = Signal();\n\
+                        pub let vdd = Signal();\n\
+                        let hidden = Signal();\n\
+                        pin(a, x=0, y=0);\n\
+                        pin(a, x=2, y=0);\n\
+                        pin(b, x=0, y=0);\n\
+                        pin(hidden, x=4, y=0);\n\
+                    }";
+        let (errors, output) = symbol_errors(body);
+        let source = format!("{SCHEMATIC_PRELUDE}{SYMBOL_PRELUDE}{body}");
+        let reported = errors
+            .iter()
+            .map(|error| {
+                (
+                    error.kind.to_string(),
+                    error.span.as_ref().map(|span| span_text(&source, span)),
+                )
+            })
+            .collect_vec();
+        assert_eq!(
+            reported,
+            [
+                (
+                    ExecErrorKind::DuplicatePin { port: "a".into() }.to_string(),
+                    Some("pin(a, x=2, y=0)")
+                ),
+                (
+                    ExecErrorKind::CoincidentPins { x: 0, y: 0 }.to_string(),
+                    Some("pin(b, x=0, y=0)")
+                ),
+                (
+                    ExecErrorKind::PinNotOnPort.to_string(),
+                    Some("pin(hidden, x=4, y=0)")
+                ),
+                (
+                    ExecErrorKind::PortWithoutPin { port: "b".into() }.to_string(),
+                    Some("pub let b = Signal()")
+                ),
+                (
+                    ExecErrorKind::PortWithoutPin { port: "vdd".into() }.to_string(),
+                    Some("pub let vdd = Signal()")
+                ),
+            ]
+        );
+        // The pins that passed are drawn.
+        let output = output.expect("a partial output");
+        assert_eq!(
+            pin_positions(top_symbol(&output)),
+            [Some((0, 0)), None, None]
+        );
+    }
+
+    #[test]
+    fn a_symbol_drawn_in_a_function_belongs_to_the_caller() {
+        let body = "fn boxed(a: Signal) {\n\
+                        rect(x0=0., y0=0., x1=2., y1=2.);\n\
+                        pin(a, x=0, y=1);\n\
+                    }\n\
+                    cell top() {\n\
+                        pub let a = Signal();\n\
+                        boxed(a);\n\
+                        text(\"t\", x=0., y=3.);\n\
+                    }";
+        let source = format!("{SCHEMATIC_PRELUDE}{SYMBOL_PRELUDE}{body}");
+        let data = compile_top(&source);
+        let symbol = top_symbol(&data);
+        let [rect, text] = symbol.items.as_slice() else {
+            panic!("{:?}", symbol.items);
+        };
+        let rect_site = rect.site.as_ref().unwrap();
+        assert_eq!(
+            rect_site
+                .origin
+                .as_ref()
+                .map(|span| span_text(&source, span)),
+            Some("boxed(a)")
+        );
+        assert!(!rect_site.editable, "drawn in a function");
+        assert_eq!(
+            span_text(&source, &rect_site.span),
+            "rect(x0=0., y0=0., x1=2., y1=2.)"
+        );
+        let text_site = text.site.as_ref().unwrap();
+        assert_eq!(text_site.origin, None);
+        assert!(text_site.editable);
+        let pin_site = symbol.pins[0].as_ref().unwrap().site.as_ref().unwrap();
+        assert_eq!(pin_site.origin, rect_site.origin, "one group");
+        assert!(!pin_site.editable);
+    }
+
+    #[test]
+    fn symbol_items_are_editable_only_with_literal_arguments() {
+        let data = compile_symbol(
+            "cell top() {\n\
+                 let w = 2.;\n\
+                 let n = 2;\n\
+                 rect(x0=0., y0=0., x1=w, y1=1.);\n\
+                 rect(x0=0., y0=0., x1=1., y1=-1.);\n\
+                 line([(0., 0.), (w, 1.)]);\n\
+                 text(\"t\", x=0., y=0., align=Align::Left);\n\
+                 for i in std::range(1) {\n\
+                     circle(x=0., y=0., r=1.);\n\
+                 }\n\
+                 let a = Signal(x=n, y=0);\n\
+                 let b = Signal(x=-1, y=0);\n\
+             }",
+        );
+        let symbol = top_symbol(&data);
+        assert_eq!(
+            symbol
+                .items
+                .iter()
+                .map(|item| item.site.as_ref().unwrap().editable)
+                .collect_vec(),
+            [false, true, false, true, false]
+        );
+        let schematic = top_schematic(&data);
+        let editable = |path: &str| match &schematic.nodes[node_at(schematic, path) as usize].source
+        {
+            NodeSource::Signal { editable, .. } => *editable,
+            other => panic!("{other:?}"),
+        };
+        assert!(!editable("a"), "a computed placement");
+        assert!(editable("b"));
+    }
+
+    #[test]
+    fn pin_labels_sit_beside_the_nearest_edge() {
+        let data = compile_symbol(
+            "cell top() {\n\
+                 pub let l = Signal();\n\
+                 pub let r = Signal();\n\
+                 pub let t = Signal();\n\
+                 pub let b = Signal();\n\
+                 pub let c = Signal();\n\
+                 rect(x0=-2., y0=-2., x1=2., y1=2.);\n\
+                 pin(l, x=-4, y=0, label=true);\n\
+                 pin(r, x=4, y=0, label=true);\n\
+                 pin(t, x=0, y=4, label=true);\n\
+                 pin(b, x=0, y=-4, label=true);\n\
+                 pin(c, x=-4, y=4, label=true);\n\
+             }",
+        );
+        let labels = top_symbol(&data)
+            .pins
+            .iter()
+            .map(|pin| pin.as_ref().unwrap().label.clone())
+            .collect_vec();
+        assert_eq!(
+            labels,
+            [
+                label(-3.5, 1., Align::Left),
+                label(3.5, 1., Align::Right),
+                label(0.5, 3., Align::Left),
+                label(0.5, -3., Align::Left),
+                // Equally far beyond the left and top edges: left wins.
+                label(-3.5, 5., Align::Left),
+            ]
+        );
+
+        // Without shapes, the pins' own bounds decide.
+        let data = compile_symbol(
+            "cell top() {\n\
+                 pub let a = Signal();\n\
+                 pub let b = Signal();\n\
+                 pin(a, x=-2, y=0, label=true);\n\
+                 pin(b, x=2, y=0, label=true);\n\
+             }",
+        );
+        let labels = top_symbol(&data)
+            .pins
+            .iter()
+            .map(|pin| pin.as_ref().unwrap().label.clone())
+            .collect_vec();
+        assert_eq!(
+            labels,
+            [label(-1.5, 1., Align::Left), label(1.5, 1., Align::Right)]
+        );
+    }
+
+    #[test]
+    fn the_generated_box_follows_its_rules() {
+        let symbol = box_symbol(&["a", "b", "c", "vdd", "vss", "VCC"], "inv");
+        assert_eq!(
+            pin_positions(&symbol),
+            [
+                Some((0, -2)),
+                Some((0, -4)),
+                Some((6, -2)),
+                Some((2, 0)),
+                Some((2, -6)),
+                Some((4, 0)),
+            ]
+        );
+        let text = |text: &str, x: f64, y: f64, align: Align| SymbolItemKind::Text {
+            text: SymbolText::Literal(text.to_owned()),
+            x,
+            y,
+            size: 1.,
+            align,
+        };
+        assert_eq!(
+            item_kinds(&symbol),
+            [
+                &SymbolItemKind::Rect {
+                    x0: 0.,
+                    y0: -6.,
+                    x1: 6.,
+                    y1: 0.,
+                    fill: false
+                },
+                &SymbolItemKind::Text {
+                    text: SymbolText::InstName,
+                    x: 0.,
+                    y: 1.,
+                    size: 1.,
+                    align: Align::Left
+                },
+                &text("inv", 0., -7., Align::Left),
+                &text("a", 0.5, -2., Align::Left),
+                &text("b", 0.5, -4., Align::Left),
+                &text("c", 5.5, -2., Align::Right),
+                &text("vdd", 2., -1., Align::Center),
+                &text("VCC", 4., -1., Align::Center),
+                &text("vss", 2., -5., Align::Center),
+            ]
+        );
+        assert!(symbol.items.iter().all(|item| item.site.is_none()));
+        assert!(
+            symbol
+                .pins
+                .iter()
+                .flatten()
+                .all(|pin| pin.site.is_none() && pin.label.is_none())
+        );
+
+        // The box is at least 4 by 4.
+        let small = box_symbol(&["a"], "x");
+        assert_eq!(small.bounds(), Some((0., -4., 4., 0.)));
+        assert_eq!(pin_positions(&small), [Some((0, -2))]);
+
+        // The box of a compiled cell uses its port names.
+        let data = compile_schematic(
+            "cell top() { pub let a = Signal(); pub let vdd = Signal(); pub let out = Signal(); }",
+        );
+        let generated = generated_box(top_schematic(&data), "top");
+        assert_eq!(generated, box_symbol(&["a", "vdd", "out"], "top"));
+        assert_eq!(
+            pin_positions(&generated),
+            [Some((0, -2)), Some((2, 0)), Some((4, -2))]
+        );
+    }
+
+    #[test]
+    fn device_symbols_exist_for_every_kind_and_terminal_count() {
+        let mos = [(0, 2), (-2, 0), (0, -2), (2, 0)];
+        let pmos = [(0, -2), (-2, 0), (0, 2), (2, 0)];
+        let two = [(0, 2), (0, -2)];
+        let bjt = [(0, 2), (-2, 0), (0, -2)];
+        let pnp = [(0, -2), (-2, 0), (0, 2)];
+        let cases: Vec<(DeviceKind, Vec<(i64, i64)>)> = vec![
+            (DeviceKind::Mos, mos.to_vec()),
+            (DeviceKind::Nmos, mos.to_vec()),
+            (DeviceKind::Pmos, pmos.to_vec()),
+            (DeviceKind::Res, two.to_vec()),
+            (DeviceKind::Cap, two.to_vec()),
+            (DeviceKind::Diode, two.to_vec()),
+            (DeviceKind::Bjt, bjt.to_vec()),
+            (DeviceKind::Npn, bjt.to_vec()),
+            (DeviceKind::Pnp, pnp.to_vec()),
+            (DeviceKind::Bjt, [bjt.as_slice(), &[(2, 0)]].concat()),
+            (DeviceKind::Npn, [bjt.as_slice(), &[(2, 0)]].concat()),
+            (DeviceKind::Pnp, [pnp.as_slice(), &[(2, 0)]].concat()),
+        ];
+        for (kind, pins) in cases {
+            let symbol = device_symbol(kind, pins.len());
+            assert_eq!(
+                pin_positions(&symbol),
+                pins.iter().map(|pin| Some(*pin)).collect_vec(),
+                "{kind:?} with {} terminals",
+                pins.len()
+            );
+            assert!(
+                symbol.items.iter().any(|item| matches!(
+                    item.kind,
+                    SymbolItemKind::Text {
+                        text: SymbolText::InstName,
+                        ..
+                    }
+                )),
+                "{kind:?} shows its instance name"
+            );
+            assert!(symbol.shape_bounds().is_some(), "{kind:?} has shapes");
+            assert!(symbol.items.iter().all(|item| item.site.is_some()));
+        }
+        // A `Subckt` gets a box with numbered pins.
+        let subckt = device_symbol(DeviceKind::Subckt, 3);
+        assert_eq!(*subckt, box_symbol(&["0", "1", "2"], ""));
+        assert_eq!(
+            pin_positions(&subckt),
+            [Some((0, -2)), Some((0, -4)), Some((4, -2))]
+        );
+        // Compiled once per process.
+        assert!(Arc::ptr_eq(
+            &device_symbol(DeviceKind::Nmos, 4),
+            &device_symbol(DeviceKind::Nmos, 4)
+        ));
+    }
+
+    /// The inverter of [`DEVICE_INVERTER`] with its symbol.
+    const DEVICE_INVERTER_SYMBOL: &str =
+        "use std::symbol::{circle, inst_name, line, param, pin, polygon};
+
+    polygon([(-2., 2.), (-2., -2.), (2., 0.)]);
+    circle(x=2.25, y=0., r=0.25);
+    line([(-4., 0.), (-2., 0.)]);
+    line([(2.5, 0.), (4., 0.)]);
+    line([(0., 1.), (0., 4.)]);
+    line([(0., -1.), (0., -4.)]);
+
+    pin(a, x=-4, y=0);
+    pin(out, x=4, y=0);
+    pin(vdd, x=0, y=4, label=true);
+    pin(vss, x=0, y=-4, label=true);
+
+    inst_name(x=2., y=2.);
+    param(\"pw\", pw, x=2., y=-2.);
+    param(\"nw\", nw, x=2., y=-3.);
+}
+";
+
+    /// [`DEVICE_INVERTER`] drawing its symbol as in the symbol docs.
+    fn device_inverter_with_symbol() -> String {
+        let (imports, rest) = DEVICE_INVERTER_SYMBOL.split_once('\n').unwrap();
+        let body = DEVICE_INVERTER.trim_end().strip_suffix('}').unwrap();
+        format!("{imports}\n{body}{rest}")
+    }
+
+    #[test]
+    fn symbols_change_the_digest_but_not_the_netlist() {
+        let drawn = compile_device_inverter(&device_inverter_with_symbol());
+        let bare = compile_device_inverter(DEVICE_INVERTER);
+        assert_eq!(spice(&drawn), spice(&bare));
+        assert_eq!(spectre(&drawn), spectre(&bare));
+        assert_ne!(drawn.geometry_digest(), bare.geometry_digest());
+        assert!(bare.cells[&bare.top].symbol.is_none());
+
+        let symbol = top_symbol(&drawn);
+        assert_eq!(
+            pin_positions(symbol),
+            [Some((-4, 0)), Some((4, 0)), Some((0, 4)), Some((0, -4))]
+        );
+        let labels = symbol
+            .pins
+            .iter()
+            .map(|pin| pin.as_ref().unwrap().label.clone())
+            .collect_vec();
+        assert_eq!(
+            labels,
+            [
+                None,
+                None,
+                label(0.5, 3., Align::Left),
+                label(0.5, -3., Align::Left)
+            ]
+        );
+        assert_eq!(symbol.bounds(), Some((-4., -4., 4., 4.)));
+        assert!(symbol.items.iter().any(|item| matches!(
+            &item.kind,
+            SymbolItemKind::Text {
+                text: SymbolText::Param { name, value: ParamValue::Float(pw) },
+                ..
+            } if name == "pw" && *pw == 2.
+        )));
+    }
+
+    #[test]
+    fn signals_makes_fresh_signals() {
+        let data = compile_schematic(
+            "cell top() {\n\
+                 pub let s = std::schematic::signals(3);\n\
+             }",
+        );
+        let schematic = top_schematic(&data);
+        assert_eq!(port_names(schematic), ["s_0", "s_1", "s_2"]);
+        assert_eq!(
+            node_paths(schematic),
+            some_paths([Some("s[0]"), Some("s[1]"), Some("s[2]")])
+        );
+        assert!(schematic.nodes.iter().all(|node| matches!(
+            node.source,
+            NodeSource::Signal {
+                editable: false,
+                placement: None,
+                ..
+            }
+        )));
     }
 }
 pub mod cli;

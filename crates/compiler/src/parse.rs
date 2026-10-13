@@ -29,6 +29,10 @@ pub const STD_LAYOUT_SOURCE: &str = include_str!("std/layout.ar");
 pub const STD_SCHEMATIC_PATH: &str = "<argon-std>/schematic.ar";
 /// Source text of the embedded `std::schematic` module.
 pub const STD_SCHEMATIC_SOURCE: &str = include_str!("std/schematic.ar");
+/// Virtual path used for diagnostics originating in `std::symbol`.
+pub const STD_SYMBOL_PATH: &str = "<argon-std>/symbol.ar";
+/// Source text of the embedded `std::symbol` module.
+pub const STD_SYMBOL_SOURCE: &str = include_str!("std/symbol.ar");
 
 /// One module of the embedded standard library.
 pub struct StdModule {
@@ -47,7 +51,7 @@ impl StdModule {
 
 /// The modules of the standard library, in the order they are typed. A module
 /// may refer only to the modules before it.
-pub const STD_MODULES: [StdModule; 3] = [
+pub const STD_MODULES: [StdModule; 4] = [
     StdModule {
         module: &["std"],
         path: STD_PATH,
@@ -62,6 +66,11 @@ pub const STD_MODULES: [StdModule; 3] = [
         module: &["std", "schematic"],
         path: STD_SCHEMATIC_PATH,
         source: STD_SCHEMATIC_SOURCE,
+    },
+    StdModule {
+        module: &["std", "symbol"],
+        path: STD_SYMBOL_PATH,
+        source: STD_SYMBOL_SOURCE,
     },
 ];
 /// Virtual path used for diagnostics originating in a cell invocation supplied

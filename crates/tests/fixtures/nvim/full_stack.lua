@@ -77,7 +77,11 @@ vim.api.nvim_create_autocmd('LspProgress', {
   end,
 })
 
-if vim.env.ARGON_TEST_MODE ~= 'rpc_errors' and vim.env.ARGON_TEST_MODE ~= 'startup_errors' then
+if
+  vim.env.ARGON_TEST_MODE ~= 'rpc_errors'
+  and vim.env.ARGON_TEST_MODE ~= 'startup_errors'
+  and vim.env.ARGON_TEST_MODE ~= 'cells'
+then
   vim.cmd('Argon openCell top()')
 end
 
@@ -373,6 +377,76 @@ elseif vim.env.ARGON_TEST_MODE == 'navigation' then
       .. ' got '
       .. tostring(shifted.range.start.line)
   )
+elseif vim.env.ARGON_TEST_MODE == 'schematic_move' then
+  -- The Rust test moves a device through the analyzer, then acknowledges the
+  -- recompiled result; one undo must take the placement and the rewritten
+  -- routes back together.
+  wait_for('GUI move to compile', function()
+    return vim.uv.fs_stat(vim.env.ARGON_TEST_GUI_EDIT_ACK) ~= nil
+  end)
+  local moved = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
+  assert(moved:find('x=2, y=4', 1, true), 'the move should be in the buffer')
+  assert(moved:find('route=[(2, 8)]', 1, true), 'the rewritten route should be in the buffer')
+  vim.cmd('undo')
+  local reverted = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
+  assert(not reverted:find('x=2, y=4', 1, true), 'one undo should revert the placement')
+  assert(not reverted:find('route=[(2, 8)]', 1, true), 'one undo should revert the routes too')
+  vim.cmd('write')
+elseif vim.env.ARGON_TEST_MODE == 'schematic_entry' then
+  -- The Rust test places a device, adds ports, wires them, and deletes the
+  -- device through the analyzer, then acknowledges the compiled result.
+  wait_for('GUI entry edits to compile', function()
+    return vim.uv.fs_stat(vim.env.ARGON_TEST_GUI_EDIT_ACK) ~= nil
+  end)
+  local edited = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
+  assert(
+    edited:find('pub let a = std::schematic::Signal(x=-6, y=0);', 1, true),
+    'the port should be in the buffer'
+  )
+  assert(
+    edited:find('pub let vss = std::schematic::Signal(x=0, y=-8);', 1, true),
+    'the second port should be in the buffer'
+  )
+  assert(not edited:find('nmos0', 1, true), 'the device and its wires should be deleted')
+  -- The commands preview a device and an instance in the GUI.
+  vim.cmd('Argon device Nmos "nch", w=1., l=0.15')
+  vim.cmd('Argon sinst child()')
+  wait_for('the GUI to receive both previews', function()
+    return vim.uv.fs_stat(vim.env.ARGON_TEST_DIAGNOSTIC_ACK) ~= nil
+  end)
+  -- Each gesture was one edit: the device, two ports, a wire, and the
+  -- deletion.
+  for _ = 1, 5 do
+    vim.cmd('undo')
+  end
+  local reverted = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
+  assert(not reverted:find('Signal(x=-6', 1, true), 'five undos should revert every gesture')
+  vim.cmd('write')
+elseif vim.env.ARGON_TEST_MODE == 'symbol_edit' then
+  -- The Rust test creates the child's symbol and moves one of its pins
+  -- through the analyzer, then acknowledges the compiled result.
+  wait_for('GUI symbol edits to compile', function()
+    return vim.uv.fs_stat(vim.env.ARGON_TEST_GUI_EDIT_ACK) ~= nil
+  end)
+  local edited = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
+  assert(
+    edited:find('std::symbol::rect(x0=0., y0=-4., x1=4., y1=0.);', 1, true),
+    'the box should be in the buffer'
+  )
+  assert(
+    edited:find('std::symbol::pin(a, x=0, y=-3, label=true);', 1, true),
+    'the moved pin should be in the buffer'
+  )
+  assert(
+    edited:find('std::symbol::pin(out, x=4, y=-2, label=true);', 1, true),
+    'the other pin should stay'
+  )
+  -- Each gesture was one edit: Create Symbol and the pin move.
+  vim.cmd('undo')
+  vim.cmd('undo')
+  local reverted = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
+  assert(not reverted:find('std::symbol', 1, true), 'two undos should revert both gestures')
+  vim.cmd('write')
 elseif vim.env.ARGON_TEST_MODE == 'agent_edit' then
   wait_for('the agent edit to reach the buffer', function()
     return contains(bufnr, 'let b = rect(')
@@ -501,6 +575,9 @@ elseif vim.env.ARGON_TEST_MODE == 'generated' then
 elseif vim.env.ARGON_TEST_MODE == 'rpc_errors' then
   -- The Rust test drives the analyzer RPC directly and acknowledges the
   -- mirrored GUI error after observing it.
+elseif vim.env.ARGON_TEST_MODE == 'cells' then
+  -- The Rust test opens a cell from the GUI's cell list and acknowledges
+  -- once it is shown.
 else
   error('unknown full-stack mode: ' .. tostring(vim.env.ARGON_TEST_MODE))
 end

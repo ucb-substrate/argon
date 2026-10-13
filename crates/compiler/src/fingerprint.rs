@@ -395,6 +395,7 @@ impl Builder<'_> {
             // and a native by the `VarId` of the path that names it.
             Ty::Param(_)
             | Ty::Native(_)
+            | Ty::Device
             | Ty::Infer(_)
             | Ty::Unknown
             | Ty::Any

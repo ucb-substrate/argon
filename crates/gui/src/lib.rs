@@ -2,7 +2,7 @@ use std::{borrow::Cow, collections::BTreeSet, net::SocketAddr};
 
 use analyzer::transport::SessionToken;
 
-use editor::Editor;
+use editor::{Editor, start_screen::START_SCREEN_CONTEXT};
 use gpui::*;
 use rust_embed::RustEmbed;
 use tracing::info;
@@ -78,6 +78,7 @@ pub fn run_gui(lang_server_addr: SocketAddr, token: SessionToken) {
                         MenuItem::action("Rename Cell…", RenameCellCommand),
                         MenuItem::separator(),
                         MenuItem::action("Save", Save),
+                        MenuItem::action("Export Netlist…", ExportNetlist),
                     ],
                 },
                 Menu {
@@ -85,6 +86,10 @@ pub fn run_gui(lang_server_addr: SocketAddr, token: SessionToken) {
                     items: vec![
                         MenuItem::action("Undo", Undo),
                         MenuItem::action("Redo", Redo),
+                        MenuItem::separator(),
+                        MenuItem::action("Copy", Copy),
+                        MenuItem::action("Paste", Paste),
+                        MenuItem::action("Delete", Delete),
                     ],
                 },
                 Menu {
@@ -95,11 +100,34 @@ pub fn run_gui(lang_server_addr: SocketAddr, token: SessionToken) {
                         MenuItem::action("Path", DrawPath),
                         MenuItem::action("Dim", DrawDim),
                         MenuItem::action("Edit", Edit),
+                        MenuItem::separator(),
+                        MenuItem::action("Wire", Wire),
+                        MenuItem::action("Port", PlacePort),
+                        MenuItem::action("Net Label", PlaceLabel),
+                        MenuItem::action("Device…", DeviceCommand),
+                        MenuItem::action("Instance…", InstantiateCommand),
+                        MenuItem::separator(),
+                        MenuItem::action("Symbol Line", SymbolLine),
+                        MenuItem::action("Symbol Circle", SymbolCircle),
+                        MenuItem::action("Symbol Arc", SymbolArc),
+                        MenuItem::action("Symbol Text…", SymbolText),
+                        MenuItem::action("Symbol Pin", SymbolPin),
+                        MenuItem::action("Create Symbol", CreateSymbol),
                     ],
                 },
                 Menu {
                     name: "View".into(),
                     items: vec![
+                        MenuItem::action("Layout", ViewLayout),
+                        MenuItem::action("Schematic", ViewSchematic),
+                        MenuItem::action("Symbol", ViewSymbol),
+                        MenuItem::separator(),
+                        MenuItem::action("Descend into Instance", Descend),
+                        MenuItem::action("Return", Return),
+                        MenuItem::action("Flylines", ToggleFlylines),
+                        MenuItem::action("Fix Positions", FixPositions),
+                        MenuItem::action("Remove Route", RemoveRoute),
+                        MenuItem::separator(),
                         MenuItem::action("Full Hierarchy", All),
                         MenuItem::action("Box Only", Zero),
                         MenuItem::action("Top Level Only", One),
@@ -122,42 +150,83 @@ pub fn run_gui(lang_server_addr: SocketAddr, token: SessionToken) {
 }
 
 fn key_bindings() -> Vec<KeyBinding> {
-    const CANVAS_CONTEXT: &str = "LayoutCanvas && !TextInput";
+    // Every canvas handles these; tool letters stay per canvas.
+    const CANVAS: &str = "Canvas && !TextInput";
+    const LAYOUT: &str = "LayoutCanvas && !TextInput";
+    const SCHEMATIC: &str = "SchematicCanvas && !TextInput";
+    const SYMBOL: &str = "SymbolCanvas && !TextInput";
     vec![
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-s", Save, None),
-        KeyBinding::new("r", DrawRect, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("p", DrawPolygon, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("s", SelectMode, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("d", DrawDim, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("i", InstantiateCommand, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("o", OpenCellCommand, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("r", DrawRect, Some(LAYOUT)),
+        KeyBinding::new("p", DrawPolygon, Some(LAYOUT)),
+        KeyBinding::new("s", SelectMode, Some(LAYOUT)),
+        KeyBinding::new("d", DrawDim, Some(LAYOUT)),
+        KeyBinding::new("i", InstantiateCommand, Some(LAYOUT)),
+        KeyBinding::new("q", Edit, Some(LAYOUT)),
+        KeyBinding::new("0", Zero, Some(LAYOUT)),
+        KeyBinding::new("1", One, Some(LAYOUT)),
+        KeyBinding::new("*", All, Some(LAYOUT)),
+        KeyBinding::new("s", SelectMode, Some(SCHEMATIC)),
+        KeyBinding::new("i", InstantiateCommand, Some(SCHEMATIC)),
+        KeyBinding::new("e", Descend, Some(SCHEMATIC)),
+        KeyBinding::new("shift-e", Return, Some(SCHEMATIC)),
+        KeyBinding::new("r", Rotate, Some(SCHEMATIC)),
+        KeyBinding::new("shift-r", Mirror, Some(SCHEMATIC)),
+        KeyBinding::new("w", Wire, Some(SCHEMATIC)),
+        KeyBinding::new("p", PlacePort, Some(SCHEMATIC)),
+        KeyBinding::new("l", PlaceLabel, Some(SCHEMATIC)),
+        KeyBinding::new("m", DeviceCommand, Some(SCHEMATIC)),
+        KeyBinding::new("/", FlipBend, Some(SCHEMATIC)),
+        KeyBinding::new("q", Edit, Some(SCHEMATIC)),
+        KeyBinding::new("delete", Delete, Some(SCHEMATIC)),
+        KeyBinding::new("backspace", Backspace, Some(SCHEMATIC)),
+        KeyBinding::new("enter", Enter, Some(SCHEMATIC)),
+        KeyBinding::new("cmd-c", Copy, Some(SCHEMATIC)),
+        KeyBinding::new("cmd-v", Paste, Some(SCHEMATIC)),
+        KeyBinding::new("s", SelectMode, Some(SYMBOL)),
+        KeyBinding::new("l", SymbolLine, Some(SYMBOL)),
+        KeyBinding::new("p", DrawPolygon, Some(SYMBOL)),
+        KeyBinding::new("r", DrawRect, Some(SYMBOL)),
+        KeyBinding::new("c", SymbolCircle, Some(SYMBOL)),
+        KeyBinding::new("a", SymbolArc, Some(SYMBOL)),
+        KeyBinding::new("t", SymbolText, Some(SYMBOL)),
+        KeyBinding::new("n", SymbolPin, Some(SYMBOL)),
+        KeyBinding::new("tab", NextPort, Some(SYMBOL)),
+        KeyBinding::new("x", SymbolRotate, Some(SYMBOL)),
+        KeyBinding::new("shift-x", SymbolMirror, Some(SYMBOL)),
+        KeyBinding::new("q", Edit, Some(SYMBOL)),
+        KeyBinding::new("delete", Delete, Some(SYMBOL)),
+        KeyBinding::new("backspace", Backspace, Some(SYMBOL)),
+        KeyBinding::new("enter", Enter, Some(SYMBOL)),
+        KeyBinding::new("cmd-c", Copy, Some(SYMBOL)),
+        KeyBinding::new("cmd-v", Paste, Some(SYMBOL)),
+        KeyBinding::new("o", OpenCellCommand, Some(CANVAS)),
+        KeyBinding::new("o", OpenCellCommand, Some(START_SCREEN_CONTEXT)),
         KeyBinding::new("cmd-n", NewCellCommand, None),
         KeyBinding::new("cmd-shift-r", RenameCellCommand, None),
-        KeyBinding::new("f", Fit, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("q", Edit, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("u", Undo, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("ctrl-r", Redo, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("0", Zero, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("1", One, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("*", All, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("left", PanLeft, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("right", PanRight, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("up", PanUp, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("down", PanDown, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("cmd-=", ZoomIn, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("cmd-+", ZoomIn, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("cmd--", ZoomOut, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("ctrl-=", ZoomIn, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("ctrl-+", ZoomIn, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("ctrl--", ZoomOut, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("f", Fit, Some(CANVAS)),
+        KeyBinding::new("u", Undo, Some(CANVAS)),
+        KeyBinding::new("ctrl-r", Redo, Some(CANVAS)),
+        KeyBinding::new("v", NextView, Some(CANVAS)),
+        KeyBinding::new("shift-v", PreviousView, Some(CANVAS)),
+        KeyBinding::new("left", PanLeft, Some(CANVAS)),
+        KeyBinding::new("right", PanRight, Some(CANVAS)),
+        KeyBinding::new("up", PanUp, Some(CANVAS)),
+        KeyBinding::new("down", PanDown, Some(CANVAS)),
+        KeyBinding::new("cmd-=", ZoomIn, Some(CANVAS)),
+        KeyBinding::new("cmd-+", ZoomIn, Some(CANVAS)),
+        KeyBinding::new("cmd--", ZoomOut, Some(CANVAS)),
+        KeyBinding::new("ctrl-=", ZoomIn, Some(CANVAS)),
+        KeyBinding::new("ctrl-+", ZoomIn, Some(CANVAS)),
+        KeyBinding::new("ctrl--", ZoomOut, Some(CANVAS)),
         KeyBinding::new("ctrl-\\", FocusInvoker, None),
         KeyBinding::new("ctrl-shift-d", ShowDiagnostics, None),
         KeyBinding::new("ctrl-shift-m", ShowMessages, None),
         KeyBinding::new(":", FocusInvokerCommandBar, Some("!TextInput")),
-        KeyBinding::new("escape", Cancel, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("enter", Enter, Some(CANVAS_CONTEXT)),
-        KeyBinding::new("backspace", Backspace, Some(CANVAS_CONTEXT)),
+        KeyBinding::new("escape", Cancel, Some(CANVAS)),
+        KeyBinding::new("enter", Enter, Some(CANVAS)),
+        KeyBinding::new("backspace", Backspace, Some(CANVAS)),
         KeyBinding::new("escape", Cancel, Some("TextInput")),
         KeyBinding::new("backspace", Backspace, Some("TextInput")),
         KeyBinding::new("delete", Delete, Some("TextInput")),
@@ -198,11 +267,22 @@ fn quit(_: &Quit, cx: &mut App) {
 mod tests {
     use gpui::{Context, FocusHandle, Render, TestAppContext, Window, div, prelude::*};
 
-    use super::{actions::*, key_bindings};
+    use super::{START_SCREEN_CONTEXT, actions::*, key_bindings};
 
     struct ShortcutTestView {
         canvas_focus: FocusHandle,
+        schematic_focus: FocusHandle,
+        symbol_focus: FocusHandle,
         input_focus: FocusHandle,
+        start_focus: FocusHandle,
+        next_view_count: usize,
+        previous_view_count: usize,
+        rotate_count: usize,
+        mirror_count: usize,
+        descend_count: usize,
+        return_count: usize,
+        fit_count: usize,
+        select_count: usize,
         undo_count: usize,
         draw_rect_count: usize,
         draw_polygon_count: usize,
@@ -222,13 +302,28 @@ mod tests {
         one_count: usize,
         all_count: usize,
         backspace_count: usize,
+        symbol_line_count: usize,
+        symbol_pin_count: usize,
+        symbol_rotate_count: usize,
+        symbol_mirror_count: usize,
     }
 
     impl ShortcutTestView {
         fn new(cx: &mut Context<Self>) -> Self {
             ShortcutTestView {
                 canvas_focus: cx.focus_handle(),
+                schematic_focus: cx.focus_handle(),
+                symbol_focus: cx.focus_handle(),
                 input_focus: cx.focus_handle(),
+                start_focus: cx.focus_handle(),
+                next_view_count: 0,
+                previous_view_count: 0,
+                rotate_count: 0,
+                mirror_count: 0,
+                descend_count: 0,
+                return_count: 0,
+                fit_count: 0,
+                select_count: 0,
                 undo_count: 0,
                 draw_rect_count: 0,
                 draw_polygon_count: 0,
@@ -248,6 +343,10 @@ mod tests {
                 one_count: 0,
                 all_count: 0,
                 backspace_count: 0,
+                symbol_line_count: 0,
+                symbol_pin_count: 0,
+                symbol_rotate_count: 0,
+                symbol_mirror_count: 0,
             }
         }
     }
@@ -255,6 +354,16 @@ mod tests {
     impl Render for ShortcutTestView {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div()
+                .on_action(cx.listener(|view, _: &NextView, _, _| view.next_view_count += 1))
+                .on_action(
+                    cx.listener(|view, _: &PreviousView, _, _| view.previous_view_count += 1),
+                )
+                .on_action(cx.listener(|view, _: &Rotate, _, _| view.rotate_count += 1))
+                .on_action(cx.listener(|view, _: &Mirror, _, _| view.mirror_count += 1))
+                .on_action(cx.listener(|view, _: &Descend, _, _| view.descend_count += 1))
+                .on_action(cx.listener(|view, _: &Return, _, _| view.return_count += 1))
+                .on_action(cx.listener(|view, _: &Fit, _, _| view.fit_count += 1))
+                .on_action(cx.listener(|view, _: &SelectMode, _, _| view.select_count += 1))
                 .on_action(cx.listener(|view, _: &Undo, _, _| view.undo_count += 1))
                 .on_action(cx.listener(|view, _: &Save, _, _| view.save_count += 1))
                 .on_action(cx.listener(|view, _: &DrawRect, _, _| view.draw_rect_count += 1))
@@ -269,6 +378,14 @@ mod tests {
                 .on_action(cx.listener(|view, _: &One, _, _| view.one_count += 1))
                 .on_action(cx.listener(|view, _: &All, _, _| view.all_count += 1))
                 .on_action(cx.listener(|view, _: &Backspace, _, _| view.backspace_count += 1))
+                .on_action(cx.listener(|view, _: &SymbolLine, _, _| view.symbol_line_count += 1))
+                .on_action(cx.listener(|view, _: &SymbolPin, _, _| view.symbol_pin_count += 1))
+                .on_action(
+                    cx.listener(|view, _: &SymbolRotate, _, _| view.symbol_rotate_count += 1),
+                )
+                .on_action(
+                    cx.listener(|view, _: &SymbolMirror, _, _| view.symbol_mirror_count += 1),
+                )
                 .on_action(
                     cx.listener(|view, _: &FocusInvokerCommandBar, _, _| {
                         view.command_bar_count += 1
@@ -293,17 +410,141 @@ mod tests {
                 )
                 .child(
                     div()
-                        .key_context("LayoutCanvas")
+                        .key_context("Canvas LayoutCanvas")
                         .track_focus(&self.canvas_focus),
                 )
                 .child(
-                    div().key_context("LayoutCanvas").child(
+                    div()
+                        .key_context("Canvas SchematicCanvas")
+                        .track_focus(&self.schematic_focus),
+                )
+                .child(
+                    div()
+                        .key_context("Canvas SymbolCanvas")
+                        .track_focus(&self.symbol_focus),
+                )
+                .child(
+                    div().key_context("Canvas LayoutCanvas").child(
                         div()
                             .key_context("TextInput")
                             .track_focus(&self.input_focus),
                     ),
                 )
+                .child(
+                    div()
+                        .key_context(START_SCREEN_CONTEXT)
+                        .track_focus(&self.start_focus),
+                )
         }
+    }
+
+    #[gpui::test]
+    fn the_start_screen_opens_and_creates_cells_but_has_no_tools(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.bind_keys(key_bindings());
+            cx.open_window(Default::default(), |_, cx| cx.new(ShortcutTestView::new))
+                .unwrap()
+        });
+
+        window
+            .update(cx, |view, window, _| window.focus(&view.start_focus))
+            .unwrap();
+        cx.simulate_keystrokes(*window, "o cmd-n r v f");
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.open_cell_count, 1);
+                assert_eq!(view.new_cell_count, 1);
+                assert_eq!(view.draw_rect_count, 0);
+                assert_eq!(view.next_view_count, 0);
+                assert_eq!(view.fit_count, 0);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn view_shortcuts_follow_the_focused_canvas(cx: &mut TestAppContext) {
+        let window = cx.update(|cx| {
+            cx.bind_keys(key_bindings());
+            cx.open_window(Default::default(), |_, cx| cx.new(ShortcutTestView::new))
+                .unwrap()
+        });
+        let keys = "v shift-v f s e shift-e r shift-r cmd-n p l n x shift-x";
+
+        // The layout canvas: `e` and `shift-e` are not bound there.
+        window
+            .update(cx, |view, window, _| window.focus(&view.canvas_focus))
+            .unwrap();
+        cx.simulate_keystrokes(*window, keys);
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.next_view_count, 1);
+                assert_eq!(view.previous_view_count, 1);
+                assert_eq!(view.fit_count, 1);
+                assert_eq!(view.select_count, 1);
+                assert_eq!(view.descend_count, 0);
+                assert_eq!(view.return_count, 0);
+                assert_eq!(view.draw_rect_count, 1);
+                assert_eq!(view.rotate_count, 0);
+                assert_eq!(view.new_cell_count, 1);
+            })
+            .unwrap();
+
+        // The schematic canvas: descend and return, but no layout tools.
+        window
+            .update(cx, |view, window, _| window.focus(&view.schematic_focus))
+            .unwrap();
+        cx.simulate_keystrokes(*window, keys);
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.next_view_count, 2);
+                assert_eq!(view.previous_view_count, 2);
+                assert_eq!(view.fit_count, 2);
+                assert_eq!(view.select_count, 2);
+                assert_eq!(view.descend_count, 1);
+                assert_eq!(view.return_count, 1);
+                assert_eq!(view.draw_rect_count, 1);
+                assert_eq!(view.rotate_count, 1);
+                assert_eq!(view.mirror_count, 1);
+                assert_eq!(view.new_cell_count, 2);
+            })
+            .unwrap();
+
+        // The symbol canvas: the common keys, plus its own drawing letters.
+        // `p` and `r` are the polygon and rectangle there, and `x` turns.
+        window
+            .update(cx, |view, window, _| window.focus(&view.symbol_focus))
+            .unwrap();
+        cx.simulate_keystrokes(*window, keys);
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.next_view_count, 3);
+                assert_eq!(view.previous_view_count, 3);
+                assert_eq!(view.fit_count, 3);
+                assert_eq!(view.select_count, 3);
+                assert_eq!(view.descend_count, 1);
+                assert_eq!(view.draw_rect_count, 2);
+                assert_eq!(view.draw_polygon_count, 2);
+                assert_eq!(view.rotate_count, 1, "`r` draws a rectangle here");
+                assert_eq!(view.symbol_line_count, 1);
+                assert_eq!(view.symbol_pin_count, 1);
+                assert_eq!(view.symbol_rotate_count, 1);
+                assert_eq!(view.symbol_mirror_count, 1);
+                assert_eq!(view.new_cell_count, 3);
+            })
+            .unwrap();
+
+        // A text field keeps the letters, but the global shortcuts work.
+        window
+            .update(cx, |view, window, _| window.focus(&view.input_focus))
+            .unwrap();
+        cx.simulate_keystrokes(*window, keys);
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.next_view_count, 3);
+                assert_eq!(view.fit_count, 3);
+                assert_eq!(view.new_cell_count, 4);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

@@ -1,0 +1,215 @@
+---
+title: "std::symbol"
+description: Shapes, text, and pins that draw a cell's symbol, and the device symbol helpers.
+sidebar_label: "std::symbol"
+---
+
+import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReference';
+
+# `std::symbol`
+
+`std::symbol` is the standard library module that draws a cell's symbol: the shapes, text, and pins a parent's schematic draws each instance of the cell with. See [Symbols](/language/schematic#symbols) for how a symbol fits into a cell.
+
+## Importing
+
+Nothing in `std::symbol` is in scope by default. Import the names a module uses:
+
+```argon
+use std::symbol::{Align, circle, inst_name, line, param, pin, polygon, rect, text};
+```
+
+`rect`, `polygon`, and `text` also exist in [`std::layout`](/language/std-layout), so a module that draws both views imports one set under aliases, or calls one by full path. A bare `rect` that nothing imports is reported as having moved to `std::layout`.
+
+Every call returns `()`. Coordinates are keyword arguments in grid units, and are required. Shape and text coordinates are `Float`, so arrows and bubbles can fall between grid points; pin coordinates are `Int`, so a parent's wires end on the grid. A `Float` that depends on constraints waits until it is solved. A value that isn't a finite number is an error.
+
+## `line` {#line}
+
+<ApiItem id="line" name="std::symbol::line" signature={'line(points: [(Float, Float)])'} summary={<>Draws an open polyline.</>}>
+
+<ParameterTable rows={[
+  {name: 'points', type: '[(Float, Float)]', requirement: 'Required, positional', description: 'Two or more points, joined in order.'},
+]} />
+
+```argon
+line([(-4., 0.), (-2., 0.)]);
+```
+
+</ApiItem>
+
+## `polygon` {#polygon}
+
+<ApiItem id="polygon" name="std::symbol::polygon" signature={'polygon(points: [(Float, Float)], fill=Bool)'} summary={<>Draws a closed outline.</>}>
+
+<ParameterTable rows={[
+  {name: 'points', type: '[(Float, Float)]', requirement: 'Required, positional', description: 'Three or more points; the last joins back to the first.'},
+  {name: 'fill', type: 'Bool', typeHref: '/language/types/scalars#bool', requirement: 'Optional keyword', description: 'Whether the outline is filled. Default false.'},
+]} />
+
+```argon
+polygon([(-2., 2.), (-2., -2.), (2., 0.)]);
+```
+
+</ApiItem>
+
+## `rect` {#rect}
+
+<ApiItem id="rect" name="std::symbol::rect" signature={'rect(x0=Float, y0=Float, x1=Float, y1=Float, fill=Bool)'} summary={<>Draws an axis-aligned rectangle.</>}>
+
+<ParameterTable rows={[
+  {name: 'x0, y0, x1, y1', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required keywords', description: 'Two opposite corners.'},
+  {name: 'fill', type: 'Bool', typeHref: '/language/types/scalars#bool', requirement: 'Optional keyword', description: 'Whether the rectangle is filled. Default false.'},
+]} />
+
+```argon
+rect(x0=-0.5, y0=-1., x1=0.5, y1=1.);
+```
+
+</ApiItem>
+
+## `circle` {#circle}
+
+<ApiItem id="circle" name="std::symbol::circle" signature={'circle(x=Float, y=Float, r=Float, fill=Bool)'} summary={<>Draws a circle.</>}>
+
+<ParameterTable rows={[
+  {name: 'x, y', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required keywords', description: 'The center.'},
+  {name: 'r', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required keyword', description: 'The radius, which must be positive.'},
+  {name: 'fill', type: 'Bool', typeHref: '/language/types/scalars#bool', requirement: 'Optional keyword', description: 'Whether the circle is filled. Default false.'},
+]} />
+
+```argon
+circle(x=2.25, y=0., r=0.25);
+```
+
+</ApiItem>
+
+## `arc` {#arc}
+
+<ApiItem id="arc" name="std::symbol::arc" signature={'arc(x=Float, y=Float, r=Float, start=Float, end=Float)'} summary={<>Draws an arc.</>}>
+
+<ParameterTable rows={[
+  {name: 'x, y', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required keywords', description: 'The center.'},
+  {name: 'r', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required keyword', description: 'The radius, which must be positive.'},
+  {name: 'start, end', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required keywords', description: 'The angles the arc runs between, counterclockwise from start to end, in degrees from the +x axis.'},
+]} />
+
+```argon
+arc(x=0., y=0., r=1., start=0., end=180.);
+```
+
+</ApiItem>
+
+## `text` {#text}
+
+<ApiItem id="text" name="std::symbol::text" signature={'text(value: String, x=Float, y=Float, size=Float, align=Align)'} summary={<>Draws literal text.</>}>
+
+<ParameterTable rows={[
+  {name: 'value', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: 'The text.'},
+  {name: 'x, y', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required keywords', description: 'The anchor: y is the vertical center, and x the left end, center, or right end by align.'},
+  {name: 'size', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'The text height, which must be positive. Default 1.'},
+  {name: 'align', type: 'Align', typeHref: '#align', requirement: 'Optional keyword', description: 'Which end of the text x anchors. Default Align::Left.'},
+]} />
+
+```argon
+text("VDD", x=1., y=3.);
+```
+
+Text runs horizontally in symbol coordinates. The GUI keeps it upright under every placement of the instance.
+
+</ApiItem>
+
+## `inst_name` {#inst-name}
+
+<ApiItem id="inst_name" name="std::symbol::inst_name" signature={'inst_name(x=Float, y=Float, size=Float, align=Align)'} summary={<>Draws the instance's name in the parent.</>}>
+
+<ParameterTable rows={[
+  {name: 'x, y', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required keywords', description: 'The anchor, as for text.'},
+  {name: 'size', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'The text height. Default 1.'},
+  {name: 'align', type: 'Align', typeHref: '#align', requirement: 'Optional keyword', description: 'Default Align::Left.'},
+]} />
+
+```argon
+inst_name(x=2., y=2.);
+```
+
+A placeholder, since the instance's name, such as `Xinv` or `Mmp`, is known only in the parent.
+
+</ApiItem>
+
+## `param` {#param}
+
+<ApiItem id="param" name="std::symbol::param" signature={'param(name: String, value: Float | Int | String, x=Float, y=Float, size=Float, align=Align)'} summary={<>Draws a parameter as name=value.</>}>
+
+<ParameterTable rows={[
+  {name: 'name', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: 'The label.'},
+  {name: 'value', type: 'Float | Int | String', requirement: 'Required, positional', description: 'The value, typed as a device parameter is, and formatted as netlists format parameters: w=0.15, c=1e-12.'},
+  {name: 'x, y', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required keywords', description: 'The anchor, as for text.'},
+  {name: 'size', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'The text height. Default 1.'},
+  {name: 'align', type: 'Align', typeHref: '#align', requirement: 'Optional keyword', description: 'Default Align::Left.'},
+]} />
+
+```argon
+param("w", w, x=2., y=-2.);
+```
+
+</ApiItem>
+
+## `pin` {#pin}
+
+<ApiItem id="pin" name="std::symbol::pin" signature={'pin(signal: Signal, x=Int, y=Int, label=Bool)'} summary={<>Places the pin of a port, where a parent's wires end.</>}>
+
+<ParameterTable rows={[
+  {name: 'signal', type: 'Signal', typeHref: '/language/std-schematic#signal', requirement: 'Required, positional', description: 'Any signal on the port\'s net, including an instance or device terminal connected to it.'},
+  {name: 'x, y', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required keywords', description: 'The pin, on the grid.'},
+  {name: 'label', type: 'Bool', typeHref: '/language/types/scalars#bool', requirement: 'Optional keyword', description: 'Whether the port\'s name is drawn beside the pin. Default false.'},
+]} />
+
+```argon
+pin(vdd, x=0, y=4, label=true);
+```
+
+Pins are checked once the body has run and the ports are known. See [pins](/language/schematic#pins) for the rules and where a label goes.
+
+</ApiItem>
+
+## `Align` {#align}
+
+```argon
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+```
+
+Which end of a text its `x` anchors: the left end, the center, or the right end.
+
+## Device helpers {#device-helpers}
+
+`std::symbol` also draws the device symbols, as Argon functions over the natives above. Each one draws its shapes, its pins, and `inst_name`, with its terminals in the order the device kind takes them. A cell that wraps one device can draw itself as that device by calling the helper on its ports.
+
+| Helper | Pins |
+| --- | --- |
+| `mos(d, g, s, b)`, `nmos(d, g, s, b)` | `d` (0, 2), `g` (-2, 0), `s` (0, -2), `b` (2, 0) |
+| `pmos(d, g, s, b)` | `s` (0, 2), `g` (-2, 0), `d` (0, -2), `b` (2, 0) |
+| `res(p, n)`, `cap(p, n)`, `diode(p, n)` | `p` (0, 2), `n` (0, -2) |
+| `bjt(c, b, e)`, `npn(c, b, e)` | `c` (0, 2), `b` (-2, 0), `e` (0, -2) |
+| `pnp(c, b, e)` | `e` (0, 2), `b` (-2, 0), `c` (0, -2) |
+| `bjt4(c, b, e, sub)`, `npn4(c, b, e, sub)`, `pnp4(c, b, e, sub)` | The pins of the 3-terminal helper, plus `sub` (2, 0). |
+
+```argon
+cell mos(nfet: Bool, w: Float, nf: Int) {
+    pub let d = Signal();
+    pub let g = Signal();
+    pub let s = Signal();
+    pub let b = Signal();
+    device(DeviceKind::Subckt, [d, g, s, b], model, l=0.15, w=w, nf=nf);
+
+    if nfet {
+        std::symbol::nmos(d, g, s, b);
+    } else {
+        std::symbol::pmos(d, g, s, b);
+    };
+}
+```
+
+The GUI draws a raw `device` with the helper for its kind and terminal count, so a wrapper cell and the device it wraps look the same. A `Subckt` device is drawn as a box with numbered pins.

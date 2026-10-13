@@ -35,7 +35,9 @@ argone .
 
 This starts Neovim, the analyzer, and the GUI window. Neovim owns the source; the analyzer compiles it and sends the result to the GUI.
 
-Click the canvas and press <kbd>O</kbd>. The command line opens with `:Argon openCell` filled in. Type `top()` and press <kbd>Enter</kbd>.
+The GUI opens on a start screen that lists your library's cells. Click `top` to open it.
+
+You can also open a cell from the keyboard. Press <kbd>O</kbd> in the GUI, and the command line opens with `:Argon openCell` filled in. Type an invocation such as `top()` and press <kbd>Enter</kbd>.
 
 ## Replace the starter cell
 

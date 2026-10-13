@@ -122,11 +122,13 @@ assert(vim.deep_equal(complete(open_cell, 'Argon openCell child(1., 2.)'), {}))
 response = { prefixLen = 4, items = items('child') }
 assert(vim.deep_equal(complete(open_cell, 'Argon openCell child(2000'), {}))
 
--- Warming caches the callee position for both subcommands without blocking.
+-- Warming caches the callee position for every cell-invocation subcommand
+-- without blocking.
 completion.warm()
-assert(#async == 2, vim.inspect(async))
+assert(#async == 3, vim.inspect(async))
 assert(async[1].command == 'openCell' and async[1].text == '', vim.inspect(async))
 assert(async[2].command == 'inst' and async[2].text == '', vim.inspect(async))
+assert(async[3].command == 'sinst' and async[3].text == '', vim.inspect(async))
 response = nil
 assert(vim.deep_equal(complete(open_cell, 'Argon openCell cached'), { 'cached_cell(' }))
 
