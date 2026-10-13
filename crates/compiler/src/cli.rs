@@ -190,6 +190,8 @@ fn execute(args: Args) -> Result<(), Failed> {
         return Ok(());
     };
 
+    // Evaluation reads only the typed AST.
+    drop(analysis.ast);
     let output = if args.gds_only {
         let output = compile::execute_cell_invocation_without_debug_info(
             &typed_ast,
@@ -197,7 +199,6 @@ fn execute(args: Args) -> Result<(), Failed> {
             &workspace,
         );
         drop(typed_ast);
-        drop(analysis.ast);
         output
     } else {
         compile::execute_cell_invocation(&typed_ast, &invocation, &workspace)
