@@ -228,6 +228,24 @@ pub fn argon_state_dir() -> Option<PathBuf> {
     argon_xdg_dir("XDG_STATE_HOME", ".local/state")
 }
 
+/// Creates `directory` and its missing parents readable only by the current
+/// user, as the XDG base directory specification asks. Existing directories
+/// keep their permissions.
+pub(crate) fn create_private_dir_all(directory: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(directory)
+    }
+}
+
 pub fn argon_cache_dir() -> Option<PathBuf> {
     argon_xdg_dir("XDG_CACHE_HOME", ".cache")
 }
@@ -349,7 +367,7 @@ pub fn init_logging() {
     let Some(log_dir) = argon_state_dir() else {
         return;
     };
-    if let Err(error) = fs::create_dir_all(&log_dir) {
+    if let Err(error) = create_private_dir_all(&log_dir) {
         eprintln!(
             "argon: could not create log directory '{}': {error}",
             log_dir.display()
@@ -2439,6 +2457,23 @@ mod tests {
         };
 
         assert!(preview_instance_cell(&output, "preview_binding").is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_dirs_are_owner_only_and_existing_parents_are_left_alone() {
+        use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+
+        let root = tempfile::tempdir().unwrap();
+        let existing = root.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+        let directory = existing.join("state/argon");
+        super::create_private_dir_all(&directory).unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&existing), 0o755);
+        assert_eq!(mode(&existing.join("state")), 0o700);
+        assert_eq!(mode(&directory), 0o700);
     }
 
     #[cfg(unix)]

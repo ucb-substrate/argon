@@ -40,20 +40,15 @@ impl Drop for SessionFile {
     }
 }
 
-fn create_private_dir(directory: &Path) -> io::Result<()> {
+/// Creates the sessions directory, making it private even if it already existed.
+fn create_sessions_dir(directory: &Path) -> io::Result<()> {
+    crate::create_private_dir_all(directory)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(directory)?;
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
     }
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(directory)
-    }
+    Ok(())
 }
 
 fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -72,7 +67,7 @@ fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
 
 /// Publishes `info` in `directory`, named for the analyzer's process and port.
 pub fn publish_in(directory: &Path, info: &SessionInfo) -> io::Result<SessionFile> {
-    create_private_dir(directory)?;
+    create_sessions_dir(directory)?;
     let name = format!("{}-{}", info.pid, info.port);
     let path = directory.join(format!("{name}.json"));
     let staging = directory.join(format!("{name}.json.tmp"));
