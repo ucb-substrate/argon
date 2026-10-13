@@ -1,8 +1,6 @@
-use std::{
-    borrow::Cow,
-    collections::BTreeSet,
-    net::{SocketAddr, TcpListener},
-};
+use std::{borrow::Cow, collections::BTreeSet, net::SocketAddr};
+
+use analyzer::transport::SessionToken;
 
 use editor::Editor;
 use gpui::*;
@@ -47,33 +45,7 @@ impl AssetSource for Assets {
     }
 }
 
-pub fn run_gui(
-    lang_server_addr: SocketAddr,
-    gui_listen_port: Option<u16>,
-    gui_register_addr: Option<SocketAddr>,
-) {
-    run_inner(lang_server_addr, gui_listen_port, None, gui_register_addr);
-}
-
-pub fn run_with_listener(
-    lang_server_addr: SocketAddr,
-    gui_listener: TcpListener,
-    gui_register_addr: SocketAddr,
-) {
-    run_inner(
-        lang_server_addr,
-        None,
-        Some(gui_listener),
-        Some(gui_register_addr),
-    );
-}
-
-fn run_inner(
-    lang_server_addr: SocketAddr,
-    gui_listen_port: Option<u16>,
-    gui_listener: Option<TcpListener>,
-    gui_register_addr: Option<SocketAddr>,
-) {
+pub fn run_gui(lang_server_addr: SocketAddr, token: SessionToken) {
     focus::initialize_target();
 
     analyzer::init_logging();
@@ -140,14 +112,7 @@ fn run_inner(
 
             cx.open_window(editor_window_options(), |window, cx| {
                 window.replace_root(cx, |window, cx| {
-                    Editor::new(
-                        cx,
-                        window,
-                        lang_server_addr,
-                        gui_listen_port,
-                        gui_listener,
-                        gui_register_addr,
-                    )
+                    Editor::new(cx, window, lang_server_addr, token.clone())
                 })
             })
             .unwrap();

@@ -1,7 +1,7 @@
 use std::{
     fmt::Display,
     future::Future,
-    net::{Ipv4Addr, SocketAddr, TcpListener},
+    net::SocketAddr,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
@@ -15,6 +15,7 @@ use analyzer::rpc::{
     InitialConditionEdit, InstancePreview, LangServerAction, LangServerClient, PathParams,
     PolygonParams, RectangleEditResult, ValueEdit,
 };
+use analyzer::transport::{self, Role, SessionToken};
 use anyhow::{Result, anyhow};
 use argonc::{ast::Span, compile::BasicRect};
 use async_compat::CompatExt;
@@ -26,11 +27,7 @@ use futures::{
     prelude::*,
 };
 use gpui::AsyncApp;
-use tarpc::{
-    context,
-    server::{Channel, incoming::Incoming},
-    tokio_serde::formats::Bincode,
-};
+use tarpc::{context, server::Channel, tokio_serde::formats::Bincode};
 use tower_lsp_server::ls_types::MessageType;
 use tracing::error;
 
@@ -55,6 +52,7 @@ fn lock_unpoisoned<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct SyncLangServerClient {
     app: AsyncApp,
     lang_server_addr: SocketAddr,
+    token: SessionToken,
     client: Arc<Mutex<LangServerClient>>,
     to_exec: UnboundedSender<EditorFn>,
 }
@@ -73,20 +71,22 @@ fn is_disconnected(error: &tarpc::client::RpcError) -> bool {
     )
 }
 
-fn connect_client(app: &AsyncApp, lang_server_addr: SocketAddr) -> Result<LangServerClient> {
+async fn connect_lang_server(
+    lang_server_addr: SocketAddr,
+    token: SessionToken,
+) -> std::io::Result<LangServerClient> {
+    let stream = transport::connect(lang_server_addr, &token, Role::Gui).await?;
+    let transport = tarpc::serde_transport::new(stream, Bincode::default());
+    Ok(LangServerClient::new(tarpc::client::Config::default(), transport).spawn())
+}
+
+fn connect_client(
+    app: &AsyncApp,
+    lang_server_addr: SocketAddr,
+    token: &SessionToken,
+) -> Result<LangServerClient> {
     app.background_executor()
-        .block(
-            async move {
-                let mut transport =
-                    tarpc::serde_transport::tcp::connect(lang_server_addr, Bincode::default);
-                transport.config_mut().max_frame_length(usize::MAX);
-                let transport = transport.await?;
-                Ok::<_, std::io::Error>(
-                    LangServerClient::new(tarpc::client::Config::default(), transport).spawn(),
-                )
-            }
-            .compat(),
-        )
+        .block(connect_lang_server(lang_server_addr, token.clone()).compat())
         .map_err(Into::into)
 }
 
@@ -106,6 +106,7 @@ impl SyncLangServerClient {
         Self {
             app,
             lang_server_addr: "127.0.0.1:1".parse().unwrap(),
+            token: SessionToken::generate().unwrap(),
             client: Arc::new(Mutex::new(client)),
             to_exec,
         }
@@ -125,6 +126,7 @@ impl SyncLangServerClient {
             Self {
                 app,
                 lang_server_addr: "127.0.0.1:1".parse().unwrap(),
+                token: SessionToken::generate().unwrap(),
                 client: Arc::new(Mutex::new(client.client)),
                 to_exec,
             },
@@ -132,13 +134,18 @@ impl SyncLangServerClient {
         )
     }
 
-    pub fn new(app: AsyncApp, lang_server_addr: SocketAddr) -> (Self, UnboundedReceiver<EditorFn>) {
-        let client = connect_client(&app, lang_server_addr).unwrap();
+    pub fn new(
+        app: AsyncApp,
+        lang_server_addr: SocketAddr,
+        token: SessionToken,
+    ) -> (Self, UnboundedReceiver<EditorFn>) {
+        let client = connect_client(&app, lang_server_addr, &token).unwrap();
         let (to_exec, rx) = mpsc::unbounded();
         (
             Self {
                 app,
                 lang_server_addr,
+                token,
                 client: Arc::new(Mutex::new(client)),
                 to_exec,
             },
@@ -189,23 +196,17 @@ impl SyncLangServerClient {
         let result = match result {
             Err(RpcCallError::Rpc(error)) if is_disconnected(&error) => {
                 let addr = self.lang_server_addr;
+                let token = self.token.clone();
                 let reconnect = self
                     .app
                     .background_executor()
                     .spawn(
                         async move {
-                            let mut transport =
-                                tarpc::serde_transport::tcp::connect(addr, Bincode::default);
-                            transport.config_mut().max_frame_length(usize::MAX);
-                            tokio::time::timeout(LANG_SERVER_CLIENT_TIMEOUT, transport)
-                                .await?
-                                .map(|transport| {
-                                    LangServerClient::new(
-                                        tarpc::client::Config::default(),
-                                        transport,
-                                    )
-                                    .spawn()
-                                })
+                            tokio::time::timeout(
+                                LANG_SERVER_CLIENT_TIMEOUT,
+                                connect_lang_server(addr, token),
+                            )
+                            .await?
                         }
                         .compat(),
                     )
@@ -271,7 +272,7 @@ impl SyncLangServerClient {
     }
 
     fn reconnect(&self) -> Result<LangServerClient> {
-        let client = connect_client(&self.app, self.lang_server_addr)?;
+        let client = connect_client(&self.app, self.lang_server_addr, &self.token)?;
         *lock_unpoisoned(&self.client) = client.clone();
         Ok(client)
     }
@@ -302,104 +303,49 @@ impl SyncLangServerClient {
         }));
     }
 
-    pub fn register_server(
-        &self,
-        configured_port: Option<u16>,
-        prebound_listener: Option<TcpListener>,
-        register_addr: Option<SocketAddr>,
-    ) {
+    /// Opens the connection the analyzer calls the GUI back over.
+    pub fn serve_callbacks(&self) {
         let client = self.clone();
         self.app
             .spawn(async move |_| {
-                let result = client
-                    .start_server(configured_port, prebound_listener, register_addr)
-                    .await;
+                let result = client.connect_callbacks().await;
                 if let Err(error) = &result {
-                    error!("Failed to register GUI: {error}");
+                    error!("Failed to connect the GUI to the analyzer: {error}");
                 }
                 client.report_connection_result(&result);
             })
             .detach();
     }
 
-    async fn start_server(
-        &self,
-        configured_port: Option<u16>,
-        prebound_listener: Option<TcpListener>,
-        register_addr: Option<SocketAddr>,
-    ) -> Result<()> {
-        let background_executor = self.app.background_executor().clone();
-        let mut listener = self
+    async fn connect_callbacks(&self) -> Result<()> {
+        let addr = self.lang_server_addr;
+        let token = self.token.clone();
+        let stream = self
             .app
             .background_executor()
             .spawn(
-                async move {
-                    if let Some(listener) = prebound_listener {
-                        match listener
-                            .set_nonblocking(true)
-                            .and_then(|_| tokio::net::TcpListener::from_std(listener))
-                        {
-                            Ok(listener) => {
-                                tarpc::serde_transport::tcp::listen_on(listener, Bincode::default)
-                                    .await
-                            }
-                            Err(error) => Err(error),
-                        }
-                    } else {
-                        let port = configured_port.unwrap_or(0);
-                        tarpc::serde_transport::tcp::listen(
-                            (Ipv4Addr::LOCALHOST, port),
-                            Bincode::default,
-                        )
-                        .await
-                    }
-                }
-                .compat(),
+                async move { transport::connect(addr, &token, Role::GuiCallback).await }.compat(),
             )
             .await?;
-        let server_addr = listener.local_addr();
-        let register_addr = register_addr.unwrap_or(server_addr);
-        let to_exec = self.to_exec.clone();
+        let background_executor = self.app.background_executor().clone();
+        let server = GuiServer {
+            to_exec: self.to_exec.clone(),
+            snapshot: Arc::default(),
+        };
         self.app
             .background_executor()
             .spawn(
                 async move {
-                    listener.config_mut().max_frame_length(usize::MAX);
-                    listener
-                        // Ignore accept errors.
-                        .filter_map(|r| futures::future::ready(r.ok()))
-                        .map(tarpc::server::BaseChannel::with_defaults)
-                        // Limit channels to 1 per IP.
-                        .max_channels_per_key(1, |t| t.transport().peer_addr().unwrap().ip())
-                        // serve is generated by the service attribute. It takes as input any type implementing
-                        // the generated World trait.
-                        .map(|channel| {
-                            let server = GuiServer {
-                                to_exec: to_exec.clone(),
-                                snapshot: Arc::default(),
-                            };
-                            channel
-                                .execute(server.serve())
-                                .for_each(|t| background_executor.spawn(t))
-                        })
-                        // Max 10 channels.
-                        .buffer_unordered(10)
-                        .for_each(|_| async {})
+                    let transport = tarpc::serde_transport::new(stream, Bincode::default());
+                    tarpc::server::BaseChannel::with_defaults(transport)
+                        .execute(server.serve())
+                        .for_each(|response| background_executor.spawn(response))
                         .await;
                 }
                 .compat(),
             )
             .detach();
-        self.register_with_analyzer(register_addr).await
-    }
-
-    async fn register_with_analyzer(&self, register_addr: SocketAddr) -> Result<()> {
-        // Registration can call back into the GUI for its first snapshot.
-        // The main thread must keep servicing those callbacks while we wait.
-        self.call_async(move |client| async move {
-            client.register(context::current(), register_addr).await
-        })
-        .await
+        Ok(())
     }
 
     pub fn select_rect(&self, span: Span) -> Result<()> {
@@ -714,6 +660,29 @@ impl Gui for GuiServer {
             .unwrap();
     }
 
+    async fn highlight_spans(
+        mut self,
+        _: context::Context,
+        revision: u64,
+        spans: Vec<argonc::ast::Span>,
+    ) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| editor.highlight_agent_edit(cx, revision, spans));
+            }))
+            .await
+            .ok();
+    }
+
+    async fn agent_activity(mut self, _: context::Context, label: Option<String>) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| editor.set_agent_activity(cx, label));
+            }))
+            .await
+            .ok();
+    }
+
     async fn activate(mut self, _context: ::tarpc::context::Context) -> () {
         self.to_exec
             .send(Box::new(|editor, cx| {
@@ -737,60 +706,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{is_disconnected, lock_unpoisoned};
-
-    #[gpui::test]
-    fn registration_yields_until_the_analyzer_replies(cx: &mut gpui::TestAppContext) {
-        use analyzer::rpc::{LangServerRequest, LangServerResponse};
-        use futures::{FutureExt, SinkExt, StreamExt};
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let (client, mut server) = super::SyncLangServerClient::for_rpc_test(cx.to_async());
-        let completed = Arc::new(AtomicBool::new(false));
-        let done = completed.clone();
-        cx.to_async()
-            .spawn(async move |_| {
-                client
-                    .register_with_analyzer("127.0.0.1:12345".parse().unwrap())
-                    .await
-                    .unwrap();
-                done.store(true, Ordering::Release);
-            })
-            .detach();
-        let request = loop {
-            if let Some(message) = server.next().now_or_never()
-                && let tarpc::ClientMessage::Request(request) = message.unwrap().unwrap()
-            {
-                break request;
-            }
-            assert!(cx.dispatcher.tick(false));
-        };
-        assert!(matches!(
-            request.message,
-            LangServerRequest::Register { .. }
-        ));
-        assert!(!completed.load(Ordering::Acquire));
-        // Foreground work can finish while the handshake is unanswered.
-        let foreground_ran = Arc::new(AtomicBool::new(false));
-        let ran = foreground_ran.clone();
-        cx.to_async()
-            .spawn(async move |_| ran.store(true, Ordering::Release))
-            .detach();
-        while !foreground_ran.load(Ordering::Acquire) {
-            assert!(cx.dispatcher.tick(false));
-        }
-        assert!(!completed.load(Ordering::Acquire));
-        server
-            .send(tarpc::Response {
-                request_id: request.id,
-                message: Ok(LangServerResponse::Register(())),
-            })
-            .now_or_never()
-            .unwrap()
-            .unwrap();
-        while !completed.load(Ordering::Acquire) {
-            assert!(cx.dispatcher.tick(false));
-        }
-    }
 
     #[test]
     fn client_lock_recovers_from_poisoning() {

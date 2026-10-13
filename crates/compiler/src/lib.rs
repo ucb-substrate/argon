@@ -194,6 +194,33 @@ mod tests {
         )
     }
 
+    #[test]
+    fn int_casts_count_exactly_on_a_coarse_grid() {
+        // sky130's 5 nm grid once snapped 830 / 340 = 2.44 to 0 before the cast.
+        let root = parse_source_text(
+            "use std::layout::rect; cell top() { let n = (830. / 340.) as Int; rect(\"met1.drawing\", x0=0., y0=0., x1=100. * (n as Float), y1=100.); }",
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let ast = crate::parse::with_std(root);
+        let output = compile_sky130(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: vec![],
+            },
+        );
+        let CompileOutput::Valid(data) = &output else {
+            panic!("the cast should compile: {output:?}");
+        };
+        let rect = data.cells[&data.top]
+            .objects
+            .values()
+            .find_map(|object| object.get_rect())
+            .expect("the cell draws a rect");
+        assert_eq!(rect.x1.0, 200.);
+    }
+
     /// Compiles `cell` from a one-file workspace with the standard library.
     fn compile_source(source: &str, cell: &str, args: Vec<CellArg>) -> CompileOutput {
         let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();

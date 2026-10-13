@@ -34,6 +34,10 @@ homedir = "0.3"
 clap = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }
+getrandom = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
+notify = "8"
 
 [dev-dependencies]
 bincode = "1"
