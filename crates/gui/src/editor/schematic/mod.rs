@@ -188,6 +188,8 @@ struct SymbolDrag {
     base: Arc<SymbolScene>,
     /// The selection in `base`.
     selection: Vec<SymbolSelection>,
+    /// What a release selects if the drag never changed anything.
+    click: Option<Vec<SymbolSelection>>,
 }
 
 impl SymbolDrag {
@@ -1891,6 +1893,7 @@ impl SchematicCanvas {
                 current: point,
                 base: scene,
                 selection: self.symbol_selection.clone(),
+                click: None,
             });
             return;
         }
@@ -1920,22 +1923,37 @@ impl SchematicCanvas {
             Some(hit) if self.symbol_selection.contains(&hit) => self.symbol_selection.clone(),
             Some(hit) => vec![hit],
         };
-        self.select_symbol(selection, cx);
-        let draggable = next.is_some_and(|hit| match hit {
+        let editable = |hit: SymbolSelection| match hit {
             SymbolSelection::Item(index) => scene.items.get(index).is_some_and(|i| i.editable),
             SymbolSelection::Pin(port) => scene
                 .pins
                 .iter()
                 .find(|pin| pin.port == port)
                 .is_some_and(|pin| pin.editable),
-        });
-        if draggable && !self.edit_waiting() {
+        };
+        // A press on the primary selection keeps it, so it can be dragged;
+        // a release without a drag then cycles to what overlaps it.
+        let grabbed = !self.edit_waiting()
+            && primary.is_some_and(|current| {
+                event.click_count == 1
+                    && !event.modifiers.shift
+                    && hits.contains(&current)
+                    && editable(current)
+            });
+        let click = if grabbed {
+            Some(selection)
+        } else {
+            self.select_symbol(selection, cx);
+            None
+        };
+        if (grabbed || next.is_some_and(editable)) && !self.edit_waiting() {
             self.symbol_drag = Some(SymbolDrag {
                 kind: SymbolDragKind::Move,
                 start: point,
                 current: point,
                 base: scene,
                 selection: self.symbol_selection.clone(),
+                click,
             });
         }
     }
@@ -2369,6 +2387,19 @@ impl SchematicCanvas {
             Hit::Label(index) => scene.labels.get(index).is_some_and(|label| label.editable),
             Hit::Wire(index) => scene.wires.get(index).is_some_and(|wire| wire.editable),
             Hit::Flyline(_) => false,
+        }
+    }
+
+    /// The drag a press on `hit` at `point` starts, if `hit` can be dragged.
+    fn drag_kind(&self, hit: Hit, point: (f64, f64)) -> Option<DragKind> {
+        if !self.draggable(hit) {
+            return None;
+        }
+        match hit {
+            Hit::Wire(wire) => self
+                .nearest_segment(wire, point)
+                .map(|segment| DragKind::Segment { wire, segment }),
+            _ => Some(DragKind::Items),
         }
     }
 
@@ -3194,7 +3225,25 @@ impl SchematicCanvas {
                     Some(hit) if self.selection.contains(&hit) => self.selection.clone(),
                     Some(hit) => vec![hit],
                 };
-                self.select(selection, cx);
+                // A drag starts on something editable, once the last edit is
+                // in a snapshot. A press on the primary selection keeps it,
+                // so it can be dragged; a release without a drag then cycles
+                // to what overlaps it.
+                let start = self.world_at(event.position, cx);
+                let grab = primary
+                    .filter(|current| {
+                        event.click_count == 1
+                            && !event.modifiers.shift
+                            && hits.contains(current)
+                            && !self.edit_waiting()
+                    })
+                    .and_then(|current| self.drag_kind(current, start));
+                let click = if grab.is_some() {
+                    Some(selection)
+                } else {
+                    self.select(selection, cx);
+                    None
+                };
                 if event.click_count == 2
                     && let Some(name) = self.selected_instance()
                 {
@@ -3203,24 +3252,18 @@ impl SchematicCanvas {
                     });
                     return;
                 }
-                // A drag starts on something editable, once the last edit is
-                // in a snapshot.
-                let kind = match next {
-                    _ if self.edit_waiting() => None,
-                    Some(Hit::Wire(wire)) if self.draggable(Hit::Wire(wire)) => self
-                        .nearest_segment(wire, self.world_at(event.position, cx))
-                        .map(|segment| DragKind::Segment { wire, segment }),
-                    Some(hit) if self.draggable(hit) => Some(DragKind::Items),
-                    _ => None,
-                };
+                let kind = grab.or_else(|| {
+                    next.filter(|_| !self.edit_waiting())
+                        .and_then(|hit| self.drag_kind(hit, start))
+                });
                 if let (Some(kind), Some(base)) = (kind, self.scene.clone()) {
-                    let start = self.world_at(event.position, cx);
                     self.drag = Some(Drag {
                         kind,
                         start,
                         current: start,
                         base,
                         selection: self.selection.clone(),
+                        click,
                     });
                 }
             }
@@ -3256,6 +3299,9 @@ impl SchematicCanvas {
         if let Some(drag) = &mut self.drag {
             drag.current = world;
             let preview = drag.preview();
+            if preview.is_some() {
+                drag.click = None;
+            }
             if preview != self.drag_overrides {
                 self.drag_overrides = preview;
                 self.rebuild_now(cx);
@@ -3265,6 +3311,9 @@ impl SchematicCanvas {
         if let Some(drag) = &mut self.symbol_drag {
             drag.current = world;
             let preview = drag.preview();
+            if preview.is_some() {
+                drag.click = None;
+            }
             if preview != self.symbol_drag_overrides {
                 self.symbol_drag_overrides = preview;
                 self.rebuild_symbol_now(cx);
@@ -3319,6 +3368,9 @@ impl SchematicCanvas {
                 }
                 _ => self.rebuild_symbol_now(cx),
             }
+            if let Some(selection) = drag.click {
+                self.select_symbol(selection, cx);
+            }
             return;
         }
         let Some(drag) = self.drag.take() else {
@@ -3330,6 +3382,9 @@ impl SchematicCanvas {
                 self.commit(overrides, cx)
             }
             _ => self.rebuild_now(cx),
+        }
+        if let Some(selection) = drag.click {
+            self.select(selection, cx);
         }
     }
 

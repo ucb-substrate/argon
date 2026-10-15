@@ -22,7 +22,26 @@ const KEYWORDS: &[&str] = &[
 
 pub(crate) struct RenameCellEdit {
     pub(crate) changes: HashMap<Uri, Vec<TextEdit>>,
-    pub(crate) invocation: String,
+    /// The names in each module that resolve to the renamed cell, mapped to
+    /// their names after the edit.
+    target_names: HashMap<ModPath, HashMap<String, String>>,
+}
+
+impl RenameCellEdit {
+    /// `invocation` with the renamed cell's new name, or `None` if the
+    /// invocation does not name the cell or keeps its name through an alias.
+    pub(crate) fn rename_invocation(&self, invocation: &str) -> Option<String> {
+        let call = parse::parse_cell(invocation).ok()?;
+        let name = call.func.path.last()?;
+        let module = reference_module_path(&ModPath::new(), &call.func.path);
+        let renamed = self.target_names.get(&module)?.get(name.name)?;
+        if renamed == name.name {
+            return None;
+        }
+        let mut invocation = invocation.to_owned();
+        invocation.replace_range(name.span.start()..name.span.end(), renamed);
+        Some(invocation)
+    }
 }
 
 pub(crate) fn validate_cell_name(name: &str) -> Result<(), String> {
@@ -350,22 +369,9 @@ pub(crate) fn rename_cell_edits(
         }
     }
 
-    let mut renamed_invocation = current_invocation.to_owned();
-    let invocation_module = reference_module_path(&ModPath::new(), &parsed_invocation.func.path);
-    let renamed_invocation_name = target_names
-        .get(&invocation_module)
-        .and_then(|module_names| module_names.get(invocation_name.name));
-    if let Some(renamed_name) = renamed_invocation_name
-        && renamed_name != invocation_name.name
-    {
-        renamed_invocation.replace_range(
-            invocation_name.span.start()..invocation_name.span.end(),
-            renamed_name,
-        );
-    }
     Ok(RenameCellEdit {
         changes,
-        invocation: renamed_invocation,
+        target_names,
     })
 }
 
@@ -423,7 +429,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(rename.invocation, "lib::blocks::unit()");
+        assert_eq!(
+            rename.rename_invocation("lib::blocks::child()").as_deref(),
+            Some("lib::blocks::unit()")
+        );
         assert_eq!(rename.changes.values().map(Vec::len).sum::<usize>(), 3);
         assert_eq!(
             rename
@@ -434,6 +443,47 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn rename_invocation_renames_root_and_module_cells() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        fs::write(
+            &source_path,
+            "mod blocks;\ncell inv(n: Int) {}\ncell top() { inv(1); }\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join("blocks.ar"), "cell child() {}\n").unwrap();
+        let workspace = parse::parse_workspace_with_std(&source_path).ast();
+
+        let rename =
+            rename_cell_edits(&workspace, "inv(2)", "unit", PositionEncoding::Utf16).unwrap();
+        assert_eq!(
+            rename.rename_invocation("inv(2)").as_deref(),
+            Some("unit(2)")
+        );
+        assert_eq!(
+            rename.rename_invocation(" lib::inv( 3 )").as_deref(),
+            Some(" lib::unit( 3 )")
+        );
+        for unchanged in ["top()", "blocks::inv(2)", "blocks::child()", "inv("] {
+            assert_eq!(rename.rename_invocation(unchanged), None, "{unchanged}");
+        }
+
+        let rename = rename_cell_edits(
+            &workspace,
+            "blocks::child()",
+            "unit",
+            PositionEncoding::Utf16,
+        )
+        .unwrap();
+        assert_eq!(
+            rename.rename_invocation("blocks::child()").as_deref(),
+            Some("blocks::unit()")
+        );
+        assert_eq!(rename.rename_invocation("child()"), None);
+        assert_eq!(rename.rename_invocation("inv(2)"), None);
     }
 
     #[test]
@@ -451,7 +501,7 @@ mod tests {
         let rename =
             rename_cell_edits(&workspace, "placed()", "unit", PositionEncoding::Utf16).unwrap();
 
-        assert_eq!(rename.invocation, "placed()");
+        assert_eq!(rename.rename_invocation("placed()"), None);
         assert_eq!(rename.changes.values().map(Vec::len).sum::<usize>(), 2);
     }
 

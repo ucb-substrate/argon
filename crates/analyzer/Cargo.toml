@@ -41,3 +41,4 @@ notify = "8"
 
 [dev-dependencies]
 bincode = "1"
+tower = { version = "0.5", default-features = false, features = ["util"] }

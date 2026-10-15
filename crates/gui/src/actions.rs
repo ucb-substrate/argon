@@ -77,5 +77,6 @@ actions!(
         SymbolMirror,
         CreateSymbol,
         ExportNetlist,
+        ToggleNeovim,
     ]
 );

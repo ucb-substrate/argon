@@ -804,15 +804,49 @@ pub fn parse_cell(input: &str) -> Result<CallExpr<&str, ParseMetadata>, anyhow::
     }
 }
 
+/// A key shared by every spelling of a cell invocation: its tokens joined by
+/// single spaces. `None` unless [`parse_cell`] accepts `input`.
+pub fn invocation_key(input: &str) -> Option<String> {
+    parse_cell(input).ok()?;
+    Some(
+        crate::parser::token_texts(input)
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use crate::parse::{parse_cell, parse_workspace_with_std_and_deps};
+    use crate::parse::{invocation_key, parse_cell, parse_workspace_with_std_and_deps};
 
     #[test]
     fn cell_invocation_parses() {
         parse_cell("test(1., 5)").expect("failed to parse cell");
+    }
+
+    #[test]
+    fn invocation_keys_ignore_whitespace_and_comments() {
+        let key = invocation_key("inv(1., 2)").expect("an invocation has a key");
+        assert_eq!(invocation_key("  inv( 1.,\n2 ) // two").unwrap(), key);
+        assert_ne!(invocation_key("inv(1., 3)").unwrap(), key);
+        assert_ne!(invocation_key("inv(1.2)").unwrap(), key);
+        assert_ne!(
+            invocation_key("pad(\"a b\")").unwrap(),
+            invocation_key("pad(\"ab\")").unwrap()
+        );
+        assert_eq!(
+            invocation_key("utils::pad()").unwrap(),
+            invocation_key("utils :: pad ( )").unwrap()
+        );
+    }
+
+    #[test]
+    fn only_invocations_have_keys() {
+        for input in ["", "inv", "invertr(", "inv() inv()", "1 + 2", "inv(1 .)"] {
+            assert_eq!(invocation_key(input), None, "{input:?}");
+        }
     }
 
     #[test]

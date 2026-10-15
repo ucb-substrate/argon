@@ -17,6 +17,7 @@ local config_keys = {
   'gui.font_size',
   'gui.hierarchy_depth',
   'gui.icon_size',
+  'gui.option_as_meta',
   'log.level',
 }
 

@@ -134,12 +134,15 @@ vim.api.nvim_create_autocmd('LspDetach', {
     end,
 })
 
-for _, lhs in ipairs({ '<C-\\>', string.char(28) }) do
-    vim.keymap.set({ 'n', 'i', 'v', 'c', 't' }, lhs, focus.gui, {
-        desc = 'Focus Argon GUI',
-        silent = true,
-        nowait = true,
-    })
+-- The embedded GUI switches focus with Cmd-\, leaving <C-\> to Neovim.
+if not vim.g.argon_embedded_gui then
+    for _, lhs in ipairs({ '<C-\\>', string.char(28) }) do
+        vim.keymap.set({ 'n', 'i', 'v', 'c', 't' }, lhs, focus.gui, {
+            desc = 'Focus Argon GUI',
+            silent = true,
+            nowait = true,
+        })
+    end
 end
 
 ---LSP restart internal implementations
@@ -284,6 +287,9 @@ M.start = function(bufnr)
             '--relay-socket',
             tostring(vim.g.argon_analyzer_relay),
         })
+    end
+    if type(analyzer_cmd) == 'table' and vim.g.argon_embedded_gui then
+        table.insert(analyzer_cmd, '--embedded-gui')
     end
     local lsp_start_config = { 
         name = 'argon',

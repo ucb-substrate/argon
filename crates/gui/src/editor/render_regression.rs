@@ -43,6 +43,9 @@ fn test_canvas(cx: &mut gpui::TestAppContext) -> Entity<LayoutCanvas> {
             root_path: Vec::new(),
             base_top: None,
             cells: None,
+            recent_cells: Vec::new(),
+            option_as_meta: false,
+            invoker: Default::default(),
         }
     });
     cx.new(|cx| {
@@ -694,53 +697,73 @@ fn test_editor(
     })
 }
 
-#[gpui::test]
-fn the_start_screen_offers_the_library_until_a_cell_opens(cx: &mut gpui::TestAppContext) {
-    use analyzer::rpc::{CellEntry, LangServerRequest, LangServerResponse};
-    use futures::{FutureExt, SinkExt, StreamExt};
+/// An editor filling a test window.
+struct Host(Entity<editor::Editor>);
 
-    struct Host(Entity<editor::Editor>);
-    impl Render for Host {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().size_full().child(self.0.clone())
-        }
+impl Render for Host {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.0.clone())
     }
+}
 
-    let canvas = test_canvas(cx);
-    let (client, mut server) = crate::rpc::SyncLangServerClient::for_rpc_test(cx.to_async());
-    canvas.update(cx, |canvas, cx| {
-        canvas.state.update(cx, |state, _| {
-            state.lang_server_client = client;
-            state.cells = Some(vec![CellEntry {
-                path: "top".to_owned(),
-                parameters: Vec::new(),
-                requires_arguments: false,
-            }]);
-        })
-    });
-    let editor = test_editor(&canvas, cx);
-    let (_, cx) = cx.add_window_view(|_, _| Host(editor.clone()));
+/// Answers the next request to the analyzer from the background, since opening
+/// a cell blocks on the reply, and returns the request.
+fn answer_open_cell(
+    mut server: crate::rpc::TestLangServerTransport,
+    cx: &gpui::VisualTestContext,
+) -> Task<analyzer::rpc::LangServerRequest> {
+    use futures::{SinkExt, StreamExt};
 
-    assert!(cx.debug_bounds("start_screen").is_some());
-    assert_eq!(
-        canvas.read_with(cx, |canvas, _| canvas.screen_bounds),
-        Bounds::default(),
-        "the canvas is not laid out before a cell opens"
-    );
-    // Opening blocks on the analyzer's reply, so answer from the background.
-    let analyzer = cx.background_executor.spawn(async move {
+    cx.background_executor.spawn(async move {
         let Some(Ok(tarpc::ClientMessage::Request(request))) = server.next().await else {
             panic!("expected a request")
         };
         server
             .send(tarpc::Response {
                 request_id: request.id,
-                message: Ok(LangServerResponse::OpenCell(())),
+                message: Ok(analyzer::rpc::LangServerResponse::OpenCell(())),
             })
             .await
             .unwrap();
         request.message
+    })
+}
+
+fn library_cell(path: &str) -> analyzer::rpc::CellEntry {
+    analyzer::rpc::CellEntry {
+        path: path.to_owned(),
+        parameters: Vec::new(),
+        requires_arguments: false,
+    }
+}
+
+#[gpui::test]
+fn the_start_screen_offers_the_library_until_a_cell_opens(cx: &mut gpui::TestAppContext) {
+    use analyzer::rpc::LangServerRequest;
+    use futures::FutureExt;
+
+    let canvas = test_canvas(cx);
+    let (client, server) = crate::rpc::SyncLangServerClient::for_rpc_test(cx.to_async());
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.update(cx, |state, _| {
+            state.lang_server_client = client;
+            state.cells = Some(vec![library_cell("top")]);
+        })
     });
+    let editor = test_editor(&canvas, cx);
+    let (_, cx) = cx.add_window_view(|_, _| Host(editor.clone()));
+
+    assert!(cx.debug_bounds("start_screen").is_some());
+    assert!(
+        cx.debug_bounds("start_recents").is_none(),
+        "nothing was opened recently"
+    );
+    assert_eq!(
+        canvas.read_with(cx, |canvas, _| canvas.screen_bounds),
+        Bounds::default(),
+        "the canvas is not laid out before a cell opens"
+    );
+    let analyzer = answer_open_cell(server, cx);
     let row = cx
         .debug_bounds("start_cell_0")
         .expect("the library's cell should be listed");
@@ -773,6 +796,80 @@ fn the_start_screen_offers_the_library_until_a_cell_opens(cx: &mut gpui::TestApp
         );
         assert!(!canvas.pending_init, "the first paint fits the cell");
     });
+}
+
+#[gpui::test]
+fn the_start_screen_reopens_recent_invocations(cx: &mut gpui::TestAppContext) {
+    use analyzer::rpc::{LangServerRequest, RecentCell};
+    use futures::FutureExt;
+
+    let canvas = test_canvas(cx);
+    let (client, server) = crate::rpc::SyncLangServerClient::for_rpc_test(cx.to_async());
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.update(cx, |state, _| {
+            state.lang_server_client = client;
+            state.cells = Some(vec![library_cell("top"), library_cell("inv")]);
+            state.recent_cells = vec![RecentCell {
+                invocation: "inv(2)".to_owned(),
+                cell: "inv".to_owned(),
+            }];
+        })
+    });
+    let editor = test_editor(&canvas, cx);
+    let (_, cx) = cx.add_window_view(|_, _| Host(editor.clone()));
+
+    assert!(cx.debug_bounds("start_recents").is_some());
+    let analyzer = answer_open_cell(server, cx);
+    let row = cx
+        .debug_bounds("start_recent_0")
+        .expect("the recent invocation should be listed");
+    cx.simulate_click(row.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let LangServerRequest::OpenCell { cell } = analyzer.now_or_never().unwrap() else {
+        panic!("expected the invocation to open")
+    };
+    assert_eq!(cell, "inv(2)", "the arguments are reopened too");
+}
+
+#[gpui::test]
+fn recent_invocations_leave_room_for_the_library(cx: &mut gpui::TestAppContext) {
+    use analyzer::rpc::RecentCell;
+
+    let canvas = test_canvas(cx);
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.update(cx, |state, _| {
+            state.cells = Some(vec![library_cell("top"), library_cell("inv")]);
+            state.recent_cells = (0..10)
+                .map(|width| RecentCell {
+                    invocation: format!("inv({width})"),
+                    cell: "inv".to_owned(),
+                })
+                .collect();
+        })
+    });
+    let editor = test_editor(&canvas, cx);
+    let (_, cx) = cx.add_window_view(|_, _| Host(editor.clone()));
+    let tall = cx.debug_bounds("start_recent_9").unwrap();
+    assert!(
+        tall.bottom() < cx.debug_bounds("start_cell_0").unwrap().top(),
+        "a tall window shows every recent invocation above the library"
+    );
+
+    let height = px(480.);
+    cx.simulate_resize(Size::new(px(1000.), height));
+    cx.run_until_parked();
+    let recents = cx.debug_bounds("start_recents").unwrap();
+    let first_cell = cx.debug_bounds("start_cell_0").unwrap();
+    let last_cell = cx.debug_bounds("start_cell_1").unwrap();
+    assert!(recents.bottom() <= first_cell.top());
+    assert!(
+        last_cell.bottom() <= height,
+        "the library stays visible: {last_cell:?} in a window {height:?} tall"
+    );
+    assert!(
+        cx.debug_bounds("start_recent_9").unwrap().bottom() > recents.bottom(),
+        "the recent invocations scroll instead"
+    );
 }
 
 #[gpui::test]

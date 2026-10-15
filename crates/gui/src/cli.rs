@@ -30,6 +30,11 @@ struct Cli {
     #[arg(long, global = true, default_value = "nvim")]
     nvim: OsString,
 
+    /// Run Neovim in this terminal, with the graphical editor in a separate
+    /// window.
+    #[arg(long, global = true)]
+    terminal: bool,
+
     #[command(subcommand)]
     command: Option<CommandKind>,
 
@@ -92,10 +97,14 @@ pub fn run() -> ExitCode {
 
 fn execute(cli: Cli) -> Result<ExitStatus> {
     match cli.command {
+        #[cfg(unix)]
+        None if !cli.terminal => run_embedded(&cli.nvim, &cli.path),
         None => {
             let focus_target = crate::focus::capture_target();
             run_nvim(&cli.nvim, &cli.path, focus_target.as_deref())
         }
+        #[cfg(unix)]
+        Some(CommandKind::Ssh(args)) if !cli.terminal => run_ssh_embedded(&cli.nvim, args),
         Some(CommandKind::Ssh(args)) => {
             let focus_target = crate::focus::capture_target();
             run_ssh(&cli.nvim, args, focus_target.as_deref())
@@ -148,6 +157,28 @@ fn run_nvim(nvim: &OsStr, path: &Path, focus_target: Option<&str>) -> Result<Exi
     command
         .status()
         .with_context(|| format!("failed to start `{}`", nvim.to_string_lossy()))
+}
+
+/// Runs Neovim inside the GUI window.
+#[cfg(unix)]
+fn run_embedded(nvim: &OsStr, path: &Path) -> Result<ExitStatus> {
+    let (working_directory, target) = nvim_location(path)?;
+    let (announcements, relay_socket) = crate::main_window::AnnouncementSource::bind_relay()
+        .context("could not create the analyzer relay socket")?;
+    let mut command = Command::new(nvim);
+    command
+        .current_dir(working_directory)
+        .arg("--embed")
+        .arg(target);
+    let (client, events) = crate::nvim::client::spawn(command)
+        .with_context(|| format!("failed to start `{}`", nvim.to_string_lossy()))?;
+    client.set_var("argon_embedded_gui", true.into());
+    client.set_var(
+        "argon_analyzer_relay",
+        relay_socket.to_string_lossy().as_ref().into(),
+    );
+    crate::run_embedded(client, events, announcements);
+    Ok(success_status())
 }
 
 fn nvim_location(path: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -237,6 +268,129 @@ fn start_forwarded_session(
             Err(error)
         }
     }
+}
+
+/// Runs remote Neovim inside the GUI window, forwarding the remote analyzer's
+/// port once it announces itself.
+#[cfg(unix)]
+fn run_ssh_embedded(nvim: &OsStr, args: SshArgs) -> Result<ExitStatus> {
+    use std::sync::{Arc, Mutex};
+
+    let control = Arc::new(SshControl::new(&args)?);
+    validate_port_overrides(&args)?;
+    let analyzer = resolve_remote_analyzer(&args, &control)?;
+    let relay = start_remote_relay(&args, &control, &analyzer)?;
+
+    let mut command = control.command(&args);
+    command
+        .arg("-T")
+        .arg(&args.host)
+        .arg(interactive_terminal_command(&remote_embedded_nvim_command(
+            nvim, &args.path,
+        )));
+    let (client, events) = crate::nvim::client::spawn(command)
+        .with_context(|| format!("failed to start `{}`", args.ssh.to_string_lossy()))?;
+    client.set_var("argon_embedded_gui", true.into());
+    client.set_var("argon_analyzer_relay", relay.socket_path.as_str().into());
+    if let Some(port) = args.remote_analyzer_port {
+        client.set_var("argon_analyzer_rpc_port", port.into());
+    }
+
+    let relay = Arc::new(Mutex::new(Some(relay)));
+    let processes = Arc::new(Mutex::new(Some(Vec::new())));
+    let (sender, receiver) = futures::channel::mpsc::unbounded();
+    thread::spawn({
+        let control = control.clone();
+        let relay = relay.clone();
+        let processes = processes.clone();
+        move || {
+            let announcement = forward_remote_analyzer(&args, &control, &relay, &processes)
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.unbounded_send(announcement);
+        }
+    });
+    let session = RemoteSession {
+        relay,
+        processes,
+        _control: control,
+    };
+    crate::run_embedded(
+        client,
+        events,
+        crate::main_window::AnnouncementSource::new(receiver, session),
+    );
+    Ok(success_status())
+}
+
+/// The relay of a remote session, until the session ends.
+#[cfg(unix)]
+type SessionRelay = std::sync::Arc<std::sync::Mutex<Option<Relay>>>;
+
+/// Processes a remote session started, stopped when the window closes.
+#[cfg(unix)]
+type SessionProcesses = std::sync::Arc<std::sync::Mutex<Option<Vec<Child>>>>;
+
+#[cfg(unix)]
+fn lock_unpoisoned<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// What an embedded SSH session keeps running until the window closes.
+#[cfg(unix)]
+struct RemoteSession {
+    relay: SessionRelay,
+    processes: SessionProcesses,
+    _control: std::sync::Arc<SshControl>,
+}
+
+#[cfg(unix)]
+impl Drop for RemoteSession {
+    fn drop(&mut self) {
+        lock_unpoisoned(&self.relay).take();
+        let processes = lock_unpoisoned(&self.processes).take();
+        for mut child in processes.into_iter().flatten() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Waits for the remote analyzer and forwards a local port to it.
+#[cfg(unix)]
+fn forward_remote_analyzer(
+    args: &SshArgs,
+    control: &SshControl,
+    relay: &SessionRelay,
+    processes: &SessionProcesses,
+) -> Result<(SocketAddr, SessionToken)> {
+    const CLOSED: &str = "the window closed before the analyzer started";
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let (remote_analyzer_port, token) = loop {
+        let polled = match lock_unpoisoned(relay).as_mut() {
+            Some(relay) => poll_relay(relay)?,
+            None => bail!(CLOSED),
+        };
+        if let Some(announcement) = polled {
+            break announcement;
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for `argon-analyzer` to start");
+        }
+    };
+    let mut tunnel = start_tunnel(args, control, remote_analyzer_port)?;
+    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, tunnel.local_analyzer_port);
+    let mut processes = lock_unpoisoned(processes);
+    match processes.as_mut() {
+        Some(processes) => processes.push(tunnel.child),
+        None => {
+            let _ = tunnel.child.kill();
+            let _ = tunnel.child.wait();
+            bail!(CLOSED);
+        }
+    }
+    Ok((addr.into(), token))
 }
 
 fn validate_port_overrides(args: &SshArgs) -> Result<()> {
@@ -441,23 +595,24 @@ impl Drop for SshControl {
     }
 }
 
+/// A temporary directory with a short path, for sockets.
 #[cfg(unix)]
-fn short_temp_root() -> PathBuf {
+pub(crate) fn short_temp_root() -> PathBuf {
     PathBuf::from("/tmp")
 }
 
 #[cfg(windows)]
-fn short_temp_root() -> PathBuf {
+pub(crate) fn short_temp_root() -> PathBuf {
     env::temp_dir()
 }
 
+/// The remote command for Neovim in the remote terminal.
 fn remote_nvim_command(
     nvim: &OsStr,
     path: &Path,
     analyzer_port: Option<u16>,
     relay_socket: &str,
 ) -> String {
-    let path = shell_quote(&path.to_string_lossy());
     let nvim = shell_quote(&nvim.to_string_lossy());
     let relay_vim = shell_quote(&format!(
         "let g:argon_analyzer_relay = '{}'",
@@ -467,6 +622,23 @@ fn remote_nvim_command(
     let rpc_port = analyzer_port
         .map(|port| format!(" --cmd 'let g:argon_analyzer_rpc_port = {port}'"))
         .unwrap_or_default();
+    in_remote_project(
+        path,
+        &format!("exec {nvim}{rpc_port} --cmd {relay_vim} --cmd {focus_mapping} \"$1\""),
+    )
+}
+
+/// The remote command for Neovim embedded in the local GUI, which sets its
+/// variables over RPC instead.
+fn remote_embedded_nvim_command(nvim: &OsStr, path: &Path) -> String {
+    let nvim = shell_quote(&nvim.to_string_lossy());
+    in_remote_project(path, &format!("exec {nvim} --embed \"$1\""))
+}
+
+/// A remote shell command that enters the project at `path` and runs
+/// `command` with the source file as `$1`.
+fn in_remote_project(path: &Path, command: &str) -> String {
+    let path = shell_quote(&path.to_string_lossy());
     format!(
         "set -- {path}; \
          if [ -d \"$1\" ]; then \
@@ -482,8 +654,32 @@ fn remote_nvim_command(
          else \
            printf '%s\\n' 'argone: remote path is not a file or directory' >&2; exit 1; \
          fi; \
-         exec {nvim}{rpc_port} --cmd {relay_vim} --cmd {focus_mapping} \"$1\""
+         {command}"
     )
+}
+
+/// Waits up to one poll interval for the relay to report the remote
+/// analyzer's port and token.
+fn poll_relay(relay: &mut Relay) -> Result<Option<(u16, SessionToken)>> {
+    match relay.lines.recv_timeout(STARTUP_POLL_INTERVAL) {
+        Ok(Ok(line)) => {
+            if let Some(announcement) = parse_analyzer_announcement(&line) {
+                let _ = relay.child.wait();
+                return Ok(Some(announcement));
+            }
+        }
+        Ok(Err(error)) => return Err(error.into()),
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Err(mpsc::RecvTimeoutError::Disconnected) => {}
+    }
+    if let Some(status) = relay
+        .child
+        .try_wait()
+        .context("failed while waiting for the analyzer relay")?
+    {
+        bail!("analyzer relay exited before reporting the RPC port ({status})");
+    }
+    Ok(None)
 }
 
 fn wait_for_remote_analyzer(
@@ -492,23 +688,8 @@ fn wait_for_remote_analyzer(
 ) -> Result<(u16, SessionToken)> {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
     loop {
-        match relay.lines.recv_timeout(STARTUP_POLL_INTERVAL) {
-            Ok(Ok(line)) => {
-                if let Some(announcement) = parse_analyzer_announcement(&line) {
-                    let _ = relay.child.wait();
-                    return Ok(announcement);
-                }
-            }
-            Ok(Err(error)) => return Err(error.into()),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {}
-        }
-        if let Some(status) = relay
-            .child
-            .try_wait()
-            .context("failed while waiting for the analyzer relay")?
-        {
-            bail!("analyzer relay exited before reporting the RPC port ({status})");
+        if let Some(announcement) = poll_relay(relay)? {
+            return Ok(announcement);
         }
         if let Some(status) = nvim_ssh
             .try_wait()
@@ -758,6 +939,18 @@ mod tests {
     }
 
     #[test]
+    fn terminal_is_a_global_flag() {
+        let local = Cli::try_parse_from(["argone", "project"]).unwrap();
+        assert!(!local.terminal);
+        let local = Cli::try_parse_from(["argone", "--terminal", "project"]).unwrap();
+        assert!(local.terminal);
+        let remote =
+            Cli::try_parse_from(["argone", "ssh", "server", "--terminal", "/work/chip"]).unwrap();
+        assert!(remote.terminal);
+        assert!(Cli::try_parse_from(["argone", "--embed", "project"]).is_err());
+    }
+
+    #[test]
     fn parses_startup_protocol_messages() {
         assert_eq!(
             parse_relay_announcement("ARGON_RELAY 1 /tmp/session/rpc.sock\n"),
@@ -844,6 +1037,52 @@ mod tests {
         assert!(command.contains("let g:argon_analyzer_relay"));
         assert!(command.contains("<C-Bslash>"));
         assert!(command.contains("'custom nvim'"));
+    }
+
+    #[test]
+    fn builds_embedded_remote_command_without_terminal_arguments() {
+        let command = remote_embedded_nvim_command(
+            OsStr::new("custom nvim"),
+            Path::new("/work/a project's files"),
+        );
+        assert!(command.contains("set -- '/work/a project'\"'\"'s files';"));
+        assert!(command.ends_with("exec 'custom nvim' --embed \"$1\""));
+        assert!(!command.contains("--cmd"));
+        assert!(!command.contains("argon_analyzer"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interactive_shell_runs_embedded_nvim_in_the_project() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        fs::create_dir(&project).unwrap();
+        fs::write(project.join("lib.ar"), "cell top() {}\n").unwrap();
+
+        let nvim = directory.path().join("fake-nvim");
+        fs::write(&nvim, "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$@\"\n").unwrap();
+        fs::set_permissions(&nvim, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let command =
+            interactive_terminal_command(&remote_embedded_nvim_command(nvim.as_os_str(), &project));
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command)
+            .env("SHELL", "/bin/sh")
+            .env("ENV", "")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}\n--embed\nlib.ar\n", project.display())
+        );
     }
 
     #[cfg(unix)]

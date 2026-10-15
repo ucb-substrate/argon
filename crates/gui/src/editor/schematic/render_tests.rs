@@ -53,6 +53,9 @@ fn test_state(cx: &mut TestAppContext, view: View) -> Entity<EditorState> {
             root_path: Vec::new(),
             base_top: None,
             cells: None,
+            recent_cells: Vec::new(),
+            option_as_meta: false,
+            invoker: Default::default(),
         }
     })
 }
@@ -600,6 +603,7 @@ mod editing {
                 current: grab,
                 base: scene,
                 selection: vec![Hit::Element(0)],
+                click: None,
             });
             (grab, (x, y))
         });
@@ -629,6 +633,98 @@ mod editing {
             keywords[..2],
             [("x", Some(x.as_str())), ("y", Some(y.as_str()))]
         );
+    }
+
+    /// Port `a` of the inverter, which ends two wires, and its position.
+    fn port_a(
+        canvas: &gpui::Entity<super::SchematicCanvas>,
+        cx: &mut TestAppContext,
+    ) -> (usize, (f64, f64)) {
+        canvas.read_with(cx, |canvas, _| {
+            let scene = canvas.scene().unwrap();
+            let port = scene.ports.iter().position(|p| p.name == "a").unwrap();
+            let (x, y) = scene.ports[port].position;
+            (port, (x as f64, y as f64))
+        })
+    }
+
+    #[gpui::test]
+    fn a_click_on_the_selection_cycles_on_release(cx: &mut TestAppContext) {
+        let (state, mut server) = rpc_state(cx);
+        // Selecting reveals the selection's source, which waits on a reply.
+        cx.background_executor
+            .spawn(async move {
+                while let Some(Ok(tarpc::ClientMessage::Request(request))) = server.next().await {
+                    let message = match request.message {
+                        LangServerRequest::SelectSpan { .. } => LangServerResponse::SelectSpan(()),
+                        LangServerRequest::CallArguments { .. } => {
+                            LangServerResponse::CallArguments(None)
+                        }
+                        _ => continue,
+                    };
+                    let response = tarpc::Response {
+                        request_id: request.id,
+                        message: Ok(message),
+                    };
+                    if server.send(response).await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        load_inverter(&state, 5, cx);
+        let canvas = test_canvas(&state, cx);
+        draw(&canvas, cx);
+        let (port, at) = port_a(&canvas, cx);
+        click(&canvas, at, 1, cx);
+        release(&canvas, cx);
+        canvas.read_with(cx, |canvas, _| {
+            assert_eq!(canvas.selection, [Hit::Port(port)]);
+        });
+        // The press keeps the port selected for a drag.
+        click(&canvas, at, 1, cx);
+        canvas.read_with(cx, |canvas, _| {
+            assert_eq!(canvas.selection, [Hit::Port(port)]);
+        });
+        release(&canvas, cx);
+        canvas.read_with(cx, |canvas, _| {
+            assert!(matches!(canvas.selection[..], [Hit::Wire(_)]));
+        });
+    }
+
+    #[gpui::test]
+    fn a_drag_from_a_selected_port_moves_it(cx: &mut TestAppContext) {
+        let (state, mut server) = rpc_state(cx);
+        load_inverter(&state, 5, cx);
+        let canvas = test_canvas(&state, cx);
+        draw(&canvas, cx);
+        let (port, at) = port_a(&canvas, cx);
+        canvas.update(cx, |canvas, _| {
+            let scene = canvas.scene().unwrap().clone();
+            canvas.selection = vec![Hit::Port(port)];
+            canvas.selection_spans = vec![scene.ports[port].span.clone()];
+        });
+        click(&canvas, at, 1, cx);
+        hover(&canvas, (at.0 + 2., at.1), cx);
+        canvas.read_with(cx, |canvas, _| {
+            assert_eq!(canvas.selection, [Hit::Port(port)]);
+            let position = canvas.scene().unwrap().ports[port].position;
+            assert_eq!(position, (at.0 as i64 + 2, at.1 as i64));
+        });
+        release(&canvas, cx);
+        let request = next_request(&mut server, cx);
+        let LangServerRequest::Place { request: place } = request.message else {
+            panic!("expected a place request, got {:?}", request.message);
+        };
+        let x = (at.0 as i64 + 2).to_string();
+        assert!(place.edits.iter().any(|edit| {
+            edit.keywords
+                .iter()
+                .any(|k| k.name == "x" && k.value.as_deref() == Some(x.as_str()))
+        }));
+        canvas.read_with(cx, |canvas, _| {
+            assert_eq!(canvas.selection, [Hit::Port(port)]);
+        });
     }
 
     #[gpui::test]
@@ -1076,6 +1172,7 @@ mod editing {
                 current: (-4., 0.),
                 base: canvas.symbol_scene().unwrap().clone(),
                 selection: canvas.symbol_selection.clone(),
+                click: None,
             });
         });
         let window = cx.add_empty_window();
@@ -1146,6 +1243,7 @@ mod editing {
                 current: (-3., 0.),
                 base: canvas.symbol_scene().unwrap().clone(),
                 selection: canvas.symbol_selection.clone(),
+                click: None,
             });
         };
         // A click alone edits nothing.

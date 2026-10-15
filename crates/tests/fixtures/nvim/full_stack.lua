@@ -578,6 +578,18 @@ elseif vim.env.ARGON_TEST_MODE == 'rpc_errors' then
 elseif vim.env.ARGON_TEST_MODE == 'cells' then
   -- The Rust test opens a cell from the GUI's cell list and acknowledges
   -- once it is shown.
+elseif vim.env.ARGON_TEST_MODE == 'recents' then
+  -- The Rust test checks what each step records as recently opened.
+  await('open_inv')
+  vim.cmd('Argon openCell inv(2)')
+  await('open_nope')
+  vim.cmd('Argon openCell nope()')
+  vim.cmd('Argon follow')
+  signal('following')
+  await('new_cell')
+  vim.cmd('Argon newCell fresh')
+  await('rename_cell')
+  vim.cmd('Argon renameCell unit')
 else
   error('unknown full-stack mode: ' .. tostring(vim.env.ARGON_TEST_MODE))
 end

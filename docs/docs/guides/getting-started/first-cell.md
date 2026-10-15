@@ -33,7 +33,7 @@ From the library directory:
 argone .
 ```
 
-This starts Neovim, the analyzer, and the GUI window. Neovim owns the source; the analyzer compiles it and sends the result to the GUI.
+This opens a window with Neovim on the left and the GUI on the right, and starts the analyzer. Neovim owns the source; the analyzer compiles it and sends the result to the GUI. <kbd>Cmd</kbd>+<kbd>Backslash</kbd> switches focus between Neovim and the GUI's canvas.
 
 The GUI opens on a start screen that lists your library's cells. Click `top` to open it.
 

@@ -7,7 +7,7 @@ use analyzer::{
     agent::AgentClient,
     rpc::{
         CellEntry, CompilationSnapshot, CompilationUpdate, DevicePreview, Gui, InstancePreview,
-        LangServerClient, SchematicInstancePreview,
+        LangServerClient, RecentCell, SchematicInstancePreview,
     },
     transport::{self, Role, SessionToken},
 };
@@ -87,6 +87,8 @@ pub enum GuiEvent {
     DevicePreview(DevicePreview),
     /// The library's cells.
     Cells(Vec<CellEntry>),
+    /// The library's recently opened cells.
+    RecentCells(Vec<RecentCell>),
     Highlight {
         revision: u64,
         spans: Vec<Span>,
@@ -214,6 +216,12 @@ impl Gui for HeadlessGui {
     async fn set_cells(self, _: context::Context, cells: Vec<CellEntry>) {
         self.events
             .send(GuiEvent::Cells(cells))
+            .expect("full-stack test should still be receiving GUI events");
+    }
+
+    async fn set_recent_cells(self, _: context::Context, cells: Vec<RecentCell>) {
+        self.events
+            .send(GuiEvent::RecentCells(cells))
             .expect("full-stack test should still be receiving GUI events");
     }
 
@@ -439,7 +447,14 @@ impl Session {
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept Neovim LSP stream");
             let (reader, writer) = tokio::io::split(stream);
-            analyzer::main_with_io_on_listener(rpc_listener, token, None, reader, writer).await;
+            analyzer::main_with_io_on_listener(
+                rpc_listener,
+                token,
+                analyzer::GuiLink::default(),
+                reader,
+                writer,
+            )
+            .await;
         });
     }
 
@@ -611,6 +626,36 @@ mod tests {
     }
 
     impl Session {
+        /// Waits for the GUI to be sent exactly `invocations` as recent cells.
+        async fn wait_for_recents(&mut self, invocations: &[&str]) -> Vec<RecentCell> {
+            let GuiEvent::RecentCells(cells) = self
+                .wait_for_event(|event| {
+                    matches!(
+                        event,
+                        GuiEvent::RecentCells(cells)
+                            if cells.iter().map(|cell| cell.invocation.as_str()).eq(invocations.iter().copied())
+                    )
+                })
+                .await
+            else {
+                unreachable!()
+            };
+            cells
+        }
+
+        /// The invocations in the library's recents file.
+        fn stored_recents(&self) -> Vec<String> {
+            let contents =
+                std::fs::read_to_string(self.project.join(".argon/recents.json")).unwrap();
+            let file: Value = serde_json::from_str(&contents).unwrap();
+            file["cells"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|cell| cell["invocation"].as_str().unwrap().to_owned())
+                .collect()
+        }
+
         async fn wait_for_rects(&mut self, count: usize) -> u64 {
             let GuiEvent::UpdateCell { revision, .. } = self
                 .wait_for_event(|event| {
@@ -1501,6 +1546,124 @@ cell top() {
             }
 
             std::fs::write(&session.ack, "ok\n").expect("acknowledge the opened cell");
+            finish_nvim(child).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recent_cells_follow_user_opens() {
+        assert_completes("waiting for recently opened cells", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new("cell top() {\n}\n\ncell inv(n: Int) {\n}\n").await;
+            session.start_analyzer();
+            let child = session.spawn_nvim("recents");
+            let analyzer = session.connect_analyzer().await;
+            session.connect_gui().await;
+
+            // Neovim opens `top()` once it starts.
+            session.wait_for_recents(&["top()"]).await;
+            session.signal("open_inv");
+            let recents = session.wait_for_recents(&["inv(2)", "top()"]).await;
+            assert_eq!(recents[0].cell, "inv");
+            assert_eq!(session.stored_recents(), ["inv(2)", "top()"]);
+            assert_eq!(
+                std::fs::read_to_string(session.project().join(".argon/.gitignore")).unwrap(),
+                "*\n"
+            );
+
+            // An invocation that does not compile is not recorded.
+            session.signal("open_nope");
+            loop {
+                match session.next_event().await {
+                    GuiEvent::RecentCells(cells) => {
+                        assert!(cells.iter().all(|cell| cell.invocation != "nope()"));
+                    }
+                    GuiEvent::UpdateCell {
+                        kind: OutputKind::StaticErrors,
+                        ..
+                    } => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(session.stored_recents(), ["inv(2)", "top()"]);
+
+            // Nor is an agent's open, even of an invocation the user opened
+            // that compiles once the agent adds its cell.
+            session.await_signal("following").await;
+            let agent = session.connect_agent().await;
+            while !agent.status(agent_context()).await.unwrap().follow_mode {
+                time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            agent
+                .open_cell(agent_context(), "nope()".to_owned())
+                .await
+                .unwrap()
+                .expect("follow mode should allow switching the GUI's cell");
+            let report = agent
+                .edit_file(
+                    agent_context(),
+                    replace(
+                        "lib.ar",
+                        "cell top() {\n}\n",
+                        "cell top() {\n}\n\ncell nope() {\n}\n",
+                        "add nope",
+                    ),
+                )
+                .await
+                .unwrap()
+                .expect("the agent edit should apply");
+            assert_eq!(report.summary.unwrap().status, CompileStatus::Valid);
+
+            session.signal("new_cell");
+            session
+                .wait_for_recents(&["fresh()", "inv(2)", "top()"])
+                .await;
+
+            // Another spelling of a recorded invocation replaces it.
+            analyzer
+                .open_cell(context::current(), "inv( 2 )".to_owned())
+                .await
+                .expect("open-cell request should reach analyzer");
+            session
+                .wait_for_recents(&["inv( 2 )", "fresh()", "top()"])
+                .await;
+
+            session.signal("rename_cell");
+            let renamed = ["unit( 2 )", "fresh()", "top()"];
+            let recents = session.wait_for_recents(&renamed).await;
+            assert_eq!(recents[0].cell, "unit");
+            assert_eq!(session.stored_recents(), renamed);
+
+            session.connect_gui().await;
+            session.wait_for_recents(&renamed).await;
+
+            std::fs::write(&session.ack, "ok\n").unwrap();
+            finish_nvim(child).await;
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recent_cells_are_loaded_when_the_analyzer_starts() {
+        assert_completes("waiting for stored recent cells", async {
+            let _guard = FULL_STACK_LOCK.lock().await;
+            let mut session = Session::new("cell top() {\n}\n\ncell inv(n: Int) {\n}\n").await;
+            let directory = session.project().join(".argon");
+            std::fs::create_dir(&directory).unwrap();
+            let stored = json!({
+                "cells": [{ "invocation": "lib::inv(2)" }, { "invocation": "top()" }]
+            });
+            std::fs::write(directory.join("recents.json"), stored.to_string()).unwrap();
+            session.start_analyzer();
+            let child = session.spawn_nvim("cells");
+            session.connect_gui().await;
+
+            let recents = session.wait_for_recents(&["lib::inv(2)", "top()"]).await;
+            assert_eq!(recents[0].cell, "inv");
+            assert_eq!(recents[1].cell, "top");
+
+            std::fs::write(&session.ack, "ok\n").unwrap();
             finish_nvim(child).await;
         })
         .await;
