@@ -222,20 +222,20 @@ dependencies = [
  "arc",
  "arcstr",
  "argonc",
- "bincode",
+ "bincode 3.0.0",
  "bytes",
  "cfgrammar",
  "clap",
  "futures",
- "getrandom 0.3.4",
- "hmac",
+ "getrandom 0.4.3",
+ "hmac 0.13.0",
  "homedir",
  "indexmap",
  "lsp-document",
  "notify",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tarpc",
  "tempfile",
  "tokio",
@@ -269,7 +269,7 @@ dependencies = [
  "anyhow",
  "approx",
  "arcstr",
- "bincode",
+ "bincode 3.0.0",
  "cfgrammar",
  "clap",
  "const_format",
@@ -290,7 +290,7 @@ dependencies = [
  "sky130",
  "sparse-linear-solver",
  "tempfile",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
  "uniquify 0.4.1 (registry+https://github.com/substrate-labs/crates-index)",
@@ -695,13 +695,13 @@ dependencies = [
  "crc32fast",
  "futures-lite 2.6.1",
  "pin-project",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "atoll"
 version = "0.1.4"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "arcstr",
  "cache",
@@ -754,7 +754,7 @@ dependencies = [
  "num-traits",
  "pastey",
  "rayon",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "v_frame",
  "y4m",
 ]
@@ -865,6 +865,12 @@ checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "bincode"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd6a120d2e16b3e1b4a24bd70f23b12d3e16b81f113364a26935f8db7245452d"
 
 [[package]]
 name = "bindgen"
@@ -1134,7 +1140,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "cache"
 version = "0.7.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "backoff",
  "clap",
@@ -1151,7 +1157,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "sha2 0.10.9",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-rusqlite",
  "tokio-stream",
@@ -1389,6 +1395,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
+name = "cmov"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
+
+[[package]]
 name = "cocoa"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1451,7 +1463,7 @@ dependencies = [
 [[package]]
 name = "codegen"
 version = "0.10.3"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "convert_case 0.11.0",
  "darling 0.23.0",
@@ -1503,7 +1515,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b60b5124979fccd9addd89d8b97a1d6eebb4950694520c75ddd722535ea443f"
 dependencies = [
  "nix 0.31.3",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1536,7 +1548,7 @@ dependencies = [
 [[package]]
 name = "config"
 version = "0.4.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "anyhow",
  "cache",
@@ -1896,6 +1908,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2931af7e13dc045d8e9d26afccc6fa115d64e115c9c84b1166288b46f6782c2"
 
 [[package]]
+name = "ctutils"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03bb0e1cc970d482d121d9a1744999169b69a07470b3d644a7894e53fcaf4574"
+dependencies = [
+ "cmov",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2099,7 +2120,7 @@ checksum = "abd57806937c9cc163efc8ea3910e00a62e2aeb0b8119f1793a978088f8f6b04"
 [[package]]
 name = "diagnostics"
 version = "0.4.1"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "serde",
  "tracing",
@@ -2125,6 +2146,7 @@ dependencies = [
  "block-buffer 0.12.1",
  "const-oid",
  "crypto-common 0.2.2",
+ "ctutils",
 ]
 
 [[package]]
@@ -2409,7 +2431,7 @@ dependencies = [
 [[package]]
 name = "enumify"
 version = "0.2.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "enumify_macros 0.3.2 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
 ]
@@ -2432,7 +2454,7 @@ dependencies = [
 [[package]]
 name = "enumify_macros"
 version = "0.3.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "convert_case 0.11.0",
  "darling 0.23.0",
@@ -2595,7 +2617,7 @@ dependencies = [
 [[package]]
 name = "examples"
 version = "0.2.1"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 
 [[package]]
 name = "exr"
@@ -2809,6 +2831,12 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "font-types"
@@ -3052,7 +3080,7 @@ dependencies = [
 [[package]]
 name = "gds"
 version = "0.4.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "arcstr",
  "byteorder",
@@ -3072,7 +3100,7 @@ dependencies = [
 [[package]]
 name = "gdsconv"
 version = "0.2.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "arcstr",
  "gds",
@@ -3080,7 +3108,7 @@ dependencies = [
  "layir",
  "serde",
  "slotmap",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
 ]
 
@@ -3232,7 +3260,7 @@ dependencies = [
 [[package]]
 name = "geometry"
 version = "0.7.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "array_map",
  "geometry_macros 0.1.2 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
@@ -3257,7 +3285,7 @@ dependencies = [
 [[package]]
 name = "geometry_macros"
 version = "0.1.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "darling 0.23.0",
  "macrotools 0.2.1 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
@@ -3529,7 +3557,7 @@ dependencies = [
  "strum 0.27.2",
  "sum_tree",
  "taffy",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "usvg",
  "util",
  "util_macros",
@@ -3623,7 +3651,7 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
- "foldhash",
+ "foldhash 0.1.5",
 ]
 
 [[package]]
@@ -3688,7 +3716,7 @@ version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
 dependencies = [
- "hmac",
+ "hmac 0.12.1",
 ]
 
 [[package]]
@@ -3698,6 +3726,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest 0.10.7",
+]
+
+[[package]]
+name = "hmac"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
+dependencies = [
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -3899,7 +3936,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -4407,7 +4444,7 @@ dependencies = [
 [[package]]
 name = "layir"
 version = "0.2.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "aph_disjoint_set",
  "arcstr",
@@ -4415,16 +4452,16 @@ dependencies = [
  "geometry 0.7.2 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
  "indexmap",
  "serde",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "uniquify 0.4.1 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
 ]
 
 [[package]]
 name = "lazy_static"
-version = "1.5.0"
+version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 dependencies = [
  "spin 0.9.9",
 ]
@@ -4701,7 +4738,7 @@ dependencies = [
 [[package]]
 name = "macrotools"
 version = "0.2.1"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -4941,7 +4978,7 @@ dependencies = [
  "rustc-hash 1.1.0",
  "spirv",
  "strum 0.26.3",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "unicode-ident",
 ]
 
@@ -5064,7 +5101,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 [[package]]
 name = "ngspice"
 version = "0.5.3"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "arcstr",
  "cache",
@@ -5078,7 +5115,7 @@ dependencies = [
  "spice",
  "substrate",
  "tera",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "unicase",
 ]
@@ -5343,12 +5380,12 @@ dependencies = [
 [[package]]
 name = "nutlex"
 version = "0.4.3"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "enumify 0.2.2 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
  "nom 8.0.0",
  "serde",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -5529,7 +5566,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "hkdf",
- "hmac",
+ "hmac 0.12.1",
  "md-5",
  "num",
  "num-bigint-dig",
@@ -5570,7 +5607,7 @@ dependencies = [
  "futures-sink",
  "js-sys",
  "pin-project-lite",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -5685,7 +5722,7 @@ dependencies = [
 [[package]]
 name = "pathtree"
 version = "0.3.1"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 
 [[package]]
 name = "pbkdf2"
@@ -5694,13 +5731,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
 dependencies = [
  "digest 0.10.7",
- "hmac",
+ "hmac 0.12.1",
 ]
 
 [[package]]
 name = "pegasus"
 version = "0.2.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "anyhow",
  "lazy_static",
@@ -6143,7 +6180,7 @@ dependencies = [
 [[package]]
 name = "psfparser"
 version = "0.1.5"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "anyhow",
  "enumify 0.2.2 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
@@ -6262,7 +6299,7 @@ dependencies = [
  "rustc-hash 2.1.3",
  "rustls",
  "socket2",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "web-time",
@@ -6284,7 +6321,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tinyvec",
  "tracing",
  "web-time",
@@ -6455,7 +6492,7 @@ dependencies = [
  "rand 0.9.5",
  "rand_chacha 0.9.0",
  "simd_helpers",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "v_frame",
  "wasm-bindgen",
 ]
@@ -6709,9 +6746,9 @@ dependencies = [
 
 [[package]]
 name = "rust-embed"
-version = "8.12.0"
+version = "8.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9e7760e252aaba7b09f4be00e36476cf585bdb68a53552ac954cdf504ab4bc9"
+checksum = "19afa5b4b6a611de00bd1bdae6ae6f39084c9399f0679c3f52d8469cf335cc23"
 dependencies = [
  "rust-embed-impl",
  "rust-embed-utils",
@@ -6720,9 +6757,9 @@ dependencies = [
 
 [[package]]
 name = "rust-embed-impl"
-version = "8.12.0"
+version = "8.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bcfc4d6f53af43755f7a723e4b6b8794fcce052a178dd8c6c1dadc5f5343097"
+checksum = "e0d8afda6374eac59e066abee06d265247ebbaf3006cf878e2879e8356e34053"
 dependencies = [
  "mime_guess",
  "proc-macro2",
@@ -6734,9 +6771,9 @@ dependencies = [
 
 [[package]]
 name = "rust-embed-utils"
-version = "8.12.0"
+version = "8.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42ffa149f6aa81b58a5b3011d01a857c4ed12c7a732d2c51947a4c7c692185f0"
+checksum = "0d84e8ba78bd384263e5922f084cbe1b081c3b7e69add59c8fb097b879ba968a"
 dependencies = [
  "globset",
  "sha2 0.11.0",
@@ -6991,7 +7028,7 @@ dependencies = [
 [[package]]
 name = "scir"
 version = "0.9.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "arcstr",
  "diagnostics",
@@ -6999,7 +7036,7 @@ dependencies = [
  "indexmap",
  "rust_decimal",
  "serde",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "uniquify 0.4.1 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
 ]
@@ -7142,10 +7179,11 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.151"
+version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
+ "foldhash 0.2.0",
  "indexmap",
  "itoa",
  "memchr",
@@ -7341,7 +7379,7 @@ dependencies = [
 [[package]]
 name = "sky130"
 version = "0.10.3"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "arcstr",
  "atoll",
@@ -7363,7 +7401,7 @@ dependencies = [
  "spectre",
  "spice",
  "substrate",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "unicase",
 ]
 
@@ -7394,9 +7432,9 @@ dependencies = [
 
 [[package]]
 name = "smallvec"
-version = "1.16.1"
+version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
+checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
 
 [[package]]
 name = "smawk"
@@ -7430,7 +7468,7 @@ checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 [[package]]
 name = "snippets"
 version = "0.7.1"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "regex",
  "textwrap",
@@ -7457,7 +7495,7 @@ dependencies = [
 [[package]]
 name = "spectre"
 version = "0.11.3"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "arcstr",
  "cache",
@@ -7474,7 +7512,7 @@ dependencies = [
  "spice",
  "substrate",
  "tera",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "type_dispatch",
 ]
@@ -7482,7 +7520,7 @@ dependencies = [
 [[package]]
 name = "spice"
 version = "0.9.3"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "arcstr",
  "ena",
@@ -7496,7 +7534,7 @@ dependencies = [
  "rust_decimal_macros",
  "scir",
  "substrate",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "unicase",
 ]
@@ -7644,7 +7682,7 @@ dependencies = [
 [[package]]
 name = "substrate"
 version = "0.10.3"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "anyhow",
  "arcstr",
@@ -7675,7 +7713,7 @@ dependencies = [
  "snippets",
  "splines",
  "test-log",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tracing",
  "type_dispatch",
  "uniquify 0.4.1 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
@@ -7966,7 +8004,7 @@ dependencies = [
  "serde",
  "static_assertions",
  "tarpc-plugins",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-serde",
  "tokio-util",
@@ -8094,11 +8132,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.20",
+ "thiserror-impl 2.0.21",
 ]
 
 [[package]]
@@ -8114,9 +8152,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.20"
+version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8230,9 +8268,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
 dependencies = [
  "bytes",
  "libc",
@@ -8283,7 +8321,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caf600e7036b17782571dd44fa0a5cea3c82f60db5137f774a325a76a0d6852b"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "bytes",
  "educe",
  "futures-core",
@@ -8318,9 +8356,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.19"
+version = "0.7.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
 dependencies = [
  "bytes",
  "futures-core",
@@ -8610,7 +8648,7 @@ checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
 dependencies = [
  "crossbeam-channel",
  "symlink",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "time",
  "tracing-subscriber",
 ]
@@ -8709,7 +8747,7 @@ dependencies = [
 [[package]]
 name = "type_dispatch"
 version = "0.5.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "duplicate",
  "type_dispatch_macros",
@@ -8718,7 +8756,7 @@ dependencies = [
 [[package]]
 name = "type_dispatch_macros"
 version = "0.4.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "itertools 0.14.0",
  "proc-macro-crate 3.5.0",
@@ -8853,7 +8891,7 @@ dependencies = [
 [[package]]
 name = "uniquify"
 version = "0.4.1"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#28e404709b5f0793d030dad985d48c36ff2111f7"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
 dependencies = [
  "arcstr",
  "serde",
@@ -9431,7 +9469,7 @@ checksum = "3a4df73e95feddb9ec1a7e9c2ca6323b8c97d5eeeff78d28f1eccdf19c882b24"
 dependencies = [
  "parking_lot",
  "rayon",
- "thiserror 2.0.20",
+ "thiserror 2.0.21",
  "windows 0.61.3",
  "windows-future",
 ]
@@ -9468,19 +9506,6 @@ dependencies = [
  "windows-link 0.1.3",
  "windows-result 0.3.4",
  "windows-strings 0.4.2",
-]
-
-[[package]]
-name = "windows-core"
-version = "0.62.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
-dependencies = [
- "windows-implement 0.60.2",
- "windows-interface 0.59.3",
- "windows-link 0.2.1",
- "windows-result 0.4.1",
- "windows-strings 0.5.1",
 ]
 
 [[package]]
@@ -9601,15 +9626,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "windows-result"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
-dependencies = [
- "windows-link 0.2.1",
-]
-
-[[package]]
 name = "windows-strings"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9625,15 +9641,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56e6c93f3a0c3b36176cb1327a4958a0353d5d166c2a35cb268ace15e91d3b57"
 dependencies = [
  "windows-link 0.1.3",
-]
-
-[[package]]
-name = "windows-strings"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
-dependencies = [
- "windows-link 0.2.1",
 ]
 
 [[package]]
