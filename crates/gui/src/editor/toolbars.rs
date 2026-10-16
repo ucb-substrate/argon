@@ -391,6 +391,25 @@ fn workspace_title_contents(path: Option<&Path>, modified: bool) -> Div {
     contents
 }
 
+/// The draggable strip that holds the window title.
+fn title_bar_frame(theme: &Theme) -> Div {
+    div()
+        .border_color(theme.divider)
+        .window_control_area(WindowControlArea::Drag)
+        .p_1()
+        .bg(theme.titlebar)
+        .flex()
+        .items_center()
+        .justify_center()
+        .overflow_hidden()
+        .whitespace_nowrap()
+}
+
+/// The title bar of a window that has no editor yet.
+pub(crate) fn placeholder_title_bar(theme: &Theme) -> Div {
+    title_bar_frame(theme).child(workspace_title_contents(None, false))
+}
+
 impl Render for TitleBar {
     fn render(
         &mut self,
@@ -398,21 +417,10 @@ impl Render for TitleBar {
         cx: &mut gpui::Context<Self>,
     ) -> impl gpui::IntoElement {
         let state = self.state.read(cx);
-        let theme = state.theme();
-        div()
-            .border_color(theme.divider)
-            .window_control_area(WindowControlArea::Drag)
-            .p_1()
-            .bg(theme.titlebar)
-            .flex()
-            .items_center()
-            .justify_center()
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .child(workspace_title_contents(
-                state.workspace_path.as_deref(),
-                state.workspace_modified,
-            ))
+        title_bar_frame(state.theme()).child(workspace_title_contents(
+            state.workspace_path.as_deref(),
+            state.workspace_modified,
+        ))
     }
 }
 
@@ -1061,7 +1069,7 @@ mod tool_bar_tests {
     #[gpui::test]
     fn tooltips_report_the_bound_tool_hotkeys(cx: &mut TestAppContext) {
         let window = cx.update(|cx| {
-            cx.bind_keys(key_bindings());
+            cx.bind_keys(key_bindings(false));
             cx.open_window(Default::default(), |_, cx| cx.new(|_| EmptyView))
                 .unwrap()
         });

@@ -8,6 +8,12 @@ sidebar_label: Workspace
 
 The GUI shows the cell compiled from your current Neovim buffers. It's built for looking at a cell and editing it spatially; the source stays the single source of truth.
 
+## Window
+
+`argone` opens one window. Neovim is on the left, the GUI's views are on the right, and the title bar spans both. Drag the divider between them to resize. **View → Neovim** hides or shows Neovim; hiding it moves focus to the canvas.
+
+Until the analyzer starts, the right side says so. When the analyzer restarts, the GUI reconnects to the new one. Opening a file from another library in the same Neovim moves the GUI to that library.
+
 ## Views
 
 A cell has three views, shown one at a time in the same window: its layout, its [schematic](/gui/schematic), and its [symbol](/gui/symbol). Switch with the control at the right end of the tool strip, the View menu, <kbd>V</kbd> (the next view, in that order and around to the layout), or <kbd>Shift</kbd>+<kbd>V</kbd> (the previous one). Each view has its own camera, selection, and tools; the sidebars follow the view.
@@ -20,11 +26,15 @@ A cell has three views, shown one at a time in the same window: its layout, its 
 | Tool strip | The active view's tools, and the view control. In the layout view: select, rectangle, polygon, path, dimension, and instance. |
 | Left sidebar | In the layout view, scopes and nested instances; selecting one sets where new geometry is inserted. In the schematic view, the instances, devices, and nets. In the symbol view, the ports. |
 | Right sidebar | In the layout view, the drawing layer and per-layer visibility. In the other views, the properties of the selection. |
-| Neovim command line | Where the GUI asks for text, such as a cell invocation or a name. Cell invocations complete with <kbd>Tab</kbd>. |
+| Neovim | Your editor, with the source. Its command line is where the GUI asks for text, such as a cell invocation or a name. Cell invocations complete with <kbd>Tab</kbd>. |
 
 ## Start screen
 
 Until a cell is open, the window shows a start screen in place of the tool strip and sidebars. It has buttons to open a cell or [create one](/gui/cell-management#create-a-cell), and lists the cells of your library, including those in its modules. Click a cell to open it. If the cell has a parameter without a default, the Neovim command line opens with `Argon openCell` and the cell's name filled in, so you can type the arguments.
+
+Above the library's cells, **Recently opened** lists the last ten invocations opened in this library, newest first, arguments included. Click one to reopen exactly that invocation. An invocation is added once it compiles, whether you opened it from the GUI or with `:Argon openCell`, or made it with **New Cell…**. Cells an [agent](/tools/agents) opens aren't added. Invocations that differ only in spacing or comments count as one, and reopening an invocation moves it to the top. Renaming a cell updates its invocations in the list. An invocation is dimmed if its cell isn't among the library's cells, such as a deleted cell or one from a dependency, but you can still click it.
+
+The list is stored in `.argon/recents.json` in the library's root directory. When Argon creates `.argon/`, it adds a `.gitignore` that ignores everything in it, so the list stays out of version control.
 
 ## Open a cell
 

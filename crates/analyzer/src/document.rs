@@ -2,7 +2,7 @@
 
 use arcstr::ArcStr;
 use lsp_document::{IndexedText, Pos, TextChange, TextMap, apply_change};
-use tower_lsp_server::ls_types::{Position, PositionEncodingKind, Range};
+use tower_lsp_server::ls_types::{Position, PositionEncodingKind, Range, TextEdit};
 
 /// The unit an LSP `Position::character` counts.
 ///
@@ -186,6 +186,26 @@ impl Document {
         }
     }
 
+    /// The text after `edits`, whose ranges all address this text, are applied
+    /// together as one `WorkspaceEdit`.
+    pub(crate) fn edited(&self, edits: &[TextEdit]) -> String {
+        let mut edits = edits.iter().enumerate().collect::<Vec<_>>();
+        // The last edit goes first, so the ranges before it still hold.
+        edits.sort_by_key(|&(index, edit)| std::cmp::Reverse((edit.range.start, index)));
+        let mut document = self.clone();
+        document.apply_changes(
+            edits
+                .into_iter()
+                .map(|(_, edit)| DocumentChange {
+                    range: Some(edit.range),
+                    patch: edit.new_text.clone(),
+                })
+                .collect(),
+            self.version.saturating_add(1),
+        );
+        document.contents().to_owned()
+    }
+
     pub(crate) fn version(&self) -> i32 {
         self.version
     }
@@ -327,6 +347,24 @@ mod tests {
             4,
         );
         assert_eq!(doc.contents(), "abc");
+    }
+
+    #[test]
+    fn edits_apply_together_against_the_original_text() {
+        let doc = Document::new("ab\ncd\n", 0, PositionEncoding::Utf8);
+        let edit = |line, start, end, text: &str| TextEdit {
+            range: Range::new(Position::new(line, start), Position::new(line, end)),
+            new_text: text.to_owned(),
+        };
+        let edits = [
+            edit(0, 0, 1, "xyz"),
+            edit(1, 1, 2, "w"),
+            // Inserts at one place keep their order.
+            edit(1, 0, 0, "1"),
+            edit(1, 0, 0, "2"),
+        ];
+        assert_eq!(doc.edited(&edits), "xyzb\n12cw\n");
+        assert_eq!(doc.contents(), "ab\ncd\n");
     }
 
     #[test]

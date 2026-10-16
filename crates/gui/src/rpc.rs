@@ -16,7 +16,8 @@ use analyzer::rpc::{
     DeleteRequest, DevicePreview, DimensionParams, EditReceipt, FocusEditorParams, Gui,
     InitialConditionEdit, InstancePreview, LangServerAction, LangServerClient, PasteRequest,
     PathParams, PlaceDeviceRequest, PlaceRequest, PlaceSchematicInstanceRequest, PolygonParams,
-    RectangleEditResult, RenameRequest, SchematicInstancePreview, SetArgumentRequest, ValueEdit,
+    RecentCell, RectangleEditResult, RenameRequest, SchematicInstancePreview, SetArgumentRequest,
+    ValueEdit,
 };
 use analyzer::transport::{self, Role, SessionToken};
 use anyhow::{Result, anyhow};
@@ -29,15 +30,12 @@ use futures::{
     },
     prelude::*,
 };
-use gpui::AsyncApp;
+use gpui::{AsyncApp, Task};
 use tarpc::{context, server::Channel, tokio_serde::formats::Bincode};
 use tower_lsp_server::ls_types::MessageType;
 use tracing::error;
 
-use crate::{
-    editor::{Editor, prepare_compilation_snapshot},
-    editor_window_options, focus,
-};
+use crate::editor::{Editor, prepare_compilation_snapshot};
 
 pub const LANG_SERVER_CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_SNAPSHOT_PREPARATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -141,10 +139,10 @@ impl SyncLangServerClient {
         app: AsyncApp,
         lang_server_addr: SocketAddr,
         token: SessionToken,
-    ) -> (Self, UnboundedReceiver<EditorFn>) {
-        let client = connect_client(&app, lang_server_addr, &token).unwrap();
+    ) -> Result<(Self, UnboundedReceiver<EditorFn>)> {
+        let client = connect_client(&app, lang_server_addr, &token)?;
         let (to_exec, rx) = mpsc::unbounded();
-        (
+        Ok((
             Self {
                 app,
                 lang_server_addr,
@@ -153,7 +151,7 @@ impl SyncLangServerClient {
                 to_exec,
             },
             rx,
-        )
+        ))
     }
 
     fn call<T, F, Fut>(&self, request: F) -> Result<T>
@@ -306,21 +304,24 @@ impl SyncLangServerClient {
         }));
     }
 
-    /// Opens the connection the analyzer calls the GUI back over.
-    pub fn serve_callbacks(&self) {
+    /// Opens the connection the analyzer calls the GUI back over and serves
+    /// it until the returned task is dropped.
+    pub fn serve_callbacks(&self) -> Task<()> {
         let client = self.clone();
         self.app
-            .spawn(async move |_| {
-                let result = client.connect_callbacks().await;
-                if let Err(error) = &result {
-                    error!("Failed to connect the GUI to the analyzer: {error}");
+            .spawn(async move |_| match client.connect_callbacks().await {
+                Ok(server) => {
+                    client.report_connection_result(&Ok(()));
+                    server.await;
                 }
-                client.report_connection_result(&result);
+                Err(error) => {
+                    error!("Failed to connect the GUI to the analyzer: {error}");
+                    client.report_connection_result::<()>(&Err(error));
+                }
             })
-            .detach();
     }
 
-    async fn connect_callbacks(&self) -> Result<()> {
+    async fn connect_callbacks(&self) -> Result<Task<()>> {
         let addr = self.lang_server_addr;
         let token = self.token.clone();
         let stream = self
@@ -335,20 +336,16 @@ impl SyncLangServerClient {
             to_exec: self.to_exec.clone(),
             snapshot: Arc::default(),
         };
-        self.app
-            .background_executor()
-            .spawn(
-                async move {
-                    let transport = tarpc::serde_transport::new(stream, Bincode::default());
-                    tarpc::server::BaseChannel::with_defaults(transport)
-                        .execute(server.serve())
-                        .for_each(|response| background_executor.spawn(response))
-                        .await;
-                }
-                .compat(),
-            )
-            .detach();
-        Ok(())
+        Ok(self.app.background_executor().spawn(
+            async move {
+                let transport = tarpc::serde_transport::new(stream, Bincode::default());
+                tarpc::server::BaseChannel::with_defaults(transport)
+                    .execute(server.serve())
+                    .for_each(|response| background_executor.spawn(response))
+                    .await;
+            }
+            .compat(),
+        ))
     }
 
     /// Reveals `span` in the editor.
@@ -682,7 +679,7 @@ impl Gui for GuiServer {
                 let _ = cx.update(|cx| editor.set_compilation_active(cx, activity_id, true));
             }))
             .await
-            .unwrap();
+            .ok();
     }
 
     async fn compilation_finished(mut self, _: context::Context, activity_id: u64) {
@@ -691,7 +688,7 @@ impl Gui for GuiServer {
                 let _ = cx.update(|cx| editor.set_compilation_active(cx, activity_id, false));
             }))
             .await
-            .unwrap();
+            .ok();
     }
 
     async fn update_cell(mut self, _: context::Context, update: CompilationUpdate) -> bool {
@@ -713,7 +710,7 @@ impl Gui for GuiServer {
                 let _ = sender.send(context);
             }))
             .await
-            .unwrap();
+            .ok();
         let Ok(Some(preparation_context)) = receiver.await else {
             return true;
         };
@@ -729,7 +726,7 @@ impl Gui for GuiServer {
                     .update(|cx| editor.finish_snapshot_preparation(cx, preparation_id, snapshot));
             }))
             .await
-            .unwrap();
+            .ok();
         true
     }
 
@@ -739,7 +736,7 @@ impl Gui for GuiServer {
                 let _ = cx.update(|cx| editor.fit_to_screen(cx));
             }))
             .await
-            .unwrap();
+            .ok();
     }
 
     async fn set_workspace_path(mut self, _: context::Context, path: Option<std::path::PathBuf>) {
@@ -748,7 +745,7 @@ impl Gui for GuiServer {
                 let _ = cx.update(|cx| editor.set_workspace_path(cx, path));
             }))
             .await
-            .unwrap();
+            .ok();
     }
 
     async fn workspace_modified(mut self, _: context::Context, modified: bool) {
@@ -757,7 +754,7 @@ impl Gui for GuiServer {
                 let _ = cx.update(|cx| editor.set_workspace_modified(cx, modified));
             }))
             .await
-            .unwrap();
+            .ok();
     }
 
     async fn show_message(mut self, _: context::Context, typ: MessageType, message: String) {
@@ -794,11 +791,11 @@ impl Gui for GuiServer {
             .send(Box::new(move |editor, cx| {
                 let _ = cx.update(|cx| {
                     editor.place_instance(cx, preview);
-                    focus::activate_gui(cx);
+                    editor.activate(cx);
                 });
             }))
             .await
-            .unwrap();
+            .ok();
     }
 
     async fn schematic_target(mut self, _: context::Context) -> Option<Span> {
@@ -822,11 +819,11 @@ impl Gui for GuiServer {
             .send(Box::new(move |editor, cx| {
                 let _ = cx.update(|cx| {
                     editor.place_schematic_instance(cx, preview);
-                    focus::activate_gui(cx);
+                    editor.activate(cx);
                 });
             }))
             .await
-            .unwrap();
+            .ok();
     }
 
     async fn place_device(mut self, _: context::Context, preview: DevicePreview) {
@@ -834,29 +831,27 @@ impl Gui for GuiServer {
             .send(Box::new(move |editor, cx| {
                 let _ = cx.update(|cx| {
                     editor.place_device(cx, preview);
-                    focus::activate_gui(cx);
+                    editor.activate(cx);
                 });
             }))
             .await
-            .unwrap();
+            .ok();
     }
     async fn configure(mut self, _: tarpc::context::Context, config: ArgonConfig) -> () {
         let _ = analyzer::reload_log_filter(&config.log.level);
         self.to_exec
             .send(Box::new(move |editor, cx| {
-                editor
-                    .state
-                    .update(cx, |state, cx| {
-                        state.hierarchy_depth = config.gui.hierarchy_depth.unwrap_or(usize::MAX);
-                        state.dark_mode = config.gui.dark_mode;
-                        state.icon_size = config.gui.icon_size;
-                        state.font_size = config.gui.font_size;
-                        cx.notify();
-                    })
-                    .unwrap();
+                let _ = editor.state.update(cx, |state, cx| {
+                    state.hierarchy_depth = config.gui.hierarchy_depth.unwrap_or(usize::MAX);
+                    state.dark_mode = config.gui.dark_mode;
+                    state.icon_size = config.gui.icon_size;
+                    state.font_size = config.gui.font_size;
+                    state.option_as_meta = config.gui.option_as_meta;
+                    cx.notify();
+                });
             }))
             .await
-            .unwrap();
+            .ok();
     }
 
     async fn highlight_spans(
@@ -885,18 +880,13 @@ impl Gui for GuiServer {
     async fn activate(mut self, _context: ::tarpc::context::Context) -> () {
         self.to_exec
             .send(Box::new(|editor, cx| {
-                let editor = editor.clone();
                 let _ = cx.update(|cx| {
-                    if cx.windows().is_empty() {
-                        let _ = cx.open_window(editor_window_options(), |window, cx| {
-                            window.replace_root(cx, |_, _| editor)
-                        });
-                    }
-                    focus::activate_gui(cx);
+                    crate::main_window::reopen_standalone(editor, cx);
+                    editor.activate(cx);
                 });
             }))
             .await
-            .unwrap();
+            .ok();
     }
 
     async fn set_cells(mut self, _: context::Context, cells: Vec<CellEntry>) {
@@ -904,6 +894,18 @@ impl Gui for GuiServer {
             .send(Box::new(move |editor, cx| {
                 let _ = editor.state.update(cx, |state, cx| {
                     state.cells = Some(cells);
+                    cx.notify();
+                });
+            }))
+            .await
+            .ok();
+    }
+
+    async fn set_recent_cells(mut self, _: context::Context, cells: Vec<RecentCell>) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = editor.state.update(cx, |state, cx| {
+                    state.recent_cells = cells;
                     cx.notify();
                 });
             }))

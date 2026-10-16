@@ -12,7 +12,7 @@ The Neovim plugin starts `argon-analyzer` for `.ar` buffers and adds the `:Argon
 
 | Command | Description |
 | --- | --- |
-| `:Argon gui` | Start the GUI, or focus it if it's already running. |
+| `:Argon gui` | Focus the GUI's canvas. With `argone --terminal`, start the GUI first if it isn't running. |
 | `:Argon openCell <EXPR>` | Compile and show a cell, such as `top(100.)`. |
 | `:Argon newCell <NAME>` | Insert an empty cell in the current module and open it. |
 | `:Argon renameCell <NAME>` | Rename the open cell and every reference to it. |
@@ -64,7 +64,7 @@ are the ones that can be named at a call site.
 
 ## Focus handoff
 
-<kbd>Ctrl</kbd>+<kbd>Backslash</kbd> switches focus between Neovim and the GUI. When the GUI opens a command in Neovim, focus returns to the canvas once the command finishes or is cancelled.
+In the `argone` window, <kbd>Cmd</kbd>+<kbd>Backslash</kbd> switches focus between Neovim and the canvas, and <kbd>Ctrl</kbd>+<kbd>Backslash</kbd> belongs to Neovim. With `argone --terminal`, <kbd>Ctrl</kbd>+<kbd>Backslash</kbd> switches between the terminal and the GUI. When the GUI opens a command in Neovim, focus returns to the canvas once the command finishes or is cancelled.
 
 ## How edits flow
 

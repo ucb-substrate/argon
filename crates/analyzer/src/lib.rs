@@ -7,6 +7,7 @@ pub mod document;
 pub mod hook;
 pub mod mcp;
 mod navigation;
+mod recents;
 pub mod rpc;
 mod schematic_edit;
 pub mod session;
@@ -151,6 +152,8 @@ pub struct GuiConfig {
     /// Global GUI font-size override in logical pixels.
     #[serde(default, deserialize_with = "deserialize_gui_size")]
     pub font_size: Option<f32>,
+    /// Whether Option acts as Meta in the GUI's Neovim pane on macOS.
+    pub option_as_meta: bool,
 }
 
 impl Default for GuiConfig {
@@ -160,6 +163,7 @@ impl Default for GuiConfig {
             hierarchy_depth: None,
             icon_size: None,
             font_size: None,
+            option_as_meta: false,
         }
     }
 }
@@ -398,19 +402,56 @@ pub fn reload_log_filter(level: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// How long the editor may take to report all of an analyzer edit it applied.
+/// Neovim reports the edits after the first one together, once its change
+/// debounce passes.
+pub(crate) const PENDING_EDIT_TIMEOUT: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Default)]
 pub(crate) struct SourceState {
     pub(crate) revision: u64,
     pub(crate) cell: Option<String>,
+    /// An invocation the user opened, to record as recent once it compiles.
+    pub(crate) pending_recent: Option<String>,
     pub(crate) editor_files: IndexMap<Uri, Document>,
-    pub(crate) pending_workspace_edits: IndexMap<Uri, usize>,
+    /// The text each file will have once the editor reports all of the
+    /// analyzer's edit to it.
+    pub(crate) pending_workspace_edits: IndexMap<Uri, String>,
     pub(crate) workspace_modified: bool,
+}
+
+/// What a change to an editor file means for an analyzer edit to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditProgress {
+    /// No analyzer edit to the file is in flight.
+    Unrelated,
+    /// The editor has reported part of the edit, and the rest is to come.
+    Partial,
+    /// The editor has reported all of the edit.
+    Complete,
 }
 
 impl SourceState {
     fn advance_revision(&mut self) -> u64 {
         self.revision = self.revision.saturating_add(1);
         self.revision
+    }
+
+    /// How much of the analyzer's edit to `uri` the editor has reported,
+    /// retiring the edit once all of it has arrived.
+    fn edit_progress(&mut self, uri: &Uri) -> EditProgress {
+        let Some(expected) = self.pending_workspace_edits.get(uri) else {
+            return EditProgress::Unrelated;
+        };
+        if self
+            .editor_files
+            .get(uri)
+            .is_none_or(|document| document.contents() != expected)
+        {
+            return EditProgress::Partial;
+        }
+        self.pending_workspace_edits.shift_remove(uri);
+        EditProgress::Complete
     }
 
     fn compile_identity(&self) -> CompileIdentity {
@@ -694,10 +735,20 @@ pub struct State {
     /// Serializes agent edits so each resolves against settled text.
     agent_edits: Arc<Mutex<()>>,
     watcher: Arc<std::sync::Mutex<Option<watcher::WorkspaceWatcher>>>,
+    /// Whether the GUI embeds this analyzer's Neovim.
+    embedded: bool,
+    /// The library's recently opened invocations, most recent first. Held
+    /// while the recents file is updated, so updates don't interleave.
+    recents: Arc<Mutex<Vec<String>>>,
 }
 
 impl State {
-    fn new(server_addr: SocketAddr, editor_client: Client, token: transport::SessionToken) -> Self {
+    fn new(
+        server_addr: SocketAddr,
+        editor_client: Client,
+        token: transport::SessionToken,
+        embedded: bool,
+    ) -> Self {
         let config = read_config().unwrap_or_else(|error| {
             error!("{error}; using default configuration");
             ArgonConfig::default()
@@ -721,12 +772,34 @@ impl State {
             follow_mode: Default::default(),
             agent_edits: Default::default(),
             watcher: Default::default(),
+            embedded,
+            recents: Default::default(),
         }
     }
 
     pub(crate) fn notify_source_changed(&self) {
         self.source_changes
             .send_modify(|count| *count = count.wrapping_add(1));
+    }
+
+    /// Waits up to `timeout` for `found` to return a value for the source
+    /// state, which is rechecked each time an editor document changes.
+    pub(crate) async fn wait_for_source<T>(
+        &self,
+        timeout: Duration,
+        found: impl Fn(&SourceState) -> Option<T>,
+    ) -> Option<T> {
+        let mut changes = self.source_changes.subscribe();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(value) = found(&*self.source_state.lock().await) {
+                return Some(value);
+            }
+            match tokio::time::timeout_at(deadline, changes.changed()).await {
+                Ok(Ok(())) => {}
+                _ => return None,
+            }
+        }
     }
 
     fn apply_config(&self, config: ArgonConfig) {
@@ -930,6 +1003,40 @@ impl State {
         }
     }
 
+    /// Sends the library's recent cells to the GUI.
+    async fn publish_recent_cells(&self, connection: Option<GuiConnection>) {
+        let Some(connection) = connection else {
+            return;
+        };
+        // Holding the list while sending keeps a stale list from arriving last.
+        let recents = self.recents.lock().await;
+        let cells = recents.iter().cloned().map(rpc::RecentCell::new).collect();
+        if let Err(error) = connection
+            .client
+            .set_recent_cells(context::current(), cells)
+            .await
+            && is_gui_disconnected(&error)
+        {
+            self.clear_gui_connection(connection.id).await;
+        }
+    }
+
+    /// Replaces the recent cells with what `update` returns for the library
+    /// root, off the async runtime, then sends them to the GUI.
+    async fn update_recents(&self, update: impl FnOnce(&Path) -> Vec<String> + Send + 'static) {
+        let Some(root_dir) = self.root_dir.get().cloned() else {
+            return;
+        };
+        {
+            let mut recents = self.recents.lock().await;
+            match tokio::task::spawn_blocking(move || update(&root_dir)).await {
+                Ok(cells) => *recents = cells,
+                Err(error) => error!("could not update the recent cells: {error}"),
+            }
+        }
+        self.publish_recent_cells(self.gui_connection().await).await;
+    }
+
     async fn publish_workspace_path(&self, connection: Option<GuiConnection>) -> bool {
         let Some(connection) = connection else {
             return true;
@@ -997,16 +1104,35 @@ impl Backend {
     }
 
     fn compile_after_debounce(&self, identity: CompileIdentity) {
-        let backend = self.clone();
         let delay = self.state.config().analyzer.compile_debounce_ms;
+        self.compile_after(identity, Duration::from_millis(delay));
+    }
+
+    /// Compiles `identity` after `delay`, unless the source or cell changes
+    /// first.
+    fn compile_after(&self, identity: CompileIdentity, delay: Duration) {
+        let backend = self.clone();
         tokio::spawn(async move {
-            if delay > 0 {
-                tokio::time::sleep(Duration::from_millis(delay)).await;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
             }
             if backend.state.is_latest_compile_request(&identity).await {
                 backend.update_cell(identity).await;
             }
         });
+    }
+
+    /// Compiles `identity` after an editor document changed: at once when the
+    /// change completes an analyzer edit, and after the debounce otherwise. A
+    /// partly reported edit waits for the rest, up to `PENDING_EDIT_TIMEOUT`.
+    async fn compile_after_change(&self, progress: EditProgress, identity: CompileIdentity) {
+        match progress {
+            EditProgress::Complete => {
+                self.update_cell(identity).await;
+            }
+            EditProgress::Partial => self.compile_after(identity, PENDING_EDIT_TIMEOUT),
+            EditProgress::Unrelated => self.compile_after_debounce(identity),
+        }
     }
 
     /// Compile and publish diagnostics for an exact source/cell identity.
@@ -1053,10 +1179,10 @@ impl Backend {
             revision: identity.revision,
             output,
         });
-        {
+        let recent = {
             // The freshness check and commit are atomic with respect to source
             // and cell changes because they take this same lock.
-            let source = self.state.source_state.lock().await;
+            let mut source = self.state.source_state.lock().await;
             let mut compiled = self.state.published_state.lock().await;
             if source.compile_identity() != identity {
                 return None;
@@ -1078,13 +1204,26 @@ impl Backend {
             compiled.compiled_revision = identity.revision;
             compiled.messages = result.messages.clone();
             compiled.latest = latest;
-        }
+            let drawable = snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.data().is_some());
+            if drawable && source.pending_recent == identity.cell {
+                source.pending_recent.take()
+            } else {
+                None
+            }
+        };
         self.state
             .compiled_revisions
             .send_replace(identity.revision);
         self.state
             .publish_cells(self.state.gui_connection().await)
             .await;
+        if let Some(invocation) = recent {
+            self.state
+                .update_recents(move |root| recents::record(root, &invocation))
+                .await;
+        }
 
         for message in result.messages {
             if !self.state.is_latest_compile_request(&identity).await {
@@ -1275,6 +1414,7 @@ impl LanguageServer for Backend {
         let root_dir = root_uri.and_then(|root| root.to_file_path().map(|path| path.into_owned()));
         if let Some(root_dir) = root_dir {
             let _ = self.state.root_dir.set(root_dir.clone());
+            self.state.update_recents(recents::load).await;
             self.state.publish_session(&root_dir);
             // A recursive watch walks the whole tree on some platforms.
             let backend = self.clone();
@@ -1336,30 +1476,17 @@ impl LanguageServer for Backend {
                 .compiler
                 .set_source_text(path, doc.contents().to_owned());
         }
-        source.editor_files.insert(uri, doc);
+        source.editor_files.insert(uri.clone(), doc);
         source.advance_revision();
+        let progress = source.edit_progress(&uri);
         let identity = source.compile_identity();
         drop(source);
         self.state.notify_source_changed();
-        self.compile_after_debounce(identity);
+        self.compile_after_change(progress, identity).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let mut source = self.state.source_state.lock().await;
-        let analyzer_edit = source
-            .pending_workspace_edits
-            .contains_key(&params.text_document.uri);
-        if let Some(count) = source
-            .pending_workspace_edits
-            .get_mut(&params.text_document.uri)
-        {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                source
-                    .pending_workspace_edits
-                    .shift_remove(&params.text_document.uri);
-            }
-        }
         let mut changed_source = None;
         if let Some(doc) = source.editor_files.get_mut(&params.text_document.uri) {
             let previous = doc.contents().to_owned();
@@ -1392,14 +1519,11 @@ impl LanguageServer for Backend {
             self.state.compiler.set_source_text(path, contents);
             source.advance_revision();
         }
+        let progress = source.edit_progress(&params.text_document.uri);
         let identity = source.compile_identity();
         drop(source);
         self.state.notify_source_changed();
-        if analyzer_edit {
-            self.update_cell(identity).await;
-        } else {
-            self.compile_after_debounce(identity);
-        }
+        self.compile_after_change(progress, identity).await;
     }
 
     async fn goto_definition(
@@ -1670,6 +1794,13 @@ impl Backend {
                 }
             }
         }
+        if self.state.embedded {
+            self.state
+                .editor_client
+                .log_message(MessageType::INFO, "The GUI is still connecting")
+                .await;
+            return Ok(());
+        }
         let old_gui = self.state.take_gui_process().await;
         if let Some(mut gui) = old_gui {
             let _ = gui.kill().await;
@@ -1735,9 +1866,11 @@ impl Backend {
     }
 
     async fn select_and_open_cell(&self, cell: impl Into<String>) {
+        let cell = cell.into();
         let identity = {
             let mut source = self.state.source_state.lock().await;
-            source.cell = Some(cell.into());
+            source.pending_recent = Some(cell.clone());
+            source.cell = Some(cell);
             source.compile_identity()
         };
         self.open_cell_view(identity).await;
@@ -1801,10 +1934,14 @@ impl Backend {
         let invocation = format!("{}()", params.name);
         let previous = {
             let mut source = self.state.source_state.lock().await;
-            source.cell.replace(invocation)
+            (
+                source.cell.replace(invocation.clone()),
+                source.pending_recent.replace(invocation),
+            )
         };
         if !self.state.apply_source_edit(params.uri, edit).await {
-            self.state.source_state.lock().await.cell = previous;
+            let mut source = self.state.source_state.lock().await;
+            (source.cell, source.pending_recent) = previous;
         }
         Ok(())
     }
@@ -1823,7 +1960,7 @@ impl Backend {
                 .await;
             return Ok(());
         };
-        let rename = match cell_edit::rename_cell_edits(
+        let mut rename = match cell_edit::rename_cell_edits(
             &ast,
             &current_invocation,
             &params.name,
@@ -1835,13 +1972,30 @@ impl Backend {
                 return Ok(());
             }
         };
+        let renamed = |invocation: &str| {
+            rename
+                .rename_invocation(invocation)
+                .unwrap_or_else(|| invocation.to_owned())
+        };
         let previous = {
             let mut source = self.state.source_state.lock().await;
-            source.cell.replace(rename.invocation)
+            let pending_recent = source.pending_recent.as_deref().map(renamed);
+            (
+                source.cell.replace(renamed(&current_invocation)),
+                std::mem::replace(&mut source.pending_recent, pending_recent),
+            )
         };
-        if !self.state.apply_source_changes(rename.changes, None).await {
-            self.state.source_state.lock().await.cell = previous;
+        let changes = std::mem::take(&mut rename.changes);
+        if !self.state.apply_source_changes(changes, None).await {
+            let mut source = self.state.source_state.lock().await;
+            (source.cell, source.pending_recent) = previous;
+            return Ok(());
         }
+        self.state
+            .update_recents(move |root| {
+                recents::rewrite(root, |invocation| rename.rename_invocation(invocation))
+            })
+            .await;
         Ok(())
     }
 
@@ -2475,26 +2629,25 @@ async fn serve_rpc(listener: tokio::net::TcpListener, state: State) {
     }
 }
 
-pub async fn main(rpc_port: Option<u16>, relay_socket: Option<PathBuf>) {
-    main_with_io(
-        rpc_port,
-        relay_socket,
-        tokio::io::stdin(),
-        tokio::io::stdout(),
-    )
-    .await;
+/// How the analyzer finds and launches its GUI.
+#[derive(Clone, Debug, Default)]
+pub struct GuiLink {
+    /// Unix socket through which to report the RPC port and token.
+    pub relay_socket: Option<PathBuf>,
+    /// Whether the GUI embeds this analyzer's Neovim.
+    pub embedded: bool,
+}
+
+pub async fn main(rpc_port: Option<u16>, gui: GuiLink) {
+    main_with_io(rpc_port, gui, tokio::io::stdin(), tokio::io::stdout()).await;
 }
 
 /// Runs the analyzer over an arbitrary LSP transport.
 ///
 /// The production binary supplies stdin and stdout. Tests can supply a TCP
 /// stream without launching a second Cargo target.
-pub async fn main_with_io<I, O>(
-    rpc_port: Option<u16>,
-    relay_socket: Option<PathBuf>,
-    stdin: I,
-    stdout: O,
-) where
+pub async fn main_with_io<I, O>(rpc_port: Option<u16>, gui: GuiLink, stdin: I, stdout: O)
+where
     I: AsyncRead + Unpin,
     O: AsyncWrite,
 {
@@ -2514,7 +2667,7 @@ pub async fn main_with_io<I, O>(
             return;
         }
     };
-    main_with_io_on_listener(listener, token, relay_socket, stdin, stdout).await;
+    main_with_io_on_listener(listener, token, gui, stdin, stdout).await;
 }
 
 /// Runs the analyzer using pre-bound GUI RPC and LSP transports.
@@ -2524,7 +2677,7 @@ pub async fn main_with_io<I, O>(
 pub async fn main_with_io_on_listener<I, O>(
     rpc_listener: tokio::net::TcpListener,
     token: transport::SessionToken,
-    relay_socket: Option<PathBuf>,
+    gui: GuiLink,
     stdin: I,
     stdout: O,
 ) where
@@ -2538,8 +2691,8 @@ pub async fn main_with_io_on_listener<I, O>(
             return;
         }
     };
-    if let Some(path) = relay_socket
-        && let Err(error) = announce_rpc_port(&path, server_addr.port(), &token)
+    if let Some(path) = &gui.relay_socket
+        && let Err(error) = announce_rpc_port(path, server_addr.port(), &token)
     {
         eprintln!(
             "failed to announce analyzer RPC port through `{}`: {error}",
@@ -2550,7 +2703,7 @@ pub async fn main_with_io_on_listener<I, O>(
 
     let mut ext_state = None;
     let (service, socket) = LspService::build(|client| {
-        let state = State::new(server_addr, client, token);
+        let state = State::new(server_addr, client, token, gui.embedded);
         ext_state = Some(state.clone());
         Backend { state }
     })
@@ -2864,6 +3017,32 @@ mod tests {
         assert_eq!(mode(&directory), 0o700);
     }
 
+    #[tokio::test]
+    async fn an_embedded_analyzer_waits_for_its_gui_instead_of_starting_one() {
+        use futures::StreamExt;
+
+        let mut state = None;
+        let (_service, socket) = tower_lsp_server::LspService::build(|client| {
+            let token = super::transport::SessionToken::generate().unwrap();
+            let backend = super::Backend {
+                state: super::State::new("127.0.0.1:1".parse().unwrap(), client, token, true),
+            };
+            state = Some(backend.state.clone());
+            backend
+        })
+        .finish();
+        tokio::spawn(socket.for_each(|_| async {}));
+        let state = state.unwrap();
+
+        super::Backend {
+            state: state.clone(),
+        }
+        .start_gui()
+        .await
+        .unwrap();
+        assert!(state.take_gui_process().await.is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn rpc_port_and_token_are_announced_through_a_unix_socket() {
@@ -2884,5 +3063,250 @@ mod tests {
             receiver.join().unwrap(),
             format!("43210 {}\n", token.to_hex())
         );
+    }
+
+    mod pending_edits {
+        use std::{collections::HashMap, time::Duration};
+
+        use futures::{SinkExt, StreamExt};
+        use serde_json::{Value, json};
+        use tokio::sync::mpsc;
+        use tower::{Service, ServiceExt};
+        use tower_lsp_server::{
+            LanguageServer, LspService,
+            jsonrpc::{Id, Request, Response},
+            ls_types::{
+                ApplyWorkspaceEditParams, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+                Position, Range, TextDocumentContentChangeEvent, TextDocumentItem, TextEdit, Uri,
+                VersionedTextDocumentIdentifier,
+            },
+        };
+
+        use crate::{ArgonConfig, Backend, PENDING_EDIT_TIMEOUT, State, transport::SessionToken};
+
+        const BEFORE: &str = "cell top() {\n    let a = 1.;\n    let b = 2.;\n}\n";
+        const AFTER: &str = "cell top() {\n    let a = 3.;\n    let b = 4.;\n}\n";
+
+        /// An analyzer with `BEFORE` open as `lib.ar` in a workspace that
+        /// compiles, and the editor's side of its connection. The editor
+        /// answers every request but `workspace/applyEdit`, which the test
+        /// answers.
+        struct Editor {
+            backend: Backend,
+            uri: Uri,
+            workspace_edits: mpsc::UnboundedReceiver<(Id, ApplyWorkspaceEditParams)>,
+            responses: mpsc::UnboundedSender<Response>,
+            _service: LspService<Backend>,
+            _directory: tempfile::TempDir,
+        }
+
+        impl Editor {
+            async fn open() -> Self {
+                let directory = tempfile::tempdir().unwrap();
+                std::fs::copy(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../examples/tech/basic.tech.toml"),
+                    directory.path().join("tech.toml"),
+                )
+                .unwrap();
+                std::fs::write(
+                    directory.path().join("Argon.toml"),
+                    "name = \"pending-edits\"\ntech = \"tech.toml\"\n",
+                )
+                .unwrap();
+                let path = directory.path().join("lib.ar");
+                std::fs::write(&path, BEFORE).unwrap();
+
+                let mut backend = None;
+                let (mut service, mut socket) = LspService::build(|client| {
+                    let token = SessionToken::generate().unwrap();
+                    let built = Backend {
+                        state: State::new("127.0.0.1:1".parse().unwrap(), client, token, false),
+                    };
+                    backend = Some(built.clone());
+                    built
+                })
+                .finish();
+                let backend = backend.unwrap();
+                let initialize = Request::build("initialize")
+                    .params(json!({ "capabilities": {} }))
+                    .id(1)
+                    .finish();
+                service
+                    .ready()
+                    .await
+                    .unwrap()
+                    .call(initialize)
+                    .await
+                    .unwrap();
+                // Only the analyzer's own edits compile within a test.
+                let mut config = ArgonConfig::default();
+                config.analyzer.compile_debounce_ms = 60_000;
+                backend.state.apply_config(config);
+                backend
+                    .state
+                    .root_dir
+                    .set(directory.path().to_path_buf())
+                    .unwrap();
+                backend.state.source_state.lock().await.cell = Some("top()".to_owned());
+
+                let (edits, workspace_edits) = mpsc::unbounded_channel();
+                let (responses, mut outgoing) = mpsc::unbounded_channel::<Response>();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            request = socket.next() => {
+                                let Some(request) = request else {
+                                    break;
+                                };
+                                let (method, id, params) = request.into_parts();
+                                match id {
+                                    Some(id) if method == "workspace/applyEdit" => {
+                                        let params = serde_json::from_value(params.unwrap()).unwrap();
+                                        let _ = edits.send((id, params));
+                                    }
+                                    Some(id) => {
+                                        let _ = socket.send(Response::from_ok(id, Value::Null)).await;
+                                    }
+                                    None => {}
+                                }
+                            }
+                            Some(response) = outgoing.recv() => {
+                                let _ = socket.send(response).await;
+                            }
+                        }
+                    }
+                });
+
+                let uri = Uri::from_file_path(&path).unwrap();
+                backend
+                    .did_open(DidOpenTextDocumentParams {
+                        text_document: TextDocumentItem {
+                            uri: uri.clone(),
+                            language_id: "argon".to_owned(),
+                            version: 0,
+                            text: BEFORE.to_owned(),
+                        },
+                    })
+                    .await;
+                Self {
+                    backend,
+                    uri,
+                    workspace_edits,
+                    responses,
+                    _service: service,
+                    _directory: directory,
+                }
+            }
+
+            /// Asks the editor to set `a` to 3 and `b` to 4 in one edit,
+            /// returning whether it applied and the source revision once the
+            /// request returns.
+            fn edit(&self) -> tokio::task::JoinHandle<(bool, u64)> {
+                let replacement = |line| TextEdit {
+                    range: Range::new(Position::new(line, 12), Position::new(line, 14)),
+                    new_text: if line == 1 { "3." } else { "4." }.to_owned(),
+                };
+                let changes =
+                    HashMap::from([(self.uri.clone(), vec![replacement(1), replacement(2)])]);
+                let state = self.backend.state.clone();
+                tokio::spawn(async move {
+                    let applied = state.apply_source_changes(changes, None).await;
+                    (applied, state.source_state.lock().await.revision)
+                })
+            }
+
+            /// The edits of the next workspace edit the analyzer asks for.
+            async fn workspace_edit(&mut self) -> (Id, Vec<TextEdit>) {
+                let (id, params) = self.workspace_edits.recv().await.unwrap();
+                let mut changes = params.edit.changes.unwrap();
+                (id, changes.remove(&self.uri).unwrap())
+            }
+
+            fn applied(&self, id: Id) {
+                self.responses
+                    .send(Response::from_ok(id, json!({ "applied": true })))
+                    .unwrap();
+            }
+
+            /// Reports `edit` as the change that brought the buffer to `version`.
+            async fn change(&self, version: i32, edit: &TextEdit) {
+                self.backend
+                    .did_change(DidChangeTextDocumentParams {
+                        text_document: VersionedTextDocumentIdentifier {
+                            uri: self.uri.clone(),
+                            version,
+                        },
+                        content_changes: vec![TextDocumentContentChangeEvent {
+                            range: Some(edit.range),
+                            range_length: None,
+                            text: edit.new_text.clone(),
+                        }],
+                    })
+                    .await;
+            }
+
+            async fn compiled_revision(&self) -> u64 {
+                self.backend
+                    .state
+                    .published_state
+                    .lock()
+                    .await
+                    .compiled_revision
+            }
+        }
+
+        #[tokio::test]
+        async fn an_edit_reported_in_parts_compiles_once_all_of_it_arrives() {
+            let mut editor = Editor::open().await;
+            let edit = editor.edit();
+            let (id, edits) = editor.workspace_edit().await;
+            // Like Neovim, report the edit nearest the end at once, answer,
+            // and report the rest after a debounce.
+            editor.change(1, &edits[1]).await;
+            assert_eq!(editor.compiled_revision().await, 0);
+            editor.applied(id);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            editor.change(2, &edits[0]).await;
+
+            // Revision 1 opened the file and revision 2 had half the edit.
+            assert_eq!(edit.await.unwrap(), (true, 3));
+            assert_eq!(editor.compiled_revision().await, 3);
+            let published = editor.backend.state.published_state.lock().await;
+            assert!(
+                published
+                    .ast
+                    .values()
+                    .any(|module| module.source_text.as_str() == AFTER)
+            );
+        }
+
+        #[tokio::test]
+        async fn an_edit_never_reported_in_full_is_withdrawn_and_compiled_as_is() {
+            let mut editor = Editor::open().await;
+            let edit = editor.edit();
+            let (id, edits) = editor.workspace_edit().await;
+            editor.change(1, &edits[1]).await;
+            editor.applied(id);
+
+            assert_eq!(edit.await.unwrap(), (true, 2));
+            let state = &editor.backend.state;
+            assert!(
+                state
+                    .source_state
+                    .lock()
+                    .await
+                    .pending_workspace_edits
+                    .is_empty()
+            );
+            let mut compiled = state.compiled_revisions.subscribe();
+            tokio::time::timeout(
+                PENDING_EDIT_TIMEOUT * 10,
+                compiled.wait_for(|&revision| revision >= 2),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
     }
 }

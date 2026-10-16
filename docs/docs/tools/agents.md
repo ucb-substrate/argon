@@ -96,4 +96,4 @@ For Claude Code, `argon-analyzer hook` is a `PreToolUse` hook that steers those 
 
 ## Security
 
-The analyzer listens on a local port, which the GUI and the MCP server connect to. Every connection must present a token that the analyzer generates at startup, so other users on the same machine can't connect to it. The token reaches the GUI through its environment, or over SSH for `argone ssh`. The MCP server reads it from a session record in `$XDG_STATE_HOME/argon/sessions` (`~/.local/state/argon/sessions` by default), which only you can read.
+The analyzer listens on a local port, which the GUI and the MCP server connect to. Every connection must present a token that the analyzer generates at startup, so other users on the same machine can't connect to it. The token reaches the GUI over a private socket that `argone` creates, through its environment for `argone gui`, or over SSH for `argone ssh`. The MCP server reads it from a session record in `$XDG_STATE_HOME/argon/sessions` (`~/.local/state/argon/sessions` by default), which only you can read.

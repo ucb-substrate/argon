@@ -254,6 +254,50 @@ fn run(len: usize, font: Font, color: Rgba) -> TextRun {
     }
 }
 
+/// The size text of `font_px` is painted at, at most `MAX_TEXT_PX`; `None`
+/// when it is too small to read.
+fn text_px(font_px: f32) -> Option<f32> {
+    (font_px >= MIN_TEXT_PX).then(|| font_px.min(MAX_TEXT_PX))
+}
+
+/// A box holding `text` as `paint_text` lays it out, allowing each glyph an
+/// em of advance and half an em of overhang.
+fn text_bounds(
+    text: &str,
+    anchor: Point<Pixels>,
+    font_px: f32,
+    align: Align,
+    vertical: bool,
+) -> Bounds<Pixels> {
+    let em = px(font_px);
+    let line_height = px(font_px * 1.2);
+    let chars = text.chars().count() as f32;
+    let bounds = if vertical {
+        let total = line_height * chars;
+        let bottom = match align {
+            Align::Left => anchor.y,
+            Align::Center => anchor.y + total.half(),
+            Align::Right => anchor.y + total,
+        };
+        Bounds::new(
+            point(anchor.x - em.half(), bottom - total),
+            Size::new(em, total),
+        )
+    } else {
+        let width = em * chars;
+        let x = match align {
+            Align::Left => anchor.x,
+            Align::Center => anchor.x - width.half(),
+            Align::Right => anchor.x - width,
+        };
+        Bounds::new(
+            point(x, anchor.y - line_height.half()),
+            Size::new(width, line_height),
+        )
+    };
+    bounds.dilate(em.half())
+}
+
 /// Paints `text` anchored at `anchor`, which is its vertical center and its
 /// left end, center, or right end by `align`; vertical text runs bottom to
 /// top.
@@ -271,7 +315,15 @@ pub fn paint_text(
     vertical: bool,
     color: Rgba,
 ) {
-    if !(MIN_TEXT_PX..=MAX_TEXT_PX).contains(&font_px) || text.is_empty() {
+    let Some(font_px) = text_px(font_px) else {
+        return;
+    };
+    if text.is_empty()
+        || !intersects(
+            text_bounds(text, anchor, font_px, align, vertical),
+            window.content_mask().bounds,
+        )
+    {
         return;
     }
     let font = window.text_style().font();
@@ -413,6 +465,21 @@ fn paint_placed_symbol(
     color: Rgba,
     pin_color: Rgba,
 ) {
+    paint_symbol_graphics(window, viewport, bounds, symbol, color, pin_color);
+    for text in &symbol.texts {
+        paint_placed_text(window, cx, viewport, bounds, text, color);
+    }
+}
+
+/// Paints the shapes and pins of `symbol`, leaving out its text.
+fn paint_symbol_graphics(
+    window: &mut Window,
+    viewport: Viewport,
+    bounds: Bounds<Pixels>,
+    symbol: &PlacedSymbol,
+    color: Rgba,
+    pin_color: Rgba,
+) {
     for shape in &symbol.shapes {
         paint_shape(window, viewport, bounds, shape, color);
     }
@@ -423,9 +490,6 @@ fn paint_placed_symbol(
             PIN_SIZE,
             pin_color,
         );
-    }
-    for text in &symbol.texts {
-        paint_placed_text(window, cx, viewport, bounds, text, color);
     }
 }
 
@@ -510,39 +574,38 @@ fn paint_scene(
 
     for (index, element) in scene.elements.iter().enumerate() {
         let element_bounds = world_bounds_px(viewport, bounds, element.bounds);
-        if !intersects(element_bounds, bounds) {
-            continue;
-        }
-        let selected = frame.selection.contains(&Hit::Element(index));
-        let hovered = frame.hover == Some(Hit::Element(index));
-        if selected || hovered {
-            window.paint_quad(fill(
-                element_bounds,
-                if selected {
-                    theme.selection
-                } else {
-                    theme.hover
-                },
-            ));
-        }
+        let on_canvas = intersects(element_bounds, bounds);
         let color = if element.editable {
             theme.symbol
         } else {
             theme.locked
         };
+        if on_canvas {
+            let selected = frame.selection.contains(&Hit::Element(index));
+            let hovered = frame.hover == Some(Hit::Element(index));
+            if selected || hovered {
+                window.paint_quad(fill(
+                    element_bounds,
+                    if selected {
+                        theme.selection
+                    } else {
+                        theme.hover
+                    },
+                ));
+            }
+            if boxes_only {
+                outline(window, element_bounds, color, px(1.));
+            } else {
+                paint_symbol_graphics(window, viewport, bounds, &element.symbol, color, theme.pin);
+            }
+        }
         if boxes_only {
-            outline(window, element_bounds, color, px(1.));
             continue;
         }
-        paint_placed_symbol(
-            window,
-            cx,
-            viewport,
-            bounds,
-            &element.symbol,
-            color,
-            theme.pin,
-        );
+        // Text reaches past the element's bounds, so it is culled on its own.
+        for text in &element.symbol.texts {
+            paint_placed_text(window, cx, viewport, bounds, text, color);
+        }
         // Key parameters beside a device, since its helper knows none.
         if !element.params.is_empty() {
             let (x1, y0) = (element.bounds.2, element.bounds.0);
@@ -984,5 +1047,33 @@ fn paint_symbol_scene(
             false,
             theme.subtext,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_past_the_cap_keeps_the_capped_size() {
+        assert_eq!(text_px(MIN_TEXT_PX / 2.), None);
+        assert_eq!(text_px(20.), Some(20.));
+        assert_eq!(text_px(MAX_TEXT_PX * 10.), Some(MAX_TEXT_PX));
+    }
+
+    #[test]
+    fn text_bounds_follow_the_alignment() {
+        let anchor = point(px(100.), px(50.));
+        let left = text_bounds("abcd", anchor, 10., Align::Left, false);
+        assert!(left.left() < anchor.x && left.right() >= anchor.x + px(40.));
+        let right = text_bounds("abcd", anchor, 10., Align::Right, false);
+        assert!(right.left() <= anchor.x - px(40.) && right.right() > anchor.x);
+        let center = text_bounds("abcd", anchor, 10., Align::Center, false);
+        assert_eq!(center.center(), anchor);
+        assert!(center.top() < anchor.y - px(6.) && center.bottom() > anchor.y + px(6.));
+        // Vertical text runs upward from a left-aligned anchor.
+        let vertical = text_bounds("abcd", anchor, 10., Align::Left, true);
+        assert!(vertical.top() <= anchor.y - px(48.) && vertical.bottom() > anchor.y);
+        assert!(vertical.left() < anchor.x - px(5.) && vertical.right() > anchor.x + px(5.));
     }
 }

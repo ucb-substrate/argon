@@ -89,6 +89,18 @@ impl fmt::Debug for SessionToken {
     }
 }
 
+/// Parses the `PORT TOKEN` line an analyzer writes to its relay socket.
+pub fn parse_announcement(line: &str) -> Option<(u16, SessionToken)> {
+    let mut fields = line.split_whitespace();
+    let port = fields
+        .next()?
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)?;
+    let token = SessionToken::from_hex(fields.next()?)?;
+    fields.next().is_none().then_some((port, token))
+}
+
 /// What a connection is for, which decides the service it is served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
@@ -355,6 +367,19 @@ mod tests {
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
+
+    #[test]
+    fn announcements_carry_a_port_and_a_token() {
+        let token = "ab".repeat(32);
+        assert_eq!(
+            parse_announcement(&format!("1234 {token}\n")),
+            Some((1234, SessionToken::from_hex(&token).unwrap()))
+        );
+        assert_eq!(parse_announcement("1234\n"), None);
+        assert_eq!(parse_announcement(&format!("0 {token}")), None);
+        assert_eq!(parse_announcement("1234 not-a-token"), None);
+        assert_eq!(parse_announcement(&format!("1234 {token} extra")), None);
+    }
 
     async fn listener() -> (TcpListener, SocketAddr) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

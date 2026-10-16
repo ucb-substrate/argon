@@ -7,7 +7,7 @@ use std::{
 };
 
 use analyzer::rpc::{
-    CellEntry, CompilationSnapshot, DevicePreview, InstancePreview, LangServerAction,
+    CellEntry, CompilationSnapshot, DevicePreview, InstancePreview, LangServerAction, RecentCell,
     SchematicInstancePreview,
 };
 use argonc::compile::{CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId};
@@ -31,6 +31,7 @@ use crate::{
         ShowDiagnostics, ShowMessages, Undo, ViewLayout, ViewSchematic, ViewSymbol,
     },
     editor::{canvas::ToolState, input::TextInput},
+    main_window::MainWindow,
     rpc::SyncLangServerClient,
     theme::{DARK_THEME, LIGHT_THEME, Theme},
 };
@@ -102,6 +103,26 @@ impl RootStep {
             }
         }
     }
+}
+
+/// Where focus goes when the GUI hands off to Neovim.
+#[derive(Clone, Default)]
+pub(crate) enum Invoker {
+    /// The application that launched the GUI.
+    #[default]
+    App,
+    /// The Neovim pane in this window.
+    Pane {
+        window: AnyWindowHandle,
+        main: WeakEntity<MainWindow>,
+    },
+}
+
+/// The tasks that serve an [`Editor`]. Dropping them disconnects it from the
+/// analyzer.
+pub(crate) struct EditorTasks {
+    _exec: Task<()>,
+    _callbacks: Task<()>,
 }
 
 /// How long objects an agent edit changed stay outlined.
@@ -198,6 +219,11 @@ pub struct EditorState {
     /// The library's cells, offered on the start screen. `None` until the
     /// analyzer sends them.
     pub cells: Option<Vec<CellEntry>>,
+    /// The cell invocations recently opened in the library, most recent first.
+    pub recent_cells: Vec<RecentCell>,
+    /// Whether Option acts as Meta in the Neovim pane on macOS.
+    pub option_as_meta: bool,
+    pub(crate) invoker: Invoker,
 }
 
 #[derive(Clone, Debug)]
@@ -327,7 +353,7 @@ fn mark_layer_used(state: &mut ProcessScopeState, layer: &str) {
 }
 
 impl EditorState {
-    fn theme(&self) -> &'static Theme {
+    pub(crate) fn theme(&self) -> &'static Theme {
         if self.dark_mode {
             &DARK_THEME
         } else {
@@ -652,14 +678,16 @@ pub(crate) fn prepare_compilation_snapshot(
 }
 
 impl Editor {
-    pub fn new(
-        cx: &mut Context<Self>,
+    /// Connects to the analyzer at `lang_server_addr` and builds the views.
+    pub(crate) fn new(
+        cx: &mut App,
         window: &mut Window,
         lang_server_addr: SocketAddr,
         token: analyzer::transport::SessionToken,
-    ) -> Self {
+        invoker: Invoker,
+    ) -> anyhow::Result<(Self, EditorTasks)> {
         let (lang_server_client, mut rx) =
-            SyncLangServerClient::new(cx.to_async(), lang_server_addr, token);
+            SyncLangServerClient::new(cx.to_async(), lang_server_addr, token)?;
         let solved_cell = cx.new(|_cx| None);
         let tool = cx.new(|_cx| ToolState::default());
         let layers = cx.new(|_cx| Layers {
@@ -703,13 +731,18 @@ impl Editor {
                 root_path: Vec::new(),
                 base_top: None,
                 cells: None,
+                recent_cells: Vec::new(),
+                option_as_meta: false,
+                invoker: invoker.clone(),
             }
         });
         let title_bar = cx.new(|_cx| TitleBar::new(&state));
         let tool_bar = cx.new(|_cx| ToolBar::new(&state));
         let canvas_focus_handle = cx.focus_handle();
         let text_input_focus_handle = cx.focus_handle();
-        window.focus(&canvas_focus_handle);
+        if matches!(invoker, Invoker::App) {
+            window.focus(&canvas_focus_handle);
+        }
         let text_input = cx.new(|cx| {
             TextInput::new_dimension_input(
                 cx,
@@ -746,19 +779,19 @@ impl Editor {
             schematic_sidebar,
             properties_sidebar,
         };
-        cx.to_async()
-            .spawn({
-                let editor = editor.clone();
-                async move |app| loop {
-                    if let Some(exec) = rx.next().await {
-                        exec(&editor, app);
-                    }
+        let exec = cx.spawn({
+            let editor = editor.clone();
+            async move |app| {
+                while let Some(exec) = rx.next().await {
+                    exec(&editor, app);
                 }
-            })
-            .detach();
-        lang_server_client.serve_callbacks();
-
-        editor
+            }
+        });
+        let tasks = EditorTasks {
+            _exec: exec,
+            _callbacks: lang_server_client.serve_callbacks(),
+        };
+        Ok((editor, tasks))
     }
 
     fn apply_snapshot(&self, cx: &mut App, snapshot: PreparedCompilationSnapshot) -> bool {
@@ -823,6 +856,22 @@ impl Editor {
         match self.state.read(cx).view {
             View::Layout => self.canvas.focus_handle(cx),
             View::Schematic | View::Symbol => self.schematic_canvas.focus_handle(cx),
+        }
+    }
+
+    /// Focuses the active view's canvas.
+    pub(crate) fn focus_canvas(&self, window: &mut Window, cx: &App) {
+        window.focus(&self.active_focus_handle(cx));
+    }
+
+    /// Brings the editor forward: its canvas when Neovim is in the same
+    /// window, otherwise the whole application.
+    pub(crate) fn activate(&self, cx: &mut App) {
+        match self.state.read(cx).invoker.clone() {
+            Invoker::App => crate::focus::activate_gui(cx),
+            Invoker::Pane { window, .. } => {
+                let _ = window.update(cx, |_, window, cx| self.focus_canvas(window, cx));
+            }
         }
     }
 
@@ -1092,7 +1141,7 @@ impl Editor {
             .dispatch_action(LangServerAction::Undo);
     }
 
-    fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
         let _ = self
             .state
             .read(cx)
@@ -1126,11 +1175,16 @@ impl Editor {
         self.open_invoking_command(None, true, cx);
     }
 
-    fn show_messages(&mut self, _: &ShowMessages, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn show_messages(
+        &mut self,
+        _: &ShowMessages,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.open_invoking_command(Some("messages<CR>"), false, cx);
     }
 
-    fn show_diagnostics(
+    pub(crate) fn show_diagnostics(
         &mut self,
         _: &ShowDiagnostics,
         _window: &mut Window,
@@ -1231,7 +1285,7 @@ impl Editor {
         self.open_invoking_command(Some("Argon openCell "), true, cx);
     }
 
-    fn new_cell_command(
+    pub(crate) fn new_cell_command(
         &mut self,
         _: &NewCellCommand,
         _window: &mut Window,
@@ -1240,7 +1294,7 @@ impl Editor {
         self.open_invoking_command(Some("Argon newCell "), true, cx);
     }
 
-    fn rename_cell_command(
+    pub(crate) fn rename_cell_command(
         &mut self,
         _: &RenameCellCommand,
         _window: &mut Window,
@@ -1284,6 +1338,15 @@ pub(crate) fn open_command(
 }
 
 fn focus_invoker(state: &Entity<EditorState>, cx: &mut App) {
+    if let Invoker::Pane { window, main } = state.read(cx).invoker.clone() {
+        // Deferred so that this also works while `window` is being updated.
+        cx.defer(move |cx| {
+            let _ = window.update(cx, |_, window, cx| {
+                let _ = main.update(cx, |main, cx| main.focus_nvim(window, cx));
+            });
+        });
+        return;
+    }
     if !crate::focus::activate_invoker() {
         state.update(cx, |state, _cx| {
             state.fatal_error = Some(EditorMessage {
@@ -1554,16 +1617,12 @@ impl Render for Editor {
             .flex()
             .flex_col()
             .justify_start()
-            .border_1()
-            .border_color(theme.divider)
             .bg(theme.bg)
-            .rounded(px(10.))
             .text_color(theme.text)
             .overflow_hidden()
             .whitespace_nowrap()
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_left_mouse_up))
-            .child(self.title_bar.clone())
             .when(!start_screen, |root| root.child(self.tool_bar.clone()))
             .child(body)
             .child(status_bar);

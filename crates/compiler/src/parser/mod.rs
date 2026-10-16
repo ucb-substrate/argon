@@ -210,6 +210,16 @@ pub fn parse_cell(input: &str) -> Result<CallExpr<&str, ParseMetadata>, Vec<Pars
     }
 }
 
+/// The text of each token in `input`, without whitespace or comments.
+pub(crate) fn token_texts(input: &str) -> impl Iterator<Item = &str> {
+    let mut lexer = lexer::Lexer::new(input, 0);
+    std::iter::from_fn(move || {
+        let token = lexer.next_token();
+        (token.kind != token::TokenKind::Eof)
+            .then(|| &input[token.start as usize..token.end as usize])
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};

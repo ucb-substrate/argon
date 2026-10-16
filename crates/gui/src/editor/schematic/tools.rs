@@ -32,6 +32,8 @@ pub struct Drag {
     pub base: Arc<Scene>,
     /// The selection in `base`.
     pub selection: Vec<Hit>,
+    /// What a release selects if the pointer never moved a grid unit.
+    pub click: Option<Vec<Hit>>,
 }
 
 impl Drag {

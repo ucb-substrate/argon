@@ -16,7 +16,6 @@ use argonc::{
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use tarpc::context;
-use tokio::time::Instant;
 use tower_lsp_server::{
     NotCancellable, OngoingProgress, Unbounded,
     ls_types::{Diagnostic, ProgressToken, Range, TextEdit, Uri, request::Request},
@@ -543,32 +542,17 @@ impl Backend {
         Ok(())
     }
 
-    /// Waits until `found` returns a value for the source state, which is
-    /// rechecked each time an editor document changes.
-    async fn wait_for_source<T>(&self, found: impl Fn(&SourceState) -> Option<T>) -> Option<T> {
-        let mut changes = self.state.source_changes.subscribe();
-        let deadline = Instant::now() + SETTLE_TIMEOUT;
-        loop {
-            if let Some(value) = found(&*self.state.source_state.lock().await) {
-                return Some(value);
-            }
-            match tokio::time::timeout_at(deadline, changes.changed()).await {
-                Ok(Ok(())) => {}
-                _ => return None,
-            }
-        }
-    }
-
     async fn wait_for_version(&self, uri: &Uri, version: i32) -> bool {
-        self.wait_for_source(|source| {
-            source
-                .editor_files
-                .get(uri)
-                .filter(|document| document.version() >= version)
-                .map(|_| ())
-        })
-        .await
-        .is_some()
+        self.state
+            .wait_for_source(SETTLE_TIMEOUT, |source| {
+                source
+                    .editor_files
+                    .get(uri)
+                    .filter(|document| document.version() >= version)
+                    .map(|_| ())
+            })
+            .await
+            .is_some()
     }
 
     async fn wait_for_compiled(&self, revision: u64) -> bool {
@@ -612,7 +596,8 @@ impl Backend {
                 .message
                 .unwrap_or_else(|| format!("Neovim could not open {}.", path.display())));
         }
-        self.wait_for_source(|source| open_uri(source, path))
+        self.state
+            .wait_for_source(SETTLE_TIMEOUT, |source| open_uri(source, path))
             .await
             .ok_or_else(|| format!("Neovim opened {} but did not attach it.", path.display()))
     }
@@ -636,7 +621,9 @@ impl Backend {
                 plan_for(document)?
             };
             let confirm = self.state.config().agent.approval == ApprovalMode::Always;
-            self.state.begin_pending_edit(uri).await;
+            self.state
+                .begin_pending_edit(uri, plan.new_text.clone())
+                .await;
             let result = self
                 .state
                 .editor_client
@@ -653,28 +640,34 @@ impl Backend {
             match result {
                 Ok(ApplyAgentEditResult::Applied { version }) => {
                     if !self.wait_for_version(uri, version).await {
-                        self.state.end_pending_edit(uri).await;
+                        self.state.end_pending_edit(uri, &plan.new_text).await;
                         return Err(
                             "Neovim applied the edit but never reported the change.".to_owned()
                         );
+                    }
+                    // Still in flight after Neovim reported every change: its
+                    // text differs from the plan's, so compile what it has.
+                    if self.state.end_pending_edit(uri, &plan.new_text).await {
+                        let identity = self.state.source_state.lock().await.compile_identity();
+                        self.update_cell(identity).await;
                     }
                     let revision = self.state.source_state.lock().await.revision;
                     return Ok((plan, revision));
                 }
                 Ok(ApplyAgentEditResult::Stale { version }) => {
-                    self.state.end_pending_edit(uri).await;
+                    self.state.end_pending_edit(uri, &plan.new_text).await;
                     self.wait_for_version(uri, version).await;
                 }
                 Ok(ApplyAgentEditResult::Rejected) => {
-                    self.state.end_pending_edit(uri).await;
+                    self.state.end_pending_edit(uri, &plan.new_text).await;
                     return Err("The user rejected this edit in Neovim.".to_owned());
                 }
                 Ok(ApplyAgentEditResult::Failed { message }) => {
-                    self.state.end_pending_edit(uri).await;
+                    self.state.end_pending_edit(uri, &plan.new_text).await;
                     return Err(format!("Neovim could not apply the edit: {message}"));
                 }
                 Err(error) => {
-                    self.state.end_pending_edit(uri).await;
+                    self.state.end_pending_edit(uri, &plan.new_text).await;
                     return Err(format!("Could not reach Neovim: {error}"));
                 }
             }
@@ -934,6 +927,7 @@ impl Agent for Backend {
         let identity = {
             let mut source = self.state.source_state.lock().await;
             source.cell = Some(cell);
+            source.pending_recent = None;
             source.compile_identity()
         };
         if let Some(connection) = self.update_cell(identity.clone()).await {

@@ -22,12 +22,16 @@ These work in every view while the canvas has focus:
 | Arrow keys | Pan |
 | <kbd>Cmd/Ctrl</kbd>+<kbd>+</kbd> / <kbd>-</kbd> | Zoom in or out |
 | <kbd>:</kbd> | Focus the Neovim command line, where `:Argon` arguments complete with <kbd>Tab</kbd> |
-| <kbd>Ctrl</kbd>+<kbd>Backslash</kbd> | Switch between the GUI and Neovim |
+| <kbd>Cmd</kbd>+<kbd>Backslash</kbd> | Switch between the canvas and Neovim (on Linux, <kbd>Super</kbd>+<kbd>Backslash</kbd>) |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> | Show diagnostics |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> | Show messages |
 | <kbd>Backspace</kbd> | Undo the last point or edge picked by the active tool |
 | <kbd>Esc</kbd> | Cancel the current operation or clear the selection |
 | <kbd>Enter</kbd> | Confirm or finish the current operation |
+
+With `argone --terminal`, Neovim runs in its own terminal, and <kbd>Ctrl</kbd>+<kbd>Backslash</kbd> switches between the GUI and that terminal instead.
+
+While Neovim has focus, keys go to Neovim, except for the shortcuts that work everywhere: <kbd>Cmd</kbd>+<kbd>Q</kbd>, <kbd>Cmd</kbd>+<kbd>S</kbd>, <kbd>Cmd</kbd>+<kbd>N</kbd>, <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd>, <kbd>Cmd</kbd>+<kbd>Backslash</kbd>, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd>, and <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd>. <kbd>Cmd</kbd>+<kbd>V</kbd> pastes the clipboard into Neovim, and other <kbd>Cmd</kbd> combinations reach Neovim as `<D-…>` keys. <kbd>Ctrl</kbd>+<kbd>Backslash</kbd> reaches Neovim too, so <kbd>Ctrl</kbd>+<kbd>Backslash</kbd> <kbd>Ctrl</kbd>+<kbd>N</kbd> leaves terminal mode in `:terminal`. Neovim draws with the font in `guifont`, using the first installed font in the list, and honors `linespace`.
 
 In the layout view:
 
@@ -91,6 +95,7 @@ dark_mode = true
 hierarchy_depth = 3
 icon_size = 20
 font_size = 14
+option_as_meta = false
 
 [log]
 level = "info"
@@ -99,7 +104,7 @@ level = "info"
 approval = "never"
 ```
 
-`font_size` and `icon_size` are in logical pixels, from 1 to 256. `agent.approval` is `"never"` or `"always"`; see [Agents](/tools/agents#approving-edits). After editing the file, run `:Argon reload`. To change a value for this session only, use `:Argon set`; to write the current settings back to disk, use `:Argon saveConfig`.
+`font_size` and `icon_size` are in logical pixels, from 1 to 256. On macOS, <kbd>Option</kbd> types characters such as `ß` in Neovim; set `option_as_meta = true` to send it as Meta (`<M-…>`) instead. On Linux, <kbd>Alt</kbd> always sends Meta. `agent.approval` is `"never"` or `"always"`; see [Agents](/tools/agents#approving-edits). After editing the file, run `:Argon reload`. To change a value for this session only, use `:Argon set`; to write the current settings back to disk, use `:Argon saveConfig`.
 
 ## Troubleshooting
 
@@ -117,4 +122,4 @@ Run `:Argon diagnostics` and `:Argon log`. For more, set `log.level = "debug"` a
 
 ### The GUI didn't start
 
-Check that `argon-analyzer` and `argone` are on your `PATH`, the buffer's file ends in `.ar`, and the library has `Argon.toml` and `lib.ar`. Then run `:Argon gui`.
+If the window stays at "Starting the analyzer…", or the GUI doesn't open with `--terminal`, check that `argon-analyzer` and `argone` are on your `PATH`, the buffer's file ends in `.ar`, and the library has `Argon.toml` and `lib.ar`. With `--terminal`, then run `:Argon gui`.

@@ -6,7 +6,7 @@ use arcstr::Substr;
 use argonc::{
     ast::{CellDecl, Decl, Span},
     compile::{Align, BasicRect, CellId, CompileOutput, CompiledData, DeviceKind, Symbol},
-    parse::{AnnotatedParseAst, ParseMetadata, WorkspaceParseAst},
+    parse::{self, AnnotatedParseAst, ParseMetadata, WorkspaceParseAst},
 };
 
 use serde::{Deserialize, Serialize};
@@ -17,8 +17,8 @@ use tower_lsp_server::ls_types::{
 };
 
 use crate::{
-    ArgonConfig, Backend, PublishedState, Redo, Save, SourceState, State, Undo, document::Document,
-    schematic_edit,
+    ArgonConfig, Backend, PENDING_EDIT_TIMEOUT, PublishedState, Redo, Save, SourceState, State,
+    Undo, document::Document, schematic_edit,
 };
 
 /// A single source rewrite: replace the text at `span` with `value`. Used to
@@ -482,6 +482,33 @@ pub struct CellEntry {
     pub requires_arguments: bool,
 }
 
+/// A cell invocation recently opened in the library.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentCell {
+    /// The invocation, such as `inverter(1200., 2000., 4)`.
+    pub invocation: String,
+    /// The invoked cell's path as written, without a leading `lib::`, such as
+    /// `utils::pad`. Empty if the invocation does not parse.
+    pub cell: String,
+}
+
+impl RecentCell {
+    pub(crate) fn new(invocation: String) -> Self {
+        let cell = parse::parse_cell(&invocation)
+            .map(|call| {
+                let path = call
+                    .func
+                    .path
+                    .iter()
+                    .map(|ident| ident.name)
+                    .collect::<Vec<_>>();
+                path.strip_prefix(&["lib"]).unwrap_or(&path).join("::")
+            })
+            .unwrap_or_default();
+        Self { invocation, cell }
+    }
+}
+
 #[tarpc::service]
 pub trait LangServer {
     async fn select_span(span: Span);
@@ -547,6 +574,8 @@ pub trait Gui {
     async fn activate();
     /// Replaces the library's cells, which the GUI offers before a cell is open.
     async fn set_cells(cells: Vec<CellEntry>);
+    /// Replaces the library's recently opened cells, most recent first.
+    async fn set_recent_cells(cells: Vec<RecentCell>);
     /// Briefly outlines objects whose source overlaps `spans`, once the GUI
     /// shows `revision` or later.
     async fn highlight_spans(revision: u64, spans: Vec<Span>);
@@ -744,37 +773,93 @@ impl State {
         }
     }
 
-    /// Marks an analyzer edit to `uri` as in flight, so the `didChange` it
-    /// produces compiles immediately.
-    pub(crate) async fn begin_pending_edit(&self, uri: &Uri) {
-        *self
-            .source_state
+    /// Marks an analyzer edit to `uri` as in flight until the editor reports
+    /// `expected`, the file's text with all of the edit applied.
+    pub(crate) async fn begin_pending_edit(&self, uri: &Uri, expected: String) {
+        self.source_state
             .lock()
             .await
             .pending_workspace_edits
-            .entry(uri.clone())
-            .or_default() += 1;
+            .insert(uri.clone(), expected);
     }
 
-    /// Withdraws an in-flight edit that will not produce a `didChange`.
-    pub(crate) async fn end_pending_edit(&self, uri: &Uri) {
+    /// Withdraws the in-flight edit that leaves `uri` as `expected`, unless
+    /// it has completed or a newer edit replaced it. Returns whether it was
+    /// still in flight.
+    pub(crate) async fn end_pending_edit(&self, uri: &Uri, expected: &str) -> bool {
         let mut state = self.source_state.lock().await;
-        if let Some(count) = state.pending_workspace_edits.get_mut(uri) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                state.pending_workspace_edits.shift_remove(uri);
+        let in_flight = state
+            .pending_workspace_edits
+            .get(uri)
+            .is_some_and(|pending| pending == expected);
+        if in_flight {
+            state.pending_workspace_edits.shift_remove(uri);
+        }
+        in_flight
+    }
+
+    /// The text each file that `changes` alters will have once the editor
+    /// applies them, to its buffer or, when it has none, to the file on disk.
+    async fn edited_texts(&self, changes: &HashMap<Uri, Vec<TextEdit>>) -> Vec<(Uri, String)> {
+        let mut texts = Vec::new();
+        for (uri, edits) in changes {
+            let open = self
+                .source_state
+                .lock()
+                .await
+                .editor_files
+                .get(uri)
+                .cloned();
+            let document = match open {
+                Some(document) => document,
+                None => {
+                    let Some(path) = uri.to_file_path() else {
+                        continue;
+                    };
+                    let Ok(text) = tokio::fs::read_to_string(&path).await else {
+                        continue;
+                    };
+                    self.document(text)
+                }
+            };
+            let edited = document.edited(edits);
+            if edited != document.contents() {
+                texts.push((uri.clone(), edited));
+            }
+        }
+        texts
+    }
+
+    /// Waits until the editor reports all of each edit in `pending`,
+    /// withdrawing the ones it has not reported in time.
+    async fn wait_for_pending_edits(&self, pending: &[(Uri, String)]) {
+        let in_flight = |source: &SourceState| {
+            pending
+                .iter()
+                .any(|(uri, expected)| source.pending_workspace_edits.get(uri) == Some(expected))
+        };
+        let arrived = self
+            .wait_for_source(PENDING_EDIT_TIMEOUT, |source| {
+                (!in_flight(source)).then_some(())
+            })
+            .await;
+        if arrived.is_none() {
+            for (uri, expected) in pending {
+                self.end_pending_edit(uri, expected).await;
             }
         }
     }
 
+    /// Applies `changes` through the editor as one edit, returning once the
+    /// editor has reported all of it.
     pub(crate) async fn apply_source_changes(
         &self,
         changes: HashMap<Uri, Vec<TextEdit>>,
         focus: Option<Uri>,
     ) -> bool {
-        let pending_uris = changes.keys().cloned().collect::<Vec<_>>();
-        for uri in &pending_uris {
-            self.begin_pending_edit(uri).await;
+        let pending = self.edited_texts(&changes).await;
+        for (uri, expected) in &pending {
+            self.begin_pending_edit(uri, expected.clone()).await;
         }
         let result: Result<(), String> = async {
             if let Some(uri) = focus {
@@ -809,12 +894,13 @@ impl State {
         .await;
 
         if let Err(error) = result {
-            for uri in &pending_uris {
-                self.end_pending_edit(uri).await;
+            for (uri, expected) in &pending {
+                self.end_pending_edit(uri, expected).await;
             }
             self.report_message(MessageType::ERROR, error).await;
             false
         } else {
+            self.wait_for_pending_edits(&pending).await;
             true
         }
     }
@@ -1121,7 +1207,8 @@ impl State {
         }
         self.publish_workspace_modified(modified, Some(connection.clone()))
             .await;
-        self.publish_cells(Some(connection)).await;
+        self.publish_cells(Some(connection.clone())).await;
+        self.publish_recent_cells(Some(connection)).await;
         Backend { state: self }.open_current().await;
     }
 }
@@ -2214,7 +2301,9 @@ cell top() { let a = inst(leaf(), x=0., y=0.); }
         );
         assert!(!editor_buffers_are_current(&source_state, &compiled));
 
-        source_state.pending_workspace_edits.insert(uri, 1);
+        source_state
+            .pending_workspace_edits
+            .insert(uri, "cell top() { rect(); }\n".to_owned());
         assert!(editor_buffers_are_current(&source_state, &compiled));
     }
 

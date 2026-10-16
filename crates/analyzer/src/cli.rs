@@ -14,6 +14,10 @@ struct Args {
     #[arg(long)]
     relay_socket: Option<PathBuf>,
 
+    /// The GUI embeds this analyzer's Neovim, so never start a separate GUI.
+    #[arg(long)]
+    embedded_gui: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -57,20 +61,14 @@ pub async fn run() {
                 eprintln!("argon-analyzer hook: {error}");
             }
         }
-        None => crate::main(args.rpc_port, args.relay_socket).await,
+        None => {
+            let gui = crate::GuiLink {
+                relay_socket: args.relay_socket,
+                embedded: args.embedded_gui,
+            };
+            crate::main(args.rpc_port, gui).await
+        }
     }
-}
-
-/// Parses the `PORT TOKEN` line the analyzer writes to the relay socket.
-fn parse_port_and_token(line: &str) -> Option<(u16, String)> {
-    let mut fields = line.split_whitespace();
-    let port = fields
-        .next()?
-        .parse::<u16>()
-        .ok()
-        .filter(|port| *port != 0)?;
-    let token = crate::transport::SessionToken::from_hex(fields.next()?)?;
-    fields.next().is_none().then(|| (port, token.to_hex()))
 }
 
 #[cfg(unix)]
@@ -87,7 +85,7 @@ async fn run_relay() -> io::Result<()> {
     let (stream, _) = listener.accept().await?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).await?;
-    let (port, token) = parse_port_and_token(&line).ok_or_else(|| {
+    let (port, token) = crate::transport::parse_announcement(&line).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid analyzer RPC announcement",
@@ -95,7 +93,7 @@ async fn run_relay() -> io::Result<()> {
     })?;
     // Stdout is the SSH channel back to Argone, so the token stays private.
     stdout
-        .write_all(format!("ARGON_ANALYZER 2 {port} {token}\n").as_bytes())
+        .write_all(format!("ARGON_ANALYZER 2 {port} {}\n", token.to_hex()).as_bytes())
         .await?;
     stdout.flush().await
 }
@@ -106,22 +104,4 @@ async fn run_relay() -> io::Result<()> {
         io::ErrorKind::Unsupported,
         "relay requires a Unix-like remote host",
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_port_and_token;
-
-    #[test]
-    fn relay_announcements_carry_a_port_and_a_token() {
-        let token = "ab".repeat(32);
-        assert_eq!(
-            parse_port_and_token(&format!("1234 {token}\n")),
-            Some((1234, token.clone()))
-        );
-        assert_eq!(parse_port_and_token("1234\n"), None);
-        assert_eq!(parse_port_and_token(&format!("0 {token}")), None);
-        assert_eq!(parse_port_and_token("1234 not-a-token"), None);
-        assert_eq!(parse_port_and_token(&format!("1234 {token} extra")), None);
-    }
 }
