@@ -1,3 +1,5 @@
+use std::layout::rect;
+
 cell via() {
     let via = rect("via1");
     let met1 = rect("met1");

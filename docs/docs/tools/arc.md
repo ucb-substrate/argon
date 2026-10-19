@@ -58,7 +58,7 @@ Parses, resolves, and type-checks the library without running a cell. No technol
 ## `arc run`
 
 ```text
-arc run --cell <EXPR> [--output <PATH>] [--gds | --gds-only]
+arc run --cell <EXPR> [--output <PATH>] [--gds | --gds-only] [--spice] [--spectre] [--netlist-width <COLS>]
 ```
 
 | Option | Required/default | Description |
@@ -67,6 +67,9 @@ arc run --cell <EXPR> [--output <PATH>] [--gds | --gds-only]
 | `-o, --output <PATH>` | `target/argon.bin` | Where to write the compiled layout. |
 | `--gds` | Off | Also write `target/argon.gds`. |
 | `--gds-only` | Off | Write only `target/argon.gds`, without the compiled layout the editor opens. Uses much less memory, so it suits generating large layouts. |
+| `--spice` | Off | Also write a SPICE netlist to `target/argon.spice`. |
+| `--spectre` | Off | Also write a Spectre netlist to `target/argon.scs`. |
+| `--netlist-width <COLS>` | `80` | Break netlist lines longer than this many characters; `0` turns wrapping off. Requires `--spice` or `--spectre`. |
 | `--manifest-path <PATH>` | `Argon.toml` | Library to run. |
 | `--argonc <PATH>` | `ARGONC` or `argonc` | Compiler executable to use. |
 
@@ -74,11 +77,14 @@ arc run --cell <EXPR> [--output <PATH>] [--gds | --gds-only]
 arc run --cell 'top(10., 20.)'
 arc run --cell 'top(10., 20.)' --gds
 arc run --cell 'top(10., 20.)' --gds-only
+arc run --cell 'inv(2., 1., 2)' --spice --spectre
 ```
 
 :::tip
 Quote the cell expression so the shell doesn't interpret the parentheses.
 :::
+
+Netlists are described in [Schematics](/language/schematic#netlists).
 
 ## `arc doc`
 
@@ -95,6 +101,8 @@ Generates a standalone HTML reference for the library, one page per module, with
 
 ```argon title="lib.ar"
 //! Standard cells for this library.
+
+use std::layout::rect;
 
 /// Draws a square on the requested layer.
 ///

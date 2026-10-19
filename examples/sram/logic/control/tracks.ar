@@ -2,6 +2,8 @@
 // y = 205 + 460k and met2 runs vertically on columns x = 350 + 460j. Wires
 // are 320 nm wide, so wires on distinct grid lines are at least 140 nm apart.
 
+use std::layout::{crect, rect, text};
+
 fn track_y(k: Int) -> Float { 205. + 460. * k as Float }
 fn track_x(j: Int) -> Float { 350. + 460. * j as Float }
 

@@ -26,29 +26,37 @@ type FxIndexSet<T> = IndexSet<T, BuildHasherDefault<FxHasher>>;
 mod direct;
 mod ops;
 mod result;
+mod schematic;
 
 pub use result::{
     CompileOutput, ExecError, ExecErrorCompileOutput, ExecErrorKind, StaticError,
     StaticErrorCompileOutput, StaticErrorKind,
 };
+pub(crate) use schematic::Namer;
+pub use schematic::{
+    Detached, DetachedKind, DetachedReason, Device, DeviceKind, Element, Net, NetIdx, NodeId,
+    ParamValue, Schematic, SchematicInstValue, SchematicInstance, SignalRef,
+};
+use schematic::{DeviceRecord, NodeOrigin, SchInstRecord, SchematicState};
 
 use crate::ast::ListCompExpr;
 use crate::ast::annotated::AnnotatedAst;
 use crate::ast::{
-    ArithOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, EnumVariant, FieldAccessExpr, FnDecl,
-    ForLoop, IdentPath, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, MatchArm,
-    MatchExpr, ModPath, Pattern, Scope, Span, StructDecl, StructField, StructLitExpr,
-    StructLitField, TyParam, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, WorkspaceAst,
+    ArithOp, CastExpr, ComparisonOp, ConstantDecl, EnumDecl, EnumVariant, FieldAccessExpr,
+    FieldPattern, FnDecl, ForLoop, IdentPath, IndexExpr, IndexFieldAccessExpr, IntLiteral,
+    KwArgValue, MatchArm, MatchExpr, ModPath, Pattern, Scope, Span, StructDecl, StructField,
+    StructLitExpr, StructLitField, TyParam, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl,
+    VariantPayload, WorkspaceAst,
 };
 use crate::gds::{ImportedGdsElement, import_gds};
-use crate::parse::{CellInvocation, ParseOutput, WorkspaceParseAst};
+use crate::parse::{CellInvocation, ParseOutput, STD_MODULES, WorkspaceParseAst};
 use crate::solver::{Constrained, ConstraintId, Var};
 use crate::tech::{Technology, read_tech};
 use crate::workspace::WorkspaceConfig;
 use crate::{
     ast::{
         ArgDecl, Ast, AstMetadata, AstTransformer, BinOp, BinOpExpr, BoolOp, CallExpr, CellDecl,
-        Decl, Expr, Ident, IfExpr, LetBinding, Statement,
+        Decl, Expr, Ident, IfExpr, LetBinding, LetPattern, Statement,
     },
     cellcache::{CachedCell, CellCache},
     fingerprint::{ItemIndex, RebaseError, SpanRebase},
@@ -116,17 +124,18 @@ pub(crate) const MAX_TEXT_LEN: usize = 512;
 /// Field names an instance already answers, so a cell's top-level `let` may
 /// not shadow one.
 ///
-/// A cell's public fields are exactly its top-level `let` bindings, and
-/// `inst.x` / `inst.y` are the instance's position. The reserved-name check
-/// and the `Ty::Inst` field-access arm both read this list.
+/// A cell's fields are its top-level `let` bindings, of which an instance
+/// reads only the `pub` ones, and `inst.x` / `inst.y` are a layout instance's
+/// position. The reserved-name check and the instance field-access arms read
+/// this list; a schematic instance has no position, so it answers neither.
 ///
 /// The evaluator's `ValueRef::Inst` field dispatch is the third site and
 /// cannot: each name maps to a different field of the instance, so it matches
 /// the literals directly and must be updated alongside this constant.
 pub const RESERVED_CELL_FIELDS: [&str; 2] = ["x", "y"];
 
-pub const BUILTINS: [&str; 26] = [
-    "list",
+/// Functions the compiler implements that every module calls by bare name.
+pub const BUILTINS: [&str; 17] = [
     "cons",
     "head",
     "tail",
@@ -142,22 +151,26 @@ pub const BUILTINS: [&str; 26] = [
     "max_int",
     "min_int",
     "max_via_array",
-    "crect",
-    "rect",
-    "polygon",
-    "path",
-    "text",
     "float",
     "eq",
-    "dimension",
-    "inst",
-    "bbox",
 ];
 
-/// A builtin function, resolved from its name once per call site.
+/// Helpers of `std::layout` for which a `std::` path reports the module they
+/// are in.
+const MOVED_STD_HELPERS: [&str; 8] = [
+    "intersection",
+    "union",
+    "array",
+    "array2",
+    "max_array",
+    "eq_rect",
+    "center_rects",
+    "crect2rect",
+];
+
+/// A builtin function or native item, resolved once per call site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Builtin {
-    List,
     Cons,
     Head,
     Tail,
@@ -183,12 +196,16 @@ enum Builtin {
     Dimension,
     Inst,
     Bbox,
+    Signal,
+    Connect,
+    Device,
+    SchematicInst,
 }
 
 impl Builtin {
+    /// The builtin a bare name calls.
     fn from_name(name: &str) -> Option<Self> {
         Some(match name {
-            "list" => Self::List,
             "cons" => Self::Cons,
             "head" => Self::Head,
             "tail" => Self::Tail,
@@ -204,32 +221,152 @@ impl Builtin {
             "max_int" => Self::MaxInt,
             "min_int" => Self::MinInt,
             "max_via_array" => Self::MaxViaArray,
-            "crect" => Self::Crect,
-            "rect" => Self::Rect,
-            "polygon" => Self::Polygon,
-            "path" => Self::Path,
-            "text" => Self::Text,
             "float" => Self::Float,
             "eq" => Self::Eq,
-            "dimension" => Self::Dimension,
-            "inst" => Self::Inst,
-            "bbox" => Self::Bbox,
             _ => return None,
         })
+    }
+
+    /// Whether this builtin implements a native item rather than a bare name.
+    fn is_native(self) -> bool {
+        matches!(
+            self,
+            Self::Crect
+                | Self::Rect
+                | Self::Polygon
+                | Self::Path
+                | Self::Text
+                | Self::Dimension
+                | Self::Inst
+                | Self::Bbox
+                | Self::Signal
+                | Self::Connect
+                | Self::Device
+                | Self::SchematicInst
+        )
+    }
+
+    /// The builtin that implements a native item.
+    fn from_native(native: Native) -> Self {
+        match native {
+            Native::Rect => Self::Rect,
+            Native::Crect => Self::Crect,
+            Native::Polygon => Self::Polygon,
+            Native::Path => Self::Path,
+            Native::Text => Self::Text,
+            Native::Dimension => Self::Dimension,
+            Native::LayoutInst => Self::Inst,
+            Native::Bbox => Self::Bbox,
+            Native::Signal => Self::Signal,
+            Native::Connect => Self::Connect,
+            Native::Device => Self::Device,
+            Native::SchematicInst => Self::SchematicInst,
+        }
+    }
+}
+
+/// An item the compiler implements but binds inside a `std` module, so that
+/// it is reached by path or `use` like any other item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Native {
+    Rect,
+    Crect,
+    Polygon,
+    Path,
+    Text,
+    Dimension,
+    LayoutInst,
+    Bbox,
+    Signal,
+    Connect,
+    Device,
+    SchematicInst,
+}
+
+impl Native {
+    pub const ALL: [Native; 12] = [
+        Native::Rect,
+        Native::Crect,
+        Native::Polygon,
+        Native::Path,
+        Native::Text,
+        Native::Dimension,
+        Native::LayoutInst,
+        Native::Bbox,
+        Native::Signal,
+        Native::Connect,
+        Native::Device,
+        Native::SchematicInst,
+    ];
+
+    /// The module the native is bound in.
+    pub fn module(self) -> &'static [&'static str] {
+        match self {
+            Native::Rect
+            | Native::Crect
+            | Native::Polygon
+            | Native::Path
+            | Native::Text
+            | Native::Dimension
+            | Native::LayoutInst
+            | Native::Bbox => &["std", "layout"],
+            Native::Signal | Native::Connect | Native::Device | Native::SchematicInst => {
+                &["std", "schematic"]
+            }
+        }
+    }
+
+    /// The name the native is bound to in its module.
+    pub fn name(self) -> &'static str {
+        match self {
+            Native::Rect => "rect",
+            Native::Crect => "crect",
+            Native::Polygon => "polygon",
+            Native::Path => "path",
+            Native::Text => "text",
+            Native::Dimension => "dimension",
+            Native::LayoutInst => "inst",
+            Native::Bbox => "bbox",
+            Native::Signal => "Signal",
+            Native::Connect => "connect",
+            Native::Device => "device",
+            Native::SchematicInst => "inst",
+        }
+    }
+
+    /// The full path the native is reached by, such as `std::layout::rect`.
+    pub fn path(self) -> String {
+        self.module().iter().chain([&self.name()]).join("::")
+    }
+
+    /// The natives bound in `module`.
+    pub fn in_module(module: &[String]) -> impl Iterator<Item = Native> + '_ {
+        Self::ALL
+            .into_iter()
+            .filter(move |native| native.module().iter().eq(module.iter()))
+    }
+
+    /// The `std::layout` native bound to `name`, which a bare `name` that
+    /// does not resolve is reported as having moved to.
+    pub fn named(name: &str) -> Option<Native> {
+        Self::ALL
+            .into_iter()
+            .find(|native| native.module() == ["std", "layout"] && native.name() == name)
     }
 }
 
 /// The module that the leading segments of a qualified `path` name.
 ///
-/// `std::…` is absolute into the standard library, `lib::…` is absolute from
-/// the workspace root, and anything else is relative to `current`. `items` is
-/// how many trailing segments name the thing being resolved rather than its
-/// module: one for a `use` or a call, two for an `Enum::Variant`.
+/// `std::…` is absolute into the standard library and its submodules, `lib::…`
+/// is absolute from the workspace root, and anything else is relative to
+/// `current`. `items` is how many trailing segments name the thing being
+/// resolved rather than its module: one for a `use` or a call, two for an
+/// `Enum::Variant`.
 ///
 /// Which of the three forms a path takes is decided by its *first* segment, so
 /// the trailing item segments are dropped only after that: `use lib;` names the
 /// workspace root, not a child of the current module.
-pub(crate) fn module_prefix<'a>(
+pub fn module_prefix<'a>(
     current: &ModPath,
     path: impl IntoIterator<Item = &'a str>,
     items: usize,
@@ -237,7 +374,11 @@ pub(crate) fn module_prefix<'a>(
     let path: Vec<&str> = path.into_iter().collect();
     let prefix = &path[..path.len().saturating_sub(items)];
     match path.first().copied() {
-        Some("std") => vec!["std".to_string()],
+        Some("std") => ["std"]
+            .into_iter()
+            .chain(prefix.iter().skip(1).copied())
+            .map(str::to_string)
+            .collect(),
         Some("lib") => prefix.iter().skip(1).map(|name| name.to_string()).collect(),
         _ => current
             .iter()
@@ -274,6 +415,8 @@ pub fn static_compile(
 pub struct TypedWorkspace {
     pub ast: WorkspaceAst<VarIdTyMetadata>,
     pub defs: Arc<TypeDefs>,
+    /// The native item bound to each `VarId` that names one.
+    pub natives: Arc<IndexMap<VarId, Native>>,
 }
 
 impl std::ops::Deref for TypedWorkspace {
@@ -786,7 +929,7 @@ impl<'a> AstTransformer for ImportPass<'a> {
         &mut self,
         _input: &EnumVariant<Self::InputS, Self::InputMetadata>,
         _name: &Ident<Self::OutputS, Self::OutputMetadata>,
-        _payload: &[TySpec<Self::OutputS, Self::OutputMetadata>],
+        _payload: &VariantPayload<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::EnumVariant {
     }
 
@@ -926,6 +1069,13 @@ impl<'a> AstTransformer for ImportPass<'a> {
         _input: &crate::ast::TupleExpr<Self::InputS, Self::InputMetadata>,
         _items: &[Expr<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr {
+    }
+
+    fn dispatch_seq_expr(
+        &mut self,
+        _input: &crate::ast::SeqLiteral<Self::InputS, Self::InputMetadata>,
+        _items: &[Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::SeqExpr {
     }
 
     fn dispatch_field_access_expr(
@@ -1320,7 +1470,15 @@ pub(crate) struct VarIdTyFrame {
 }
 
 /// The fields of a fully typed cell, by name.
-type CellFields = IndexMap<String, Ty>;
+type CellFields = IndexMap<String, CellField>;
+
+/// A top-level `let` binding of a cell.
+#[derive(Debug, Clone)]
+struct CellField {
+    ty: Ty,
+    /// Whether the binding is a `pub let`, which an instance may read.
+    public: bool,
+}
 
 pub(crate) struct VarIdTyPass<'a> {
     ast: &'a AnnotatedAst<ParseMetadata>,
@@ -1329,6 +1487,8 @@ pub(crate) struct VarIdTyPass<'a> {
     cell_fields: &'a IndexMap<VarId, CellFields>,
     /// Struct and enum definitions of every module typed before this one.
     type_defs: &'a TypeDefs,
+    /// The native items bound by every module typed so far, this one included.
+    natives: &'a mut IndexMap<VarId, Native>,
     /// Struct and enum definitions of this module.
     local_defs: TypeDefs,
     /// The struct declarations of this module, by the id of each struct's name.
@@ -1369,7 +1529,7 @@ struct CellTyping<'a> {
     /// Top-level `let` name to the indices of the statements declaring it,
     /// ascending. A name declared more than once is re-bound in sequence: a
     /// statement sees the nearest `let` above it, and the field an instance
-    /// answers is the last.
+    /// answers is the last, whose `pub` decides its visibility.
     lets: IndexMap<Substr, Vec<usize>>,
     /// The typed parameters and the frame binding them, once typed.
     params: Option<(Vec<ArgDecl<Substr, VarIdTyMetadata>>, VarIdTyFrame)>,
@@ -1405,21 +1565,23 @@ impl StatementView {
     fn extend(&mut self, typing: &CellTyping<'_>) {
         let stmt = self.limit;
         self.limit += 1;
-        let Statement::LetBinding(binding) = &typing.decl.scope.stmts[stmt] else {
-            return;
-        };
-        let name = &binding.name.name;
+        let names = typing.decl.scope.stmts[stmt].let_names();
         match &typing.stmts[stmt] {
-            Some(Statement::LetBinding(typed)) => {
-                self.frame
-                    .var_bindings
-                    .insert(name.clone(), typed.metadata.clone());
-                self.untyped.swap_remove(name.as_str());
+            Some(typed) => {
+                // A bare name in a pattern may have typed as a unit variant,
+                // so the typed statement says which names it bound.
+                for name in names {
+                    self.untyped.swap_remove(name.name.as_str());
+                }
+                for (name, id, ty) in typed_let_bindings(typed) {
+                    self.frame.var_bindings.insert(name.name.clone(), (id, ty));
+                }
             }
-            Some(_) => unreachable!("a `let` statement is typed as a `let`"),
             None => {
-                self.frame.var_bindings.swap_remove(name.as_str());
-                self.untyped.insert(name.clone(), stmt);
+                for name in names {
+                    self.frame.var_bindings.swap_remove(name.name.as_str());
+                    self.untyped.insert(name.name.clone(), stmt);
+                }
             }
         }
     }
@@ -1453,6 +1615,8 @@ struct Demand {
     cell: VarId,
     /// Index of the `let` statement declaring the field.
     stmt: usize,
+    /// The field's name.
+    field: String,
     /// Where it was read, for the diagnostic if the demand cannot be met.
     span: cfgrammar::Span,
 }
@@ -1475,6 +1639,8 @@ struct WorkspaceTyping<'a> {
     cell_fields: IndexMap<VarId, CellFields>,
     /// Struct and enum definitions of every typed module.
     type_defs: TypeDefs,
+    /// The native items bound by every typed module.
+    natives: IndexMap<VarId, Native>,
     ast: WorkspaceAst<VarIdTyMetadata>,
     errors: Vec<StaticError>,
     next_id: VarId,
@@ -1488,18 +1654,19 @@ pub(crate) fn execute_var_id_ty_pass<'a>(
         mod_bindings: IndexMap::new(),
         cell_fields: IndexMap::new(),
         type_defs: TypeDefs::new(),
+        natives: IndexMap::new(),
         ast: IndexMap::new(),
         errors: Vec::new(),
         next_id: 1,
     };
-    let std_mod_path = vec!["std".to_string()];
-    let std_mod_path = ast.get_key_value(&std_mod_path).map(|(k, _)| k);
+    // `std` is never a DAG edge, so its modules are typed first, in their
+    // fixed order.
+    let std_paths = STD_MODULES
+        .iter()
+        .filter_map(|module| ast.get_key_value(&module.mod_path()).map(|(path, _)| path))
+        .collect_vec();
     if let Some((root, _)) = ast.get_key_value(&vec![]) {
-        for path in [std_mod_path, Some(root)]
-            .into_iter()
-            .flatten()
-            .chain(ast.keys())
-        {
+        for path in std_paths.into_iter().chain([root]).chain(ast.keys()) {
             execute_var_id_ty_pass_inner(ast, dag, path, &mut typing);
         }
     }
@@ -1507,6 +1674,7 @@ pub(crate) fn execute_var_id_ty_pass<'a>(
         TypedWorkspace {
             ast: typing.ast,
             defs: Arc::new(typing.type_defs),
+            natives: Arc::new(typing.natives),
         },
         typing.errors,
     )
@@ -1535,6 +1703,7 @@ fn execute_var_id_ty_pass_inner<'a>(
         mod_bindings: &typing.mod_bindings,
         cell_fields: &typing.cell_fields,
         type_defs: &typing.type_defs,
+        natives: &mut typing.natives,
         local_defs: TypeDefs::new(),
         struct_decls: IndexMap::new(),
         infer: InferCtx::default(),
@@ -1588,8 +1757,11 @@ pub enum Ty {
     String,
     Cell(Arc<CellTy>),
     Inst(Arc<CellTy>),
+    /// A cell placed with `std::schematic::inst`.
+    SchematicInst(Arc<CellTy>),
+    /// A signal of a cell's schematic, made by `std::schematic::Signal()`.
+    Signal,
     Nil,
-    SeqNil,
     Fn(Box<FnTy>),
     /// A user-declared `enum`: the declaring enum and its type arguments.
     Enum(Arc<EnumTy>),
@@ -1604,6 +1776,8 @@ pub enum Ty {
     Param(Arc<TyParamTy>),
     /// An inference variable, solved and removed before its unit is finished.
     Infer(InferId),
+    /// The binding of a native item, which may only be called.
+    Native(Native),
 }
 
 /// A type parameter of a generic declaration.
@@ -1698,7 +1872,114 @@ pub struct VariantDef {
     /// The [`VarId`] the variant is bound to by `use`, the prelude, and the
     /// evaluator's global frame.
     pub id: VarId,
-    pub payload: Vec<Ty>,
+    pub payload: VariantTys,
+}
+
+/// The payload types of a [`VariantDef`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VariantTys {
+    /// Positional types; empty for a unit variant.
+    Tuple(Vec<Ty>),
+    /// Named fields in declaration order.
+    Struct(IndexMap<String, Ty>),
+}
+
+impl VariantTys {
+    /// Whether the variant carries nothing.
+    pub fn is_unit(&self) -> bool {
+        matches!(self, Self::Tuple(payload) if payload.is_empty())
+    }
+
+    /// How many values the variant carries.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Tuple(payload) => payload.len(),
+            Self::Struct(fields) => fields.len(),
+        }
+    }
+
+    /// Whether the variant carries nothing. A named payload with no fields is
+    /// empty without being a unit variant.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The payload types in declaration order.
+    pub fn tys(&self) -> impl Iterator<Item = &Ty> {
+        let (tuple, fields) = match self {
+            Self::Tuple(payload) => (Some(payload), None),
+            Self::Struct(fields) => (None, Some(fields)),
+        };
+        tuple
+            .into_iter()
+            .flatten()
+            .chain(fields.into_iter().flatten().map(|(_, ty)| ty))
+    }
+}
+
+/// A pattern's annotated path and what it resolved to, if anything.
+type ResolvedPatternPath = (IdentPath<Substr, VarIdTyMetadata>, Option<PatternTarget>);
+
+/// The kind of function a value of type `ty` may hold, if any, named as
+/// [`Value::kind_name`] names it.
+fn function_kind(ty: &Ty) -> Option<&'static str> {
+    match ty {
+        Ty::Fn(_) => Some("function"),
+        Ty::CellFn(_) => Some("cell generator"),
+        Ty::Ctor(_) => Some("variant constructor"),
+        Ty::Native(_) => Some("builtin function"),
+        Ty::Seq(inner) => function_kind(inner),
+        Ty::Tuple(tys) => tys.iter().find_map(function_kind),
+        Ty::Struct(ty) => ty.args.iter().find_map(function_kind),
+        Ty::Enum(ty) => ty.args.iter().find_map(function_kind),
+        _ => None,
+    }
+}
+
+/// The names a typed `let` statement binds, with their ids and types; empty
+/// for any other statement.
+pub(crate) fn typed_let_bindings<S>(
+    stmt: &Statement<S, VarIdTyMetadata>,
+) -> Vec<(&Ident<S, VarIdTyMetadata>, VarId, Ty)> {
+    match stmt {
+        Statement::LetBinding(binding) => {
+            vec![(
+                &binding.name,
+                binding.metadata.0,
+                binding.metadata.1.clone(),
+            )]
+        }
+        Statement::LetPattern(binding) => binding
+            .pattern
+            .bindings()
+            .into_iter()
+            .map(|(name, (id, ty))| (name, *id, ty.clone()))
+            .collect(),
+        Statement::Expr { .. } | Statement::ForLoop(_) => Vec::new(),
+    }
+}
+
+/// The declaration a pattern's path names.
+enum PatternTarget {
+    /// An enum variant, carrying any type arguments the path spelled out.
+    Variant(VarId, Arc<CtorTy>),
+    /// A struct declaration, with the type arguments the path spelled out.
+    Struct(VarId, Arc<StructTy>, Option<Vec<Ty>>),
+}
+
+/// The checked form of a struct literal: the type it builds and, when the
+/// literal names an enum variant, that variant.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructLitTy {
+    pub ty: Ty,
+    pub variant: Option<String>,
+}
+
+impl StructLitTy {
+    /// The checked form of a literal that builds `ty` directly.
+    fn of(ty: Ty) -> Self {
+        Self { ty, variant: None }
+    }
 }
 
 /// A struct or enum definition.
@@ -1769,6 +2050,7 @@ pub(crate) fn subst(ty: &Ty, map: &HashMap<VarId, Ty>) -> Ty {
         })),
         Ty::Cell(cell) => Ty::Cell(Arc::new(cell.subst(map))),
         Ty::Inst(cell) => Ty::Inst(Arc::new(cell.subst(map))),
+        Ty::SchematicInst(cell) => Ty::SchematicInst(Arc::new(cell.subst(map))),
         Ty::Fn(f) => Ty::Fn(Box::new(FnTy {
             params: f.params.clone(),
             sig: f.sig.subst(map),
@@ -1789,9 +2071,10 @@ pub(crate) fn subst(ty: &Ty, map: &HashMap<VarId, Ty>) -> Ty {
         | Ty::Path
         | Ty::Point
         | Ty::String
+        | Ty::Signal
         | Ty::Nil
-        | Ty::SeqNil
-        | Ty::Infer(_) => ty.clone(),
+        | Ty::Infer(_)
+        | Ty::Native(_) => ty.clone(),
     }
 }
 
@@ -1883,6 +2166,12 @@ impl InferCtx {
                 args: cell.args.iter().map(|arg| self.deep(arg)).collect(),
                 ..(**cell).clone()
             })),
+            Ty::SchematicInst(cell) if !cell.args.is_empty() => {
+                Ty::SchematicInst(Arc::new(CellTy {
+                    args: cell.args.iter().map(|arg| self.deep(arg)).collect(),
+                    ..(**cell).clone()
+                }))
+            }
             _ => ty,
         }
     }
@@ -1896,7 +2185,9 @@ impl InferCtx {
             Ty::Struct(s) => s.args.iter().any(|arg| self.has_unsolved(arg)),
             Ty::Enum(e) => e.args.iter().any(|arg| self.has_unsolved(arg)),
             Ty::Ctor(c) => c.args.iter().any(|arg| self.has_unsolved(arg)),
-            Ty::Cell(cell) | Ty::Inst(cell) => cell.args.iter().any(|arg| self.has_unsolved(arg)),
+            Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => {
+                cell.args.iter().any(|arg| self.has_unsolved(arg))
+            }
             _ => false,
         }
     }
@@ -1910,7 +2201,9 @@ impl InferCtx {
             Ty::Struct(s) => s.args.iter().any(|arg| self.occurs(id, arg)),
             Ty::Enum(e) => e.args.iter().any(|arg| self.occurs(id, arg)),
             Ty::Ctor(c) => c.args.iter().any(|arg| self.occurs(id, arg)),
-            Ty::Cell(cell) | Ty::Inst(cell) => cell.args.iter().any(|arg| self.occurs(id, arg)),
+            Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => {
+                cell.args.iter().any(|arg| self.occurs(id, arg))
+            }
             _ => false,
         }
     }
@@ -1940,7 +2233,7 @@ impl InferCtx {
                     self.solve_unsolved(arg, solution);
                 }
             }
-            Ty::Cell(cell) | Ty::Inst(cell) => {
+            Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => {
                 for arg in &cell.args {
                     self.solve_unsolved(arg, solution);
                 }
@@ -2005,9 +2298,10 @@ impl std::fmt::Display for Ty {
             Ty::Point => write!(f, "Point"),
             Ty::String => write!(f, "String"),
             Ty::Nil => write!(f, "()"),
-            Ty::SeqNil => write!(f, "[]"),
             Ty::Cell(cell) => write!(f, "Cell({})", cell.name),
             Ty::Inst(cell) => write!(f, "Inst({})", cell.name),
+            Ty::SchematicInst(cell) => write!(f, "SchematicInst({})", cell.name),
+            Ty::Signal => write!(f, "Signal"),
             Ty::CellFn(cell_fn) => {
                 write!(f, "cell {}", cell_fn.cell.name)?;
                 fmt_params(f, &cell_fn.params)?;
@@ -2023,7 +2317,11 @@ impl std::fmt::Display for Ty {
                 fmt_args(f, &e.args)
             }
             Ty::Seq(inner) => write!(f, "[{inner}]"),
-            Ty::Tuple(elements) => write!(f, "({})", elements.iter().format(", ")),
+            // A one-element tuple keeps its comma: `(T)` is the type `T`.
+            Ty::Tuple(elements) => match elements.as_slice() {
+                [element] => write!(f, "({element},)"),
+                _ => write!(f, "({})", elements.iter().format(", ")),
+            },
             Ty::Struct(s) => {
                 write!(f, "{}", s.name)?;
                 fmt_args(f, &s.args)
@@ -2031,6 +2329,8 @@ impl std::fmt::Display for Ty {
             Ty::Ctor(c) => write!(f, "{}::{}", c.enum_name, c.variant),
             Ty::Param(param) => write!(f, "{}", param.name),
             Ty::Infer(_) => write!(f, "_"),
+            Ty::Native(Native::Signal) => write!(f, "Signal"),
+            Ty::Native(native) => write!(f, "fn {}", native.name()),
         }
     }
 }
@@ -2046,7 +2346,6 @@ impl Ty {
             | Ty::Polygon
             | Ty::Path
             | Ty::Inst(_)
-            | Ty::SeqNil
             | Ty::Param(_)
             | Ty::Infer(_) => true,
             Ty::Seq(elem) => elem.may_hold_objects(),
@@ -2056,14 +2355,26 @@ impl Ty {
             | Ty::Point
             | Ty::String
             | Ty::Cell(_)
+            | Ty::SchematicInst(_)
+            | Ty::Signal
             | Ty::Nil
             | Ty::Fn(_)
             | Ty::Enum(_)
             | Ty::CellFn(_)
             | Ty::Tuple(_)
             | Ty::Struct(_)
-            | Ty::Ctor(_) => false,
+            | Ty::Ctor(_)
+            | Ty::Native(_) => false,
         }
+    }
+
+    /// Whether a value of this type may be a signal or schematic instance,
+    /// which a binding's name can name.
+    fn may_be_schematic_node(&self) -> bool {
+        matches!(
+            self,
+            Ty::Signal | Ty::SchematicInst(_) | Ty::Unknown | Ty::Any | Ty::Param(_) | Ty::Infer(_)
+        )
     }
 
     pub fn from_name(name: &str) -> Option<Self> {
@@ -2077,8 +2388,6 @@ impl Ty {
             "Point" => Some(Ty::Point),
             "Any" => Some(Ty::Any),
             "String" => Some(Ty::String),
-            "()" => Some(Ty::Nil),
-            "[]" => Some(Ty::SeqNil),
             _ => None,
         }
     }
@@ -2088,8 +2397,7 @@ impl Ty {
     ///
     /// The inverse of [`Self::from_name`], so that anything reporting what a
     /// type annotation resolved to reads the same table the annotation was
-    /// resolved against. `()` and `[]` are spellings the grammar produces
-    /// rather than identifiers, so they have no name here.
+    /// resolved against.
     pub fn primitive_name(&self) -> Option<&'static str> {
         Some(match self {
             Ty::Bool => "Bool",
@@ -2216,8 +2524,6 @@ mod builtin_sig {
     pub(super) static CONS: LazyLock<FnTy> = LazyLock::new(|| scheme([param(), seq()], seq()));
     pub(super) static HEAD: LazyLock<FnTy> = LazyLock::new(|| scheme([seq()], param()));
     pub(super) static TAIL: LazyLock<FnTy> = LazyLock::new(|| scheme([seq()], seq()));
-    /// `list` is variadic: every element is unified with `T`.
-    pub(super) static LIST: LazyLock<FnTy> = LazyLock::new(|| scheme([param()], seq()));
     pub(super) static SEQ_LEN: LazyLock<FnTy> = LazyLock::new(|| scheme([seq()], Ty::Int));
     pub(super) static SEQ_CONCAT: LazyLock<FnTy> = LazyLock::new(|| scheme([seq(), seq()], seq()));
     pub(super) static SEQ_FLATTEN: LazyLock<FnTy> =
@@ -2311,6 +2617,11 @@ mod builtin_sig {
             ("construction", Ty::Bool),
         ])
     });
+    pub(super) static CONNECT: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::Signal, Ty::Signal]));
+    /// Like [`INST`], the cell is checked by `assert_ty_is_cell`.
+    pub(super) static SCHEMATIC_INST: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::Any]));
     /// A builtin that takes no arguments, and the empty keyword set that
     /// builtins with variadic positional arguments check against.
     pub(super) static NONE: LazyLock<Signature> = LazyLock::new(Signature::default);
@@ -2441,7 +2752,9 @@ impl AstMetadata for VarIdTyMetadata {
     type Typ = ();
     type CastExpr = Ty;
     type TupleExpr = Ty;
-    type StructLitExpr = Ty;
+    /// The sequence type the literal was inferred to have.
+    type SeqExpr = Ty;
+    type StructLitExpr = StructLitTy;
 }
 
 impl<'a> VarIdTyPass<'a> {
@@ -2528,6 +2841,7 @@ impl<'a> VarIdTyPass<'a> {
             }
         }
         self.bind_prelude();
+        self.bind_natives();
         for decl in &self.ast.ast.decls {
             if let Decl::Use(u) = decl {
                 self.declare_use_decl(u);
@@ -2621,8 +2935,13 @@ impl<'a> VarIdTyPass<'a> {
             .args
             .iter()
             .map(|arg| (arg, self.ty_from_spec(&arg.ty)))
-            .collect();
+            .collect::<Vec<_>>();
         self.bindings.pop();
+        let name = self.qualified_name(&input.name.name);
+        for (arg, ty) in &sig {
+            self.check_signal_param(&name, &arg.name.name, ty, arg.ty.span, false);
+        }
+        let sig = sig.into_iter().collect();
         // Generated declarations -- the signatures standing in for GDS-backed
         // cells -- sit at the front of the list. They have no declared fields
         // to trace back to, so field accesses on them fall through to the
@@ -2647,19 +2966,17 @@ impl<'a> VarIdTyPass<'a> {
 
         let mut lets: IndexMap<Substr, Vec<usize>> = IndexMap::new();
         for (stmt, statement) in input.scope.stmts.iter().enumerate() {
-            let Statement::LetBinding(binding) = statement else {
-                continue;
-            };
-            let name = &binding.name;
-            if RESERVED_CELL_FIELDS.contains(&name.name.as_str()) {
-                self.errors.push(StaticError {
-                    span: self.span(name.span),
-                    kind: StaticErrorKind::ReservedCellField {
-                        name: name.name.to_string(),
-                    },
-                });
+            for name in statement.let_names() {
+                if RESERVED_CELL_FIELDS.contains(&name.name.as_str()) {
+                    self.errors.push(StaticError {
+                        span: self.span(name.span),
+                        kind: StaticErrorKind::ReservedCellField {
+                            name: name.name.to_string(),
+                        },
+                    });
+                }
+                lets.entry(name.name.clone()).or_default().push(stmt);
             }
-            lets.entry(name.name.clone()).or_default().push(stmt);
         }
         self.cells.insert(
             cell_id,
@@ -2890,14 +3207,11 @@ impl<'a> VarIdTyPass<'a> {
                         || goal.attempting == Some(Unit::Stmt(demand.stmt)))
             });
             if cyclic {
-                let Statement::LetBinding(binding) = &typing.decl.scope.stmts[demand.stmt] else {
-                    unreachable!("demands name `let` statements")
-                };
                 self.errors.push(StaticError {
                     span: self.span(demand.span),
                     kind: StaticErrorKind::CyclicCellField {
                         cell: typing.decl.name.name.to_string(),
-                        field: binding.name.name.to_string(),
+                        field: demand.field.clone(),
                     },
                 });
                 self.poisoned.insert((demand.cell, demand.stmt));
@@ -2955,13 +3269,15 @@ impl<'a> VarIdTyPass<'a> {
                 kind: StaticErrorKind::CellWithTailExpr,
             });
         }
+        // A name bound again replaces the earlier binding, so the last one
+        // decides both the type and the visibility.
         let fields = stmts
             .iter()
-            .filter_map(|stmt| match stmt {
-                Statement::LetBinding(binding) => {
-                    Some((binding.name.name.to_string(), binding.metadata.1.clone()))
-                }
-                _ => None,
+            .flat_map(|stmt| {
+                let public = stmt.public().is_some();
+                typed_let_bindings(stmt)
+                    .into_iter()
+                    .map(move |(name, _, ty)| (name.name.to_string(), CellField { ty, public }))
             })
             .collect();
         self.finished_cell_fields.insert(cell, fields);
@@ -2984,12 +3300,17 @@ impl<'a> VarIdTyPass<'a> {
 
     /// Records that the current attempt read the field declared by statement
     /// `stmt` of `cell` before it was typed.
-    fn demand(&mut self, cell: VarId, stmt: usize, span: cfgrammar::Span) {
+    fn demand(&mut self, cell: VarId, stmt: usize, field: &str, span: cfgrammar::Span) {
         if self.poisoned.contains(&(cell, stmt)) {
             return;
         }
         if let Some(attempt) = self.attempt.as_mut() {
-            attempt.demands.push(Demand { cell, stmt, span });
+            attempt.demands.push(Demand {
+                cell,
+                stmt,
+                field: field.to_string(),
+                span,
+            });
         }
     }
 
@@ -3003,13 +3324,13 @@ impl<'a> VarIdTyPass<'a> {
         let (Some(cell), Some(&stmt)) = (attempt.cell, attempt.visible_untyped.get(name)) else {
             return false;
         };
-        self.demand(cell, stmt, span);
+        self.demand(cell, stmt, name, span);
         true
     }
 
-    /// Whether an instance of `cell` would answer `field`.
+    /// Whether `cell` declares `field`, publicly or not.
     ///
-    /// A cell's public fields are its top-level `let` bindings plus
+    /// A cell's fields are its top-level `let` bindings plus
     /// [`RESERVED_CELL_FIELDS`]; a GDS-backed cell publishes its geometry at
     /// execution time, so it answers anything.
     fn cell_declares_field(&self, cell: &CellTy, field: &str) -> bool {
@@ -3030,12 +3351,50 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
+    /// Whether `cell` declares `field` without `pub`.
+    ///
+    /// GDS-backed cells and [`RESERVED_CELL_FIELDS`] are always public.
+    fn is_private_field(&self, cell: &CellTy, field: &str) -> bool {
+        if cell.dynamic_fields || RESERVED_CELL_FIELDS.contains(&field) {
+            return false;
+        }
+        let Some(def) = cell.def else {
+            return false;
+        };
+        if let Some(fields) = self.finished_cell_fields.get(&def) {
+            fields.get(field).is_some_and(|field| !field.public)
+        } else if let Some(typing) = self.cells.get(&def) {
+            typing
+                .lets
+                .get(field)
+                .and_then(|stmts| stmts.last())
+                .is_some_and(|&stmt| typing.decl.scope.stmts[stmt].public().is_none())
+        } else {
+            self.cell_fields
+                .get(&def)
+                .and_then(|fields| fields.get(field))
+                .is_some_and(|field| !field.public)
+        }
+    }
+
+    /// Reports a read of the private `field` of `cell`.
+    fn private_field(&mut self, cell: &CellTy, field: &Ident<Substr, VarIdTyMetadata>) {
+        self.errors.push(StaticError {
+            span: self.span(field.span),
+            kind: StaticErrorKind::PrivateField {
+                field: field.name.to_string(),
+                cell: cell.name.clone(),
+            },
+        });
+    }
+
     /// The type of `field` read from an instance of `cell`, whose type is
     /// `base_ty`.
     ///
     /// A field of a cell of this module whose statement has not been typed yet
     /// is a demand: the read types `Unknown` for now and the statement making
-    /// it is retried once the field is typed.
+    /// it is retried once the field is typed. A private field is reported
+    /// without a demand.
     fn inst_field_ty(
         &mut self,
         cell: &CellTy,
@@ -3052,12 +3411,16 @@ impl<'a> VarIdTyPass<'a> {
         let Some(def) = cell.def else {
             return Ty::Any;
         };
+        if self.is_private_field(cell, name) {
+            self.private_field(cell, field);
+            return Ty::Unknown;
+        }
         // Field types mention the cell's own type parameters; an instance
         // reads them with its arguments substituted.
         let map = cell.param_map();
         if let Some(fields) = self.finished_cell_fields.get(&def) {
             return match fields.get(name) {
-                Some(ty) => subst(ty, &map),
+                Some(field) => subst(&field.ty, &map),
                 None => self.no_field_on_ty(field, base_ty.clone()),
             };
         }
@@ -3067,10 +3430,16 @@ impl<'a> VarIdTyPass<'a> {
                 return self.no_field_on_ty(field, base_ty.clone());
             };
             return match &typing.stmts[stmt] {
-                Some(Statement::LetBinding(binding)) => subst(&binding.metadata.1, &map),
-                Some(_) => unreachable!("`lets` indexes `let` statements"),
+                Some(typed) => match typed_let_bindings(typed)
+                    .into_iter()
+                    .find(|(binding, _, _)| binding.name == *name)
+                {
+                    Some((_, _, ty)) => subst(&ty, &map),
+                    // The name typed as a unit variant, not a binding.
+                    None => self.no_field_on_ty(field, base_ty.clone()),
+                },
                 None => {
-                    self.demand(def, stmt, field.span);
+                    self.demand(def, stmt, name, field.span);
                     Ty::Unknown
                 }
             };
@@ -3080,7 +3449,7 @@ impl<'a> VarIdTyPass<'a> {
             .get(&def)
             .and_then(|fields| fields.get(name))
         {
-            Some(ty) => subst(ty, &map),
+            Some(field) => subst(&field.ty, &map),
             None => self.no_field_on_ty(field, base_ty.clone()),
         }
     }
@@ -3149,11 +3518,23 @@ impl<'a> VarIdTyPass<'a> {
             return Ty::Unknown;
         };
         let explicit = explicit.or_else(|| (!ctor.args.is_empty()).then(|| ctor.args.clone()));
-        let is_unit = def
+        let payload = def
             .variants
             .get(&ctor.variant)
-            .is_some_and(|variant| variant.payload.is_empty());
-        if is_unit {
+            .map(|variant| &variant.payload);
+        if matches!(payload, Some(VariantTys::Struct(_))) {
+            // A named payload has no value form as a bare name; it is built
+            // with braces, which `dispatch_struct_lit_expr` checks.
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::StructVariantConstruction(format!(
+                    "{}::{}",
+                    ctor.enum_name, ctor.variant
+                )),
+            });
+            return Ty::Unknown;
+        }
+        if payload.is_some_and(VariantTys::is_unit) {
             let map = self.instantiate(&def.params, explicit, span, &ctor.enum_name);
             return Ty::Enum(Arc::new(EnumTy {
                 def: ctor.def,
@@ -3251,6 +3632,15 @@ impl<'a> VarIdTyPass<'a> {
         if let Some(binding) = self.module_item(&module, &item.name) {
             return Ok(binding);
         }
+        if path[0].name == "std"
+            && module == ["std"]
+            && MOVED_STD_HELPERS.contains(&item.name.as_str())
+        {
+            return Err(QualifiedError::Moved {
+                name: format!("std::{}", item.name),
+                path: format!("std::layout::{}", item.name),
+            });
+        }
         if module == *self.current_path || self.mod_bindings.contains_key(&module) {
             return Err(QualifiedError::Undeclared {
                 name: item.name.to_string(),
@@ -3267,6 +3657,9 @@ impl<'a> VarIdTyPass<'a> {
                 (span, StaticErrorKind::InvalidVariant(variant))
             }
             QualifiedError::Undeclared { name } => (span, StaticErrorKind::UndeclaredVar { name }),
+            QualifiedError::Moved { name, path } => {
+                (span, StaticErrorKind::MovedItem { name, path })
+            }
             QualifiedError::NotAnEnum { span } => (span, StaticErrorKind::NotAnEnum),
         };
         self.errors.push(StaticError {
@@ -3328,27 +3721,53 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
+    /// Binds the native items of this module, if it is a `std` module that
+    /// has any.
+    fn bind_natives(&mut self) {
+        for native in Native::in_module(self.current_path) {
+            let id = self.alloc(&Substr::from(native.name()), Ty::Native(native));
+            self.natives.insert(id, native);
+        }
+    }
+
     fn declare_use_decl(&mut self, use_decl: &UseDecl<Substr, ParseMetadata>) {
         let item = use_decl.path.last().expect("use paths are non-empty");
         let local_name = use_decl.alias.as_ref().unwrap_or(item);
-        let imported = self.resolve_qualified(&use_decl.path).ok();
-        if let Some(binding) = imported {
-            self.bindings
-                .last_mut()
-                .unwrap()
-                .var_bindings
-                .insert(local_name.name.clone(), binding);
-        } else {
+        // A call of a one-segment builtin name types as the builtin before the
+        // name is looked up, so an import under that name would be ignored.
+        if BUILTINS.contains(&local_name.name.as_str()) {
             self.errors.push(StaticError {
-                span: self.span(use_decl.span),
-                kind: StaticErrorKind::UnresolvedImport {
-                    path: use_decl
-                        .path
-                        .iter()
-                        .map(|ident| ident.name.as_str())
-                        .join("::"),
-                },
+                span: self.span(local_name.span),
+                kind: StaticErrorKind::RedeclarationOfBuiltin,
             });
+            return;
+        }
+        match self.resolve_qualified(&use_decl.path) {
+            Ok(binding) => {
+                self.bindings
+                    .last_mut()
+                    .unwrap()
+                    .var_bindings
+                    .insert(local_name.name.clone(), binding);
+            }
+            Err(QualifiedError::Moved { name, path }) => {
+                self.errors.push(StaticError {
+                    span: self.span(use_decl.span),
+                    kind: StaticErrorKind::MovedItem { name, path },
+                });
+            }
+            Err(_) => {
+                self.errors.push(StaticError {
+                    span: self.span(use_decl.span),
+                    kind: StaticErrorKind::UnresolvedImport {
+                        path: use_decl
+                            .path
+                            .iter()
+                            .map(|ident| ident.name.as_str())
+                            .join("::"),
+                    },
+                });
+            }
         }
     }
 
@@ -3469,7 +3888,7 @@ impl<'a> VarIdTyPass<'a> {
                 name.to_owned(),
                 VariantDef {
                     id: self.alloc_id(),
-                    payload: Vec::new(),
+                    payload: VariantTys::Tuple(Vec::new()),
                 },
             );
         }
@@ -3505,18 +3924,34 @@ impl<'a> VarIdTyPass<'a> {
             .variants
             .iter()
             .map(|variant| {
-                let payload = variant
-                    .payload
-                    .iter()
-                    .map(|spec| self.ty_from_spec(spec))
-                    .collect_vec();
+                let payload = match &variant.payload {
+                    VariantPayload::Tuple(payload) => VariantTys::Tuple(
+                        payload
+                            .iter()
+                            .map(|spec| self.ty_from_spec(spec))
+                            .collect_vec(),
+                    ),
+                    VariantPayload::Struct(input) => {
+                        let mut fields = IndexMap::with_capacity(input.len());
+                        for field in input {
+                            let ty = self.ty_from_spec(&field.ty);
+                            if fields.insert(field.name.name.to_string(), ty).is_some() {
+                                self.errors.push(StaticError {
+                                    span: self.span(field.name.span),
+                                    kind: StaticErrorKind::DuplicateNameDeclaration,
+                                });
+                            }
+                        }
+                        VariantTys::Struct(fields)
+                    }
+                };
                 (variant.name.name.as_str(), payload)
             })
             .collect_vec();
         self.bindings.pop();
         let all = payloads
             .iter()
-            .flat_map(|(_, payload)| payload.iter().cloned())
+            .flat_map(|(_, payload)| payload.tys().cloned())
             .collect_vec();
         let Some(AdtDef::Enum(def)) = self.local_defs.get_mut(&id) else {
             unreachable!("bound as an enum")
@@ -3663,6 +4098,17 @@ impl<'a> VarIdTyPass<'a> {
                 let (def, ty_name) = match &ty {
                     Ty::Struct(s) => (s.def, s.name.clone()),
                     Ty::Enum(e) => (e.def, e.name.clone()),
+                    Ty::Native(Native::Signal) => {
+                        self.check_ty_arg_arity(name.span, "Signal", 0, args.len());
+                        return Ty::Signal;
+                    }
+                    Ty::Native(_) => {
+                        self.errors.push(StaticError {
+                            span: self.span(name.span),
+                            kind: StaticErrorKind::UnknownType,
+                        });
+                        return Ty::Unknown;
+                    }
                     _ => {
                         self.check_ty_arg_arity(name.span, &self.display(&ty), 0, args.len());
                         return ty;
@@ -3847,7 +4293,7 @@ impl<'a> VarIdTyPass<'a> {
         };
         let map = param_map(&def.params, &enum_ty.args);
         for variant in def.variants.values() {
-            for payload in &variant.payload {
+            for payload in variant.payload.tys() {
                 match self.shallow(&subst(payload, &map)) {
                     Ty::Int | Ty::Bool | Ty::Nil | Ty::Unknown | Ty::Any | Ty::Infer(_) => {}
                     Ty::Float => return Err(EqualityFailure::Float),
@@ -3912,21 +4358,17 @@ impl<'a> VarIdTyPass<'a> {
                 kind: StaticErrorKind::NilNotOrd,
             });
         }
-        if matches!(left_ty, Ty::SeqNil) && matches!(right_ty, Ty::SeqNil) && !is_equality {
+        // A sequence may only be compared for equality/inequality against a
+        // written `[]`: the evaluator has no arm for two populated sequences,
+        // and none for ordering a sequence at all. The test is on the operand
+        // rather than its type, which no longer distinguishes an empty
+        // sequence from any other.
+        let empty_literal = |expr: &Expr<_, _>| matches!(expr, Expr::Seq(s) if s.items.is_empty());
+        let against_empty = empty_literal(left) || empty_literal(right);
+        if matches!(self.shallow(&join_ty), Ty::Seq(_)) && !(is_equality && against_empty) {
             self.errors.push(StaticError {
                 span: self.span(span),
-                kind: StaticErrorKind::SeqNilNotOrd,
-            });
-        }
-        // A sequence may only be compared for equality/inequality against `[]`:
-        // the evaluator has no arm for two populated sequences, and none for
-        // ordering a sequence at all.
-        if matches!(self.shallow(&join_ty), Ty::Seq(_))
-            && !(is_equality && (left_ty == Ty::SeqNil || right_ty == Ty::SeqNil))
-        {
-            self.errors.push(StaticError {
-                span: self.span(span),
-                kind: StaticErrorKind::SeqMustCompareEqSeqNil,
+                kind: StaticErrorKind::SeqMustCompareEqEmpty,
             });
         }
         // `Ty::Any` is deliberately *not* admitted here: the evaluator has no
@@ -3943,7 +4385,6 @@ impl<'a> VarIdTyPass<'a> {
                     | Ty::Enum(_)
                     | Ty::Seq(_)
                     | Ty::Nil
-                    | Ty::SeqNil
                     | Ty::Unknown
                     | Ty::Infer(_)
             ) {
@@ -3959,8 +4400,7 @@ impl<'a> VarIdTyPass<'a> {
 
     /// Makes `a` and `b` the same type, solving inference variables as needed.
     /// A wildcard (`Any` or `Unknown`) equals every type and solves the
-    /// variables on the other side to itself; `[]` belongs to every sequence
-    /// type.
+    /// variables on the other side to itself.
     fn unify(&mut self, a: &Ty, b: &Ty) -> bool {
         let a = self.shallow(a);
         let b = self.shallow(b);
@@ -3981,7 +4421,6 @@ impl<'a> VarIdTyPass<'a> {
                 self.infer.solve_unsolved(&a, &b);
                 true
             }
-            (Ty::SeqNil, Ty::Seq(_)) | (Ty::Seq(_), Ty::SeqNil) => true,
             (Ty::Seq(a), Ty::Seq(b)) => self.unify(a, b),
             (Ty::Tuple(a), Ty::Tuple(b)) => self.unify_all(a, b),
             (Ty::Struct(a), Ty::Struct(b)) => a.def == b.def && self.unify_all(&a.args, &b.args),
@@ -3990,7 +4429,9 @@ impl<'a> VarIdTyPass<'a> {
                 a.def == b.def && a.variant == b.variant && self.unify_all(&a.args, &b.args)
             }
             (Ty::Param(a), Ty::Param(b)) => a.id == b.id,
-            (Ty::Cell(a), Ty::Cell(b)) | (Ty::Inst(a), Ty::Inst(b)) => {
+            (Ty::Cell(a), Ty::Cell(b))
+            | (Ty::Inst(a), Ty::Inst(b))
+            | (Ty::SchematicInst(a), Ty::SchematicInst(b)) => {
                 a.def == b.def
                     && a.dynamic_fields == b.dynamic_fields
                     && self.unify_all(&a.args, &b.args)
@@ -4006,16 +4447,13 @@ impl<'a> VarIdTyPass<'a> {
 
     /// The common type of two branches, or `None` when they have none.
     ///
-    /// A wildcard absorbs the other branch, and `[]` widens to the other
-    /// branch's sequence type; otherwise the two are unified.
+    /// A wildcard absorbs the other branch; otherwise the two are unified.
     fn join(&mut self, a: &Ty, b: &Ty) -> Option<Ty> {
         let a = self.shallow(a);
         let b = self.shallow(b);
         match (&a, &b) {
             (Ty::Unknown, other) | (other, Ty::Unknown) => Some(other.clone()),
             (Ty::Any, _) | (_, Ty::Any) => Some(Ty::Any),
-            (Ty::SeqNil, Ty::Seq(_)) => Some(b),
-            (Ty::Seq(_), Ty::SeqNil) => Some(a),
             _ => self.unify(&a, &b).then(|| self.shallow(&a)),
         }
     }
@@ -4029,6 +4467,11 @@ impl<'a> VarIdTyPass<'a> {
                     expected: self.display(expected),
                 },
             });
+            // A failed unification can leave variables on either side unsolved.
+            // They follow from the mismatch just reported, so solve them to
+            // `Unknown` rather than reporting them again.
+            self.infer.solve_unsolved(found, &Ty::Unknown);
+            self.infer.solve_unsolved(expected, &Ty::Unknown);
         }
     }
 
@@ -4045,14 +4488,14 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
-    fn assert_ty_is_enum(&mut self, span: cfgrammar::Span, ty: &Ty) {
+    fn assert_ty_is_matchable(&mut self, span: cfgrammar::Span, ty: &Ty) {
         let ty = self.shallow(ty);
-        if !(matches!(ty, Ty::Enum(_) | Ty::Infer(_)) || ty.is_wildcard()) {
+        if !(matches!(ty, Ty::Enum(_) | Ty::Struct(_) | Ty::Infer(_)) || ty.is_wildcard()) {
             self.errors.push(StaticError {
                 span: self.span(span),
                 kind: StaticErrorKind::IncorrectTyCategory {
                     found: self.display(&ty),
-                    expected: "Enum".into(),
+                    expected: "Enum or Struct".into(),
                 },
             });
         }
@@ -4170,7 +4613,17 @@ impl<'a> VarIdTyPass<'a> {
         let Some(variant) = def.variants.get(&ctor.variant) else {
             return (None, Ty::Unknown);
         };
-        if variant.payload.is_empty() {
+        let VariantTys::Tuple(payload) = variant.payload.clone() else {
+            self.errors.push(StaticError {
+                span: self.span(call_span),
+                kind: StaticErrorKind::StructVariantConstruction(format!(
+                    "{}::{}",
+                    ctor.enum_name, ctor.variant
+                )),
+            });
+            return (None, Ty::Unknown);
+        };
+        if payload.is_empty() {
             self.errors.push(StaticError {
                 span: self.span(call_span),
                 kind: StaticErrorKind::CannotCall(format!("{}::{}", ctor.enum_name, ctor.variant)),
@@ -4185,17 +4638,17 @@ impl<'a> VarIdTyPass<'a> {
                 kind: StaticErrorKind::InvalidKwArg,
             });
         }
-        if args.posargs.len() != variant.payload.len() {
+        if args.posargs.len() != payload.len() {
             self.errors.push(StaticError {
                 span: self.span(call_span),
                 kind: StaticErrorKind::VariantPayloadArity {
                     variant: ctor.variant.clone(),
-                    expected: variant.payload.len(),
+                    expected: payload.len(),
                     found: args.posargs.len(),
                 },
             });
         }
-        for (arg, payload) in args.posargs.iter().zip(&variant.payload) {
+        for (arg, payload) in args.posargs.iter().zip(&payload) {
             self.assert_eq_ty(arg.span(), &arg.ty(), &subst(payload, &map));
         }
         let ty = Ty::Enum(Arc::new(EnumTy {
@@ -4229,9 +4682,35 @@ impl<'a> VarIdTyPass<'a> {
                 Ty::CellFn(ty) => {
                     let map = self.instantiate(&ty.params, explicit, call_span, name);
                     self.typecheck_args(call_span, args, &ty.sig.subst(&map));
+                    // An argument still unsolved is left to the evaluator.
+                    for param in &ty.params {
+                        let arg = self.infer.deep(&map[&param.id]);
+                        if !self.infer.has_unsolved(&arg) {
+                            self.check_signal_param(
+                                &ty.cell.name,
+                                &param.name,
+                                &arg,
+                                call_span,
+                                true,
+                            );
+                        }
+                    }
                     (Some(varid), Ty::Cell(Arc::new(ty.cell.subst(&map))))
                 }
                 Ty::Ctor(ctor) => self.typecheck_ctor_call(varid, &ctor, call_span, args, explicit),
+                Ty::Native(native) => {
+                    if let Some(explicit) = explicit {
+                        self.errors.push(StaticError {
+                            span: self.span(call_span),
+                            kind: StaticErrorKind::TypeArgArity {
+                                ty: name.to_owned(),
+                                expected: 0,
+                                found: explicit.len(),
+                            },
+                        });
+                    }
+                    (Some(varid), self.typecheck_native(native, call_span, args))
+                }
                 ty => {
                     self.errors.push(StaticError {
                         span: self.span(call_span),
@@ -4246,12 +4725,265 @@ impl<'a> VarIdTyPass<'a> {
             }
             self.errors.push(StaticError {
                 span: self.span(call_span),
-                kind: StaticErrorKind::UndeclaredVar {
-                    name: name.to_owned(),
-                },
+                kind: self.undeclared(name, is_local),
             });
             (None, Ty::Unknown)
         }
+    }
+
+    /// The error for a name that does not resolve. A bare name of a native
+    /// says which module to import it from.
+    fn undeclared(&self, name: &str, bare: bool) -> StaticErrorKind {
+        match Native::named(name).filter(|_| bare) {
+            Some(native) => StaticErrorKind::MovedItem {
+                name: name.to_owned(),
+                path: native.path(),
+            },
+            None => StaticErrorKind::UndeclaredVar {
+                name: name.to_owned(),
+            },
+        }
+    }
+
+    /// Checks a call of a native item and returns the call's type.
+    fn typecheck_native(
+        &mut self,
+        native: Native,
+        call_span: cfgrammar::Span,
+        args: &crate::ast::Args<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        match native {
+            Native::Rect | Native::Crect => {
+                let sig = if native == Native::Crect {
+                    &builtin_sig::CRECT
+                } else {
+                    &builtin_sig::RECT
+                };
+                self.typecheck_args(call_span, args, sig);
+                Ty::Rect
+            }
+            Native::Polygon => {
+                let coordinates = args.kwargs.iter().filter_map(|kwarg| {
+                    let name = kwarg.name.name.as_str();
+                    polygon_coordinate(name).map(|_| (name, Ty::Float))
+                });
+                let sig = Signature::positional([Ty::String, Ty::Int]).keywords(coordinates);
+                self.typecheck_args(call_span, args, &sig);
+                Ty::Polygon
+            }
+            Native::Path => {
+                let keywords = args.kwargs.iter().filter_map(|kwarg| {
+                    let name = kwarg.name.name.as_str();
+                    (matches!(
+                        name,
+                        "width"
+                            | "widthi"
+                            | "begin_extension"
+                            | "begin_extensioni"
+                            | "end_extension"
+                            | "end_extensioni"
+                    ) || polygon_coordinate(name).is_some())
+                    .then_some((name, Ty::Float))
+                });
+                let sig = Signature::positional([Ty::String, Ty::Int]).keywords(keywords);
+                self.typecheck_args(call_span, args, &sig);
+                Ty::Path
+            }
+            Native::Text => {
+                // text, layer, x, y
+                self.typecheck_args(call_span, args, &builtin_sig::TEXT);
+                Ty::Nil
+            }
+            Native::Bbox => {
+                self.assert_eq_arity(call_span, args.posargs.len(), 1);
+                // `assert_eq_arity` only records a diagnostic, so the argument
+                // must still be fetched fallibly, as the sibling natives do.
+                if let Some(arg) = args.posargs.first() {
+                    let argty = self.shallow(&arg.ty());
+                    if !matches!(argty, Ty::Cell(_) | Ty::Inst(_)) {
+                        self.errors.push(StaticError {
+                            span: self.span(call_span),
+                            kind: StaticErrorKind::IncorrectTyCategory {
+                                found: self.display(&argty),
+                                expected: "Cell/Inst".to_string(),
+                            },
+                        });
+                    }
+                }
+                Ty::Rect
+            }
+            Native::Dimension => {
+                self.typecheck_args(call_span, args, &builtin_sig::DIMENSION);
+                Ty::Nil
+            }
+            Native::LayoutInst => {
+                self.typecheck_args(call_span, args, &builtin_sig::INST);
+                if let Some(ty) = args.posargs.first() {
+                    self.assert_ty_is_cell(ty.span(), &ty.ty());
+                    match self.shallow(&ty.ty()) {
+                        Ty::Cell(c) => Ty::Inst(c.clone()),
+                        Ty::Any => Ty::Any,
+                        _ => Ty::Unknown,
+                    }
+                } else {
+                    Ty::Unknown
+                }
+            }
+            Native::Signal => {
+                self.typecheck_args(call_span, args, &builtin_sig::NONE);
+                Ty::Signal
+            }
+            Native::Connect => {
+                self.typecheck_args(call_span, args, &builtin_sig::CONNECT);
+                Ty::Nil
+            }
+            Native::Device => {
+                let module = vec!["std".to_owned(), "schematic".to_owned()];
+                let kind = match self.module_item(&module, "DeviceKind") {
+                    Some((_, ty @ Ty::Enum(_))) => ty,
+                    _ => Ty::Unknown,
+                };
+                let terminals = Ty::Seq(Box::new(Ty::Signal));
+                self.typecheck_posargs(call_span, &args.posargs, &[kind, terminals, Ty::String]);
+                self.typecheck_device_params(&args.kwargs);
+                Ty::Nil
+            }
+            Native::SchematicInst => {
+                self.typecheck_args(call_span, args, &builtin_sig::SCHEMATIC_INST);
+                if let Some(ty) = args.posargs.first() {
+                    self.assert_ty_is_cell(ty.span(), &ty.ty());
+                    match self.shallow(&ty.ty()) {
+                        Ty::Cell(c) => Ty::SchematicInst(c.clone()),
+                        Ty::Any => Ty::Any,
+                        _ => Ty::Unknown,
+                    }
+                } else {
+                    Ty::Unknown
+                }
+            }
+        }
+    }
+
+    /// Checks the keyword arguments of `device`, which are the device's
+    /// parameters: any names, distinct regardless of case as in a netlist,
+    /// each a `Float`, `Int`, or `String`.
+    fn typecheck_device_params(&mut self, kwargs: &[KwArgValue<Substr, VarIdTyMetadata>]) {
+        let mut seen = IndexSet::new();
+        for kwarg in kwargs {
+            let name = kwarg.name.name.as_str();
+            if !seen.insert(name.to_ascii_lowercase()) {
+                self.errors.push(StaticError {
+                    span: self.span(kwarg.name.span),
+                    kind: StaticErrorKind::DuplicateKwArg,
+                });
+                continue;
+            }
+            let ty = self.shallow(&kwarg.value.ty());
+            if !(matches!(ty, Ty::Float | Ty::Int | Ty::String | Ty::Infer(_)) || ty.is_wildcard())
+            {
+                self.errors.push(StaticError {
+                    span: self.span(kwarg.value.span()),
+                    kind: StaticErrorKind::InvalidDeviceParamType {
+                        name: name.to_owned(),
+                        found: self.display(&ty),
+                    },
+                });
+            }
+        }
+    }
+
+    /// The first signal or schematic instance a value of type `ty` can hold,
+    /// with the path to it from `ty`.
+    ///
+    /// Each struct and enum definition is entered once, so recursive types
+    /// stay finite; the type arguments are walked every time, so a signal
+    /// cannot hide behind an argument of a definition already entered.
+    fn signal_path(&self, ty: &Ty, visited: &mut IndexSet<VarId>) -> Option<(Ty, String)> {
+        let prefixed = |segment: String, found: Option<(Ty, String)>| {
+            found.map(|(ty, path)| (ty, format!("{segment}{path}")))
+        };
+        match ty {
+            Ty::Signal | Ty::SchematicInst(_) => Some((ty.clone(), String::new())),
+            Ty::Seq(inner) => prefixed("[]".to_owned(), self.signal_path(inner, visited)),
+            Ty::Tuple(items) => items.iter().enumerate().find_map(|(index, item)| {
+                prefixed(format!(".{index}"), self.signal_path(item, visited))
+            }),
+            Ty::Struct(struct_ty) => {
+                if visited.insert(struct_ty.def)
+                    && let Some(def) = self.adt_def(struct_ty.def).and_then(AdtDef::as_struct)
+                {
+                    let map = param_map(&def.params, &struct_ty.args);
+                    for (name, field) in &def.fields {
+                        let found = self.signal_path(&subst(field, &map), visited);
+                        if found.is_some() {
+                            return prefixed(format!(".{name}"), found);
+                        }
+                    }
+                }
+                struct_ty
+                    .args
+                    .iter()
+                    .find_map(|arg| self.signal_path(arg, visited))
+            }
+            Ty::Enum(enum_ty) => {
+                if visited.insert(enum_ty.def)
+                    && let Some(def) = self.adt_def(enum_ty.def).and_then(AdtDef::as_enum)
+                {
+                    let map = param_map(&def.params, &enum_ty.args);
+                    for (variant, def) in &def.variants {
+                        let payload: Vec<(String, &Ty)> = match &def.payload {
+                            VariantTys::Tuple(tys) => tys
+                                .iter()
+                                .enumerate()
+                                .map(|(index, ty)| (index.to_string(), ty))
+                                .collect(),
+                            VariantTys::Struct(fields) => {
+                                fields.iter().map(|(name, ty)| (name.clone(), ty)).collect()
+                            }
+                        };
+                        for (element, ty) in payload {
+                            let found = self.signal_path(&subst(ty, &map), visited);
+                            if found.is_some() {
+                                return prefixed(format!("::{variant}.{element}"), found);
+                            }
+                        }
+                    }
+                }
+                enum_ty
+                    .args
+                    .iter()
+                    .find_map(|arg| self.signal_path(arg, visited))
+            }
+            _ => None,
+        }
+    }
+
+    /// Reports a parameter of `cell`, or a type argument of a call of it,
+    /// whose type `ty` can hold a signal or a schematic instance.
+    fn check_signal_param(
+        &mut self,
+        cell: &str,
+        param: &str,
+        ty: &Ty,
+        span: cfgrammar::Span,
+        type_param: bool,
+    ) {
+        let Some((found, path)) = self.signal_path(ty, &mut IndexSet::new()) else {
+            return;
+        };
+        let ty = self.display(ty);
+        let via = (!path.is_empty()).then(|| format!("{ty}{path}"));
+        self.errors.push(StaticError {
+            span: self.span(span),
+            kind: StaticErrorKind::SignalCellParam {
+                cell: cell.to_owned(),
+                param: param.to_owned(),
+                ty,
+                found: self.display(&found),
+                via,
+                type_param,
+            },
+        });
     }
 }
 
@@ -4264,6 +4996,8 @@ enum QualifiedError {
     },
     /// The module exists but has no such item.
     Undeclared { name: String },
+    /// The item is in a `std` submodule, at `path`.
+    Moved { name: String, path: String },
     /// The second-to-last segment names neither an enum nor a module.
     NotAnEnum { span: cfgrammar::Span },
 }
@@ -4285,7 +5019,9 @@ fn mentions_param(ty: &Ty, id: VarId) -> bool {
         Ty::Struct(s) => s.args.iter().any(|arg| mentions_param(arg, id)),
         Ty::Enum(e) => e.args.iter().any(|arg| mentions_param(arg, id)),
         Ty::Ctor(c) => c.args.iter().any(|arg| mentions_param(arg, id)),
-        Ty::Cell(cell) | Ty::Inst(cell) => cell.args.iter().any(|arg| mentions_param(arg, id)),
+        Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => {
+            cell.args.iter().any(|arg| mentions_param(arg, id))
+        }
         Ty::Fn(f) => {
             f.sig
                 .args
@@ -4312,9 +5048,10 @@ fn mentions_param(ty: &Ty, id: VarId) -> bool {
         | Ty::Path
         | Ty::Point
         | Ty::String
+        | Ty::Signal
         | Ty::Nil
-        | Ty::SeqNil
-        | Ty::Infer(_) => false,
+        | Ty::Infer(_)
+        | Ty::Native(_) => false,
     }
 }
 
@@ -4334,7 +5071,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             }
             Expr::Index(index_expr) => index_expr.metadata.clone(),
             Expr::Nil(_) => Ty::Nil,
-            Expr::SeqNil(_) => Ty::SeqNil,
+            Expr::Seq(lit) => lit.metadata.clone(),
             Expr::FloatLiteral(_) => Ty::Float,
             Expr::IntLiteral(_) => Ty::Int,
             Expr::BoolLiteral(_) => Ty::Bool,
@@ -4343,7 +5080,7 @@ impl<S> Expr<S, VarIdTyMetadata> {
             Expr::Cast(cast) => cast.metadata.clone(),
             Expr::UnaryOp(unary_op_expr) => unary_op_expr.metadata.clone(),
             Expr::Tuple(t) => t.metadata.clone(),
-            Expr::StructLit(lit) => lit.metadata.clone(),
+            Expr::StructLit(lit) => lit.metadata.ty.clone(),
         }
     }
 }
@@ -4367,29 +5104,42 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         // Parser grammar ensures paths cannot be empty.
         assert!(!input.path.is_empty());
         let explicit = self.explicit_args(input);
-        if input.path.len() == 1 {
+        let resolved = if input.path.len() == 1 {
             let name = &input.path[0].name;
-            if let Some((varid, ty)) = self.lookup(name) {
-                (Some(varid), self.value_ty(ty, explicit, input.span))
+            if let Some(binding) = self.lookup(name) {
+                Some(binding)
             } else if self.demand_local(name, input.span) {
-                (None, Ty::Unknown)
+                None
             } else {
                 self.errors.push(StaticError {
                     span: self.span(input.span),
-                    kind: StaticErrorKind::UndeclaredVar {
-                        name: name.to_string(),
+                    kind: self.undeclared(name, true),
+                });
+                None
+            }
+        } else {
+            match self.resolve_qualified(&input.path) {
+                Ok(binding) => Some(binding),
+                Err(error) => {
+                    self.report_qualified_error(error, input.span);
+                    None
+                }
+            }
+        };
+        match resolved {
+            // A native is not a value; only a call reaches it, through
+            // `dispatch_call_expr`.
+            Some((_, Ty::Native(native))) => {
+                self.errors.push(StaticError {
+                    span: self.span(input.span),
+                    kind: StaticErrorKind::NativeNotCallable {
+                        name: native.name().to_owned(),
                     },
                 });
                 (None, Ty::Unknown)
             }
-        } else {
-            match self.resolve_qualified(&input.path) {
-                Ok((varid, ty)) => (Some(varid), self.value_ty(ty, explicit, input.span)),
-                Err(error) => {
-                    self.report_qualified_error(error, input.span);
-                    (None, Ty::Unknown)
-                }
-            }
+            Some((varid, ty)) => (Some(varid), self.value_ty(ty, explicit, input.span)),
+            None => (None, Ty::Unknown),
         }
     }
 
@@ -4412,11 +5162,37 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             .iter()
             .map(|variant| EnumVariant {
                 name: self.transform_ident(&variant.name),
-                payload: variant
-                    .payload
-                    .iter()
-                    .map(|spec| self.transform_ty_spec(spec))
-                    .collect(),
+                // `dispatch_struct_field` is unreachable in this pass, so a
+                // named payload's fields are built here with the types
+                // `define_enum_decl` resolved.
+                payload: match &variant.payload {
+                    VariantPayload::Tuple(payload) => VariantPayload::Tuple(
+                        payload
+                            .iter()
+                            .map(|spec| self.transform_ty_spec(spec))
+                            .collect(),
+                    ),
+                    VariantPayload::Struct(fields) => VariantPayload::Struct(
+                        fields
+                            .iter()
+                            .map(|field| StructField {
+                                name: self.transform_ident(&field.name),
+                                ty: self.transform_ty_spec(&field.ty),
+                                span: field.span,
+                                metadata: def
+                                    .as_ref()
+                                    .and_then(|def| def.variants.get(variant.name.name.as_str()))
+                                    .and_then(|variant| match &variant.payload {
+                                        VariantTys::Struct(tys) => {
+                                            tys.get(field.name.name.as_str()).cloned()
+                                        }
+                                        VariantTys::Tuple(_) => None,
+                                    })
+                                    .unwrap_or_default(),
+                            })
+                            .collect(),
+                    ),
+                },
                 span: variant.span,
                 metadata: def
                     .as_ref()
@@ -4455,7 +5231,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         _input: &EnumVariant<Substr, Self::InputMetadata>,
         _name: &Ident<Substr, Self::OutputMetadata>,
-        _payload: &[TySpec<Substr, Self::OutputMetadata>],
+        _payload: &VariantPayload<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::EnumVariant {
         // `transform_enum_decl` builds the variants itself.
         unreachable!()
@@ -4557,22 +5333,30 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         let lookup = if path.path.len() == 1 {
             self.lookup(name)
         } else {
-            let module = module_prefix(
-                self.current_path,
-                path.path.iter().map(|ident| ident.name.as_str()),
-                1,
-            );
-            self.module_item(&module, name)
+            // A qualified path is `Enum::Variant` or `module::item`, so the
+            // same resolution a variant pattern uses applies here.
+            match self.resolve_qualified(&path.path) {
+                Ok(binding) => Some(binding),
+                Err(error) => {
+                    self.report_qualified_error(error, path.span);
+                    None
+                }
+            }
         };
         let Some((_, ty)) = lookup else {
-            self.errors.push(StaticError {
-                span: self.span(path.span),
-                kind: StaticErrorKind::UndeclaredVar {
-                    name: name.to_string(),
-                },
-            });
-            return Ty::Unknown;
+            if path.path.len() == 1 {
+                self.errors.push(StaticError {
+                    span: self.span(path.span),
+                    kind: StaticErrorKind::UndeclaredVar {
+                        name: name.to_string(),
+                    },
+                });
+            }
+            return StructLitTy::default();
         };
+        if let Ty::Ctor(ctor) = ty {
+            return self.variant_lit(input, path, fields, base, &ctor);
+        }
         let Ty::Struct(struct_ty) = ty else {
             // An `Unknown` binding was already diagnosed where it was bound.
             if !matches!(ty, Ty::Unknown) {
@@ -4581,14 +5365,14 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     kind: StaticErrorKind::NotAStruct,
                 });
             }
-            return Ty::Unknown;
+            return StructLitTy::default();
         };
         let Some(def) = self
             .adt_def(struct_ty.def)
             .and_then(AdtDef::as_struct)
             .cloned()
         else {
-            return Ty::Unknown;
+            return StructLitTy::default();
         };
         let explicit = self.explicit_args(path);
         let map = self.instantiate(&def.params, explicit, path.span, &struct_ty.name);
@@ -4647,7 +5431,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 }
             }
         }
-        ty
+        StructLitTy::of(ty)
     }
 
     fn dispatch_cell_decl(
@@ -4854,58 +5638,63 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         arms: &[crate::ast::MatchArm<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::MatchExpr {
         let scrutinee_ty = self.shallow(&scrutinee.ty());
-        self.assert_ty_is_enum(scrutinee.span(), &scrutinee_ty);
+        self.assert_ty_is_matchable(scrutinee.span(), &scrutinee_ty);
 
         // The scrutinee type is only known statically when it is a declared
-        // enum. `Any` is common in practice, because cell and instance types
-        // cannot be named, so arms are then checked against the enum the
-        // *patterns* name instead. The evaluator has no fallback for an arm set
-        // that does not cover the runtime variant, so the checks below are what
-        // keep it from reaching an unmatched value.
-        fn variant_ty(arm: &MatchArm<Substr, VarIdTyMetadata>) -> Option<&Ty> {
+        // enum or struct. `Any` is common in practice, because cell and
+        // instance types cannot be named, so arms are then checked against the
+        // type the *patterns* name instead. The evaluator has no fallback for
+        // an arm set that does not cover the runtime value, so the checks below
+        // are what keep it from reaching an unmatched value.
+        fn pattern_ty(arm: &MatchArm<Substr, VarIdTyMetadata>) -> Option<&Ty> {
             match &arm.pattern {
-                Pattern::Variant { path, .. } => Some(&path.metadata.1),
+                Pattern::Variant { path, .. } | Pattern::Struct { path, .. } => {
+                    Some(&path.metadata.1)
+                }
                 _ => None,
             }
         }
-        let pattern_ty = arms
+        let named_ty = arms
             .iter()
-            .filter_map(variant_ty)
-            .find(|ty| matches!(ty, Ty::Enum(_)))
+            .filter_map(pattern_ty)
+            .find(|ty| matches!(ty, Ty::Enum(_) | Ty::Struct(_)))
             .cloned();
         let expected_ty = match scrutinee_ty {
-            Ty::Enum(_) => Some(scrutinee_ty.clone()),
-            _ => pattern_ty,
+            Ty::Enum(_) | Ty::Struct(_) => Some(scrutinee_ty.clone()),
+            _ => named_ty,
         };
 
-        // Neither the scrutinee nor any arm pattern names an enum, so there is
-        // nothing to check the arms against: an unsayable match type has to be
-        // reported here or `--check` accepts a program the evaluator refuses.
+        // Neither the scrutinee nor any arm pattern names an enum or struct, so
+        // there is nothing to check the arms against: an unsayable match type
+        // has to be reported here or `--check` accepts a program the evaluator
+        // refuses.
         let Some(expected_ty) = expected_ty else {
             let already_diagnosed = matches!(scrutinee_ty, Ty::Unknown)
                 || arms
                     .iter()
-                    .filter_map(variant_ty)
+                    .filter_map(pattern_ty)
                     .any(|ty| matches!(ty, Ty::Unknown));
             if !already_diagnosed {
                 self.errors.push(StaticError {
                     span: self.span(scrutinee.span()),
-                    kind: StaticErrorKind::NotAnEnum,
+                    kind: StaticErrorKind::NotMatchable,
                 });
             }
             return Ty::Unknown;
         };
         // An `Any` scrutinee leaves the patterns' type arguments unsolved; an
-        // inference variable scrutinee is solved to the patterns' enum.
+        // inference variable scrutinee is solved to the patterns' type.
         self.unify(&scrutinee_ty, &expected_ty);
-        let Ty::Enum(enum_ty) = &expected_ty else {
-            unreachable!("expected type is an enum")
+        // The enum variants no arm has covered yet. A struct has one shape,
+        // covered once an arm matches every value of it.
+        let mut remaining = match &expected_ty {
+            Ty::Enum(enum_ty) => self
+                .adt_def(enum_ty.def)
+                .and_then(AdtDef::as_enum)
+                .map(|def| def.variants.keys().cloned().collect::<IndexSet<_>>())
+                .unwrap_or_default(),
+            _ => IndexSet::from([String::new()]),
         };
-        let mut remaining = self
-            .adt_def(enum_ty.def)
-            .and_then(AdtDef::as_enum)
-            .map(|def| def.variants.keys().cloned().collect::<IndexSet<_>>())
-            .unwrap_or_default();
         let mut covered = IndexSet::new();
         let mut result: Option<Ty> = None;
         for arm in arms {
@@ -4916,9 +5705,27 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 });
             } else {
                 match &arm.pattern {
-                    Pattern::Variant { path, .. } => {
-                        // All arms must belong to the same enum, whether or not
-                        // the scrutinee's own type pinned that enum down.
+                    // All arms must name the same type, whether or not the
+                    // scrutinee's own type pinned that type down.
+                    Pattern::Variant { path, .. } | Pattern::Struct { path, .. }
+                        if matches!(expected_ty, Ty::Struct(_)) =>
+                    {
+                        self.assert_eq_ty(arm.pattern.span(), &path.metadata.1, &expected_ty);
+                        let catch_all = match &arm.pattern {
+                            Pattern::Struct { fields, .. } => {
+                                fields.iter().all(|field| field.pattern.is_catch_all())
+                            }
+                            _ => false,
+                        };
+                        // An arm whose path was already diagnosed counts as
+                        // covering the struct, so that it is reported once.
+                        if catch_all || matches!(path.metadata.1, Ty::Unknown) {
+                            remaining.clear();
+                        }
+                    }
+                    // A payload sub-pattern is a name or `_`, so an arm that
+                    // names a variant covers all of it.
+                    Pattern::Variant { path, .. } | Pattern::Struct { path, .. } => {
                         self.assert_eq_ty(arm.pattern.span(), &path.metadata.1, &expected_ty);
                         let variant = path.path.last().expect("paths are non-empty").name.clone();
                         remaining.swap_remove(variant.as_str());
@@ -5027,7 +5834,27 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "x" | "y" => Ty::Float,
                 _ => self.no_field_on_ty(field, Ty::Point),
             },
-            Ty::Inst(ref c) => self.inst_field_ty(c, field, &base_ty),
+            // A schematic instance has no position.
+            Ty::SchematicInst(_) if RESERVED_CELL_FIELDS.contains(&field.name.as_str()) => {
+                self.no_field_on_ty(field, base_ty.clone())
+            }
+            Ty::Inst(ref c) | Ty::SchematicInst(ref c) => {
+                let ty = self.inst_field_ty(c, field, &base_ty);
+                match function_kind(&ty) {
+                    Some(kind) => {
+                        self.errors.push(StaticError {
+                            span: self.span(field.span),
+                            kind: StaticErrorKind::UnreadableInstanceField {
+                                field: field.name.to_string(),
+                                cell: c.name.clone(),
+                                kind: kind.to_owned(),
+                            },
+                        });
+                        Ty::Unknown
+                    }
+                    None => ty,
+                }
+            }
             // A cell's coordinates are only determined relative to a
             // placement, so reading its geometry before `inst(...)` is
             // meaningless -- and the evaluator already refuses it. Saying so
@@ -5036,24 +5863,35 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             // Only when the field exists, though: telling someone who
             // misspelled a field to place the cell first is advice that
             // cannot help, so an unknown name still gets the no-field error.
+            //
+            // A private field is reported as such first, since placing the
+            // cell would not make it readable.
             Ty::Cell(ref c) if self.cell_declares_field(c, field.name.as_str()) => {
-                self.errors.push(StaticError {
-                    span: self.span(field.span),
-                    kind: StaticErrorKind::CellFieldBeforePlacement {
-                        cell: c.name.clone(),
-                        field: field.name.to_string(),
-                    },
-                });
+                if self.is_private_field(c, &field.name) {
+                    self.private_field(c, field);
+                } else {
+                    self.errors.push(StaticError {
+                        span: self.span(field.span),
+                        kind: StaticErrorKind::CellFieldBeforePlacement {
+                            cell: c.name.clone(),
+                            field: field.name.to_string(),
+                        },
+                    });
+                }
                 Ty::Unknown
             }
             Ty::CellFn(ref c) if self.cell_declares_field(&c.cell, &field.name) => {
-                self.errors.push(StaticError {
-                    span: self.span(field.span),
-                    kind: StaticErrorKind::CellFnFieldAccess {
-                        cell: c.cell.name.clone(),
-                        field: field.name.to_string(),
-                    },
-                });
+                if self.is_private_field(&c.cell, &field.name) {
+                    self.private_field(&c.cell, field);
+                } else {
+                    self.errors.push(StaticError {
+                        span: self.span(field.span),
+                        kind: StaticErrorKind::CellFnFieldAccess {
+                            cell: c.cell.name.clone(),
+                            field: field.name.to_string(),
+                        },
+                    });
+                }
                 Ty::Unknown
             }
             Ty::Struct(ref s) => {
@@ -5146,47 +5984,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
     ) -> <Self::OutputMetadata as AstMetadata>::CallExpr {
         if func.path.len() == 1 {
             match func.path[0].name.as_str() {
-                name @ "crect" | name @ "rect" => {
-                    let sig = if name == "crect" {
-                        &builtin_sig::CRECT
-                    } else {
-                        &builtin_sig::RECT
-                    };
-                    self.typecheck_args(input.span, args, sig);
-                    (None, Ty::Rect)
-                }
-                "polygon" => {
-                    let coordinates = args.kwargs.iter().filter_map(|kwarg| {
-                        let name = kwarg.name.name.as_str();
-                        polygon_coordinate(name).map(|_| (name, Ty::Float))
-                    });
-                    let sig = Signature::positional([Ty::String, Ty::Int]).keywords(coordinates);
-                    self.typecheck_args(input.span, args, &sig);
-                    (None, Ty::Polygon)
-                }
-                "path" => {
-                    let keywords = args.kwargs.iter().filter_map(|kwarg| {
-                        let name = kwarg.name.name.as_str();
-                        (matches!(
-                            name,
-                            "width"
-                                | "widthi"
-                                | "begin_extension"
-                                | "begin_extensioni"
-                                | "end_extension"
-                                | "end_extensioni"
-                        ) || polygon_coordinate(name).is_some())
-                        .then_some((name, Ty::Float))
-                    });
-                    let sig = Signature::positional([Ty::String, Ty::Int]).keywords(keywords);
-                    self.typecheck_args(input.span, args, &sig);
-                    (None, Ty::Path)
-                }
-                "text" => {
-                    // text, layer, x, y
-                    self.typecheck_args(input.span, args, &builtin_sig::TEXT);
-                    (None, Ty::Nil)
-                }
                 "cons" => self.call_scheme(&builtin_sig::CONS, input.span, args),
                 "head" => self.call_scheme(&builtin_sig::HEAD, input.span, args),
                 "tail" => self.call_scheme(&builtin_sig::TAIL, input.span, args),
@@ -5208,48 +6005,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     self.typecheck_args(input.span, args, &builtin_sig::MAX_VIA_ARRAY);
                     (None, builtin_sig::max_via_array_choice())
                 }
-                "list" => {
-                    self.typecheck_kwargs(&args.kwargs, &builtin_sig::LIST.sig.kwargs);
-                    if args.posargs.is_empty() {
-                        self.errors.push(StaticError {
-                            span: self.span(input.span),
-                            kind: StaticErrorKind::EmptyListConstructor,
-                        });
-                        (None, Ty::Nil)
-                    } else {
-                        // Every element is unified with one element type, so a
-                        // mismatch is reported at the element rather than
-                        // widened away.
-                        let element = self.fresh();
-                        for arg in &args.posargs {
-                            self.assert_eq_ty(arg.span(), &arg.ty(), &element);
-                        }
-                        (None, Ty::Seq(Box::new(element)))
-                    }
-                }
                 "range_full" => {
                     // Native builtin backing `std::range`/`std::range_full`: builds the
                     // whole `[Int]` in one pass instead of recursive `cons`.
                     self.typecheck_args(input.span, args, &builtin_sig::RANGE_FULL);
                     (None, Ty::Seq(Box::new(Ty::Int)))
-                }
-                "bbox" => {
-                    self.assert_eq_arity(input.span, args.posargs.len(), 1);
-                    // `assert_eq_arity` only records a diagnostic, so the argument
-                    // must still be fetched fallibly, as the sibling builtins do.
-                    if let Some(arg) = args.posargs.first() {
-                        let argty = self.shallow(&arg.ty());
-                        if !matches!(argty, Ty::Cell(_) | Ty::Inst(_)) {
-                            self.errors.push(StaticError {
-                                span: self.span(input.span),
-                                kind: StaticErrorKind::IncorrectTyCategory {
-                                    found: self.display(&argty),
-                                    expected: "Cell/Inst".to_string(),
-                                },
-                            });
-                        }
-                    }
-                    (None, Ty::Rect)
                 }
                 "float" => {
                     self.typecheck_args(input.span, args, &builtin_sig::NONE);
@@ -5258,23 +6018,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 "eq" => {
                     self.typecheck_args(input.span, args, &builtin_sig::EQ);
                     (None, Ty::Nil)
-                }
-                "dimension" => {
-                    self.typecheck_args(input.span, args, &builtin_sig::DIMENSION);
-                    (None, Ty::Nil)
-                }
-                "inst" => {
-                    self.typecheck_args(input.span, args, &builtin_sig::INST);
-                    if let Some(ty) = args.posargs.first() {
-                        self.assert_ty_is_cell(ty.span(), &ty.ty());
-                        match self.shallow(&ty.ty()) {
-                            Ty::Cell(c) => (None, Ty::Inst(c.clone())),
-                            Ty::Any => (None, Ty::Any),
-                            _ => (None, Ty::Unknown),
-                        }
-                    } else {
-                        (None, Ty::Unknown)
-                    }
                 }
                 name => {
                     let lookup = self.lookup(name);
@@ -5365,6 +6108,21 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         Ty::Tuple(items.iter().map(|i| i.ty()).collect())
     }
 
+    /// Every element of a sequence literal unifies with one element type, so a
+    /// mismatch is reported at the element rather than widened away. An empty
+    /// `[]` leaves that type open for whatever the literal meets to solve.
+    fn dispatch_seq_expr(
+        &mut self,
+        _input: &crate::ast::SeqLiteral<Self::InputS, Self::InputMetadata>,
+        items: &[Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::SeqExpr {
+        let element = self.fresh();
+        for item in items {
+            self.assert_eq_ty(item.span(), &item.ty(), &element);
+        }
+        Ty::Seq(Box::new(element))
+    }
+
     fn dispatch_kw_arg_value(
         &mut self,
         _input: &crate::ast::KwArgValue<Substr, Self::InputMetadata>,
@@ -5390,10 +6148,18 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 
     fn dispatch_scope(
         &mut self,
-        _input: &Scope<Substr, Self::InputMetadata>,
+        input: &Scope<Substr, Self::InputMetadata>,
         _stmts: &[Statement<Substr, Self::OutputMetadata>],
         tail: &Option<Expr<Substr, Self::OutputMetadata>>,
     ) -> <Self::OutputMetadata as AstMetadata>::Scope {
+        // A cell body is typed one statement at a time and never reaches
+        // here, so every scope that does is one `pub` does not apply to.
+        for public in input.stmts.iter().filter_map(Statement::public) {
+            self.errors.push(StaticError {
+                span: self.span(public),
+                kind: StaticErrorKind::MisplacedPub,
+            });
+        }
         tail.as_ref().map(|tail| tail.ty()).unwrap_or(Ty::Nil)
     }
 
@@ -5429,6 +6195,22 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         (self.alloc(&name.name, ty.clone()), ty)
     }
 
+    fn transform_let_pattern(
+        &mut self,
+        input: &LetPattern<Substr, Self::InputMetadata>,
+    ) -> LetPattern<Substr, Self::OutputMetadata> {
+        let value = self.transform_expr(&input.value);
+        let value_ty = self.shallow(&value.ty());
+        let pattern = self.type_pattern(&input.pattern, &value_ty);
+        self.check_let_pattern(&pattern, &value);
+        LetPattern {
+            public: input.public,
+            pattern,
+            value,
+            span: input.span,
+        }
+    }
+
     fn transform_for_loop(
         &mut self,
         input: &crate::ast::ForLoop<Self::InputS, Self::InputMetadata>,
@@ -5440,7 +6222,6 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             Ty::Any => Ty::Any,
             Ty::Unknown => Ty::Unknown,
             Ty::Seq(t) => (*t).clone(),
-            Ty::SeqNil => Ty::Any,
             // Iterating makes the sequence one of a still-unknown element.
             Ty::Infer(_) => {
                 let element = self.fresh();
@@ -5501,7 +6282,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
 }
 
 impl<'a> VarIdTyPass<'a> {
-    /// Types a `match` arm's pattern against the scrutinee's type, binding
+    /// Types a pattern against the type of the value it takes apart, binding
     /// each name it introduces in the current frame. A bare name is a unit
     /// variant pattern when it resolves to a unit variant, and a binding
     /// otherwise.
@@ -5522,7 +6303,7 @@ impl<'a> VarIdTyPass<'a> {
                     };
                     return self.type_variant_pattern(
                         path,
-                        Some((id, ctor)),
+                        Some(PatternTarget::Variant(id, ctor)),
                         &[],
                         name.span,
                         scrutinee_ty,
@@ -5535,63 +6316,189 @@ impl<'a> VarIdTyPass<'a> {
                 }
             }
             Pattern::Variant { path, fields, span } => {
-                let resolved = if path.path.len() == 1 {
-                    match self.lookup(&path.path[0].name) {
-                        Some((id, Ty::Ctor(ctor))) => Some((id, ctor)),
-                        Some(_) | None => {
-                            self.errors.push(StaticError {
-                                span: self.span(path.span),
-                                kind: StaticErrorKind::UndeclaredVar {
-                                    name: path.path[0].name.to_string(),
-                                },
-                            });
-                            None
-                        }
-                    }
-                } else {
-                    match self.resolve_qualified(&path.path) {
-                        Ok((id, Ty::Ctor(ctor))) => Some((id, ctor)),
-                        Ok(_) => {
-                            self.errors.push(StaticError {
-                                span: self.span(path.span),
-                                kind: StaticErrorKind::NotAnEnum,
-                            });
-                            None
-                        }
-                        Err(error) => {
-                            self.report_qualified_error(error, path.span);
-                            None
-                        }
-                    }
-                };
-                let explicit = self.explicit_args(path);
-                let output = IdentPath {
-                    path: path
-                        .path
-                        .iter()
-                        .map(|ident| self.transform_ident(ident))
-                        .collect(),
-                    generic_args: path
-                        .generic_args
-                        .as_ref()
-                        .map(|args| self.transform_generic_args(args)),
-                    metadata: (None, Ty::Unknown),
-                    span: path.span,
-                };
-                let resolved = resolved.map(|(id, ctor)| {
-                    (
-                        id,
-                        match explicit {
-                            Some(args) => Arc::new(CtorTy {
-                                args,
-                                ..(*ctor).clone()
-                            }),
-                            None => ctor,
-                        },
-                    )
-                });
+                let (output, resolved) = self.resolve_pattern_path(path);
                 self.type_variant_pattern(output, resolved, fields, *span, scrutinee_ty)
             }
+            Pattern::Struct {
+                path,
+                fields,
+                rest,
+                span,
+            } => {
+                let (output, resolved) = self.resolve_pattern_path(path);
+                self.type_struct_pattern(output, resolved, fields, *rest, *span, scrutinee_ty)
+            }
+        }
+    }
+
+    /// Resolves a pattern's path to an enum variant or a struct declaration,
+    /// reporting a name that is neither.
+    fn resolve_pattern_path(
+        &mut self,
+        path: &IdentPath<Substr, ParseMetadata>,
+    ) -> ResolvedPatternPath {
+        let binding = if path.path.len() == 1 {
+            let binding = self.lookup(&path.path[0].name);
+            if binding.is_none() {
+                self.errors.push(StaticError {
+                    span: self.span(path.span),
+                    kind: StaticErrorKind::UndeclaredVar {
+                        name: path.path[0].name.to_string(),
+                    },
+                });
+            }
+            binding
+        } else {
+            match self.resolve_qualified(&path.path) {
+                Ok(binding) => Some(binding),
+                Err(error) => {
+                    self.report_qualified_error(error, path.span);
+                    None
+                }
+            }
+        };
+        let explicit = self.explicit_args(path);
+        let resolved = match binding {
+            Some((id, Ty::Ctor(ctor))) => Some(PatternTarget::Variant(
+                id,
+                match explicit {
+                    Some(args) => Arc::new(CtorTy {
+                        args,
+                        ..(*ctor).clone()
+                    }),
+                    None => ctor,
+                },
+            )),
+            // A struct's own name is bound to its declaration's id; a variable
+            // of struct type is not a pattern and is reported below.
+            Some((id, Ty::Struct(struct_ty))) if id == struct_ty.def => {
+                Some(PatternTarget::Struct(id, struct_ty, explicit))
+            }
+            None => None,
+            Some((_, Ty::Struct(_))) => {
+                self.errors.push(StaticError {
+                    span: self.span(path.span),
+                    kind: StaticErrorKind::NotAStruct,
+                });
+                None
+            }
+            Some(_) => {
+                self.errors.push(StaticError {
+                    span: self.span(path.span),
+                    kind: if path.path.len() == 1 {
+                        StaticErrorKind::UndeclaredVar {
+                            name: path.path[0].name.to_string(),
+                        }
+                    } else {
+                        StaticErrorKind::NotAnEnum
+                    },
+                });
+                None
+            }
+        };
+        let output = IdentPath {
+            path: path
+                .path
+                .iter()
+                .map(|ident| self.transform_ident(ident))
+                .collect(),
+            generic_args: path
+                .generic_args
+                .as_ref()
+                .map(|args| self.transform_generic_args(args)),
+            metadata: (None, Ty::Unknown),
+            span: path.span,
+        };
+        (output, resolved)
+    }
+
+    /// Types a `E::V { f: v, g }` literal, which builds a value of `ctor`'s
+    /// enum from the variant's named fields.
+    fn variant_lit(
+        &mut self,
+        input: &StructLitExpr<Substr, ParseMetadata>,
+        path: &IdentPath<Substr, VarIdTyMetadata>,
+        fields: &[StructLitField<Substr, VarIdTyMetadata>],
+        base: &Option<Expr<Substr, VarIdTyMetadata>>,
+        ctor: &CtorTy,
+    ) -> StructLitTy {
+        let Some(def) = self.adt_def(ctor.def).and_then(AdtDef::as_enum).cloned() else {
+            return StructLitTy::default();
+        };
+        let ctor_ty = Ty::Ctor(Arc::new(ctor.clone()));
+        let payload = def.variants.get(&ctor.variant).map(|v| v.payload.clone());
+        let Some(VariantTys::Struct(payload)) = payload else {
+            // A unit variant is a value and a tuple variant is called, so
+            // neither is built with braces.
+            self.errors.push(StaticError {
+                span: self.span(path.span),
+                kind: StaticErrorKind::NotAStructVariant(format!(
+                    "{}::{}",
+                    ctor.enum_name, ctor.variant
+                )),
+            });
+            return StructLitTy::default();
+        };
+        let explicit = self.explicit_args(path);
+        let explicit = explicit.or_else(|| (!ctor.args.is_empty()).then(|| ctor.args.clone()));
+        let map = self.instantiate(&def.params, explicit, path.span, &ctor.enum_name);
+        let ty = Ty::Enum(Arc::new(EnumTy {
+            def: ctor.def,
+            name: ctor.enum_name.clone(),
+            args: def
+                .params
+                .iter()
+                .map(|param| map[&param.id].clone())
+                .collect(),
+        }));
+
+        let mut seen = IndexSet::new();
+        for field in fields {
+            let field_name = field.name.name.as_str();
+            let Some(expected) = payload.get(field_name) else {
+                self.no_field_on_ty(&field.name, ctor_ty.clone());
+                continue;
+            };
+            if !seen.insert(field_name) {
+                self.errors.push(StaticError {
+                    span: self.span(field.name.span),
+                    kind: StaticErrorKind::DuplicateStructField {
+                        field: field_name.to_string(),
+                    },
+                });
+                continue;
+            }
+            self.assert_eq_ty(
+                field.value.span(),
+                &field.value.ty(),
+                &subst(expected, &map),
+            );
+        }
+        // Unlike a struct literal, a variant has no `..base`: the base would
+        // have to be this very variant, which only a `match` can establish.
+        if let Some(base) = base {
+            self.errors.push(StaticError {
+                span: self.span(base.span()),
+                kind: StaticErrorKind::VariantLiteralBase,
+            });
+        }
+        let missing = payload
+            .keys()
+            .filter(|name| !seen.contains(name.as_str()))
+            .map(|name| format!("`{name}`"))
+            .collect_vec();
+        if !missing.is_empty() {
+            self.errors.push(StaticError {
+                span: self.span(input.span),
+                kind: StaticErrorKind::MissingStructFields {
+                    ty: self.display(&ctor_ty),
+                    fields: missing.join(", "),
+                },
+            });
+        }
+        StructLitTy {
+            ty,
+            variant: Some(ctor.variant.clone()),
         }
     }
 
@@ -5599,17 +6506,26 @@ impl<'a> VarIdTyPass<'a> {
     fn type_variant_pattern(
         &mut self,
         mut path: IdentPath<Substr, VarIdTyMetadata>,
-        resolved: Option<(VarId, Arc<CtorTy>)>,
+        resolved: Option<PatternTarget>,
         fields: &[Pattern<Substr, ParseMetadata>],
         span: cfgrammar::Span,
         scrutinee_ty: &Ty,
     ) -> Pattern<Substr, VarIdTyMetadata> {
-        let Some((id, ctor)) = resolved else {
-            let fields = fields
-                .iter()
-                .map(|field| self.type_pattern(field, &Ty::Unknown))
-                .collect();
-            return Pattern::Variant { path, fields, span };
+        let (id, ctor) = match resolved {
+            Some(PatternTarget::Variant(id, ctor)) => (id, ctor),
+            target => {
+                if let Some(PatternTarget::Struct(_, struct_ty, _)) = target {
+                    self.errors.push(StaticError {
+                        span: self.span(span),
+                        kind: StaticErrorKind::StructPatternWithoutBraces(struct_ty.name.clone()),
+                    });
+                }
+                let fields = fields
+                    .iter()
+                    .map(|field| self.type_pattern(field, &Ty::Unknown))
+                    .collect();
+                return Pattern::Variant { path, fields, span };
+            }
         };
         let def = self.adt_def(ctor.def).and_then(AdtDef::as_enum).cloned();
         let Some(def) = def else {
@@ -5619,8 +6535,61 @@ impl<'a> VarIdTyPass<'a> {
                 span,
             };
         };
-        // The scrutinee's arguments when it is this enum; fresh variables
-        // otherwise, which the arm's body or the scrutinee may then solve.
+        let (map, payload) =
+            self.variant_pattern_payload(&mut path, id, &ctor, &def, span, scrutinee_ty);
+        // Named fields are taken apart by a braced pattern; a `(..)` one here
+        // would bind by position.
+        let VariantTys::Tuple(payload) = payload else {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::StructVariantConstruction(format!(
+                    "{}::{}",
+                    ctor.enum_name, ctor.variant
+                )),
+            });
+            let fields = fields
+                .iter()
+                .map(|field| self.type_pattern(field, &Ty::Unknown))
+                .collect();
+            return Pattern::Variant { path, fields, span };
+        };
+        if fields.len() != payload.len() {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::VariantPayloadArity {
+                    variant: ctor.variant.clone(),
+                    expected: payload.len(),
+                    found: fields.len(),
+                },
+            });
+        }
+        let fields = fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let ty = payload
+                    .get(index)
+                    .map_or(Ty::Unknown, |payload| subst(payload, &map));
+                self.type_pattern(field, &ty)
+            })
+            .collect();
+        Pattern::Variant { path, fields, span }
+    }
+
+    /// Instantiates the enum of a variant pattern, annotates its path with the
+    /// enum type, and returns the substitution and the variant's payload.
+    ///
+    /// The type arguments are the scrutinee's when it is this enum, and fresh
+    /// variables otherwise, which the arm's body or the scrutinee may solve.
+    fn variant_pattern_payload(
+        &mut self,
+        path: &mut IdentPath<Substr, VarIdTyMetadata>,
+        id: VarId,
+        ctor: &CtorTy,
+        def: &EnumDef,
+        span: cfgrammar::Span,
+        scrutinee_ty: &Ty,
+    ) -> (HashMap<VarId, Ty>, VariantTys) {
         let args = match scrutinee_ty {
             Ty::Enum(enum_ty) if enum_ty.def == ctor.def && ctor.args.is_empty() => {
                 enum_ty.args.clone()
@@ -5647,28 +6616,169 @@ impl<'a> VarIdTyPass<'a> {
             .variants
             .get(&ctor.variant)
             .map(|variant| variant.payload.clone())
-            .unwrap_or_default();
-        if fields.len() != payload.len() {
-            self.errors.push(StaticError {
-                span: self.span(span),
-                kind: StaticErrorKind::VariantPayloadArity {
-                    variant: ctor.variant.clone(),
-                    expected: payload.len(),
-                    found: fields.len(),
-                },
-            });
-        }
+            .unwrap_or_else(|| VariantTys::Tuple(Vec::new()));
+        (map, payload)
+    }
+
+    /// Types a `S { f, g: name, .. }` or `E::V { f, g: name, .. }` pattern
+    /// whose path resolved to `resolved`, if it did.
+    fn type_struct_pattern(
+        &mut self,
+        mut path: IdentPath<Substr, VarIdTyMetadata>,
+        resolved: Option<PatternTarget>,
+        fields: &[FieldPattern<Substr, ParseMetadata>],
+        rest: bool,
+        span: cfgrammar::Span,
+        scrutinee_ty: &Ty,
+    ) -> Pattern<Substr, VarIdTyMetadata> {
+        let unchecked = |this: &mut Self, path| {
+            let fields = fields
+                .iter()
+                .map(|field| FieldPattern {
+                    name: this.transform_ident(&field.name),
+                    pattern: this.type_pattern(&field.pattern, &Ty::Unknown),
+                    shorthand: field.shorthand,
+                    span: field.span,
+                })
+                .collect();
+            Pattern::Struct {
+                path,
+                fields,
+                rest,
+                span,
+            }
+        };
+        // The substitution for the declaration's type parameters, its named
+        // fields, and the type that names the pattern in diagnostics.
+        let (map, declared, pattern_ty) = match resolved {
+            None => return unchecked(self, path),
+            Some(PatternTarget::Variant(id, ctor)) => {
+                let Some(def) = self.adt_def(ctor.def).and_then(AdtDef::as_enum).cloned() else {
+                    return unchecked(self, path);
+                };
+                let (map, payload) =
+                    self.variant_pattern_payload(&mut path, id, &ctor, &def, span, scrutinee_ty);
+                let VariantTys::Struct(payload) = payload else {
+                    self.errors.push(StaticError {
+                        span: self.span(span),
+                        kind: StaticErrorKind::NotAStructVariant(format!(
+                            "{}::{}",
+                            ctor.enum_name, ctor.variant
+                        )),
+                    });
+                    return unchecked(self, path);
+                };
+                (map, payload, Ty::Ctor(Arc::new((*ctor).clone())))
+            }
+            Some(PatternTarget::Struct(id, struct_ty, explicit)) => {
+                let Some(def) = self
+                    .adt_def(struct_ty.def)
+                    .and_then(AdtDef::as_struct)
+                    .cloned()
+                else {
+                    return unchecked(self, path);
+                };
+                // Like a variant pattern, a struct pattern takes the
+                // scrutinee's type arguments when it is this struct.
+                let args = match scrutinee_ty {
+                    Ty::Struct(ty) if ty.def == struct_ty.def && explicit.is_none() => {
+                        ty.args.clone()
+                    }
+                    _ => {
+                        let map = self.instantiate(&def.params, explicit, span, &struct_ty.name);
+                        def.params
+                            .iter()
+                            .map(|param| map[&param.id].clone())
+                            .collect()
+                    }
+                };
+                let map = param_map(&def.params, &args);
+                let ty = Ty::Struct(Arc::new(StructTy {
+                    def: struct_ty.def,
+                    name: struct_ty.name.clone(),
+                    args,
+                }));
+                path.metadata = (Some(id), ty.clone());
+                (map, def.fields, ty)
+            }
+        };
+        let mut seen = IndexSet::new();
         let fields = fields
             .iter()
-            .enumerate()
-            .map(|(index, field)| {
-                let ty = payload
-                    .get(index)
-                    .map_or(Ty::Unknown, |payload| subst(payload, &map));
-                self.type_pattern(field, &ty)
+            .map(|field| {
+                let name = field.name.name.as_str();
+                let ty = match declared.get(name) {
+                    Some(ty) if seen.insert(name.to_string()) => subst(ty, &map),
+                    Some(_) => {
+                        self.errors.push(StaticError {
+                            span: self.span(field.name.span),
+                            kind: StaticErrorKind::DuplicateStructField {
+                                field: name.to_string(),
+                            },
+                        });
+                        Ty::Unknown
+                    }
+                    None => self.no_field_on_ty(&field.name, pattern_ty.clone()),
+                };
+                FieldPattern {
+                    name: self.transform_ident(&field.name),
+                    pattern: self.type_pattern(&field.pattern, &ty),
+                    shorthand: field.shorthand,
+                    span: field.span,
+                }
             })
             .collect();
-        Pattern::Variant { path, fields, span }
+        if !rest {
+            let missing = declared
+                .keys()
+                .filter(|name| !seen.contains(name.as_str()))
+                .map(|name| format!("`{name}`"))
+                .collect_vec();
+            if !missing.is_empty() {
+                self.errors.push(StaticError {
+                    span: self.span(span),
+                    kind: StaticErrorKind::MissingPatternFields {
+                        ty: self.display(&pattern_ty),
+                        fields: missing.join(", "),
+                    },
+                });
+            }
+        }
+        Pattern::Struct {
+            path,
+            fields,
+            rest,
+            span,
+        }
+    }
+
+    /// Checks that a typed `let` pattern matches every value of `value`'s
+    /// type: a struct pattern whose fields are names or `_`.
+    fn check_let_pattern(
+        &mut self,
+        pattern: &Pattern<Substr, VarIdTyMetadata>,
+        value: &Expr<Substr, VarIdTyMetadata>,
+    ) {
+        match pattern {
+            Pattern::Struct { path, fields, .. } if matches!(path.metadata.1, Ty::Struct(_)) => {
+                self.assert_eq_ty(value.span(), &value.ty(), &path.metadata.1);
+                for field in fields {
+                    if !field.pattern.is_catch_all() {
+                        self.errors.push(StaticError {
+                            span: self.span(field.pattern.span()),
+                            kind: StaticErrorKind::RefutableLetPattern,
+                        });
+                    }
+                }
+            }
+            // A path that resolved to nothing was reported by resolution.
+            Pattern::Struct { path, .. } | Pattern::Variant { path, .. }
+                if matches!(path.metadata.1, Ty::Unknown) => {}
+            _ => self.errors.push(StaticError {
+                span: self.span(pattern.span()),
+                kind: StaticErrorKind::RefutableLetPattern,
+            }),
+        }
     }
 }
 
@@ -5714,7 +6824,7 @@ fn unsolved_vars(ty: &Ty, out: &mut Vec<InferId>) {
         Ty::Struct(s) => s.args.iter().for_each(|arg| unsolved_vars(arg, out)),
         Ty::Enum(e) => e.args.iter().for_each(|arg| unsolved_vars(arg, out)),
         Ty::Ctor(c) => c.args.iter().for_each(|arg| unsolved_vars(arg, out)),
-        Ty::Cell(cell) | Ty::Inst(cell) => {
+        Ty::Cell(cell) | Ty::Inst(cell) | Ty::SchematicInst(cell) => {
             cell.args.iter().for_each(|arg| unsolved_vars(arg, out));
         }
         _ => {}
@@ -5748,6 +6858,10 @@ fn erase_infer(ty: &Ty) -> Ty {
             ..(**cell).clone()
         })),
         Ty::Inst(cell) => Ty::Inst(Arc::new(CellTy {
+            args: cell.args.iter().map(erase_infer).collect(),
+            ..(**cell).clone()
+        })),
+        Ty::SchematicInst(cell) => Ty::SchematicInst(Arc::new(CellTy {
             args: cell.args.iter().map(erase_infer).collect(),
             ..(**cell).clone()
         })),
@@ -5814,7 +6928,7 @@ impl AstTransformer for Zonker<'_> {
         &mut self,
         input: &EnumVariant<Substr, VarIdTyMetadata>,
         _name: &Ident<Substr, VarIdTyMetadata>,
-        _payload: &[TySpec<Substr, VarIdTyMetadata>],
+        _payload: &VariantPayload<Substr, VarIdTyMetadata>,
     ) -> Option<VarId> {
         input.metadata
     }
@@ -5891,6 +7005,7 @@ impl AstTransformer for Zonker<'_> {
         let value = self.transform_expr(&input.value);
         let bound = self.ty(&input.metadata.1, input.name.span);
         LetBinding {
+            public: input.public,
             name,
             ty,
             value,
@@ -5979,14 +7094,25 @@ impl AstTransformer for Zonker<'_> {
         self.ty(&input.metadata, input.span)
     }
 
+    fn dispatch_seq_expr(
+        &mut self,
+        input: &crate::ast::SeqLiteral<Substr, VarIdTyMetadata>,
+        _items: &[Expr<Substr, VarIdTyMetadata>],
+    ) -> Ty {
+        self.ty(&input.metadata, input.span)
+    }
+
     fn dispatch_struct_lit_expr(
         &mut self,
         input: &StructLitExpr<Substr, VarIdTyMetadata>,
         _path: &IdentPath<Substr, VarIdTyMetadata>,
         _fields: &[StructLitField<Substr, VarIdTyMetadata>],
         _base: &Option<Expr<Substr, VarIdTyMetadata>>,
-    ) -> Ty {
-        self.ty(&input.metadata, input.span)
+    ) -> StructLitTy {
+        StructLitTy {
+            ty: self.ty(&input.metadata.ty, input.span),
+            variant: input.metadata.variant.clone(),
+        }
     }
 
     fn dispatch_struct_lit_path(
@@ -6108,10 +7234,16 @@ pub enum CellArg {
     Int(i64),
     Bool(bool),
     String(String),
-    /// An enum value, like [`Value::Enum`]: its variant and payload.
+    /// A unit or tuple variant, like [`Value::Enum`]: its variant and payload.
     Enum {
         variant: String,
         payload: Vec<CellArg>,
+    },
+    /// A variant with named fields, like [`Value::Enum`]: its variant and its
+    /// fields in declaration order.
+    StructVariant {
+        variant: String,
+        fields: Vec<(String, CellArg)>,
     },
     Seq(Vec<CellArg>),
     /// A struct value: the qualified name of its type and its fields in
@@ -6151,6 +7283,18 @@ pub enum CellArg {
     Tuple(Vec<CellArg>),
 }
 
+/// The declared payload of `variant` of the enum `ty`, and the substitution
+/// of `ty`'s arguments for its parameters.
+fn variant_payload<'a>(
+    variant: &str,
+    ty: &EnumTy,
+    defs: &'a TypeDefs,
+) -> Option<(&'a VariantTys, HashMap<VarId, Ty>)> {
+    let def = defs.get(&ty.def).and_then(AdtDef::as_enum)?;
+    let variant = def.variants.get(variant)?;
+    Some((&variant.payload, param_map(&def.params, &ty.args)))
+}
+
 impl CellArg {
     /// Whether this argument inhabits `ty`. Struct and enum types are looked up
     /// in `defs`; a type parameter, like `Any`, admits anything.
@@ -6166,23 +7310,32 @@ impl CellArg {
             | (Self::Path { .. }, Ty::Path)
             | (Self::Point(..), Ty::Point) => true,
             (Self::Enum { variant, payload }, Ty::Enum(ty)) => {
-                let Some(def) = defs.get(&ty.def).and_then(AdtDef::as_enum) else {
+                let Some((VariantTys::Tuple(declared), map)) = variant_payload(variant, ty, defs)
+                else {
                     return false;
                 };
-                let Some(variant) = def.variants.get(variant) else {
-                    return false;
-                };
-                let map = param_map(&def.params, &ty.args);
-                payload.len() == variant.payload.len()
+                payload.len() == declared.len()
                     && payload
                         .iter()
-                        .zip(&variant.payload)
+                        .zip(declared)
                         .all(|(value, ty)| value.matches_ty(&subst(ty, &map), defs))
+            }
+            (Self::StructVariant { variant, fields }, Ty::Enum(ty)) => {
+                let Some((VariantTys::Struct(declared), map)) = variant_payload(variant, ty, defs)
+                else {
+                    return false;
+                };
+                fields.len() == declared.len()
+                    && fields
+                        .iter()
+                        .zip(declared)
+                        .all(|((name, value), (field, ty))| {
+                            name == field && value.matches_ty(&subst(ty, &map), defs)
+                        })
             }
             (Self::Seq(values), Ty::Seq(inner)) => {
                 values.iter().all(|value| value.matches_ty(inner, defs))
             }
-            (Self::Seq(values), Ty::SeqNil) => values.is_empty(),
             (Self::Tuple(values), Ty::Tuple(tys)) => {
                 values.len() == tys.len()
                     && values
@@ -6214,7 +7367,7 @@ impl CellArg {
             Self::Int(_) => "Int",
             Self::Bool(_) => "Bool",
             Self::String(_) => "String",
-            Self::Enum { .. } => "enum value",
+            Self::Enum { .. } | Self::StructVariant { .. } => "enum value",
             Self::Seq(_) => "sequence",
             Self::Struct { .. } => "struct",
             Self::Rect { .. } => "Rect",
@@ -6243,6 +7396,8 @@ pub(crate) enum CellArgKey {
     String(String),
     /// The variant and its payload.
     Enum(String, Vec<CellArgKey>),
+    /// The variant and its named fields in declaration order.
+    StructVariant(String, Vec<(String, CellArgKey)>),
     Seq(Vec<CellArgKey>),
     Struct(String, Vec<(String, CellArgKey)>),
     /// Layer, drawability, and `x0, y0, x1, y1`.
@@ -6289,6 +7444,13 @@ impl From<&CellArg> for CellArgKey {
             CellArg::Enum { variant, payload } => {
                 Self::Enum(variant.clone(), payload.iter().map(Self::from).collect())
             }
+            CellArg::StructVariant { variant, fields } => Self::StructVariant(
+                variant.clone(),
+                fields
+                    .iter()
+                    .map(|(field, value)| (field.clone(), Self::from(value)))
+                    .collect(),
+            ),
             CellArg::Seq(v) => Self::Seq(v.iter().map(Self::from).collect()),
             CellArg::Struct { name, fields } => Self::Struct(
                 name.clone(),
@@ -6397,9 +7559,10 @@ mod module_prefix_tests {
             module_prefix(&current(), ["lib", "utils", "item"], 1),
             ["utils"]
         );
+        assert_eq!(module_prefix(&current(), ["std", "item"], 1), ["std"]);
         assert_eq!(
             module_prefix(&current(), ["std", "shapes", "item"], 1),
-            ["std"]
+            ["std", "shapes"]
         );
     }
 
@@ -7375,9 +8538,12 @@ struct CellState {
     name: String,
     solve_iters: u64,
     solver: Solver,
+    /// Every top-level `let` binding, public or not.
     fields: IndexMap<String, ValueId>,
     /// The values of every exec scope binding.
     bound_values: Vec<ValueId>,
+    /// The names in `fields` whose last binding is a `pub let`.
+    public_fields: IndexSet<String>,
     emit: Vec<Emit>,
     object_emit: Vec<ObjectEmit>,
     /// Objects in creation order, which is also ID order.
@@ -7418,6 +8584,7 @@ struct CellState {
     /// [`mark_emitted_proxies_as_layout`] uses this set to tell the
     /// two apart once the emission list has been resolved to object IDs.
     proxy_objects: FxIndexSet<ObjectId>,
+    schematic: SchematicState,
 }
 
 impl CellState {
@@ -7456,6 +8623,8 @@ struct ExecPass<'a> {
     /// Struct and enum definitions, read for cell-argument checks and struct
     /// literal field order.
     defs: &'a TypeDefs,
+    /// The builtin implementing each native item, by the item's id.
+    natives: FxHashMap<VarId, Builtin>,
     tech: Technology,
     gds_imports: HashMap<VarId, (String, PathBuf)>,
     cell_states: FxIndexMap<CellId, CellState>,
@@ -7482,7 +8651,7 @@ struct ExecPass<'a> {
     listed: ValueBits,
     frames: Frames,
     nil_value: ValueId,
-    seq_nil_value: ValueId,
+    empty_seq_value: ValueId,
     true_value: ValueId,
     false_value: ValueId,
     global_frame: FrameId,
@@ -7583,6 +8752,28 @@ fn restore_rects(value: &Value, objects: &mut Vec<(ObjectId, Object)>) {
                 restore_rects(value, objects);
             }
         }
+        Value::Tuple(items) => {
+            for value in items.iter() {
+                restore_rects(value, objects);
+            }
+        }
+        Value::Struct(value) => {
+            for value in value.fields.values() {
+                restore_rects(value, objects);
+            }
+        }
+        Value::Enum(value) => match &value.payload {
+            VariantValues::Tuple(items) => {
+                for value in items {
+                    restore_rects(value, objects);
+                }
+            }
+            VariantValues::Struct(fields) => {
+                for value in fields.values() {
+                    restore_rects(value, objects);
+                }
+            }
+        },
         _ => {}
     }
 }
@@ -7668,6 +8859,11 @@ impl<'a> ExecPass<'a> {
             fn_decls: Vec::new(),
             cell_decls: Vec::new(),
             defs: &workspace.defs,
+            natives: workspace
+                .natives
+                .iter()
+                .map(|(id, native)| (*id, Builtin::from_native(*native)))
+                .collect(),
             tech,
             gds_imports,
             cell_states: FxIndexMap::default(),
@@ -7675,7 +8871,7 @@ impl<'a> ExecPass<'a> {
                 (1, DeferValue::Ready(Value::Nil)),
                 (2, DeferValue::Ready(Value::Bool(true))),
                 (3, DeferValue::Ready(Value::Bool(false))),
-                (4, DeferValue::Ready(Value::SeqNil)),
+                (4, DeferValue::Ready(Value::Seq(Arc::new(Seq::new())))),
             ]),
             spare_evals: Vec::new(),
             collect_at: MIN_COLLECT_VALUES,
@@ -7700,7 +8896,7 @@ impl<'a> ExecPass<'a> {
             nil_value: 1,
             true_value: 2,
             false_value: 3,
-            seq_nil_value: 4,
+            empty_seq_value: 4,
             global_frame: 0,
             next_value_id: 6,
             next_id: 6,
@@ -7845,9 +9041,6 @@ impl<'a> ExecPass<'a> {
             });
         }
         let path = match input.cell[0] {
-            "std" => {
-                vec!["std".to_string()]
-            }
             "lib" => input
                 .cell
                 .iter()
@@ -8325,6 +9518,7 @@ impl<'a> ExecPass<'a> {
                         solver: Solver::with_grid(self.tech.grid_step()),
                         fields: Default::default(),
                         bound_values: Vec::new(),
+                        public_fields: Default::default(),
                         emit: Vec::new(),
                         object_emit: Vec::new(),
                         deferred: Worklist::new(values_start),
@@ -8343,6 +9537,7 @@ impl<'a> ExecPass<'a> {
                         var_span_map: FxIndexMap::default(),
                         var_dependents: FxIndexMap::default(),
                         proxy_objects: FxIndexSet::default(),
+                        schematic: SchematicState::default(),
                     }
                 )
                 .is_none()
@@ -8372,38 +9567,7 @@ impl<'a> ExecPass<'a> {
                 scope: root_scope_id,
                 seq_num,
             };
-            match stmt {
-                Statement::LetBinding(binding) => {
-                    let value = self.visit_expr(loc, &binding.value);
-                    self.frames
-                        .get_mut(&fid)
-                        .unwrap()
-                        .bindings
-                        .insert(binding.metadata.0, value);
-                    self.cell_states
-                        .get_mut(&cell_id)
-                        .unwrap()
-                        .fields
-                        .insert(binding.name.name.to_string(), value);
-                    if binding.metadata.1.may_hold_objects() {
-                        let state = self.cell_state_mut(loc.cell);
-                        state
-                            .scopes
-                            .get_mut(&loc.scope)
-                            .unwrap()
-                            .bindings
-                            .push((loc.seq_num, (binding.name.name.clone(), value)));
-                        state.bound_values.push(value);
-                    }
-                    seq_num = seq_num.next();
-                }
-                Statement::Expr { value, .. } => {
-                    self.visit_expr(loc, value);
-                }
-                Statement::ForLoop(f) => {
-                    self.eval_for_loop(loc, f, false);
-                }
-            }
+            seq_num = self.eval_stmt(loc, stmt, true);
             self.operands.truncate(operands);
             if self.aborted {
                 return Err(());
@@ -8563,6 +9727,23 @@ impl<'a> ExecPass<'a> {
                 })
                 .map(|inst| (inst.span.clone(), ExecErrorKind::InvalidType)),
         );
+        // A detached value has no object to emit either. Emitting one is a use,
+        // and `emit` skips it as it does a poisoned value.
+        let detached = self
+            .cell_state(cell_id)
+            .emit
+            .iter()
+            .filter_map(|emit| match emit.target {
+                EmitTarget::Value(value) => match self.values[&value].get_ready() {
+                    Some(Value::Detached(detached)) => Some((emit.span.clone(), detached.clone())),
+                    _ => None,
+                },
+                EmitTarget::Object(_) => None,
+            })
+            .collect_vec();
+        for (span, detached) in detached {
+            self.detached_value(cell_id, span, detached);
+        }
         // ...and `!` on an `Any` value is likewise unproven, as is `!` on a
         // sequence, which has no single element to emit.
         invalid.extend(
@@ -8577,7 +9758,10 @@ impl<'a> ExecPass<'a> {
                     EmitTarget::Value(value) => Some((emit, value)),
                     EmitTarget::Object(_) => None,
                 })
-                .filter(|(_, value)| !self.is_poisoned(*value))
+                .filter(|(_, value)| {
+                    !self.is_poisoned(*value)
+                        && !matches!(self.values[value].get_ready(), Some(Value::Detached(_)))
+                })
                 .filter(|(_, value)| {
                     !self.values[value]
                         .get_ready()
@@ -8695,7 +9879,7 @@ impl<'a> ExecPass<'a> {
             return;
         };
         let span_paths = cell.span_paths();
-        let children = cell
+        let mut children = cell
             .objects
             .values()
             .filter_map(|object| match object {
@@ -8703,6 +9887,16 @@ impl<'a> ExecPass<'a> {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        children.extend(
+            cell.schematic
+                .instances
+                .iter()
+                .map(|instance| instance.cell),
+        );
+        // A field can name a cell that nothing here instantiates.
+        for field in cell.fields.values() {
+            field.for_each_cell(&mut |child| children.push(child));
+        }
         // Retaining a parent whose children are not retained would guarantee a
         // miss on every future lookup, since `reinstate` requires the whole
         // closure. GDS-imported children live in their own cache.
@@ -8987,12 +10181,17 @@ impl<'a> ExecPass<'a> {
                         span: span.clone(),
                     }],
                     root,
-                    fields,
+                    fields: fields
+                        .iter()
+                        .map(|(name, ids)| (name.clone(), FieldValue::from_objects(ids)))
+                        .collect(),
+                    private_fields: IndexSet::new(),
                     sse_basis: SseBasis::Nullspace(Vec::new()),
                     objects,
                     fallback_constraints_used: Vec::new(),
                     unsolved_vars: IndexSet::new(),
                     inconsistent_constraints: IndexSet::new(),
+                    schematic: Schematic::default(),
                 }),
             );
         }
@@ -9243,6 +10442,7 @@ impl<'a> ExecPass<'a> {
             scope_metadata: state.scope_metadata.iter().cloned().collect(),
             root: state.root_scope,
             fields: IndexMap::new(),
+            private_fields: IndexSet::new(),
             sse_basis: state.sse_basis.clone(),
             fallback_constraints_used: state.fallback_constraints_used.clone(),
             unsolved_vars: state.unsolved_vars.clone().unwrap_or_default(),
@@ -9256,6 +10456,7 @@ impl<'a> ExecPass<'a> {
                 if debug_info { objects.len() } else { 0 },
                 Default::default(),
             ),
+            schematic: Schematic::default(),
         };
         if debug_info {
             for (id, scope) in state.scopes.iter() {
@@ -9277,12 +10478,13 @@ impl<'a> ExecPass<'a> {
                 EmitTarget::Object(id) => id,
                 EmitTarget::Value(value) => {
                     // A poisoned value reported its own diagnostic and never
-                    // became an object. Skipping it is what lets the rest of
+                    // became an object, and a detached one was reported when
+                    // it was emitted. Skipping either is what lets the rest of
                     // the cell reach the GUI instead of the whole compile
                     // returning no layout at all.
                     if matches!(
                         self.values[&value].as_ref().into_ready(),
-                        Some(Value::Poison)
+                        Some(Value::Poison | Value::Detached(_))
                     ) {
                         continue;
                     }
@@ -9332,37 +10534,52 @@ impl<'a> ExecPass<'a> {
             for (seq_num, (name, value)) in scope.bindings.iter() {
                 if let Some(obj_id) = emit_value(*value) {
                     let scope = ccell.scopes.get_mut(id).expect("scope not found");
-                    scope
-                        .bindings
-                        .push((*seq_num, (name.to_string(), obj_id.clone())));
-                    if *id == ccell.root {
-                        ccell.fields.insert(name.to_string(), obj_id);
-                    }
-                }
-            }
-        }
-        if !debug_info {
-            // Construction rects with nothing to report were not stored; the
-            // ones a field names are put back in their place.
-            debug_assert!(objects.is_sorted_by_key(|(id, _)| *id));
-            for (_, (_, value)) in state.scopes[&state.root_scope].bindings.iter() {
-                if let Some(value) = self.values[value].as_ref().into_ready()
-                    && value.obj_ids().is_some()
-                {
-                    restore_rects(value, &mut objects);
+                    scope.bindings.push((*seq_num, (name.to_string(), obj_id)));
                 }
             }
         }
 
+        let fields = state
+            .fields
+            .iter()
+            .map(|(name, vid)| {
+                let value = self.values[vid]
+                    .as_ref()
+                    .into_ready()
+                    .expect("cell fields must be ready");
+                (name.as_str(), value, state.public_fields.contains(name))
+            })
+            .collect_vec();
+        let (schematic, nets) = state.schematic.emit(cell, &fields, &self.compiled_cells);
+        ccell.schematic = schematic;
+        for (name, value, public) in &fields {
+            if !public {
+                ccell.private_fields.insert((*name).to_owned());
+                continue;
+            }
+            ccell.fields.insert(
+                (*name).to_owned(),
+                FieldValue::solve(value, &state.solver, &nets),
+            );
+        }
+
         // Without debug information, an object only the editor would show is
         // dropped: one that is not drawn, not an instance, not named by a
-        // field, and that the output checks would not report.
+        // public field, and that the output checks would not report.
         let mut named = FxHashSet::default();
         let mut layers = IndexSet::new();
         if !debug_info {
+            // Construction rects with nothing to report were not stored; the
+            // ones a public field names are put back in their place.
+            debug_assert!(objects.is_sorted_by_key(|(id, _)| *id));
+            for (_, value, public) in &fields {
+                if *public {
+                    restore_rects(value, &mut objects);
+                }
+            }
             for field in ccell.fields.values() {
-                field.for_each(&mut |id| {
-                    named.insert(*id);
+                field.for_each_object(&mut |id| {
+                    named.insert(id);
                 });
             }
             layers.extend(self.tech.layers.iter().map(|layer| layer.name.clone()));
@@ -9613,23 +10830,29 @@ impl<'a> ExecPass<'a> {
                         );
                     }
                     // A unit variant is a value; a tuple variant is a
-                    // constructor awaiting its payload.
+                    // constructor awaiting its payload. A variant with named
+                    // fields is built by a literal, so its name has no value
+                    // of its own and the type checker rejects every read.
                     Decl::Enum(e) => {
                         for variant in &e.variants {
                             let Some(id) = variant.metadata else {
                                 continue;
                             };
                             let name = variant.name.name.to_string();
-                            let value = if variant.payload.is_empty() {
-                                Value::Enum(Arc::new(EnumValue {
-                                    variant: name,
-                                    payload: Vec::new(),
-                                }))
-                            } else {
-                                Value::Ctor(Arc::new(CtorValue {
-                                    variant: name,
-                                    arity: variant.payload.len(),
-                                }))
+                            let value = match &variant.payload {
+                                VariantPayload::Struct(_) => Value::Poison,
+                                VariantPayload::Tuple(payload) if payload.is_empty() => {
+                                    Value::Enum(Arc::new(EnumValue {
+                                        variant: name,
+                                        payload: VariantValues::Tuple(Vec::new()),
+                                    }))
+                                }
+                                VariantPayload::Tuple(payload) => {
+                                    Value::Ctor(Arc::new(CtorValue {
+                                        variant: name,
+                                        arity: payload.len(),
+                                    }))
+                                }
                             };
                             let vid = self.new_ready_value(value);
                             assert!(
@@ -9666,32 +10889,106 @@ impl<'a> ExecPass<'a> {
         })
     }
 
-    fn eval_stmt(&mut self, loc: DynLoc, stmt: &'a Statement<Substr, VarIdTyMetadata>) {
+    /// Evaluates `stmt` at `loc` and returns the sequence number that follows
+    /// the names it binds. A top-level statement of a cell also publishes
+    /// those names as fields of the cell.
+    fn eval_stmt(
+        &mut self,
+        loc: DynLoc,
+        stmt: &'a Statement<Substr, VarIdTyMetadata>,
+        top_level: bool,
+    ) -> SeqNum {
         match stmt {
             Statement::LetBinding(binding) => {
                 let value = self.visit_expr(loc, &binding.value);
-                self.frames
-                    .get_mut(&loc.frame)
-                    .unwrap()
-                    .bindings
-                    .insert(binding.metadata.0, value);
-                if self.debug_info && binding.metadata.1.may_hold_objects() {
-                    let state = self.cell_state_mut(loc.cell);
-                    state
-                        .scopes
-                        .get_mut(&loc.scope)
-                        .unwrap()
-                        .bindings
-                        .push((loc.seq_num, (binding.name.name.clone(), value)));
-                    state.bound_values.push(value);
+                let field = top_level.then_some(binding.public.is_some());
+                let (id, ty) = &binding.metadata;
+                self.bind_let(loc, *id, ty, &binding.name.name, value, field);
+                loc.seq_num.next()
+            }
+            Statement::LetPattern(binding) => {
+                let value = self.visit_expr(loc, &binding.value);
+                let mut seq_num = loc.seq_num;
+                let Pattern::Struct { path, fields, .. } = &binding.pattern else {
+                    return seq_num;
+                };
+                let struct_name = match &path.metadata.1 {
+                    Ty::Struct(ty) => Some(ty.name.clone()),
+                    _ => None,
+                };
+                let public = top_level.then_some(binding.public.is_some());
+                for field in fields {
+                    let Pattern::Binding { name, metadata } = &field.pattern else {
+                        continue;
+                    };
+                    let loc = DynLoc { seq_num, ..loc };
+                    let element = self.new_deferred_value(loc, |_| {
+                        PartialEvalState::Destructure(Box::new(PartialDestructure {
+                            base: value,
+                            struct_name: struct_name.clone(),
+                            field: field.name.name.to_string(),
+                            span: field.span,
+                        }))
+                    });
+                    self.bind_let(loc, metadata.0, &metadata.1, &name.name, element, public);
+                    seq_num = seq_num.next();
                 }
+                seq_num
             }
             Statement::Expr { value, .. } => {
                 self.visit_expr(loc, value);
+                loc.seq_num
             }
             Statement::ForLoop(f) => {
                 self.eval_for_loop(loc, f, false);
+                loc.seq_num
             }
+        }
+    }
+
+    /// Binds the `let` name `name`, with id `id` and type `ty`, to `value` at
+    /// `loc`.
+    ///
+    /// `field` is `Some(public)` for a top-level `let` of a cell, which also
+    /// becomes a field of the cell.
+    fn bind_let(
+        &mut self,
+        loc: DynLoc,
+        id: VarId,
+        ty: &Ty,
+        name: &Substr,
+        value: ValueId,
+        field: Option<bool>,
+    ) {
+        self.frames
+            .get_mut(&loc.frame)
+            .unwrap()
+            .bindings
+            .insert(id, value);
+        let debug_info = self.debug_info;
+        let state = self.cell_state_mut(loc.cell);
+        if ty.may_be_schematic_node() {
+            state.schematic.hint(value, name);
+        }
+        if let Some(public) = field {
+            state.fields.insert(name.to_string(), value);
+            // A later binding of the same name decides its visibility.
+            if public {
+                state.public_fields.insert(name.to_string());
+            } else {
+                state.public_fields.shift_remove(name.as_str());
+            }
+        }
+        // Only object-valued bindings are shown, and without debug
+        // information only the cell's fields are kept.
+        if ty.may_hold_objects() && (debug_info || field.is_some()) {
+            state
+                .scopes
+                .get_mut(&loc.scope)
+                .unwrap()
+                .bindings
+                .push((loc.seq_num, (name.clone(), value)));
+            state.bound_values.push(value);
         }
     }
 
@@ -9800,10 +11097,7 @@ impl<'a> ExecPass<'a> {
                 scope,
                 seq_num,
             };
-            self.eval_stmt(loc, stmt);
-            if matches!(stmt, Statement::LetBinding(_)) {
-                seq_num = seq_num.next();
-            }
+            seq_num = self.eval_stmt(loc, stmt, false);
         }
 
         let loc = DynLoc {
@@ -10043,7 +11337,12 @@ impl<'a> ExecPass<'a> {
     ) -> ValueId {
         match expr {
             Expr::Nil(_) => self.nil_value,
-            Expr::SeqNil(_) => self.seq_nil_value,
+            Expr::Seq(seq) if seq.items.is_empty() => self.empty_seq_value,
+            Expr::Seq(seq) => self.new_deferred_value(loc, |this| {
+                PartialEvalState::Seq(PartialSeqExpr {
+                    items: seq.items.iter().map(|i| this.visit_expr(loc, i)).collect(),
+                })
+            }),
             Expr::FloatLiteral(f) => self.new_ready_value(Value::Linear(LinearExpr::from(f.value))),
             Expr::IntLiteral(i) => self.new_ready_value(Value::Int(i.value)),
             Expr::BoolLiteral(b) => {
@@ -10076,10 +11375,16 @@ impl<'a> ExecPass<'a> {
             }
             Expr::Call(c) => {
                 // Builtins are the calls the type checker resolved to no
-                // declaration.
-                if c.metadata.0.is_none() {
-                    let builtin = Builtin::from_name(&c.func.path.last().unwrap().name)
-                        .expect("a call without a declaration names a builtin");
+                // declaration, and natives the declarations the compiler
+                // implements.
+                let builtin = match c.metadata.0 {
+                    None => Some(
+                        Builtin::from_name(&c.func.path.last().unwrap().name)
+                            .expect("a call without a declaration names a builtin"),
+                    ),
+                    Some(id) => self.natives.get(&id).copied(),
+                };
+                if let Some(builtin) = builtin {
                     self.new_deferred_value(loc, |this| {
                         PartialEvalState::Call(PartialCallExpr {
                             expr: c,
@@ -10356,11 +11661,16 @@ impl<'a> ExecPass<'a> {
             }),
             Expr::StructLit(lit) => {
                 // A static error aborts compilation before anything is
-                // executed, so the literal is known to name a struct.
-                let Ty::Struct(ty) = &lit.metadata else {
-                    unreachable!("struct literal was not resolved to a struct type")
+                // executed, so the literal is known to name a struct or a
+                // variant with named fields.
+                let target = match (&lit.metadata.ty, &lit.metadata.variant) {
+                    (Ty::Struct(ty), _) => StructLitTarget::Struct(ty.clone()),
+                    (Ty::Enum(ty), Some(variant)) => StructLitTarget::Variant {
+                        ty: ty.clone(),
+                        variant: variant.clone(),
+                    },
+                    _ => unreachable!("struct literal was not resolved to a struct or variant"),
                 };
-                let ty = ty.clone();
                 self.new_deferred_value(loc, |this| {
                     let fields = lit
                         .fields
@@ -10370,7 +11680,7 @@ impl<'a> ExecPass<'a> {
                     let base = lit.base.as_ref().map(|base| this.visit_expr(loc, base));
                     PartialEvalState::StructLit(PartialStructLit {
                         expr: lit,
-                        ty,
+                        target,
                         fields,
                         base,
                     })
@@ -10454,10 +11764,21 @@ impl<'a> ExecPass<'a> {
             CellArg::String(s) => Value::String(s.clone()),
             CellArg::Enum { variant, payload } => Value::Enum(Arc::new(EnumValue {
                 variant: variant.clone(),
-                payload: payload
-                    .iter()
-                    .map(|arg| self.bind_cell_arg(cell_id, span, arg))
-                    .collect(),
+                payload: VariantValues::Tuple(
+                    payload
+                        .iter()
+                        .map(|arg| self.bind_cell_arg(cell_id, span, arg))
+                        .collect(),
+                ),
+            })),
+            CellArg::StructVariant { variant, fields } => Value::Enum(Arc::new(EnumValue {
+                variant: variant.clone(),
+                payload: VariantValues::Struct(
+                    fields
+                        .iter()
+                        .map(|(field, arg)| (field.clone(), self.bind_cell_arg(cell_id, span, arg)))
+                        .collect(),
+                ),
             })),
             CellArg::Seq(v) => Value::Seq(Arc::new(
                 v.iter()
@@ -10603,12 +11924,14 @@ impl<'a> ExecPass<'a> {
     /// to a cell and an error has been recorded.
     ///
     /// A shape is passed by value: its coordinates are resolved in this cell's
-    /// solver, and the callee receives the constants. See [`CellArg`].
+    /// solver, and the callee receives the constants. See [`CellArg`]. `span`
+    /// is the call passing the value.
     pub fn cell_arg_from_value(
         &mut self,
         cell_id: CellId,
         dependent_vid: ValueId,
         val: &Value,
+        span: &Span,
     ) -> Result<Option<CellArg>, ()> {
         Ok(match val {
             Value::Linear(v) => {
@@ -10624,24 +11947,38 @@ impl<'a> ExecPass<'a> {
             Value::Int(i) => Some(CellArg::Int(*i)),
             Value::Bool(b) => Some(CellArg::Bool(*b)),
             Value::String(s) => Some(CellArg::String(s.clone())),
-            Value::Enum(value) => {
-                let mut payload = Vec::with_capacity(value.payload.len());
-                for v in &value.payload {
-                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
-                        Some(arg) => payload.push(arg),
-                        None => return Ok(None),
+            Value::Enum(value) => match &value.payload {
+                VariantValues::Tuple(values) => {
+                    let mut payload = Vec::with_capacity(values.len());
+                    for v in values {
+                        match self.cell_arg_from_value(cell_id, dependent_vid, v, span)? {
+                            Some(arg) => payload.push(arg),
+                            None => return Ok(None),
+                        }
                     }
+                    Some(CellArg::Enum {
+                        variant: value.variant.clone(),
+                        payload,
+                    })
                 }
-                Some(CellArg::Enum {
-                    variant: value.variant.clone(),
-                    payload,
-                })
-            }
-            Value::SeqNil => Some(CellArg::Seq(Vec::new())),
+                VariantValues::Struct(values) => {
+                    let mut fields = Vec::with_capacity(values.len());
+                    for (name, v) in values {
+                        match self.cell_arg_from_value(cell_id, dependent_vid, v, span)? {
+                            Some(arg) => fields.push((name.clone(), arg)),
+                            None => return Ok(None),
+                        }
+                    }
+                    Some(CellArg::StructVariant {
+                        variant: value.variant.clone(),
+                        fields,
+                    })
+                }
+            },
             Value::Seq(s) => {
                 let mut args = Vec::with_capacity(s.len());
                 for v in s.iter() {
-                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v, span)? {
                         Some(arg) => args.push(arg),
                         None => return Ok(None),
                     }
@@ -10651,7 +11988,7 @@ impl<'a> ExecPass<'a> {
             Value::Struct(value) => {
                 let mut fields = Vec::with_capacity(value.fields.len());
                 for (name, v) in value.fields.iter() {
-                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v, span)? {
                         Some(arg) => fields.push((name.clone(), arg)),
                         None => return Ok(None),
                     }
@@ -10720,7 +12057,7 @@ impl<'a> ExecPass<'a> {
             Value::Tuple(items) => {
                 let mut args = Vec::with_capacity(items.len());
                 for v in items.iter() {
-                    match self.cell_arg_from_value(cell_id, dependent_vid, v)? {
+                    match self.cell_arg_from_value(cell_id, dependent_vid, v, span)? {
                         Some(arg) => args.push(arg),
                         None => return Ok(None),
                     }
@@ -10731,6 +12068,22 @@ impl<'a> ExecPass<'a> {
             // `Err` into poison of its own rather than a second diagnostic
             // naming a type the value never had.
             Value::Poison => return Err(()),
+            // A cell parameter cannot hold these, which the type checker
+            // rejects unless the value arrived as `Any`.
+            Value::Signal(_) | Value::SchematicInst(_) => {
+                self.errors.push(ExecError {
+                    span: Some(span.clone()),
+                    cell: cell_id,
+                    kind: ExecErrorKind::SignalCellArgument {
+                        kind: val.kind_name().to_owned(),
+                    },
+                });
+                return Err(());
+            }
+            Value::Detached(detached) => {
+                self.detached_value(cell_id, span.clone(), detached.clone());
+                return Err(());
+            }
             v => {
                 self.errors.push(ExecError {
                     span: None,
@@ -10891,6 +12244,226 @@ impl<'a> ExecPass<'a> {
         Ok(true)
     }
 
+    /// Reports a use of the detached value `detached` at `span`.
+    fn detached_value(&mut self, cell_id: CellId, span: Span, detached: Arc<Detached>) {
+        self.errors.push(ExecError {
+            span: Some(span),
+            cell: cell_id,
+            kind: ExecErrorKind::DetachedValue(detached),
+        });
+    }
+
+    /// Where `eval` uses its input `input`: the argument of a native call,
+    /// and otherwise the expression being evaluated.
+    fn use_span(&self, eval: &PartialEval<'a>, input: ValueId) -> Span {
+        let span = match &eval.state {
+            PartialEvalState::If(e) => e.expr.cond.span(),
+            PartialEvalState::Match(e) => e.expr.scrutinee.span(),
+            PartialEvalState::Arith(e) => e.expr.span,
+            PartialEvalState::Comparison(e) => e.expr.span,
+            PartialEvalState::BoolOp(e) => match e.state {
+                BoolOpState::Left(_) => e.expr.left.span(),
+                BoolOpState::Right(_) => e.expr.right.span(),
+            },
+            PartialEvalState::UnaryOp(e) => e.expr.span,
+            PartialEvalState::Call(call) if call.builtin.is_some_and(Builtin::is_native) => {
+                let posargs = call
+                    .state
+                    .posargs
+                    .iter()
+                    .zip(&call.expr.args.posargs)
+                    .map(|(arg, expr)| (*arg, expr.span()));
+                let kwargs = call
+                    .state
+                    .kwargs
+                    .iter()
+                    .zip(&call.expr.args.kwargs)
+                    .map(|(arg, kwarg)| (*arg, kwarg.value.span()));
+                posargs
+                    .chain(kwargs)
+                    .find(|(arg, _)| *arg == input)
+                    .map_or(call.expr.span, |(_, span)| span)
+            }
+            PartialEvalState::Call(e) => e.expr.span,
+            PartialEvalState::FieldAccess(e) => e.expr.span,
+            PartialEvalState::IndexFieldAccess(e) => e.expr.span,
+            PartialEvalState::Index(e) => e.expr.span,
+            PartialEvalState::Constraint(c) => return c.span.clone(),
+            PartialEvalState::Cast(e) => e.expr.span,
+            PartialEvalState::ForLoop(f) => f.for_loop.seq.span(),
+            PartialEvalState::ForItem(item) => item.for_loop.span,
+            PartialEvalState::Destructure(d) => d.span,
+            PartialEvalState::StructLit(lit) => lit.expr.span,
+            // These only pass their inputs through.
+            PartialEvalState::Tuple(_) | PartialEvalState::Seq(_) | PartialEvalState::Ctor(_) => {
+                let state = self.cell_state(eval.loc.cell);
+                let metadata = state.scopes[&eval.loc.scope].metadata;
+                return state.scope_metadata[metadata.0 as usize].span.clone();
+            }
+        };
+        self.span(&eval.loc, span)
+    }
+
+    /// The node of `value` if it is a signal of `cell_id`.
+    fn local_node(&self, cell_id: CellId, value: &Value) -> Option<NodeId> {
+        match value {
+            Value::Signal(signal)
+                if signal.cell == cell_id
+                    && self.cell_state(cell_id).schematic.contains(signal.node) =>
+            {
+                Some(signal.node)
+            }
+            _ => None,
+        }
+    }
+
+    /// Validates a ready `device` call at `loc`, whose value is `vid`, into a
+    /// record. `Ok(None)` means a parameter waits on the solver; `Err` means a
+    /// diagnostic has been recorded.
+    fn device_record(
+        &mut self,
+        vid: ValueId,
+        loc: &DynLoc,
+        call: &PartialCallExpr<'a>,
+    ) -> Result<Option<DeviceRecord>, ()> {
+        let cell_id = loc.cell;
+        let arg = |this: &Self, index: usize| {
+            this.values[&call.state.posargs[index]]
+                .get_ready()
+                .cloned()
+                .expect("device arguments are ready")
+        };
+        let arg_span =
+            |this: &Self, index: usize| this.span(loc, call.expr.args.posargs[index].span());
+
+        let kind = match arg(self, 0) {
+            Value::Enum(value) if value.payload.is_empty() => {
+                DeviceKind::from_variant(&value.variant)
+            }
+            _ => None,
+        };
+        let Some(kind) = kind else {
+            self.invalid_type(cell_id, &arg_span(self, 0));
+            return Err(());
+        };
+
+        let Value::Seq(items) = arg(self, 1) else {
+            self.invalid_type(cell_id, &arg_span(self, 1));
+            return Err(());
+        };
+        let mut terminals = Vec::with_capacity(items.len());
+        for item in items.iter() {
+            match item {
+                Value::Detached(detached) => {
+                    self.detached_value(cell_id, arg_span(self, 1), detached.clone());
+                    return Err(());
+                }
+                item => match self.local_node(cell_id, item) {
+                    Some(node) => terminals.push(node),
+                    None => {
+                        self.invalid_type(cell_id, &arg_span(self, 1));
+                        return Err(());
+                    }
+                },
+            }
+        }
+
+        let Value::String(model) = arg(self, 2) else {
+            self.invalid_type(cell_id, &arg_span(self, 2));
+            return Err(());
+        };
+        if model.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            self.errors.push(ExecError {
+                span: Some(arg_span(self, 2)),
+                cell: cell_id,
+                kind: ExecErrorKind::InvalidDeviceModel { model },
+            });
+            return Err(());
+        }
+        let model = (!model.is_empty()).then_some(model);
+
+        let mut value = None;
+        let mut params = Vec::new();
+        let mut pending = false;
+        for (kwarg, arg) in call.expr.args.kwargs.iter().zip(&call.state.kwargs) {
+            let name = kwarg.name.name.to_string();
+            let invalid = |this: &mut Self, reason: String| {
+                this.errors.push(ExecError {
+                    span: Some(this.span(loc, kwarg.value.span())),
+                    cell: cell_id,
+                    kind: ExecErrorKind::InvalidDeviceParam {
+                        name: name.clone(),
+                        reason,
+                    },
+                });
+                Err(())
+            };
+            let param = match self.values[arg]
+                .get_ready()
+                .cloned()
+                .expect("checked ready")
+            {
+                Value::Int(i) => ParamValue::Int(i),
+                Value::String(s) if s.contains(['\n', '\r']) => {
+                    return invalid(
+                        self,
+                        "a string parameter must not contain a line break".into(),
+                    );
+                }
+                Value::String(s) => ParamValue::String(s),
+                Value::Linear(expr) => match self.cell_state(cell_id).solver.eval_expr_exact(&expr)
+                {
+                    Some(f) if f.is_finite() => ParamValue::Float(f),
+                    Some(_) => return invalid(self, "the value is not a finite number".into()),
+                    None => {
+                        for (_, var) in expr.coeffs {
+                            self.add_var_dependent(cell_id, var, vid);
+                        }
+                        pending = true;
+                        continue;
+                    }
+                },
+                other => {
+                    let found = other.kind_name();
+                    return invalid(
+                        self,
+                        format!("expected a Float, Int, or String, found {found}"),
+                    );
+                }
+            };
+            if name.eq_ignore_ascii_case("value") {
+                value = Some(param);
+            } else {
+                params.push((name, param));
+            }
+        }
+        if pending {
+            return Ok(None);
+        }
+
+        let span = self.span(loc, call.expr.span);
+        if let Err(reason) = kind.check(terminals.len(), model.is_some(), value.is_some()) {
+            self.errors.push(ExecError {
+                span: Some(span),
+                cell: cell_id,
+                kind: ExecErrorKind::InvalidDevice {
+                    kind: kind.name().to_owned(),
+                    reason,
+                },
+            });
+            return Err(());
+        }
+        Ok(Some(DeviceRecord {
+            order: vid,
+            kind,
+            terminals,
+            model,
+            value,
+            params,
+            span,
+        }))
+    }
+
     fn eval_partial(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
         // Evaluate the owned state in place. Removing it temporarily releases
         // the table borrow while builtins mutate the evaluator.
@@ -10962,11 +12535,23 @@ impl<'a> ExecPass<'a> {
         // Poison propagates here rather than at each read: a value built from
         // one whose diagnostic was already reported would otherwise raise a
         // second, derived error at every level of the expression tree it
-        // appears in.
-        if vref
-            .state
-            .any_input(|input| matches!(self.values.get(&input), Some(Defer::Ready(Value::Poison))))
-        {
+        // appears in. Holding a detached value is fine; inspecting one is not.
+        let passes_through = vref.state.passes_through();
+        let mut detached = None;
+        let poisoned = vref.state.any_input(|input| match self.values.get(&input) {
+            Some(Defer::Ready(Value::Poison)) => true,
+            Some(Defer::Ready(Value::Detached(value))) if !passes_through && detached.is_none() => {
+                detached = Some((input, value.clone()));
+                false
+            }
+            _ => false,
+        });
+        if poisoned {
+            return self.poison(vid);
+        }
+        if let Some((input, detached)) = detached {
+            let span = self.use_span(vref, input);
+            self.detached_value(vref.loc.cell, span, detached);
             return self.poison(vid);
         }
         match vref.state {
@@ -11706,26 +13291,6 @@ impl<'a> ExecPass<'a> {
                         false
                     }
                 }
-                Some(Builtin::List) => {
-                    let (ready, unready): (Vec<_>, Vec<_>) =
-                        c.state.posargs.iter().partition_map(|v| {
-                            if let Defer::Ready(v) = &self.values[v] {
-                                Either::Left(v)
-                            } else {
-                                Either::Right(*v)
-                            }
-                        });
-                    if unready.is_empty() {
-                        let value = ops::list(ready);
-                        self.values.insert(vid, Defer::Ready(value));
-                        true
-                    } else {
-                        for arg_vid in unready {
-                            self.add_value_dependent(arg_vid, vid);
-                        }
-                        false
-                    }
-                }
                 Some(Builtin::RangeFull) => {
                     if let (Defer::Ready(start), Defer::Ready(stop), Defer::Ready(step)) = (
                         &self.values[&c.state.posargs[0]],
@@ -12034,6 +13599,114 @@ impl<'a> ExecPass<'a> {
                         false
                     }
                 }
+                Some(Builtin::Signal) => {
+                    let node = NodeId(self.alloc_id());
+                    self.cell_state_mut(cell_id).schematic.add_node(
+                        node,
+                        NodeOrigin::Local,
+                        (vid, 0),
+                    );
+                    let signal = SignalRef {
+                        cell: cell_id,
+                        node,
+                    };
+                    self.values.insert(vid, Defer::Ready(Value::Signal(signal)));
+                    true
+                }
+                Some(Builtin::Connect) => {
+                    let args = [c.state.posargs[0], c.state.posargs[1]];
+                    if let Some(arg) = args.into_iter().find(|arg| !self.values[arg].is_ready()) {
+                        self.add_value_dependent(arg, vid);
+                        return Ok(false);
+                    }
+                    let nodes = args.map(|arg| {
+                        let value = self.values[&arg].get_ready().expect("checked ready");
+                        self.local_node(cell_id, value)
+                    });
+                    let [Some(left), Some(right)] = nodes else {
+                        let span = self.span(&vref.loc, c.expr.span);
+                        self.invalid_type(cell_id, &span);
+                        return self.poison(vid);
+                    };
+                    self.cell_state_mut(cell_id).schematic.connect(left, right);
+                    self.values.insert(vid, Defer::Ready(Value::Nil));
+                    true
+                }
+                Some(Builtin::Device) => {
+                    if let Some(arg) = c
+                        .state
+                        .posargs
+                        .iter()
+                        .chain(&c.state.kwargs)
+                        .copied()
+                        .find(|arg| !self.values[arg].is_ready())
+                    {
+                        self.add_value_dependent(arg, vid);
+                        return Ok(false);
+                    }
+                    match self.device_record(vid, &vref.loc, c) {
+                        Ok(Some(record)) => {
+                            self.cell_state_mut(cell_id).schematic.add_device(record);
+                            self.values.insert(vid, Defer::Ready(Value::Nil));
+                            true
+                        }
+                        Ok(None) => false,
+                        Err(()) => return self.poison(vid),
+                    }
+                }
+                Some(Builtin::SchematicInst) => {
+                    let arg = c.state.posargs[0];
+                    let Some(value) = self.values[&arg].get_ready() else {
+                        self.add_value_dependent(arg, vid);
+                        return Ok(false);
+                    };
+                    // A cell is compiled before its value is ready.
+                    let child = value
+                        .get_cell()
+                        .copied()
+                        .filter(|child| self.compiled_cells.contains_key(child));
+                    let span = self.span(&vref.loc, c.expr.span);
+                    let Some(child) = child else {
+                        self.invalid_type(cell_id, &span);
+                        return self.poison(vid);
+                    };
+                    let ports = self.compiled_cells[&child].schematic.ports.len();
+                    let id = self.object_id();
+                    let nodes = (0..ports).map(|_| NodeId(self.alloc_id())).collect_vec();
+                    let schematic = &mut self.cell_state_mut(cell_id).schematic;
+                    let instance = schematic.next_instance();
+                    for (port, node) in nodes.iter().enumerate() {
+                        schematic.add_node(
+                            *node,
+                            NodeOrigin::Terminal { instance, port },
+                            (vid, port),
+                        );
+                    }
+                    schematic.add_instance(SchInstRecord {
+                        order: vid,
+                        id,
+                        cell: child,
+                        terminals: nodes.clone(),
+                        span,
+                    });
+                    let terminals = nodes
+                        .into_iter()
+                        .map(|node| {
+                            Value::Signal(SignalRef {
+                                cell: cell_id,
+                                node,
+                            })
+                        })
+                        .collect();
+                    let value = SchematicInstValue {
+                        id: Some(id),
+                        cell: child,
+                        terminals,
+                    };
+                    self.values
+                        .insert(vid, Defer::Ready(Value::SchematicInst(Arc::new(value))));
+                    true
+                }
                 None => unreachable!("a cell call is evaluated by `eval_cell_call`"),
             },
             PartialEvalState::Arith(arith) => {
@@ -12094,184 +13767,35 @@ impl<'a> ExecPass<'a> {
                                         // solved/compiled, and therefore it will be in the
                                         // compiled cell map.
                                         let cell = &self.compiled_cells[&inst_cell_id];
-                                        let field_value =
-                                            if let Some(field_value) = cell.field(field) {
-                                                field_value
-                                            } else {
+                                        let span =
+                                            self.span(&vref.loc, field_access_expr.expr.span);
+                                        let field_value = match instance_field(cell, field) {
+                                            Ok(field_value) => field_value,
+                                            // Reported when the cell was compiled.
+                                            Err(None) => return self.poison(vid),
+                                            Err(Some(kind)) => {
                                                 self.errors.push(ExecError {
-                                                    span: Some(self.span(
-                                                        &vref.loc,
-                                                        field_access_expr.expr.span,
-                                                    )),
+                                                    span: Some(span),
                                                     cell: cell_id,
-                                                    kind: ExecErrorKind::NoFieldOnInstance {
-                                                        field: field.to_string(),
-                                                        cell: cell.name.clone(),
-                                                    },
+                                                    kind,
                                                 });
                                                 return self.poison(vid);
-                                            };
-                                        let cell_values = &self.cell_values;
-                                        let obj_id = &mut self.next_id;
+                                            }
+                                        };
                                         let cell_state =
                                             self.cell_states.get_mut(&cell_id).unwrap();
-                                        let proxies = &mut cell_state.proxy_objects;
-                                        let objects = &mut cell_state.objects;
-                                        let transformed = Value::from_array(field_value.map(
-                                            &mut move |v| match v {
-                                                SolvedValue::Rect(rect) => {
-                                                    let id = object_id(obj_id);
-                                                    let [x0, y0, x1, y1] = transform_bounds(
-                                                        [
-                                                            rect.x0.0, rect.y0.0, rect.x1.0,
-                                                            rect.y1.0,
-                                                        ],
-                                                        inst.reflect,
-                                                        inst.angle,
-                                                    );
-                                                    let xrect = Rect {
-                                                        id,
-                                                        layer: rect.layer.clone(),
-                                                        x0: LinearExpr::add(x0, inst.x.clone()),
-                                                        y0: LinearExpr::add(y0, inst.y.clone()),
-                                                        x1: LinearExpr::add(x1, inst.x.clone()),
-                                                        y1: LinearExpr::add(y1, inst.y.clone()),
-                                                        // A view of geometry the instance already draws, so it
-                                                        // is construction geometry -- drawing it again would put a
-                                                        // phantom shape on top of the SREF. `!` opts back in; see
-                                                        // `mark_emitted_proxies_as_layout`.
-                                                        construction: true,
-                                                        span: None,
-                                                    };
-                                                    proxies.insert(xrect.id);
-                                                    let xrect = Arc::new(xrect);
-                                                    objects.push((
-                                                        xrect.id,
-                                                        Object::Rect(xrect.clone()),
-                                                    ));
-                                                    Value::Rect(xrect)
-                                                }
-                                                SolvedValue::Polygon(polygon) => {
-                                                    let id = object_id(obj_id);
-                                                    let mat = tmat(inst.angle, inst.reflect);
-                                                    let polygon = Polygon {
-                                                        id,
-                                                        layer: polygon.layer.clone(),
-                                                        points: polygon
-                                                            .points
-                                                            .iter()
-                                                            .map(|(x, y)| {
-                                                                let (x, y) =
-                                                                    ifmatvec(mat, (x.0, y.0));
-                                                                (
-                                                                    LinearExpr::add(
-                                                                        x,
-                                                                        inst.x.clone(),
-                                                                    ),
-                                                                    LinearExpr::add(
-                                                                        y,
-                                                                        inst.y.clone(),
-                                                                    ),
-                                                                )
-                                                            })
-                                                            .collect(),
-                                                        // A view of geometry the instance already draws, so it
-                                                        // is construction geometry -- drawing it again would put a
-                                                        // phantom shape on top of the SREF. `!` opts back in; see
-                                                        // `mark_emitted_proxies_as_layout`.
-                                                        construction: true,
-                                                        span: polygon.span.clone(),
-                                                    };
-                                                    proxies.insert(polygon.id);
-                                                    let polygon = Arc::new(polygon);
-                                                    objects.push((
-                                                        polygon.id,
-                                                        Object::Polygon(polygon.clone()),
-                                                    ));
-                                                    Value::Polygon(polygon)
-                                                }
-                                                SolvedValue::Path(path) => {
-                                                    let id = object_id(obj_id);
-                                                    let mat = tmat(inst.angle, inst.reflect);
-                                                    let path = Path {
-                                                        id,
-                                                        layer: path.layer.clone(),
-                                                        width: LinearExpr::from(path.width.0),
-                                                        points: path
-                                                            .points
-                                                            .iter()
-                                                            .map(|(x, y)| {
-                                                                let (x, y) =
-                                                                    ifmatvec(mat, (x.0, y.0));
-                                                                (
-                                                                    LinearExpr::add(
-                                                                        x,
-                                                                        inst.x.clone(),
-                                                                    ),
-                                                                    LinearExpr::add(
-                                                                        y,
-                                                                        inst.y.clone(),
-                                                                    ),
-                                                                )
-                                                            })
-                                                            .collect(),
-                                                        begin_extension: LinearExpr::from(
-                                                            path.begin_extension.0,
-                                                        ),
-                                                        end_extension: LinearExpr::from(
-                                                            path.end_extension.0,
-                                                        ),
-                                                        // A view of geometry the instance already draws, so it
-                                                        // is construction geometry -- drawing it again would put a
-                                                        // phantom shape on top of the SREF. `!` opts back in; see
-                                                        // `mark_emitted_proxies_as_layout`.
-                                                        construction: true,
-                                                        span: path.span.clone(),
-                                                    };
-                                                    proxies.insert(path.id);
-                                                    let path = Arc::new(path);
-                                                    objects.push((
-                                                        path.id,
-                                                        Object::Path(path.clone()),
-                                                    ));
-                                                    Value::Path(path)
-                                                }
-                                                SolvedValue::Instance(cinst) => {
-                                                    let (angle, reflect, cx, cy) = cascade(
-                                                        inst.angle,
-                                                        inst.reflect,
-                                                        cinst.angle,
-                                                        cinst.reflect,
-                                                        cinst.x,
-                                                        cinst.y,
-                                                    );
-                                                    let id = object_id(obj_id);
-                                                    let oinst = Instance {
-                                                        id,
-                                                        cell: cell_values[&cinst.cell],
-                                                        x: LinearExpr::add(inst.x.clone(), cx),
-                                                        y: LinearExpr::add(inst.y.clone(), cy),
-                                                        angle,
-                                                        reflect,
-                                                        // A view of geometry the instance already draws, so it
-                                                        // is construction geometry -- drawing it again would put a
-                                                        // phantom shape on top of the SREF. `!` opts back in; see
-                                                        // `mark_emitted_proxies_as_layout`.
-                                                        construction: true,
-                                                        span: cinst.span.clone(),
-                                                    };
-                                                    proxies.insert(oinst.id);
-                                                    let oinst = Arc::new(oinst);
-                                                    objects.push((
-                                                        oinst.id,
-                                                        Object::Inst(oinst.clone()),
-                                                    ));
-                                                    Value::Inst(oinst)
-                                                }
-                                                _ => unreachable!(),
-                                            },
-                                        ));
-                                        Some(transformed)
+                                        let mut reader = LayoutReader {
+                                            inst,
+                                            cell,
+                                            cell_values: &self.cell_values,
+                                            next_id: &mut self.next_id,
+                                            proxies: &mut cell_state.proxy_objects,
+                                            objects: &mut cell_state.objects,
+                                            span: &span,
+                                        };
+                                        Some(
+                                            field_value.read(&mut reader, &FieldPath::Field(field)),
+                                        )
                                     } else {
                                         None
                                     }
@@ -12284,6 +13808,36 @@ impl<'a> ExecPass<'a> {
                                 self.add_value_dependent(inst.cell, vid);
                                 false
                             }
+                        }
+                        ValueRef::SchematicInst(instance) => {
+                            let field = field_access_expr.expr.field.name.as_str();
+                            let span = self.span(&vref.loc, field_access_expr.expr.span);
+                            let Some(cell) = self.compiled_cells.get(&instance.cell) else {
+                                self.invalid_type(cell_id, &span);
+                                return self.poison(vid);
+                            };
+                            let field_value = match instance_field(cell, field) {
+                                Ok(field_value) => field_value,
+                                // Reported when the cell was compiled.
+                                Err(None) => return self.poison(vid),
+                                Err(Some(kind)) => {
+                                    self.errors.push(ExecError {
+                                        span: Some(span),
+                                        cell: cell_id,
+                                        kind,
+                                    });
+                                    return self.poison(vid);
+                                }
+                            };
+                            let mut reader = SchematicReader {
+                                instance,
+                                cell,
+                                cells: &self.compiled_cells,
+                                span: &span,
+                            };
+                            let val = field_value.read(&mut reader, &FieldPath::Field(field));
+                            self.values.insert(vid, DeferValue::Ready(val));
+                            true
                         }
                         _ => {
                             let field = field_access_expr.expr.field.name.as_str();
@@ -12388,6 +13942,26 @@ impl<'a> ExecPass<'a> {
                     false
                 }
             }
+            PartialEvalState::Seq(seq) => {
+                let items = seq
+                    .items
+                    .iter()
+                    .map(|i| self.values[i].get_ready().cloned())
+                    .collect::<Option<Seq>>();
+                if let Some(items) = items {
+                    self.values
+                        .insert(vid, DeferValue::Ready(Value::Seq(Arc::new(items))));
+                    true
+                } else {
+                    let dep = seq
+                        .items
+                        .iter()
+                        .find(|&i| !self.values[i].is_ready())
+                        .unwrap();
+                    self.add_value_dependent(*dep, vid);
+                    false
+                }
+            }
             PartialEvalState::StructLit(lit) => {
                 let pending = lit
                     .fields
@@ -12409,12 +13983,38 @@ impl<'a> ExecPass<'a> {
                             .and_then(|(_, value)| values[value].get_ready())
                     };
                     let base = lit.base.and_then(|base| values[&base].get_ready());
-                    let result = ops::struct_lit(self.defs, &lit.ty, explicit, base);
+                    let result = ops::struct_lit(self.defs, &lit.target, explicit, base);
                     let expr = lit.expr;
                     return self.finish_op(vid, &vref.loc, result, |at| match at {
                         ErrorAt::Base => expr.base.as_ref().expect("only a base fails").span(),
                         _ => expr.span,
                     });
+                }
+            }
+            PartialEvalState::Destructure(d) => {
+                if let Defer::Ready(base) = &self.values[&d.base] {
+                    // The base may have arrived as `Any`, so it was never
+                    // checked against the struct the pattern names.
+                    let element = match base.as_ref() {
+                        ValueRef::Struct(value)
+                            if d.struct_name
+                                .as_ref()
+                                .is_none_or(|name| *name == value.name) =>
+                        {
+                            value.fields.get(&d.field).cloned()
+                        }
+                        _ => None,
+                    };
+                    let Some(element) = element else {
+                        let span = self.span(&vref.loc, d.span);
+                        self.invalid_type(cell_id, &span);
+                        return self.poison(vid);
+                    };
+                    self.values.insert(vid, DeferValue::Ready(element));
+                    true
+                } else {
+                    self.add_value_dependent(d.base, vid);
+                    false
                 }
             }
             PartialEvalState::Ctor(ctor) => {
@@ -12437,7 +14037,7 @@ impl<'a> ExecPass<'a> {
                         vid,
                         DeferValue::Ready(Value::Enum(Arc::new(EnumValue {
                             variant: ctor.variant.clone(),
-                            payload,
+                            payload: VariantValues::Tuple(payload),
                         }))),
                     );
                     true
@@ -12465,10 +14065,11 @@ impl<'a> ExecPass<'a> {
             // User functions are never deferred.
             let mut arg_vals = Vec::with_capacity(c.state.posargs.len());
             let mut unready = Vec::new();
+            let span = self.span(&vref.loc, c.expr.span);
             for arg_vid in c.state.posargs.iter() {
                 match self.values[arg_vid].clone() {
                     Defer::Ready(v) => {
-                        match self.cell_arg_from_value(cell_id, *arg_vid, &v) {
+                        match self.cell_arg_from_value(cell_id, *arg_vid, &v, &span) {
                             Ok(Some(arg)) => arg_vals.push(arg),
                             Ok(None) => unready.push(*arg_vid),
                             // The diagnostic is already recorded, here
@@ -12598,18 +14199,19 @@ impl<'a> ExecPass<'a> {
             MatchExprState::Scrutinee(scrutinee) => {
                 if let Defer::Ready(val) = &self.values[&scrutinee] {
                     // A scrutinee typed `Any` was never proven to be an
-                    // enum value, and even a genuine enum value may belong
-                    // to a different enum than the arms name.
-                    let Some(value) = val.get_enum().cloned() else {
+                    // enum or struct value, and even a genuine one may be
+                    // of a different type than the arms name.
+                    if !matches!(val, Value::Enum(_) | Value::Struct(_)) {
                         let span = self.span(&vref.loc, match_.expr.scrutinee.span());
                         self.invalid_type(cell_id, &span);
                         return self.poison(vid);
-                    };
+                    }
+                    let value = val.clone();
                     let arm = match_
                         .expr
                         .arms
                         .iter()
-                        .find(|arm| pattern_matches(&arm.pattern, &Value::Enum(value.clone())));
+                        .find(|arm| pattern_matches(&arm.pattern, &value));
                     let Some(arm) = arm else {
                         let span = self.span(&vref.loc, match_.expr.scrutinee.span());
                         self.invalid_type(cell_id, &span);
@@ -12623,7 +14225,7 @@ impl<'a> ExecPass<'a> {
                         users: 1,
                         call: None,
                     };
-                    self.bind_pattern(&arm.pattern, scrutinee, &Value::Enum(value), &mut frame);
+                    self.bind_pattern(&arm.pattern, scrutinee, &value, &mut frame);
                     let fid = self.frame_id();
                     self.insert_frame(fid, frame);
                     let value = self.visit_expr(
@@ -12731,7 +14333,7 @@ impl<'a> ExecPass<'a> {
                         );
                         item.state = ForItemState::Body(body);
                     } else {
-                        self.values.insert(vid, Defer::Ready(Value::SeqNil));
+                        self.values.insert(vid, Defer::Ready(empty_seq()));
                     }
                     true
                 } else {
@@ -12784,12 +14386,7 @@ impl<'a> ExecPass<'a> {
                         seq.push_back(value);
                     }
                 }
-                let value = if seq.is_empty() {
-                    Value::SeqNil
-                } else {
-                    Value::Seq(Arc::new(seq))
-                };
-                self.values.insert(vid, Defer::Ready(value));
+                self.values.insert(vid, Defer::Ready(seq_value(seq)));
                 true
             } else {
                 self.add_value_dependent(items[f.ready], vid);
@@ -12800,7 +14397,6 @@ impl<'a> ExecPass<'a> {
                 let seq = match val.as_ref() {
                     // `s.clone()` is now an O(1) refcount bump (was an O(n) deep copy).
                     ValueRef::Seq(s) => s.clone(),
-                    ValueRef::SeqNil => Arc::new(Seq::new()),
                     _ => {
                         let span = self.span(&vref.loc, f.for_loop.seq.span());
                         self.errors.push(ExecError {
@@ -12896,16 +14492,40 @@ impl<'a> ExecPass<'a> {
                 let Value::Enum(value) = value else {
                     return;
                 };
-                for (field, element) in fields.iter().zip(&value.payload) {
-                    match field {
-                        Pattern::Binding { metadata, .. } => {
-                            let vid = self.new_ready_value(element.clone());
-                            frame.bindings.insert(metadata.0, vid);
-                        }
-                        Pattern::Wildcard { .. } | Pattern::Variant { .. } => {}
-                    }
+                for (field, element) in fields.iter().zip(value.payload.values()) {
+                    self.bind_payload_element(field, element, frame);
                 }
             }
+            Pattern::Struct { fields, .. } => {
+                let values = match value {
+                    Value::Struct(value) => &value.fields,
+                    Value::Enum(value) => match &value.payload {
+                        VariantValues::Struct(values) => values,
+                        VariantValues::Tuple(_) => return,
+                    },
+                    _ => return,
+                };
+                for field in fields {
+                    let Some(element) = values.get(field.name.name.as_str()) else {
+                        continue;
+                    };
+                    self.bind_payload_element(&field.pattern, element, frame);
+                }
+            }
+        }
+    }
+
+    /// Binds one element of a variant or struct pattern, which is a name or
+    /// `_`.
+    fn bind_payload_element(
+        &mut self,
+        pattern: &Pattern<Substr, VarIdTyMetadata>,
+        element: &Value,
+        frame: &mut Frame,
+    ) {
+        if let Pattern::Binding { metadata, .. } = pattern {
+            let vid = self.new_ready_value(element.clone());
+            frame.bindings.insert(metadata.0, vid);
         }
     }
 
@@ -13011,18 +14631,25 @@ pub enum Value {
     ///   // ...
     /// }
     ///
-    /// let mycell_inst = inst(mycell(), x=0, y=0);
+    /// let mycell_inst = std::layout::inst(mycell(), x=0, y=0);
     /// ```
     ///
     /// `mycell_inst` is a value of type `Inst`.
     Inst(Arc<Instance>),
+    /// A signal of the current cell's schematic.
+    Signal(SignalRef),
+    /// A cell placed with `std::schematic::inst`, or one read through another
+    /// schematic instance.
+    SchematicInst(Arc<SchematicInstValue>),
+    /// A placeholder read through an instance, which is an error to use. See
+    /// [`Detached`].
+    Detached(Arc<Detached>),
     Seq(Arc<Seq>),
     /// Shared, because loops and field reads clone values.
     Tuple(Arc<[Value]>),
     /// A struct value. Shared, because loops and field reads clone values
     /// and its field map is large relative to the scalar variants.
     Struct(Arc<StructValue>),
-    SeqNil,
     Nil,
     /// A value whose diagnostic has already been reported.
     ///
@@ -13062,7 +14689,10 @@ impl Value {
             Self::CellFn(_) => "cell generator",
             Self::Cell(_) => "cell",
             Self::Inst(_) => "instance",
-            Self::Seq(_) | Self::SeqNil => "sequence",
+            Self::Signal(_) => "signal",
+            Self::SchematicInst(_) => "schematic instance",
+            Self::Detached(_) => "detached value",
+            Self::Seq(_) => "sequence",
             Self::Tuple(_) => "tuple",
             Self::Struct(_) => "struct",
             Self::Nil => "nil",
@@ -13082,17 +14712,7 @@ impl Value {
             Value::Seq(s) => Some(Arrayed::Array(
                 s.iter().map(|v| v.obj_ids()).collect::<Option<Vec<_>>>()?,
             )),
-            Value::SeqNil => Some(Arrayed::Array(Vec::new())),
             _ => None,
-        }
-    }
-
-    fn from_array(arr: Arrayed<Value>) -> Self {
-        match arr {
-            Arrayed::Elem(v) => v,
-            Arrayed::Array(s) => {
-                Self::Seq(Arc::new(s.into_iter().map(Value::from_array).collect()))
-            }
         }
     }
 }
@@ -13101,8 +14721,43 @@ impl Value {
 #[derive(Debug, Clone)]
 pub struct EnumValue {
     pub variant: String,
-    /// Empty for a unit variant.
-    pub payload: Vec<Value>,
+    pub payload: VariantValues,
+}
+
+/// The payload of an [`EnumValue`].
+#[derive(Debug, Clone)]
+pub enum VariantValues {
+    /// Positional elements; empty for a unit variant.
+    Tuple(Vec<Value>),
+    /// Named fields in declaration order.
+    Struct(FxIndexMap<String, Value>),
+}
+
+impl VariantValues {
+    /// How many values the variant carries.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Tuple(payload) => payload.len(),
+            Self::Struct(fields) => fields.len(),
+        }
+    }
+
+    /// Whether the variant carries nothing.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The payload values in declaration order.
+    pub fn values(&self) -> impl Iterator<Item = &Value> {
+        let (tuple, fields) = match self {
+            Self::Tuple(payload) => (Some(payload), None),
+            Self::Struct(fields) => (None, Some(fields)),
+        };
+        tuple
+            .into_iter()
+            .flatten()
+            .chain(fields.into_iter().flatten().map(|(_, value)| value))
+    }
 }
 
 /// A tuple variant as a callable. See [`Value::Ctor`].
@@ -13117,28 +14772,107 @@ fn pattern_matches(pattern: &Pattern<Substr, VarIdTyMetadata>, value: &Value) ->
     match pattern {
         Pattern::Wildcard { .. } | Pattern::Binding { .. } => true,
         Pattern::Variant { path, fields, .. } => {
-            let Value::Enum(value) = value else {
+            let Some(value) = enum_value(path, value) else {
                 return false;
             };
-            path.path
-                .last()
-                .is_some_and(|name| *name.name == *value.variant)
-                && fields.len() == value.payload.len()
+            fields.len() == value.payload.len()
                 && fields
                     .iter()
-                    .zip(&value.payload)
+                    .zip(value.payload.values())
                     .all(|(field, element)| pattern_matches(field, element))
+        }
+        Pattern::Struct { path, fields, .. } => {
+            let values = match (&path.metadata.1, value) {
+                (Ty::Struct(ty), Value::Struct(value)) if value.name == ty.name => &value.fields,
+                (Ty::Struct(_), _) => return false,
+                _ => match enum_value(path, value).map(|value| &value.payload) {
+                    Some(VariantValues::Struct(values)) => values,
+                    _ => return false,
+                },
+            };
+            fields.iter().all(|field| {
+                values
+                    .get(field.name.name.as_str())
+                    .is_some_and(|element| pattern_matches(&field.pattern, element))
+            })
         }
     }
 }
 
-/// Structural equality of two values, or `None` for a pair the evaluator
-/// cannot compare.
+/// Calls `bind` with each name `pattern`, which matches `value`, binds and the
+/// value it binds, as [`ExecPass::bind_pattern`] binds them.
+fn for_each_pattern_binding(
+    pattern: &Pattern<Substr, VarIdTyMetadata>,
+    value: &Value,
+    bind: &mut impl FnMut(VarId, &Value),
+) {
+    let mut element = |pattern: &Pattern<Substr, VarIdTyMetadata>, element: &Value| {
+        if let Pattern::Binding { metadata, .. } = pattern {
+            bind(metadata.0, element);
+        }
+    };
+    match pattern {
+        Pattern::Wildcard { .. } => {}
+        Pattern::Binding { metadata, .. } => bind(metadata.0, value),
+        Pattern::Variant { fields, .. } => {
+            let Value::Enum(value) = value else {
+                return;
+            };
+            for (field, value) in fields.iter().zip(value.payload.values()) {
+                element(field, value);
+            }
+        }
+        Pattern::Struct { fields, .. } => {
+            let values = match value {
+                Value::Struct(value) => &value.fields,
+                Value::Enum(value) => match &value.payload {
+                    VariantValues::Struct(values) => values,
+                    VariantValues::Tuple(_) => return,
+                },
+                _ => return,
+            };
+            for field in fields {
+                if let Some(value) = values.get(field.name.name.as_str()) {
+                    element(&field.pattern, value);
+                }
+            }
+        }
+    }
+}
+
+/// `value` as the enum value the last segment of `path` names, if it is one.
+fn enum_value<'a>(
+    path: &IdentPath<Substr, VarIdTyMetadata>,
+    value: &'a Value,
+) -> Option<&'a EnumValue> {
+    let Value::Enum(value) = value else {
+        return None;
+    };
+    let variant = path.path.last()?;
+    (*variant.name == *value.variant).then_some(&**value)
+}
+
+/// The empty sequence, shared so that making one does not allocate.
+fn empty_seq() -> Value {
+    thread_local! {
+        static EMPTY: Arc<Seq> = Arc::new(Seq::new());
+    }
+    EMPTY.with(|empty| Value::Seq(empty.clone()))
+}
+
+/// The sequence value holding `seq`.
+fn seq_value(seq: Seq) -> Value {
+    if seq.is_empty() {
+        empty_seq()
+    } else {
+        Value::Seq(Arc::new(seq))
+    }
+}
+
 /// The elements of a sequence value, or `None` for any other value.
-fn seq_elements(value: &Value) -> Option<std::borrow::Cow<'_, Seq>> {
+fn seq_elements(value: &Value) -> Option<&Seq> {
     match value {
-        Value::SeqNil => Some(std::borrow::Cow::Owned(Seq::new())),
-        Value::Seq(s) => Some(std::borrow::Cow::Borrowed(s)),
+        Value::Seq(s) => Some(s),
         _ => None,
     }
 }
@@ -13146,26 +14880,19 @@ fn seq_elements(value: &Value) -> Option<std::borrow::Cow<'_, Seq>> {
 /// Evaluates a native sequence builtin on ready arguments, or returns `None`
 /// when an argument has the wrong runtime type.
 fn seq_builtin(name: &str, args: &[&Value]) -> Option<Value> {
-    let seq = |s: Seq| {
-        if s.is_empty() {
-            Value::SeqNil
-        } else {
-            Value::Seq(Arc::new(s))
-        }
-    };
     Some(match name {
         "seq_len" => Value::Int(seq_elements(args[0])?.len() as i64),
         "seq_concat" => {
-            let mut out = seq_elements(args[0])?.into_owned();
-            out.append(seq_elements(args[1])?.into_owned());
-            seq(out)
+            let mut out = seq_elements(args[0])?.clone();
+            out.append(seq_elements(args[1])?.clone());
+            seq_value(out)
         }
         "seq_flatten" => {
             let mut out = Seq::new();
             for part in seq_elements(args[0])?.iter() {
-                out.append(seq_elements(part)?.into_owned());
+                out.append(seq_elements(part)?.clone());
             }
-            seq(out)
+            seq_value(out)
         }
         "seq_sum" => {
             let mut total: i64 = 0;
@@ -13187,6 +14914,8 @@ fn seq_builtin(name: &str, args: &[&Value]) -> Option<Value> {
     })
 }
 
+/// Structural equality of two values, or `None` for a pair the evaluator
+/// cannot compare.
 fn values_equal(left: &Value, right: &Value) -> Option<bool> {
     match (left, right) {
         (Value::Int(l), Value::Int(r)) => Some(l == r),
@@ -13200,7 +14929,7 @@ fn values_equal(left: &Value, right: &Value) -> Option<bool> {
                 return None;
             }
             let mut equal = true;
-            for (l, r) in l.payload.iter().zip(&r.payload) {
+            for (l, r) in l.payload.values().zip(r.payload.values()) {
                 equal &= values_equal(l, r)?;
             }
             Some(equal)
@@ -13375,12 +15104,17 @@ pub struct CompiledCell {
     pub scopes: FxIndexMap<ScopeId, CompiledScope>,
     scope_metadata: Vec<ScopeMetadata>,
     pub root: ScopeId,
-    pub fields: IndexMap<String, Arrayed<ObjectId>>,
+    /// The cell's `pub let` bindings, which an instance of it reads.
+    pub fields: IndexMap<String, FieldValue>,
+    /// The names of the cell's other top-level `let` bindings.
+    pub private_fields: IndexSet<String>,
     pub sse_basis: SseBasis,
     pub objects: FxIndexMap<ObjectId, SolvedValue>,
     pub fallback_constraints_used: Vec<UsedFallback>,
     pub unsolved_vars: IndexSet<Var>,
     pub inconsistent_constraints: IndexSet<ConstraintId>,
+    /// The cell's schematic view; empty for a cell with no schematic content.
+    pub schematic: Schematic,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13412,6 +15146,523 @@ impl<T> Arrayed<T> {
     }
 }
 
+/// The solved value of a cell field, like [`Value`].
+///
+/// Geometry is named by object id and points are kept in the cell's frame, so
+/// that an instance can move both into its parent's frame when it reads them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FieldValue {
+    /// A rect, polygon, path, or instance of the cell.
+    Object(ObjectId),
+    Float(f64),
+    Int(i64),
+    Bool(bool),
+    String(String),
+    Point(f64, f64),
+    Cell(CellId),
+    Nil,
+    Seq(Vec<FieldValue>),
+    Tuple(Vec<FieldValue>),
+    /// A struct value: the qualified name of its type and its fields.
+    Struct {
+        name: String,
+        fields: Vec<(String, FieldValue)>,
+    },
+    /// A unit or tuple variant and its payload.
+    Enum {
+        variant: String,
+        payload: Vec<FieldValue>,
+    },
+    /// A variant with named fields.
+    StructVariant {
+        variant: String,
+        fields: Vec<(String, FieldValue)>,
+    },
+    /// A signal on a net of the cell's schematic.
+    Signal(NetIdx),
+    /// A schematic instance: one [`Self::Signal`] or [`Self::Detached`] per
+    /// port of `cell`.
+    SchematicInst {
+        cell: CellId,
+        terminals: Vec<FieldValue>,
+    },
+    /// A detached value, which reads back as itself through either kind of
+    /// instance.
+    Detached(Arc<Detached>),
+    /// A field whose value was poisoned, which already reported why. Only ever
+    /// a whole field.
+    Poison,
+    /// A field holding a value of the named kind, such as a function, which
+    /// cannot leave its cell. Only ever a whole field.
+    Unreadable(String),
+}
+
+impl FieldValue {
+    /// The field for `value`, whose solver variables belong to `solver` and
+    /// whose signals are on the nets `nets` gives their nodes.
+    fn solve(value: &Value, solver: &Solver, nets: &HashMap<NodeId, NetIdx>) -> Self {
+        Self::try_solve(value, solver, nets).unwrap_or_else(|field| field)
+    }
+
+    /// Like [`Self::solve`], but a part that makes the whole field
+    /// [`Self::Poison`] or [`Self::Unreadable`] returns it as `Err`.
+    fn try_solve(
+        value: &Value,
+        solver: &Solver,
+        nets: &HashMap<NodeId, NetIdx>,
+    ) -> Result<Self, Self> {
+        let solve = |value: &Value| Self::try_solve(value, solver, nets);
+        let solve_fields = |fields: &FxIndexMap<String, Value>| {
+            fields
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), solve(value)?)))
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let exact =
+            |expr: &LinearExpr| solver.eval_expr_exact(expr).expect("cell field not solved");
+        Ok(match value {
+            Value::Rect(rect) => Self::Object(rect.id),
+            Value::Polygon(polygon) => Self::Object(polygon.id),
+            Value::Path(path) => Self::Object(path.id),
+            Value::Inst(inst) => Self::Object(inst.id),
+            Value::Linear(expr) => Self::Float(exact(expr)),
+            Value::Int(i) => Self::Int(*i),
+            Value::Bool(b) => Self::Bool(*b),
+            Value::String(s) => Self::String(s.clone()),
+            Value::Point(point) => Self::Point(exact(&point.0), exact(&point.1)),
+            Value::Cell(cell) => Self::Cell(*cell),
+            Value::Nil => Self::Nil,
+            Value::Seq(items) => Self::Seq(items.iter().map(solve).collect::<Result<_, _>>()?),
+            Value::Tuple(items) => Self::Tuple(items.iter().map(solve).collect::<Result<_, _>>()?),
+            Value::Struct(value) => Self::Struct {
+                name: value.name.clone(),
+                fields: solve_fields(&value.fields)?,
+            },
+            Value::Enum(value) => match &value.payload {
+                VariantValues::Tuple(items) => Self::Enum {
+                    variant: value.variant.clone(),
+                    payload: items.iter().map(solve).collect::<Result<_, _>>()?,
+                },
+                VariantValues::Struct(fields) => Self::StructVariant {
+                    variant: value.variant.clone(),
+                    fields: solve_fields(fields)?,
+                },
+            },
+            Value::Signal(signal) => match nets.get(&signal.node) {
+                Some(net) => Self::Signal(*net),
+                None => return Err(Self::Poison),
+            },
+            Value::SchematicInst(instance) => Self::SchematicInst {
+                cell: instance.cell,
+                terminals: instance
+                    .terminals
+                    .iter()
+                    .map(solve)
+                    .collect::<Result<_, _>>()?,
+            },
+            Value::Detached(detached) => Self::Detached(detached.clone()),
+            Value::Poison => return Err(Self::Poison),
+            Value::Fn(_) | Value::CellFn(_) | Value::Ctor(_) => {
+                return Err(Self::Unreadable(value.kind_name().to_owned()));
+            }
+        })
+    }
+
+    /// The field for objects named the way a GDS cell names them.
+    fn from_objects(objects: &Arrayed<ObjectId>) -> Self {
+        match objects {
+            Arrayed::Elem(id) => Self::Object(*id),
+            Arrayed::Array(items) => Self::Seq(items.iter().map(Self::from_objects).collect()),
+        }
+    }
+
+    /// Rebuilds the field as a value through an instance, which `reader`
+    /// reads each leaf through. `path` is where the field is within the value
+    /// read.
+    fn read(&self, reader: &mut dyn FieldReader, path: &FieldPath<'_>) -> Value {
+        let tuple = |items: &[FieldValue], reader: &mut dyn FieldReader| {
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| item.read(reader, &FieldPath::Position(path, index)))
+                .collect::<Vec<_>>()
+        };
+        let named = |fields: &[(String, FieldValue)], reader: &mut dyn FieldReader| {
+            fields
+                .iter()
+                .map(|(name, field)| {
+                    let value = field.read(reader, &FieldPath::Member(path, name));
+                    (name.clone(), value)
+                })
+                .collect::<FxIndexMap<_, _>>()
+        };
+        match self {
+            Self::Object(id) => reader.object(*id, path),
+            Self::Float(f) => Value::Linear(LinearExpr::from(*f)),
+            Self::Int(i) => Value::Int(*i),
+            Self::Bool(b) => Value::Bool(*b),
+            Self::String(s) => Value::String(s.clone()),
+            Self::Point(x, y) => reader.point(*x, *y, path),
+            Self::Cell(cell) => Value::Cell(*cell),
+            Self::Nil => Value::Nil,
+            Self::Seq(items) => seq_value(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| item.read(reader, &FieldPath::Index(path, index)))
+                    .collect(),
+            ),
+            Self::Tuple(items) => Value::Tuple(tuple(items, reader).into()),
+            Self::Struct { name, fields } => Value::Struct(Arc::new(StructValue {
+                name: name.clone(),
+                fields: named(fields, reader),
+            })),
+            Self::Enum { variant, payload } => Value::Enum(Arc::new(EnumValue {
+                variant: variant.clone(),
+                payload: VariantValues::Tuple(tuple(payload, reader)),
+            })),
+            Self::StructVariant { variant, fields } => Value::Enum(Arc::new(EnumValue {
+                variant: variant.clone(),
+                payload: VariantValues::Struct(named(fields, reader)),
+            })),
+            Self::Signal(net) => reader.signal(*net, path),
+            Self::SchematicInst { cell, terminals } => {
+                reader.schematic_inst(*cell, terminals, path)
+            }
+            Self::Detached(detached) => Value::Detached(detached.clone()),
+            Self::Poison | Self::Unreadable(_) => Value::Poison,
+        }
+    }
+
+    /// Translates the spans of the detached values in this field onto another
+    /// revision of the workspace.
+    fn rebase_spans(&mut self, rebase: &SpanRebase) -> Result<(), RebaseError> {
+        match self {
+            Self::Detached(detached) => rebase.rebase(&mut Arc::make_mut(detached).span),
+            Self::Seq(items)
+            | Self::Tuple(items)
+            | Self::Enum { payload: items, .. }
+            | Self::SchematicInst {
+                terminals: items, ..
+            } => items
+                .iter_mut()
+                .try_for_each(|item| item.rebase_spans(rebase)),
+            Self::Struct { fields, .. } | Self::StructVariant { fields, .. } => fields
+                .iter_mut()
+                .try_for_each(|(_, field)| field.rebase_spans(rebase)),
+            Self::Object(_)
+            | Self::Float(_)
+            | Self::Int(_)
+            | Self::Bool(_)
+            | Self::String(_)
+            | Self::Point(..)
+            | Self::Cell(_)
+            | Self::Nil
+            | Self::Signal(_)
+            | Self::Poison
+            | Self::Unreadable(_) => Ok(()),
+        }
+    }
+
+    /// Calls `f` on the span of every detached value in this field.
+    fn for_each_span<E>(&self, f: &mut impl FnMut(&Span) -> Result<(), E>) -> Result<(), E> {
+        match self {
+            Self::Detached(detached) => f(&detached.span),
+            Self::Seq(items)
+            | Self::Tuple(items)
+            | Self::Enum { payload: items, .. }
+            | Self::SchematicInst {
+                terminals: items, ..
+            } => items.iter().try_for_each(|item| item.for_each_span(f)),
+            Self::Struct { fields, .. } | Self::StructVariant { fields, .. } => fields
+                .iter()
+                .try_for_each(|(_, field)| field.for_each_span(f)),
+            Self::Object(_)
+            | Self::Float(_)
+            | Self::Int(_)
+            | Self::Bool(_)
+            | Self::String(_)
+            | Self::Point(..)
+            | Self::Cell(_)
+            | Self::Nil
+            | Self::Signal(_)
+            | Self::Poison
+            | Self::Unreadable(_) => Ok(()),
+        }
+    }
+
+    /// Calls `f` on every object this field names.
+    fn for_each_object(&self, f: &mut impl FnMut(ObjectId)) {
+        match self {
+            Self::Object(id) => f(*id),
+            Self::Seq(items)
+            | Self::Tuple(items)
+            | Self::Enum { payload: items, .. }
+            | Self::SchematicInst {
+                terminals: items, ..
+            } => items.iter().for_each(|item| item.for_each_object(f)),
+            Self::Struct { fields, .. } | Self::StructVariant { fields, .. } => fields
+                .iter()
+                .for_each(|(_, field)| field.for_each_object(f)),
+            Self::Float(_)
+            | Self::Int(_)
+            | Self::Bool(_)
+            | Self::String(_)
+            | Self::Point(..)
+            | Self::Cell(_)
+            | Self::Nil
+            | Self::Signal(_)
+            | Self::Detached(_)
+            | Self::Poison
+            | Self::Unreadable(_) => {}
+        }
+    }
+
+    /// Calls `f` on every cell this field names.
+    fn for_each_cell(&self, f: &mut impl FnMut(CellId)) {
+        match self {
+            Self::Cell(cell) => f(*cell),
+            Self::SchematicInst { cell, .. } => f(*cell),
+            Self::Seq(items) | Self::Tuple(items) | Self::Enum { payload: items, .. } => {
+                items.iter().for_each(|item| item.for_each_cell(f))
+            }
+            Self::Struct { fields, .. } | Self::StructVariant { fields, .. } => {
+                fields.iter().for_each(|(_, field)| field.for_each_cell(f))
+            }
+            Self::Object(_)
+            | Self::Float(_)
+            | Self::Int(_)
+            | Self::Bool(_)
+            | Self::String(_)
+            | Self::Point(..)
+            | Self::Nil
+            | Self::Signal(_)
+            | Self::Detached(_)
+            | Self::Poison
+            | Self::Unreadable(_) => {}
+        }
+    }
+}
+
+/// Where a value is within the field it was read from, built into a string
+/// only when a diagnostic needs it.
+#[derive(Clone, Copy)]
+enum FieldPath<'a> {
+    Field(&'a str),
+    /// An element of a sequence.
+    Index(&'a FieldPath<'a>, usize),
+    /// An element of a tuple or a tuple variant's payload.
+    Position(&'a FieldPath<'a>, usize),
+    /// A field of a struct, or a port of a schematic instance.
+    Member(&'a FieldPath<'a>, &'a str),
+}
+
+impl std::fmt::Display for FieldPath<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Field(name) => write!(f, "{name}"),
+            Self::Index(parent, index) => write!(f, "{parent}[{index}]"),
+            Self::Position(parent, index) => write!(f, "{parent}.{index}"),
+            Self::Member(parent, name) => write!(f, "{parent}.{name}"),
+        }
+    }
+}
+
+/// Reads the leaves of a field through one kind of instance, each of which
+/// reads what its view of the cell has.
+trait FieldReader {
+    fn object(&mut self, id: ObjectId, path: &FieldPath<'_>) -> Value;
+    fn point(&mut self, x: f64, y: f64, path: &FieldPath<'_>) -> Value;
+    fn signal(&mut self, net: NetIdx, path: &FieldPath<'_>) -> Value;
+    fn schematic_inst(
+        &mut self,
+        cell: CellId,
+        terminals: &[FieldValue],
+        path: &FieldPath<'_>,
+    ) -> Value;
+}
+
+/// A detached value for the field at `path` of `cell`, read at `span`.
+fn detached(
+    kind: DetachedKind,
+    reason: DetachedReason,
+    cell: &CompiledCell,
+    path: &FieldPath<'_>,
+    span: &Span,
+) -> Value {
+    Value::Detached(Arc::new(Detached {
+        kind,
+        reason,
+        cell: cell.name.clone(),
+        field: path.to_string(),
+        span: span.clone(),
+    }))
+}
+
+/// Reads a field through a layout instance, placing geometry in the parent.
+struct LayoutReader<'a> {
+    inst: &'a Instance,
+    cell: &'a CompiledCell,
+    cell_values: &'a HashMap<CellId, ValueId>,
+    next_id: &'a mut u64,
+    proxies: &'a mut FxIndexSet<ObjectId>,
+    objects: &'a mut Vec<(ObjectId, Object)>,
+    span: &'a Span,
+}
+
+impl FieldReader for LayoutReader<'_> {
+    fn object(&mut self, id: ObjectId, _path: &FieldPath<'_>) -> Value {
+        place_inst_object(
+            self.inst,
+            &self.cell.objects[&id],
+            self.cell_values,
+            self.next_id,
+            self.proxies,
+            self.objects,
+        )
+    }
+
+    fn point(&mut self, x: f64, y: f64, _path: &FieldPath<'_>) -> Value {
+        let (x, y) = ifmatvec(tmat(self.inst.angle, self.inst.reflect), (x, y));
+        Value::Point(Arc::new((
+            LinearExpr::add(x, self.inst.x.clone()),
+            LinearExpr::add(y, self.inst.y.clone()),
+        )))
+    }
+
+    fn signal(&mut self, _net: NetIdx, path: &FieldPath<'_>) -> Value {
+        detached(
+            DetachedKind::Signal,
+            DetachedReason::ThroughLayoutInstance,
+            self.cell,
+            path,
+            self.span,
+        )
+    }
+
+    fn schematic_inst(
+        &mut self,
+        _cell: CellId,
+        _terminals: &[FieldValue],
+        path: &FieldPath<'_>,
+    ) -> Value {
+        detached(
+            DetachedKind::SchematicInstance,
+            DetachedReason::ThroughLayoutInstance,
+            self.cell,
+            path,
+            self.span,
+        )
+    }
+}
+
+/// Reads a field through a schematic instance, mapping a signal on a port of
+/// the cell to the instance's terminal.
+struct SchematicReader<'a> {
+    instance: &'a SchematicInstValue,
+    cell: &'a CompiledCell,
+    cells: &'a IndexMap<CellId, Arc<CompiledCell>>,
+    span: &'a Span,
+}
+
+impl FieldReader for SchematicReader<'_> {
+    fn object(&mut self, id: ObjectId, path: &FieldPath<'_>) -> Value {
+        let kind = match self.cell.objects.get(&id) {
+            Some(SolvedValue::Instance(_)) => DetachedKind::LayoutInstance,
+            _ => DetachedKind::Geometry,
+        };
+        detached(
+            kind,
+            DetachedReason::ThroughSchematicInstance,
+            self.cell,
+            path,
+            self.span,
+        )
+    }
+
+    fn point(&mut self, _x: f64, _y: f64, path: &FieldPath<'_>) -> Value {
+        detached(
+            DetachedKind::Geometry,
+            DetachedReason::ThroughSchematicInstance,
+            self.cell,
+            path,
+            self.span,
+        )
+    }
+
+    fn signal(&mut self, net: NetIdx, path: &FieldPath<'_>) -> Value {
+        match self.cell.schematic.port_of(net) {
+            Some(port) => self
+                .instance
+                .terminals
+                .get(port)
+                .cloned()
+                .unwrap_or(Value::Poison),
+            None => detached(
+                DetachedKind::Signal,
+                DetachedReason::InternalNet,
+                self.cell,
+                path,
+                self.span,
+            ),
+        }
+    }
+
+    fn schematic_inst(
+        &mut self,
+        cell: CellId,
+        terminals: &[FieldValue],
+        path: &FieldPath<'_>,
+    ) -> Value {
+        let child = self.cells.get(&cell);
+        let terminals = terminals
+            .iter()
+            .enumerate()
+            .map(|(port, terminal)| {
+                let name = child.map_or_else(
+                    || port.to_string(),
+                    |child| child.schematic.port_name(port).to_owned(),
+                );
+                match terminal {
+                    FieldValue::Signal(net) => self.signal(*net, &FieldPath::Member(path, &name)),
+                    FieldValue::Detached(detached) => Value::Detached(detached.clone()),
+                    _ => Value::Poison,
+                }
+            })
+            .collect();
+        Value::SchematicInst(Arc::new(SchematicInstValue {
+            id: None,
+            cell,
+            terminals,
+        }))
+    }
+}
+
+/// The field `field` of `cell`, as an instance of it reads it. `Err(None)` is
+/// a poisoned field, which already reported why.
+fn instance_field<'c>(
+    cell: &'c CompiledCell,
+    field: &str,
+) -> Result<&'c FieldValue, Option<ExecErrorKind>> {
+    match cell.fields.get(field) {
+        Some(FieldValue::Poison) => Err(None),
+        Some(FieldValue::Unreadable(kind)) => Err(Some(ExecErrorKind::UnreadableInstanceField {
+            field: field.to_string(),
+            cell: cell.name.clone(),
+            kind: kind.clone(),
+        })),
+        Some(field_value) => Ok(field_value),
+        None if cell.private_fields.contains(field) => Err(Some(ExecErrorKind::PrivateField {
+            field: field.to_string(),
+            cell: cell.name.clone(),
+        })),
+        None => Err(Some(ExecErrorKind::NoFieldOnInstance {
+            field: field.to_string(),
+            cell: cell.name.clone(),
+        })),
+    }
+}
+
 impl CompiledData {
     /// A digest of everything a consumer can observe: the geometry, the layers
     /// it lands on, and the shape of the instance graph.
@@ -13435,6 +15686,7 @@ impl CompiledData {
                     hasher.write_u32(fallback.span.span.start() as u32);
                     hasher.write_u32(fallback.span.span.end() as u32);
                 }
+                hash_schematic(&mut hasher, &cell.schematic, &self.cells);
                 hasher.finish()
             })
             .collect::<Vec<_>>();
@@ -13452,6 +15704,74 @@ impl CompiledData {
 fn hash_str(hasher: &mut fnv::FnvHasher, value: &str) {
     hasher.write_usize(value.len());
     hasher.write(value.as_bytes());
+}
+
+/// Hashes everything a netlist of `schematic` shows.
+fn hash_schematic(
+    hasher: &mut fnv::FnvHasher,
+    schematic: &Schematic,
+    cells: &IndexMap<CellId, Arc<CompiledCell>>,
+) {
+    let nets = |hasher: &mut fnv::FnvHasher, nets: &[NetIdx]| {
+        hasher.write_usize(nets.len());
+        for net in nets {
+            hasher.write_u32(*net);
+        }
+    };
+    let param = |hasher: &mut fnv::FnvHasher, value: &ParamValue| match value {
+        ParamValue::Float(f) => {
+            hasher.write_u8(0);
+            hasher.write_u64(f.to_bits());
+        }
+        ParamValue::Int(i) => {
+            hasher.write_u8(1);
+            hasher.write_i64(*i);
+        }
+        ParamValue::String(s) => {
+            hasher.write_u8(2);
+            hash_str(hasher, s);
+        }
+    };
+    hasher.write_usize(schematic.nets.len());
+    for net in &schematic.nets {
+        hash_str(hasher, &net.name);
+    }
+    nets(hasher, &schematic.ports);
+    for element in &schematic.elements {
+        match *element {
+            Element::Instance(index) => {
+                let instance = &schematic.instances[index];
+                hasher.write_u8(0);
+                hash_str(hasher, &instance.name);
+                // By name, because the referenced id is itself allocation-dependent.
+                hash_str(
+                    hasher,
+                    cells
+                        .get(&instance.cell)
+                        .map(|c| c.name.as_str())
+                        .unwrap_or(""),
+                );
+                nets(hasher, &instance.terminals);
+            }
+            Element::Device(index) => {
+                let device = &schematic.devices[index];
+                hasher.write_u8(1);
+                hash_str(hasher, &device.name);
+                hash_str(hasher, device.kind.name());
+                nets(hasher, &device.terminals);
+                hash_str(hasher, device.model.as_deref().unwrap_or(""));
+                hasher.write_u8(u8::from(device.value.is_some()));
+                if let Some(value) = &device.value {
+                    param(hasher, value);
+                }
+                hasher.write_usize(device.params.len());
+                for (name, value) in &device.params {
+                    hash_str(hasher, name);
+                    param(hasher, value);
+                }
+            }
+        }
+    }
 }
 
 fn hash_solved_value(
@@ -13574,16 +15894,35 @@ impl CompiledCell {
             scopes,
             scope_metadata,
             root: _,
-            fields: _,
+            fields,
+            private_fields: _,
             sse_basis: _,
             objects,
             fallback_constraints_used,
             unsolved_vars: _,
             inconsistent_constraints: _,
+            schematic,
         } = self;
 
         for metadata in scope_metadata {
             rebase.rebase(&mut metadata.span)?;
+        }
+
+        for field in fields.values_mut() {
+            field.rebase_spans(rebase)?;
+        }
+        let Schematic {
+            nets: _,
+            ports: _,
+            instances,
+            devices,
+            elements: _,
+        } = schematic;
+        for SchematicInstance { span, .. } in instances.iter_mut() {
+            rebase.rebase_opt(span)?;
+        }
+        for Device { span, .. } in devices.iter_mut() {
+            rebase.rebase_opt(span)?;
         }
 
         for scope in scopes.values_mut() {
@@ -13629,12 +15968,14 @@ impl CompiledCell {
             scopes,
             scope_metadata,
             root: _,
-            fields: _,
+            fields,
+            private_fields: _,
             sse_basis: _,
             objects,
             fallback_constraints_used,
             unsolved_vars: _,
             inconsistent_constraints: _,
+            schematic,
         } = self;
         let mut moved = false;
         let mut check = |span: &Span| -> Result<(), RebaseError> {
@@ -13644,6 +15985,26 @@ impl CompiledCell {
 
         for metadata in scope_metadata {
             check(&metadata.span)?;
+        }
+        for field in fields.values() {
+            field.for_each_span(&mut check)?;
+        }
+        let Schematic {
+            nets: _,
+            ports: _,
+            instances,
+            devices,
+            elements: _,
+        } = schematic;
+        for SchematicInstance { span, .. } in instances {
+            if let Some(span) = span {
+                check(span)?;
+            }
+        }
+        for Device { span, .. } in devices {
+            if let Some(span) = span {
+                check(span)?;
+            }
         }
 
         for scope in scopes.values() {
@@ -13683,12 +16044,6 @@ impl CompiledCell {
             check(span)?;
         }
         Ok(moved)
-    }
-
-    pub fn field(&self, name: &str) -> Option<Arrayed<&SolvedValue>> {
-        self.fields
-            .get(name)
-            .map(|o| o.map(&mut |id| &self.objects[id]))
     }
 }
 
@@ -13940,10 +16295,12 @@ enum PartialEvalState<'a> {
     Constraint(PartialConstraint),
     Cast(PartialCastExpr<'a>),
     Tuple(PartialTupleExpr),
+    Seq(PartialSeqExpr),
     StructLit(PartialStructLit<'a>),
     ForLoop(PartialForLoop<'a>),
     ForItem(PartialForItem<'a>),
     Ctor(PartialCtor),
+    Destructure(Box<PartialDestructure>),
 }
 
 impl PartialEvalState<'_> {
@@ -14004,6 +16361,7 @@ impl PartialEvalState<'_> {
             }
             Self::Cast(e) => f(e.state.value),
             Self::Tuple(e) => e.items.iter().for_each(|v| f(*v)),
+            Self::Seq(e) => e.items.iter().for_each(|v| f(*v)),
             Self::StructLit(e) => e.fields.iter().copied().chain(e.base).for_each(f),
             Self::ForLoop(l) => {
                 f(l.seq);
@@ -14013,6 +16371,22 @@ impl PartialEvalState<'_> {
                 ForItemState::Filter(v) | ForItemState::Body(v) => f(v),
             },
             Self::Ctor(c) => c.args.iter().for_each(|v| f(*v)),
+            Self::Destructure(d) => f(d.base),
+        }
+    }
+
+    /// Whether this state only passes its inputs through rather than
+    /// inspecting them. Using a detached value is an error; passing it on is
+    /// not.
+    fn passes_through(&self) -> bool {
+        match self {
+            Self::Tuple(_) | Self::Seq(_) | Self::StructLit(_) | Self::Ctor(_) => true,
+            Self::If(e) => !matches!(e.state, IfExprState::Cond(_)),
+            Self::Match(e) => matches!(e.state, MatchExprState::Value(_)),
+            // A comprehension collects its items; it inspects only its sequence.
+            Self::ForLoop(l) => l.items.is_some(),
+            Self::ForItem(item) => matches!(item.state, ForItemState::Body(_)),
+            _ => false,
         }
     }
 
@@ -14048,6 +16422,7 @@ impl PartialEvalState<'_> {
             Self::Constraint(c) => f(c.lhs) || f(c.rhs),
             Self::Cast(e) => f(e.state.value),
             Self::Tuple(e) => e.items.iter().any(|input| f(*input)),
+            Self::Seq(e) => e.items.iter().any(|input| f(*input)),
             Self::StructLit(e) => e.fields.iter().copied().chain(e.base).any(f),
             // Items before `ready` were checked as they became ready.
             Self::ForLoop(for_loop) => match &for_loop.items {
@@ -14058,8 +16433,21 @@ impl PartialEvalState<'_> {
                 ForItemState::Filter(v) | ForItemState::Body(v) => f(v),
             },
             Self::Ctor(c) => c.args.iter().any(|input| f(*input)),
+            Self::Destructure(d) => f(d.base),
         }
     }
+}
+
+/// One field read out of a struct by a `let` pattern.
+#[derive(Debug, Clone)]
+struct PartialDestructure {
+    base: ValueId,
+    /// The struct the pattern names, checked against a base that arrived as
+    /// `Any`.
+    struct_name: Option<String>,
+    field: String,
+    /// The field pattern, for diagnostics.
+    span: cfgrammar::Span,
 }
 
 /// A tuple variant being constructed from its payload arguments.
@@ -14194,15 +16582,32 @@ struct PartialTupleExpr {
     items: Vec<ValueId>,
 }
 
+/// A sequence literal being built from its elements.
+#[derive(Debug, Clone)]
+struct PartialSeqExpr {
+    items: Vec<ValueId>,
+}
+
 #[derive(Debug, Clone)]
 struct PartialStructLit<'a> {
     expr: &'a StructLitExpr<Substr, VarIdTyMetadata>,
-    /// The struct being built, from the literal's checked type; its
-    /// definition's field order is the order the value's fields take.
-    ty: Arc<StructTy>,
+    /// What the literal builds, from its checked type; the declaration's field
+    /// order is the order the value's fields take.
+    target: StructLitTarget,
     /// One value per entry of `expr.fields`.
     fields: Vec<ValueId>,
     base: Option<ValueId>,
+}
+
+/// What a [`PartialStructLit`] builds.
+#[derive(Debug, Clone)]
+enum StructLitTarget {
+    Struct(Arc<StructTy>),
+    /// A variant with named fields, and the enum it belongs to.
+    Variant {
+        ty: Arc<EnumTy>,
+        variant: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -14254,6 +16659,123 @@ pub fn ifmatvec(mat: TransformationMatrix, pt: (f64, f64)) -> (f64, f64) {
         mat[0][0] as f64 * pt.0 + mat[0][1] as f64 * pt.1,
         mat[1][0] as f64 * pt.0 + mat[1][1] as f64 * pt.1,
     )
+}
+
+/// Places `object`, an object of the cell `inst` instantiates, in the cell
+/// holding `inst`, registering the placed copy in `objects` as a proxy.
+///
+/// A placed copy is a view of geometry the instance already draws, so it is
+/// construction geometry: drawing it again would put a phantom shape on top
+/// of the SREF. `!` opts back in; see `mark_emitted_proxies_as_layout`.
+fn place_inst_object(
+    inst: &Instance,
+    object: &SolvedValue,
+    cell_values: &HashMap<CellId, ValueId>,
+    obj_id: &mut u64,
+    proxies: &mut FxIndexSet<ObjectId>,
+    objects: &mut Vec<(ObjectId, Object)>,
+) -> Value {
+    match object {
+        SolvedValue::Rect(rect) => {
+            let id = object_id(obj_id);
+            let [x0, y0, x1, y1] = transform_bounds(
+                [rect.x0.0, rect.y0.0, rect.x1.0, rect.y1.0],
+                inst.reflect,
+                inst.angle,
+            );
+            let xrect = Arc::new(Rect {
+                id,
+                layer: rect.layer.clone(),
+                x0: LinearExpr::add(x0, inst.x.clone()),
+                y0: LinearExpr::add(y0, inst.y.clone()),
+                x1: LinearExpr::add(x1, inst.x.clone()),
+                y1: LinearExpr::add(y1, inst.y.clone()),
+                construction: true,
+                span: None,
+            });
+            proxies.insert(id);
+            objects.push((id, Object::Rect(xrect.clone())));
+            Value::Rect(xrect)
+        }
+        SolvedValue::Polygon(polygon) => {
+            let id = object_id(obj_id);
+            let mat = tmat(inst.angle, inst.reflect);
+            let polygon = Arc::new(Polygon {
+                id,
+                layer: polygon.layer.clone(),
+                points: polygon
+                    .points
+                    .iter()
+                    .map(|(x, y)| {
+                        let (x, y) = ifmatvec(mat, (x.0, y.0));
+                        (
+                            LinearExpr::add(x, inst.x.clone()),
+                            LinearExpr::add(y, inst.y.clone()),
+                        )
+                    })
+                    .collect(),
+                construction: true,
+                span: polygon.span.clone(),
+            });
+            proxies.insert(id);
+            objects.push((id, Object::Polygon(polygon.clone())));
+            Value::Polygon(polygon)
+        }
+        SolvedValue::Path(path) => {
+            let id = object_id(obj_id);
+            let mat = tmat(inst.angle, inst.reflect);
+            let path = Arc::new(Path {
+                id,
+                layer: path.layer.clone(),
+                width: LinearExpr::from(path.width.0),
+                points: path
+                    .points
+                    .iter()
+                    .map(|(x, y)| {
+                        let (x, y) = ifmatvec(mat, (x.0, y.0));
+                        (
+                            LinearExpr::add(x, inst.x.clone()),
+                            LinearExpr::add(y, inst.y.clone()),
+                        )
+                    })
+                    .collect(),
+                begin_extension: LinearExpr::from(path.begin_extension.0),
+                end_extension: LinearExpr::from(path.end_extension.0),
+                construction: true,
+                span: path.span.clone(),
+            });
+            proxies.insert(id);
+            objects.push((id, Object::Path(path.clone())));
+            Value::Path(path)
+        }
+        SolvedValue::Instance(cinst) => {
+            let (angle, reflect, cx, cy) = cascade(
+                inst.angle,
+                inst.reflect,
+                cinst.angle,
+                cinst.reflect,
+                cinst.x,
+                cinst.y,
+            );
+            let id = object_id(obj_id);
+            let oinst = Arc::new(Instance {
+                id,
+                cell: cell_values[&cinst.cell],
+                x: LinearExpr::add(inst.x.clone(), cx),
+                y: LinearExpr::add(inst.y.clone(), cy),
+                angle,
+                reflect,
+                construction: true,
+                span: cinst.span.clone(),
+            });
+            proxies.insert(id);
+            objects.push((id, Object::Inst(oinst.clone())));
+            Value::Inst(oinst)
+        }
+        SolvedValue::Text(_) | SolvedValue::Dimension(_) => {
+            unreachable!("cell fields never hold text or dimensions")
+        }
+    }
 }
 
 fn tmat(rot: Rotation, refv: bool) -> TransformationMatrix {
@@ -14623,6 +17145,28 @@ fn object_id(id: &mut u64) -> ObjectId {
     ObjectId(next_id)
 }
 
+/// The index suffix (`[i][j]`) at which `value` holds `object`, preferring
+/// later entries.
+fn array_suffix(value: &Arrayed<ObjectId>, object: ObjectId) -> Option<String> {
+    match value {
+        Arrayed::Elem(id) => (*id == object).then(String::new),
+        Arrayed::Array(values) => values.iter().enumerate().rev().find_map(|(i, value)| {
+            array_suffix(value, object).map(|suffix| format!("[{i}]{suffix}"))
+        }),
+    }
+}
+
+/// Whether `object` is a kind of object that a binding can name.
+fn is_nameable(object: &SolvedValue) -> bool {
+    matches!(
+        object,
+        SolvedValue::Rect(_)
+            | SolvedValue::Polygon(_)
+            | SolvedValue::Path(_)
+            | SolvedValue::Instance(_)
+    )
+}
+
 impl CompiledData {
     /// Resolve one object's source name without allocating names for every
     /// reachable object. Later bindings and array entries win, as they do in
@@ -14634,23 +17178,8 @@ impl CompiledData {
         scope: ScopeId,
         object: ObjectId,
     ) -> Option<String> {
-        fn array_suffix(value: &Arrayed<ObjectId>, object: ObjectId) -> Option<String> {
-            match value {
-                Arrayed::Elem(id) => (*id == object).then(String::new),
-                Arrayed::Array(values) => values.iter().enumerate().rev().find_map(|(i, value)| {
-                    array_suffix(value, object).map(|suffix| format!("[{i}]{suffix}"))
-                }),
-            }
-        }
-
         let cell = &self.cells[&cell];
-        if !matches!(
-            cell.objects.get(&object)?,
-            SolvedValue::Rect(_)
-                | SolvedValue::Polygon(_)
-                | SolvedValue::Path(_)
-                | SolvedValue::Instance(_)
-        ) {
+        if !is_nameable(cell.objects.get(&object)?) {
             return None;
         }
         let mut scope = scope;
@@ -14668,6 +17197,25 @@ impl CompiledData {
             scope = parent;
             before = seq;
         }
+    }
+
+    /// The name through which an instance of `cell` reads `object`: a
+    /// root-scope binding of `cell` that is a public field, with any index
+    /// suffix. Later bindings and array entries win.
+    pub fn reachable_field_name(&self, cell: CellId, object: ObjectId) -> Option<String> {
+        let cell = &self.cells[&cell];
+        if !is_nameable(cell.objects.get(&object)?) {
+            return None;
+        }
+        cell.scopes[&cell.root]
+            .bindings
+            .iter()
+            .rev()
+            .map(|(_, binding)| binding)
+            .filter(|(name, _)| cell.fields.contains_key(name))
+            .find_map(|(name, value)| {
+                array_suffix(value, object).map(|suffix| format!("{name}{suffix}"))
+            })
     }
 
     pub fn reachable_objs(&self, cell: CellId, scope: ScopeId) -> IndexMap<ObjectId, String> {

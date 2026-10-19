@@ -1,4 +1,7 @@
 // Native rectangle transcription of the fixed Sky130 sense-amplifier macro.
+
+use std::layout::rect;
+
 cell macro_top() {
     rect("li1.drawing", x0=3605., y0=15260., x1=3775., y1=19705.);
     rect("li1.drawing", x0=1025., y0=15260., x1=1195., y1=19705.);

@@ -7,27 +7,33 @@ description: The canvas tools for geometry, dimensions, and instances.
 
 Canvas shortcuts work while the canvas has focus and no text field is active.
 
+Rectangles, polygons, paths, and instances that the GUI adds at the top level of a cell are bound with [`pub let`](/language/cells-functions#public-fields), so a parent cell can read them through an instance. Inside a loop, branch, or block they're bound with a plain `let`.
+
+The GUI writes each call with its full [`std::layout`](/language/std-layout) path, such as `std::layout::rect(...)` or `std::layout::inst(...)`, so the source needs no `use` line for it.
+
 ## Select
 
 Press <kbd>S</kbd>. You can select shapes, instances, edges, and dimension labels; what's selected determines which edits are available. Press <kbd>Q</kbd> to edit a selected dimension.
 
 ## Rectangle
 
-Pick a layer, press <kbd>R</kbd>, and click two opposite corners. The [`rect`](/language/builtins/geometry#rect) call the GUI writes uses initial values (`x0i` and so on), so you can drag the rectangle around until constraints pin it down.
+Pick a layer, press <kbd>R</kbd>, and click two opposite corners. <kbd>Backspace</kbd> discards the first corner. The [`std::layout::rect`](/language/std-layout#rect) call the GUI writes uses initial values (`x0i` and so on), so you can drag the rectangle around until constraints pin it down.
 
 ## Polygon
 
-Pick a layer, press <kbd>P</kbd>, and click the vertices in order. <kbd>Enter</kbd> closes the polygon and writes it to the source; <kbd>Esc</kbd> discards it.
+Pick a layer, press <kbd>P</kbd>, and click the vertices in order. <kbd>Enter</kbd> closes the polygon and writes it to the source; <kbd>Backspace</kbd> removes the last vertex, and <kbd>Esc</kbd> discards them all.
 
 Each vertex is constrained independently. A vertex with one constrained axis can still be dragged along the other.
 
 ## Path
 
-Choose Path from the Tools menu or the tool strip, pick a layer, and click the centerline points. A path's points, width, and end extensions are all editable.
+Choose Path from the Tools menu or the tool strip, pick a layer, and click the centerline points. <kbd>Backspace</kbd> removes the last point. A path's points, width, and end extensions are all editable.
 
 ## Dimension
 
-Press <kbd>D</kbd>, click two compatible edges, then click where the label should go. Type a float such as `50.` or a cell parameter such as `width`.
+Press <kbd>D</kbd>, click two compatible edges, then click where the label should go. <kbd>Backspace</kbd> deselects the last edge. Type a float such as `50.` or a cell parameter such as `width`.
+
+An edge of a shape inside a child instance can be picked only if the child cell declares that shape with [`pub let`](/language/cells-functions#public-fields), since the dimension reads it through the instance.
 
 Dimensions also work on rectangles imported from GDS. If the technology file configures pin layers, imported pin labels become fields you can refer to.
 

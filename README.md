@@ -85,8 +85,15 @@ library's scope, so they may call functions and build sequences:
 
 ```bash
 arc run --cell 'top(pitch * 4., -width / 2.)'
-arc run --cell 'array(cons(250., cons(350., [])), Mode::Fast)'
+arc run --cell 'array([250., 350.], Mode::Fast)'
 ```
+
+Layout is built with the functions of the `std::layout` module: `rect`,
+`crect`, `polygon`, `path`, `text`, `inst`, `bbox`, `dimension`, and rectangle
+helpers such as `array` and `intersection`. A module imports the ones it calls
+with a grouped `use`, as in `use std::layout::{inst, rect};`, or calls them by
+full path, as in `std::layout::rect(...)`. Code inserted by the GUI uses full
+paths, so it needs no import.
 
 Parameters declared with a default value are keyword parameters. They are
 passed by name, may be omitted, and must follow the positional parameters. A
@@ -95,6 +102,8 @@ parameters declared before it and to module-level items, and its type must match
 the declared type exactly:
 
 ```rust
+use std::layout::inst;
+
 cell via(layer: String, w: Float, h: Float = w, n: Int = 1) {
     // ...
 }
@@ -115,6 +124,8 @@ exactly once unless `..base` supplies the ones not listed, and a bare `name` is
 shorthand for `name: name`:
 
 ```rust
+use std::layout::{inst, rect};
+
 struct Size {
     w: Float,
     h: Float,
@@ -154,10 +165,32 @@ including on the command line:
 arc run --cell 'via(ViaParams { layer: "met1", size: Size { w: 100., h: 50. }, n: 1 })'
 ```
 
-Enum variants may carry values. A tuple variant is constructed like a call and
-taken apart by a `match` pattern that binds its payload; `_` skips an element,
-and a bare name or `_` arm matches anything. Every variant is also an item that
-`use` can import:
+A `let` takes a struct apart with a pattern that names the struct and binds its
+fields. A bare `name` binds the field of that name, `field: other` binds it
+under another name, and `field: _` drops it. A pattern must name every field
+unless it ends in `..`, and field patterns do not nest. At the top of a cell,
+each name a pattern binds is a field of the cell, like any other `let`. A
+`match` on a struct takes the same patterns:
+
+```rust
+use std::layout::rect;
+
+fn area(s: Size) -> Float {
+    let Size { w, h: height } = s;
+    w * height
+}
+
+cell via_pair(p: ViaParams) {
+    let ViaParams { layer, size, .. } = p;
+    let left = rect(layer, x0=0., y0=0., w=size.w, h=size.h);
+    let right = rect(layer, x0=2. * size.w, y0=0., w=size.w, h=size.h);
+}
+```
+
+Enum variants may carry values, either as a tuple or as named fields. A tuple
+variant is constructed like a call and taken apart by a `match` pattern that
+binds its payload; `_` skips an element, and a bare name or `_` arm matches
+anything. Every variant is also an item that `use` can import:
 
 ```rust
 enum Shape {
@@ -172,6 +205,38 @@ fn width(s: Shape) -> Float {
         Shape::Box(w, _) => w,
         _ => 0.,
     }
+}
+```
+
+A variant with named fields is written and constructed like a struct, with the
+same shorthand, and matched by a pattern that names the fields it binds. A
+pattern must name every field unless it ends in `..`, `field: name` renames a
+binding, and `field: _` drops one. Unlike a struct literal, a variant takes no
+`..base`, and like a struct literal it must be parenthesized in an `if`
+condition, a `match` scrutinee, or a `for` sequence:
+
+```rust
+use std::layout::rect;
+
+enum Shape {
+    Circle { r: Float },
+    Box { w: Float, h: Float },
+    Empty,
+}
+
+fn width(s: Shape) -> Float {
+    match s {
+        Shape::Circle { r } => 2. * r,
+        Shape::Box { w, .. } => w,
+        Shape::Empty => 0.,
+    }
+}
+
+cell top() {
+    let w = 300.;
+    let h = 20.;
+    let boxed = Shape::Box { w, h };
+    let r = rect("met1", x0=0., y0=0., w=width(boxed), h=h);
 }
 ```
 
@@ -209,6 +274,8 @@ lets a struct contain itself, and `std::unwrap_or`, `std::is_some`,
 `std::is_none`, `std::first`, and `std::last` work over any element type:
 
 ```rust
+use std::layout::inst;
+
 struct Node {
     width: Float,
     next: Option<Node>,
@@ -247,9 +314,11 @@ different positions are different arguments, so they compile to different
 cells:
 
 ```rust
+use std::layout::{crect, inst, rect};
+
 cell via_array(region: Rect, size: Float, pitch: Float) {
     let via = crect(layer="via1", x0=0., y0=0., w=size, h=size);
-    let vias = std::max_array(via, region.w, region.h, pitch, pitch);
+    let vias = std::layout::max_array(via, region.w, region.h, pitch, pitch);
     eq(vias.x0 - region.x0, region.x1 - vias.x1);
     eq(vias.y0 - region.y0, region.y1 - vias.y1);
 }
@@ -257,7 +326,7 @@ cell via_array(region: Rect, size: Float, pitch: Float) {
 cell top() {
     let met1 = rect("met1", x0=0., y0=0., w=100., h=50.);
     let met2 = rect("met2", x0=10., y0=5., w=80., h=40.);
-    let vias = inst(via_array(std::intersection(met1, met2), 10., 20.));
+    let vias = inst(via_array(std::layout::intersection(met1, met2), 10., 20.));
 }
 ```
 
@@ -274,8 +343,10 @@ recursion has to end on a parameter, since the compiler stops at a fixed
 nesting depth:
 
 ```rust
+use std::layout::{inst, rect};
+
 cell tree(n: Int) {
-    let leaf = rect("met1", x0=0., y0=0., w=100., h=100.);
+    pub let leaf = rect("met1", x0=0., y0=0., w=100., h=100.);
     if n > 0 {
         let child = inst(tree(n - 1));
         eq(child.leaf.x0, leaf.x1 + 50.);
@@ -283,6 +354,10 @@ cell tree(n: Int) {
     }
 }
 ```
+
+An instance reads only the fields its cell declares with `pub let`, such as
+`child.leaf` above. `pub` applies only to a `let` at the top level of a cell
+body, and a `pub let` with a pattern makes every name it binds public.
 
 Cell types are nominal: two cells with the same fields are different types,
 and a function that accepts either takes `Any`. The type of an instance field
@@ -351,7 +426,7 @@ independent solver coordinates, addressable either as `polygon.x0`,
 `polygon.y0`, and so on, or through `polygon.points[0].x` and `.y`:
 
 ```argon
-let outline = polygon("met1", 3,
+let outline = std::layout::polygon("met1", 3,
     x0=0., y0=0.,
     x1=100., y1=0.,
     y2=100.,
@@ -376,7 +451,7 @@ receive stable fields such as `gds_rect_12`; a shape on a configured pin layer
 uses text from the corresponding contained label layer as its field name.
 Repeated pin names are arrays (`inst.VDD[0]`, `inst.VDD[1]`). When an instance
 is collapsed in the GUI, its displayed bounding-box edges are available through
-`bbox(inst)`.
+`std::layout::bbox(inst)`.
 
 ### IDE
 
@@ -526,7 +601,8 @@ cell inset_rect(w: Float, h: Float) {
 }
 ```
 
-You can also define a hierarchical cell in your code editor as follows:
+You can also define a hierarchical cell in your code editor. Add
+`use std::layout::inst;` at the top of `lib.ar`, then add the cell:
 
 ```rust
 cell triple_rect() {

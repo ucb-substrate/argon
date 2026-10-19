@@ -1,3 +1,5 @@
+use std::layout::rect;
+
 struct Pair<A, B> {
     first: A,
     second: B,

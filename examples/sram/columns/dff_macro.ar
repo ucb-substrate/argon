@@ -1,3 +1,5 @@
+use std::layout::rect;
+
 cell sky130_fd_sc_hs__dfrbp_2() {
     rect("lvtn.drawing", x0=190., y0=190., x1=3580., y1=1300.);
     rect("lvtn.drawing", x0=3580., y0=190., x1=4520., y1=1760.);

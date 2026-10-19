@@ -90,7 +90,7 @@ fn feed_m2_to_side(g: Grid, source: Rect, supply: Int, right: Bool) -> Power {
     let strap = m1_track(g, t);
     let feeder = m2(lib::columns::util::rect_with_hspan(source, span_union(hspan(source), strap)));
     let via = power_via(from_spans(strap, vspan(feeder)), feeder);
-    Power { m1: [], m2: list(feeder, via), m1_targets: [], m2_targets: list(Target { rect: feeder, supply: supply, skip: t }) }
+    Power { m1: [], m2: [feeder, via], m1_targets: [], m2_targets: [Target { rect: feeder, supply: supply, skip: t }] }
 }
 
 // An M1 power shape run up or down onto a bank's M2 track.
@@ -99,7 +99,7 @@ fn feed_m1_to_edge(g: Grid, source: Rect, supply: Int, top: Bool) -> Power {
     let rail = m2_track(g, t);
     let feeder = m1(lib::columns::util::rect_with_vspan(source, span_union(vspan(source), rail)));
     let via = power_via(feeder, from_spans(hspan(feeder), rail));
-    Power { m1: list(feeder, via), m2: [], m1_targets: list(Target { rect: feeder, supply: supply, skip: t }), m2_targets: [] }
+    Power { m1: [feeder, via], m2: [], m1_targets: [Target { rect: feeder, supply: supply, skip: t }], m2_targets: [] }
 }
 
 fn feed_all_m2(g: Grid, rails: [Rect], supply: Int, right: Bool) -> Power {
@@ -175,7 +175,7 @@ fn merge_close(l: [Rect], done: [Rect]) -> [Rect] {
     if l == [] {
         done
     } else if done == [] {
-        merge_close(tail(l), list(head(l)))
+        merge_close(tail(l), [head(l)])
     } else if head(l).y0 - head(done).y1 < 400. {
         merge_close(tail(l), cons(lib::columns::util::rect_union(head(done), head(l)), tail(done)))
     } else {
@@ -203,7 +203,7 @@ fn feed_stripes_up(g: Grid, stripes: [Rect], supply: Int) -> Power {
         let piece = from_spans(hspan(s), (s.y1 + 100., s.y1 + 700.,));
         let up = feed_m1_to_edge(g, piece, supply, true);
         let via = power_via(piece, stub);
-        join(Power { m1: [], m2: list(stub, via), m1_targets: [], m2_targets: [] }, up)
+        join(Power { m1: [], m2: [stub, via], m1_targets: [], m2_targets: [] }, up)
     }])
 }
 
@@ -261,7 +261,7 @@ fn draw_block_bars(m1_vdd: [Rect], m1_vss: [Rect], m2_vdd: [Rect], m2_vss: [Rect
         m1: lib::logic::routing::concat(m1_up, m1_down),
         m2: cons(vdd_bar, cons(vss_bar, lib::logic::routing::concat(m2_up, m2_down))),
         m1_targets: [],
-        m2_targets: list(Target { rect: vdd_bar, supply: 0, skip: -1 }, Target { rect: vss_bar, supply: 1, skip: -1 }),
+        m2_targets: [Target { rect: vdd_bar, supply: 0, skip: -1 }, Target { rect: vss_bar, supply: 1, skip: -1 }],
     }
 }
 
@@ -335,7 +335,7 @@ fn feed_under_rbl(g: Grid, f: SramFloorplan, sources: [Rect], supply: Int, route
         power_via(corner, corner);
         Detour {
             power: join(
-                Power { m1: list(down), m2: list(upper), m1_targets: list(Target { rect: down, supply: supply, skip: -1 }), m2_targets: list(Target { rect: upper, supply: supply, skip: -1 }) },
+                Power { m1: [down], m2: [upper], m1_targets: [Target { rect: down, supply: supply, skip: -1 }], m2_targets: [Target { rect: upper, supply: supply, skip: -1 }] },
                 feed_m2_to_side(g, corner, supply, false),
             ),
             track: pick.0,
@@ -368,11 +368,11 @@ fn strip(rail: Rect, supply: Int) -> (Float, Float) {
 fn jog(above: Rect, below: Rect, supply: Int, level: (Float, Float)) -> [Rect] {
     let a = strip(above, supply);
     let b = strip(below, supply);
-    list(
+    [
         from_spans(a, (level.0, above.y0,)),
         from_spans(span_union(a, b), level),
         from_spans(b, (below.y1, level.1,)),
-    )
+    ]
 }
 
 fn clear_of(a: [Rect], b: [Rect]) -> Bool { std::all([for r in a { clear_of_one(r, b) }]) }
@@ -413,7 +413,7 @@ fn band_straps(g: Grid, j: Int, last: Int, vdd_x1: Float, vss_x1: Float, vdd: Re
         let corridor = if supply == 0 { vdd } else { vss };
         let strap = m2(from_spans((m1_track(g, 0).0, if supply == 0 { vdd_x1 } else { vss_x1 },), m2_track(g, k)));
         let via = power_via(from_spans(hspan(corridor), vspan(strap)), strap);
-        Power { m1: [], m2: list(strap, via), m1_targets: [], m2_targets: list(Target { rect: strap, supply: supply, skip: -1 }) }
+        Power { m1: [], m2: [strap, via], m1_targets: [], m2_targets: [Target { rect: strap, supply: supply, skip: -1 }] }
     }])
 }
 
@@ -464,13 +464,13 @@ fn draw_block_feeders(
     let gate_num = 2 * lib::logic::floorplan::row_bits(p);
     let wlen_layout = lib::logic::floorplan::wlen_buffer_layout(p);
     let cd = lib::logic::floorplan::col_decoder_layout(p);
-    let control_vdd = if with_control { list(control_feeder(f, control, 0)) } else { [] };
-    let control_vss = if with_control { list(control_feeder(f, control, 1)) } else { [] };
+    let control_vdd = if with_control { [control_feeder(f, control, 0)] } else { [] };
+    let control_vss = if with_control { [control_feeder(f, control, 1)] } else { [] };
     let wlen_vdd = place(lib::columns::decoder::buffer_m2_rails(wlen_layout, true), 0, f.wlen_buffer);
     let wlen_vss = place(lib::columns::decoder::buffer_m2_rails(wlen_layout, false), 0, f.wlen_buffer);
-    let left_vdd = join_rects(list(wlen_vdd, rbl_clear(f, control_vdd), list(rpc.vdd, nmos.vdd), rbl.vdd_rails));
-    let left_vss = join_rects(list(wlen_vss, rbl_clear(f, control_vss), nmos.vss, rbl.vss_rails));
-    join_all(list(
+    let left_vdd = join_rects([wlen_vdd, rbl_clear(f, control_vdd), [rpc.vdd, nmos.vdd], rbl.vdd_rails]);
+    let left_vss = join_rects([wlen_vss, rbl_clear(f, control_vss), nmos.vss, rbl.vss_rails]);
+    join_all([
             feed_right_edge(g, bitcells.vdd_rails, f.boxes.bitcells.x1, 0),
             feed_right_edge(g, bitcells.vss_rails, f.boxes.bitcells.x1, 1),
             feed_right_edge(g, cols.vdd, f.boxes.cols.x1, 0),
@@ -493,7 +493,7 @@ fn draw_block_feeders(
             draw_block_bars(place(lib::columns::decoder::col_decoder_m1_rails(cd, true), 4, f.col_decoder), place(lib::columns::decoder::col_decoder_m1_rails(cd, false), 4, f.col_decoder), place(lib::columns::decoder::col_decoder_m2_rails(cd, true), 4, f.col_decoder), place(lib::columns::decoder::col_decoder_m2_rails(cd, false), 4, f.col_decoder)),
             feed_m1_rails_right(g, place(lib::columns::top::column_m1_power_rails(p.col, true), 0, f.cols), f.boxes.cols.x1, 0),
             feed_m1_rails_right(g, place(lib::columns::top::column_m1_power_rails(p.col, false), 0, f.cols), f.boxes.cols.x1, 1),
-    ))
+    ])
 }
 
 // Regions where straps may not run. Blocks keep straps out of their whole
@@ -504,16 +504,16 @@ fn expand_right(r: Rect, d: Float) -> Rect { cbox(r.x0, r.y0, r.x1 + d, r.y1) }
 
 fn block_keepouts(f: SramFloorplan) -> [Rect] {
     let b = f.boxes;
-    list(
+    [
         b.bitcells, b.cols, b.row_decoder, b.addr_gate, b.wlen_buffer, b.pc_b_buffer, b.sense_en_buffer, b.col_decoder,
         b.write_driver_en_buffer, b.control, b.rbl, b.replica_pc, b.replica_nmos, b.replica_routing, b.dffs,
-    )
+    ]
 }
 
 fn m1_keepouts(f: SramFloorplan) -> [Rect] {
     let b = f.boxes;
     let rbl_core = cbox(b.rbl.x0 + 2520., b.rbl.y0, b.rbl.x1 - 2520., b.rbl.y1);
-    lib::logic::routing::concat(block_keepouts(f), list(
+    lib::logic::routing::concat(block_keepouts(f), [
             expand(b.bitcells, 140., 6000.),
             expand(b.cols, 140., 6000.),
             expand(rbl_core, 140., 6000.),
@@ -522,17 +522,17 @@ fn m1_keepouts(f: SramFloorplan) -> [Rect] {
             expand_right(b.pc_b_buffer, 1400.),
             expand_right(b.sense_en_buffer, 1400.),
             expand_right(b.write_driver_en_buffer, 1400.),
-    ))
+    ])
 }
 
 fn m2_keepouts(f: SramFloorplan) -> [Rect] {
     let b = f.boxes;
-    lib::logic::routing::concat(block_keepouts(f), list(
+    lib::logic::routing::concat(block_keepouts(f), [
             expand(b.bitcells, 6000., 140.),
             expand(b.cols, 6000., 140.),
             expand(b.rbl, 3480., 140.),
             expand_right(b.row_decoder, 6000.),
-    ))
+    ])
 }
 
 // Free-track runs. A run (t, a, b) is a strap on track t covering crossing
@@ -590,7 +590,7 @@ fn blocked(l: [Rect], center: Float, o: Float, n: Int, vertical: Bool) -> [(Int,
         let b = if vertical { r.y1 } else { r.x1 };
         let j0 = max_int(fdiv((a - o) as Int - 640, 680) + 1, 0);
         let j1 = min_int(cdiv((b - o) as Int + 640, 680) - 1, n - 1);
-        if j0 <= j1 { list((j0, j1,)) } else { [] }
+        if j0 <= j1 { [(j0, j1,)] } else { [] }
     }])
 }
 
@@ -641,7 +641,7 @@ fn empty_runs(t: Int, t1: Int) -> [[Run]] {
     if t == t1 { [] } else { cons([], empty_runs(t + 1, t1)) }
 }
 
-fn bank_runs(t: Int, t1: Int, a: Int, b: Int) -> [[Run]] { [for k in range_full(t, t1, 1) { list(Run { t: k, a: a, b: b }) }] }
+fn bank_runs(t: Int, t1: Int, a: Int, b: Int) -> [[Run]] { [for k in range_full(t, t1, 1) { [Run { t: k, a: a, b: b }] }] }
 
 fn concat_runs(a: [[Run]], b: [[Run]]) -> [[Run]] { lib::logic::routing::concat(a, b) }
 

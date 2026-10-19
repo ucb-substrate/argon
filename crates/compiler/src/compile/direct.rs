@@ -115,6 +115,7 @@ impl<'a> ExecPass<'a> {
                 Statement::ForLoop(f) => {
                     self.direct_for(cell, env, f, false, depth)?;
                 }
+                Statement::LetPattern(_) => return None,
             }
         }
         let value = match &scope.tail {
@@ -161,7 +162,12 @@ impl<'a> ExecPass<'a> {
     ) -> Option<Value> {
         match expr {
             Expr::Nil(_) => Some(Value::Nil),
-            Expr::SeqNil(_) => Some(Value::SeqNil),
+            Expr::Seq(seq) => Some(seq_value(
+                seq.items
+                    .iter()
+                    .map(|item| self.direct_expr(cell, env, item, depth))
+                    .collect::<Option<Seq>>()?,
+            )),
             Expr::FloatLiteral(f) => Some(Value::Linear(LinearExpr::from(f.value))),
             Expr::IntLiteral(i) => Some(Value::Int(i.value)),
             Expr::BoolLiteral(b) => Some(Value::Bool(b.value)),
@@ -184,25 +190,17 @@ impl<'a> ExecPass<'a> {
             }
             Expr::Match(match_expr) => {
                 let scrutinee = self.direct_expr(cell, env, &match_expr.scrutinee, depth)?;
-                let Value::Enum(value) = &scrutinee else {
+                if !matches!(scrutinee, Value::Enum(_) | Value::Struct(_)) {
                     return None;
-                };
+                }
                 let arm = match_expr
                     .arms
                     .iter()
                     .find(|arm| pattern_matches(&arm.pattern, &scrutinee))?;
                 let mark = env.len();
-                match &arm.pattern {
-                    Pattern::Wildcard { .. } => {}
-                    Pattern::Binding { metadata, .. } => env.push((metadata.0, scrutinee.clone())),
-                    Pattern::Variant { fields, .. } => {
-                        for (field, element) in fields.iter().zip(&value.payload) {
-                            if let Pattern::Binding { metadata, .. } = field {
-                                env.push((metadata.0, element.clone()));
-                            }
-                        }
-                    }
-                }
+                for_each_pattern_binding(&arm.pattern, &scrutinee, &mut |id, value| {
+                    env.push((id, value.clone()));
+                });
                 let value = self.direct_expr(cell, env, &arm.expr, depth)?;
                 env.truncate(mark);
                 Some(value)
@@ -266,8 +264,13 @@ impl<'a> ExecPass<'a> {
                     .collect::<Option<_>>()?,
             )),
             Expr::StructLit(lit) => {
-                let Ty::Struct(ty) = &lit.metadata else {
-                    return None;
+                let target = match (&lit.metadata.ty, &lit.metadata.variant) {
+                    (Ty::Struct(ty), _) => StructLitTarget::Struct(ty.clone()),
+                    (Ty::Enum(ty), Some(variant)) => StructLitTarget::Variant {
+                        ty: ty.clone(),
+                        variant: variant.clone(),
+                    },
+                    _ => return None,
                 };
                 let fields = lit
                     .fields
@@ -285,7 +288,7 @@ impl<'a> ExecPass<'a> {
                         .find(|(field, _)| field.name.name == *name)
                         .map(|(_, value)| value)
                 };
-                ops::struct_lit(self.defs, ty, explicit, base.as_ref()).ok()
+                ops::struct_lit(self.defs, &target, explicit, base.as_ref()).ok()
             }
         }
     }
@@ -312,7 +315,6 @@ impl<'a> ExecPass<'a> {
             let solver = &self.cell_state(cell).solver;
             return match builtin {
                 Builtin::Cons => ops::cons(refs.first()?, refs.get(1)?).ok(),
-                Builtin::List => Some(ops::list(refs)),
                 Builtin::RangeFull => {
                     ops::range_full(refs.first()?, refs.get(1)?, refs.get(2)?).ok()
                 }
@@ -372,7 +374,10 @@ impl<'a> ExecPass<'a> {
                     .iter()
                     .map(|arg| self.direct_expr(cell, env, arg, depth))
                     .collect::<Option<Vec<_>>>()?;
-                Some(Value::Enum(Arc::new(EnumValue { variant, payload })))
+                Some(Value::Enum(Arc::new(EnumValue {
+                    variant,
+                    payload: VariantValues::Tuple(payload),
+                })))
             }
             _ => None,
         }
@@ -388,7 +393,6 @@ impl<'a> ExecPass<'a> {
     ) -> Option<Value> {
         let items = match self.direct_expr(cell, env, &f.seq, depth)? {
             Value::Seq(items) => items,
-            Value::SeqNil => Arc::new(Seq::new()),
             _ => return None,
         };
         let mut seq = Seq::new();
@@ -410,13 +414,7 @@ impl<'a> ExecPass<'a> {
             }
             env.truncate(mark);
         }
-        Some(if !collect {
-            Value::Nil
-        } else if seq.is_empty() {
-            Value::SeqNil
-        } else {
-            Value::Seq(Arc::new(seq))
-        })
+        Some(if collect { seq_value(seq) } else { Value::Nil })
     }
 
     /// Whether calls to the function `index` may be evaluated directly.
@@ -442,6 +440,8 @@ impl<'a> ExecPass<'a> {
             Statement::LetBinding(binding) => self.expr_is_pure(&binding.value),
             Statement::Expr { value, .. } => self.expr_is_pure(value),
             Statement::ForLoop(f) => self.for_is_pure(f),
+            // Destructuring is left to ordinary evaluation.
+            Statement::LetPattern(_) => false,
         }) && scope
             .tail
             .as_ref()
@@ -509,6 +509,7 @@ impl<'a> ExecPass<'a> {
             Expr::UnaryOp(u) => self.expr_is_pure(&u.operand),
             Expr::Cast(cast) => self.expr_is_pure(&cast.value),
             Expr::Tuple(tuple) => tuple.items.iter().all(|item| self.expr_is_pure(item)),
+            Expr::Seq(seq) => seq.items.iter().all(|item| self.expr_is_pure(item)),
             Expr::StructLit(lit) => {
                 lit.fields
                     .iter()
@@ -516,7 +517,6 @@ impl<'a> ExecPass<'a> {
                     && lit.base.as_ref().is_none_or(|base| self.expr_is_pure(base))
             }
             Expr::Nil(_)
-            | Expr::SeqNil(_)
             | Expr::FloatLiteral(_)
             | Expr::IntLiteral(_)
             | Expr::BoolLiteral(_)
@@ -532,8 +532,7 @@ impl Builtin {
     fn is_pure(self) -> bool {
         matches!(
             self,
-            Builtin::List
-                | Builtin::Cons
+            Builtin::Cons
                 | Builtin::Head
                 | Builtin::Tail
                 | Builtin::RangeFull

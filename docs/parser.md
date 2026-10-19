@@ -349,9 +349,10 @@ while !self.at(Eof) {
 Argument declarations (`argDecl : ident COLON tySpec (EQ expr)?`) and enum
 variants / struct fields are comma-separated lists parsed by the shared
 `separated_list` helper (§8). An enum variant is
-`enumVariant : ident (LPAREN tySpecList RPAREN)?`, so `Some(T)` carries a
-payload and `None` does not. A parameter with a default value is a keyword
-parameter; `parse_arg_decls` gives the parameter list its own scope-ordinal
+`enumVariant : ident (LPAREN tySpecList RPAREN | LBRACE structFields RBRACE)?`,
+so `Some(T)` carries a positional payload, `Circle { r: Float }` a named one
+reusing `parse_struct_field`, and `None` none at all. A parameter with a
+default value is a keyword parameter; `parse_arg_decls` gives the parameter list its own scope-ordinal
 counter (§10) so scopes opened inside default values are numbered from zero.
 
 `genericParams : LT ident (COMMA ident)* COMMA? GT` follows the name of a
@@ -377,15 +378,18 @@ enum TySpecKind { Path { name: Ident, args: Vec<TySpec> }, Seq(Box<TySpec>), Tup
 
 - `Float` → `Path` with no arguments; `Option<Int>` → `Path` with one
 - `[T]` → `Seq` (a sequence/list type)
-- `(A, B)` → `Tuple`; `()` → empty `Tuple`; `(A,)` and `(A)` → 1-element `Tuple`
+- `(A, B)` → `Tuple`; `()` → empty `Tuple`; `(A,)` → 1-element `Tuple`;
+  `(A)` → `A` (unwrapped, no node)
 
 The tuple element list goes through `separated_list`, so **an empty `()` and a
-trailing comma both parse**. The empty tuple type is the **unit type**: the
-later TySpec→`Ty` lowering (`ty_from_spec` in `compile.rs`) maps an empty
-`Tuple` to `Ty::Nil` — the same type as the `()` *value* (`Expr::Nil`) — so `()`
-is a real, usable type rather than an unhandled edge case. `parse_ty_spec` is
-also guarded by `enter_depth`/`exit_depth` because `[`/`(`/`<` nest
-recursively.
+trailing comma both parse**. As in expressions, the comma is what makes a
+one-element tuple: `(A)` is the parenthesized type `A` (unwrapped, keeping the
+inner spec's own span) and `(A,)` is the one-element tuple. The empty tuple type
+is the **unit type**: the later TySpec→`Ty` lowering (`ty_from_spec` in
+`compile.rs`) maps an empty `Tuple` to `Ty::Nil` — the same type as the `()`
+*value* (`Expr::Nil`) — so `()` is a real, usable type rather than an unhandled
+edge case. `parse_ty_spec` is also guarded by `enter_depth`/`exit_depth` because
+`[`/`(`/`<` nest recursively.
 
 The one place a type takes no arguments is the target of `as`: `a as Float <
 b` is a comparison, so `parse_suffix` parses the cast target with
@@ -400,42 +404,50 @@ items with an **optional trailing comma**. That policy lives in exactly one
 place:
 
 ```rust
-fn separated_list<T>(&mut self, close: TokenKind,
-                     mut parse_item: impl FnMut(&mut Self) -> T) -> Vec<T> {
+fn separated_list_trailing<T>(
+    &mut self, close: TokenKind, mut parse_item: impl FnMut(&mut Self) -> T,
+) -> (Vec<T>, bool) {
     let mut items = Vec::new();
+    let mut trailing = false;
     while !self.at(close) && !self.at(TokenKind::Eof) {
         items.push(parse_item(self));
-        if !self.eat(TokenKind::Comma) { break; }
+        if !self.eat(TokenKind::Comma) { trailing = false; break; }
+        trailing = true;
     }
-    items
+    (items, trailing)
 }
 ```
 
-Call sites: argument declarations, enum variants, struct fields, tuple-type
-elements, and keyword arguments. Centralizing the loop is what keeps
-trailing-comma handling and the termination guarantee from drifting between them
-(that drift previously let an empty tuple type slip through silently).
+Call sites: argument declarations, enum variants, struct fields, tuple elements
+(in both types and expressions), sequence-literal elements, and keyword
+arguments. Centralizing the loop is what keeps trailing-comma handling and the
+termination guarantee from drifting between them.
+
+`separated_list` is the thin wrapper that drops the `trailing` flag, and is what
+nearly every call site uses. Only the tuple type reads the flag, to tell `(A,)`
+from `(A)`.
 
 **Termination.** Every iteration that does not `break` consumes at least the
 separator comma, so the loop runs at most once per remaining comma — a
 non-consuming `parse_item` cannot spin.
 
-> **Not every list uses it.** Two constructs are *comma-terminated*, not
-> comma-separated — a comma after **every** element is mandatory — so they keep
-> their own loops:
+> **Not every list uses it.** Two constructs keep their own loops:
 >
-> - **Tuple expressions** (`tupleExpr : LPAREN tupleExprList RPAREN` where
->   `tupleExprList : expr COMMA (expr COMMA)*`). The mandatory comma is what
->   disambiguates a parenthesized group `(a)` (no node — the inner expression's
->   own span is kept) from a one-tuple `(a,)`. `(a, b)` is therefore a **syntax
->   error**; the tuple is `(a, b,)`.
-> - **Match arms** (`matchArm : pattern FAT_ARROW expr COMMA`). The comma is
->   part of each arm, and `matchArms : matchArm+` requires at least one arm, so
->   `match k {}` is a syntax error. A `pattern` is `_`, an `identPath`, or an
->   `identPath` followed by a parenthesised list of sub-patterns, each a name
->   or `_`; `parse_pattern` records `CompletionSite::Pattern`. A bare name
->   parses as a `Pattern::Binding`, and the type checker decides whether it
->   names a unit variant instead.
+> - **Match arms** (`matchArm : pattern FAT_ARROW expr COMMA`) are
+>   *comma-terminated*, not comma-separated: a comma after **every** arm is
+>   mandatory. The comma is part of each arm, and `matchArms : matchArm+`
+>   requires at least one arm, so `match k {}` is a syntax error. A `pattern` is
+>   `_`, an `identPath`, an `identPath` followed by a parenthesised list of
+>   sub-patterns, or an `identPath` followed by a braced list of field
+>   patterns; a sub-pattern is a name or `_` either way. `parse_pattern`
+>   records `CompletionSite::Pattern`. A bare name parses as a
+>   `Pattern::Binding`, and the type checker decides whether it names a unit
+>   variant instead.
+> - **Struct patterns** (`S { f, g: name, .. }` or `E::V { f, g: name, .. }`)
+>   have two terminators — `}` and the `..` — so `parse_struct_pattern` keeps
+>   its own loop, shaped like the struct literal's. A field pattern is
+>   `fieldPattern : ident (COLON subPattern)?`, where a bare `f` is shorthand
+>   for `f: f`, and the `..` comes last and takes no comma after it.
 > - **Struct literal bodies** ([§9.5](#95-struct-literals)) are comma-separated
 >   with an optional trailing comma, but have two terminators — `}` and the
 >   `..base` — so they keep their own loop as well.
@@ -453,8 +465,8 @@ fn parse_expr(&mut self, min_bp: u8) -> Expr {
     let mut lhs = self.parse_prefix();          // a prefix op or a primary
     loop {
         let k = self.cur.kind;
-        // suffix cluster — binds tighter than any binary operator
-        if SUFFIX_BP >= min_bp && k is one of { . [ ! as } {
+        // suffixes — both levels bind tighter than any binary operator
+        if suffix_bp(k).is_some_and(|bp| bp >= min_bp) {
             lhs = self.parse_suffix(lhs, lhs_start);
             continue;
         }
@@ -480,7 +492,9 @@ point. A top-level call passes `min_bp == 0` (anything binds).
 `infix_op(kind)` is the single source of truth for the infix operator set: it
 returns `(BinOp, left_bp, right_bp)` or `None`. `BinOp` is the AST's own operator
 enum (`Arith(ArithOp)`, `Cmp(ComparisonOp)`, or `Bool(BoolOp)`), carried
-alongside its precedence, so the two cannot drift apart.
+alongside its precedence, so the two cannot drift apart. `suffix_bp(kind)` is
+the matching table for the suffixes, which have no right operand and so need
+only a left binding power.
 
 | Operators                         | (left, right) | Notes |
 |-----------------------------------|---------------|-------|
@@ -489,8 +503,9 @@ alongside its precedence, so the two cannot drift apart.
 | `== != >= > <= <`  (comparison)   | `(5, 6)`      | |
 | `+ -`  (additive)                 | `(7, 8)`      | |
 | `* / %`  (multiplicative)         | `(9, 10)`     | |
-| suffix cluster `. [] ! as`        | `SUFFIX_BP = 11` | tighter than any binary op |
+| trailing suffixes `! as`          | `TRAILING_BP = 11` | tighter than any binary op |
 | prefix unary operand `! -`        | `PREFIX_BP = 13` | see §9.4 |
+| access suffixes `. .0 []`         | `ACCESS_BP = 15` | tighter than a prefix op |
 
 The boolean operations sit below the comparisons so `a < b && c < d` reads as
 `(a < b) && (c < d)`, and `&&` binds tighter than `||`, matching Rust.
@@ -512,13 +527,19 @@ level).
 ### 9.2 Prefixes, primaries, and suffixes
 
 - **`parse_prefix`** handles the prefix unary operators `!` (logical not) and `-`
-  (negate). It parses its operand with `min_bp = PREFIX_BP`. Otherwise it falls
-  through to `parse_primary`.
+  (negate). It parses its operand with `min_bp = PREFIX_BP`, which lets the
+  access suffixes bind inside the operand but not the trailing ones
+  ([§9.4](#94-the-lhs_start-span-subtlety-and-prefix-vs-suffix)). Otherwise it
+  falls through to `parse_primary`.
 - **`parse_primary`** parses an atomic operand (the Pratt "null denotation"):
   - `(` → `parse_paren`: `()` is `nil`; `(e)` is a parenthesized group
-    (unwrapped, no node); `(e, …,)` is a tuple.
-  - `[` → `parse_seq_nil`: only the empty `[]` is an expression (the
-    sequence-nil literal). A non-empty `[…]` is *not* an expression.
+    (unwrapped, no node); `(e, …)` is a tuple, with an optional trailing comma.
+    The comma after the first element is what separates the one-tuple `(e,)`
+    from the group `(e)`; the rest is an ordinary `separated_list`.
+  - `[` → `parse_seq_literal`: `seqLiteral : LBRACK (expr (COMMA expr)*
+    COMMA?)? RBRACK`, the elements taken by `separated_list` (§8), so the
+    trailing comma is optional and `[]` is the zero-element case. Struct
+    literals are re-enabled inside the brackets, where they are unambiguous.
   - `if` / `match` / `{` → the block-form primaries `IfExpr`, `MatchExpr`,
     `Scope`. These are full expressions, so the Pratt loop can still attach
     trailing operators to them. An `if` reached here requires its `else`: only
@@ -577,11 +598,17 @@ reason: a parenthesized operand is unwrapped to its inner node, whose span
 excludes the `(`; but the rest of the compiler expects the enclosing operator to
 span from the `(`. Using the lexical start of the first token gets this right.
 
-A consequence of `PREFIX_BP (13) > SUFFIX_BP (11)` is that a prefix operator's
-operand is a bare primary — suffixes do **not** bind inside it. So `-a.b` parses
-as `(-a).b` (`FieldAccess(Neg(a), b)`), and `-a!` as `(-a)!`. The suffix cluster
-binds tighter than the binary operators, but a prefix operator grabs only its
-immediate primary and the suffix then applies to the whole unary expression.
+`PREFIX_BP (13)` sits *between* the two suffix levels, which is what decides
+where a prefix operator's operand ends. The access suffixes bind inside it, so
+`-a.b` parses as `-(a.b)` (`Neg(FieldAccess(a, b))`), `-t.0` as `-(t.0)` and
+`-s[i]` as `-(s[i])` — negating a coordinate is the common case, and this is
+Rust's rule too. The trailing suffixes do not, so `-a as Float` is
+`(-a) as Float` (Rust's rule again) and `-a!` is `(-a)!`.
+
+Suffixes never compete with *each other*: they take no right operand, so the
+loop applies them left to right in source order whatever their level. `r.x0!.y`
+is `((r.x0)!).y` and `x as Float.y` is `(x as Float).y`. The split matters only
+where a prefix operator is deciding how much to take.
 
 ### 9.5 Struct literals
 
@@ -599,6 +626,10 @@ path, the explicit fields, and the optional base:
   own loop rather than going through `separated_list`; it terminates for the
   same reason, since every iteration that does not `break` consumes the
   separator comma.
+- The same node also builds an **enum variant with named fields**, since
+  `E::V { r: 1. }` is `identPath LBRACE …` like any other literal. Which one a
+  literal builds is settled by the type checker, not the parser, and a variant
+  takes no `..base`.
 
 **The head restriction.** `if c {`, `match k {`, and `for v in seq {` already
 read `name {` as an identifier followed by the construct's own scope, so a
@@ -626,6 +657,10 @@ produce stable GUI hierarchy IDs without adding annotations to source text.
 The statement loop dispatches on `cur`:
 
 - `let name (: tySpec)? = expr ;` → `Statement::LetBinding`
+- `let pattern = expr ;` → `Statement::LetPattern`, chosen when the name after
+  `let` is followed by `{` or `::`, as in `let Size { w, .. } = s;`. The
+  pattern is parsed by `parse_pattern`; the type checker rejects any pattern
+  but a struct pattern whose fields are names or `_`.
 - `for v in expr scope` → `Statement::ForLoop`
 - `if` → parsed by `parse_if` directly rather than through `parse_expr`, with
   the `else` **optional**. This is the only position where it may be omitted,

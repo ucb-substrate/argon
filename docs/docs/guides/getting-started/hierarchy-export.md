@@ -9,7 +9,7 @@ A cell becomes reusable once you place it inside another cell.
 
 ## Compose a parent cell
 
-Add this after `inset_rect`:
+Add `inst` to the `use` line at the top of `lib.ar`, so that it reads `use std::layout::{inst, rect};`, then add this after `inset_rect`:
 
 ```argon
 cell triple_rect() {

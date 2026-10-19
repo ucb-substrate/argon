@@ -401,7 +401,6 @@ struct TextLabel {
 /// A bounded, fully collected direct frame. Keep it at its original camera
 /// while the first raster is pending, including pans into uncached geometry.
 struct DirectFrame {
-    viewport: Size<Pixels>,
     display: RasterDisplayTransform,
     content_revision: u64,
     rects: Vec<(Rect, LayerState)>,
@@ -877,6 +876,27 @@ fn segment_constraint_with_end(
         DrawSegmentConstraint::DiagonalPositive(_) => DrawSegmentConstraint::DiagonalPositive(end),
         DrawSegmentConstraint::DiagonalNegative(_) => DrawSegmentConstraint::DiagonalNegative(end),
     }
+}
+
+fn segment_constraint_end(constraint: DrawSegmentConstraint) -> usize {
+    match constraint {
+        DrawSegmentConstraint::Horizontal(end)
+        | DrawSegmentConstraint::Vertical(end)
+        | DrawSegmentConstraint::DiagonalPositive(end)
+        | DrawSegmentConstraint::DiagonalNegative(end) => end,
+    }
+}
+
+/// Removes the most recently placed point along with the constraint, if any,
+/// that snapped the segment ending at it.
+fn undo_last_draw_point(
+    points: &mut Vec<Point<f32>>,
+    constraints: &mut Vec<DrawSegmentConstraint>,
+) {
+    if points.pop().is_none() {
+        return;
+    }
+    constraints.retain(|constraint| segment_constraint_end(*constraint) < points.len());
 }
 
 fn draw_source_coordinate(value: f32, grid: f64) -> f64 {
@@ -6040,6 +6060,7 @@ impl Element for CanvasElement {
             cx.drop_image(image, Some(window));
         }
         self.inner.update(cx, |inner, cx| {
+            let resized = inner.screen_bounds.size != bounds.size;
             inner.offset =
                 offset_after_horizontal_reflow(inner.offset, inner.screen_bounds, bounds);
             inner.screen_bounds = bounds;
@@ -6053,17 +6074,16 @@ impl Element for CanvasElement {
                 .raster_tiles
                 .as_ref()
                 .is_some_and(|tiles| tiles.screen_viewport == bounds.size);
-            // A paint notification is also emitted after each background tile
-            // finishes or is cancelled. Retargeting an already-running first
-            // tile here advances its generation, causing that tile to cancel
-            // and notify again forever. Navigation input still explicitly
-            // retargets the worker when the viewport actually changes.
-            if paint_should_start_navigation_worker(
-                has_solved_layout,
-                inner.raster_prefetch_enabled,
-                raster_matches_viewport,
-                inner.raster_worker_active,
-            ) {
+            // Retarget on an actual resize, not on tile-completion paints
+            // that would repeatedly cancel and restart the worker.
+            if (resized && has_solved_layout && inner.raster_prefetch_enabled)
+                || paint_should_start_navigation_worker(
+                    has_solved_layout,
+                    inner.raster_prefetch_enabled,
+                    raster_matches_viewport,
+                    inner.raster_worker_active,
+                )
+            {
                 inner.request_navigation_raster(cx);
             }
         });
@@ -6078,26 +6098,18 @@ impl Element for CanvasElement {
                 .then(|| inner.raster_display_transform_for_current_view())
                 .flatten()
         });
-        // Retained cameras may lag a gesture, but the submitted tile field
-        // must cover the complete viewport. When the requested camera would
-        // expose an unfinished edge, keep the last covered camera until a
-        // closer full-screen raster is ready.
+        // Navigation keeps a covered camera until its replacement is ready.
+        // Resizing also retains the old field while newly exposed edges render.
         let previous_presentation = inner.last_presented_raster.get();
         let retained_direct = inner
             .retained_direct_frame
             .as_ref()
-            .filter(|frame| {
-                frame.viewport == bounds.size
-                    && inner.raster_revision_displayable(frame.content_revision)
-            })
+            .filter(|frame| inner.raster_revision_displayable(frame.content_revision))
             .cloned();
         let tile_candidate = inner
             .raster_tiles
             .clone()
-            .filter(|tiles| {
-                inner.raster_revision_displayable(tiles.content_revision)
-                    && tiles.screen_viewport == bounds.size
-            })
+            .filter(|tiles| inner.raster_revision_displayable(tiles.content_revision))
             .and_then(|tiles| {
                 // Only advance to the exact requested camera once that LOD
                 // covers the viewport. A capture-centered intermediate or a
@@ -6118,7 +6130,14 @@ impl Element for CanvasElement {
                     previous_presentation,
                     inner.scale,
                     inner.offset,
-                )?;
+                )
+                .or_else(|| {
+                    // A larger window can outgrow the retained overscan.
+                    // Keep the visible layout while the new margins render.
+                    (tiles.screen_viewport != bounds.size)
+                        .then_some(previous_presentation)
+                        .flatten()
+                })?;
                 Some((tiles, display))
             });
         // The presentation follows the density decision alone. Tools,
@@ -6871,7 +6890,6 @@ impl Element for CanvasElement {
         }
         let fresh_direct_frame = (!shallow && replay_direct.is_none()).then(|| {
             Arc::new(DirectFrame {
-                viewport: bounds.size,
                 display: RasterDisplayTransform {
                     scale: inner.scale,
                     offset: inner.offset,
@@ -8620,6 +8638,7 @@ impl Render for LayoutCanvas {
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::finish_draw_points))
             .on_action(cx.listener(Self::dark_mode))
             .on_action(cx.listener(Self::light_mode))
@@ -9617,14 +9636,13 @@ impl LayoutCanvas {
             return;
         }
 
-        let can_stage_over_active = self.raster_tiles.as_ref().is_some_and(|tiles| {
-            self.raster_revision_displayable(tiles.content_revision)
-                && tiles.screen_viewport == target.screen_viewport
-        });
+        let can_stage_over_active = self
+            .raster_tiles
+            .as_ref()
+            .is_some_and(|tiles| self.raster_revision_displayable(tiles.content_revision));
         if !can_stage_over_active {
-            // There is no compatible previous frame to retain (initial load,
-            // content invalidation, or resize), so make the center visible as
-            // soon as possible instead of waiting for nine tiles.
+            // With no displayable previous frame, show the center tile as
+            // soon as possible instead of waiting for the surrounding tiles.
             if index != target.center {
                 self.raster_images_to_drop.push(cache.image);
                 return;
@@ -11483,6 +11501,45 @@ impl LayoutCanvas {
         self.keyboard_zoom(KEYBOARD_ZOOM_FACTOR.recip(), cx);
     }
 
+    /// Undoes the last point placed by the active tool. Tools with nothing left
+    /// to undo stay active in their starting state.
+    pub(crate) fn backspace(
+        &mut self,
+        _: &Backspace,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.read(cx).tool.clone().update(cx, |tool, cx| {
+            match tool {
+                ToolState::DrawPolygon(DrawPolygonToolState {
+                    points,
+                    constraints,
+                })
+                | ToolState::DrawPath(DrawPathToolState {
+                    points,
+                    constraints,
+                }) => {
+                    if points.is_empty() {
+                        return;
+                    }
+                    undo_last_draw_point(points, constraints);
+                }
+                ToolState::DrawRect(DrawRectToolState { p0 }) => {
+                    if p0.take().is_none() {
+                        return;
+                    }
+                }
+                ToolState::DrawDim(DrawDimToolState { edges }) => {
+                    if edges.pop().is_none() {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+            cx.notify();
+        });
+    }
+
     pub(crate) fn cancel(&mut self, _: &Cancel, _window: &mut Window, cx: &mut Context<Self>) {
         self.state.read(cx).tool.clone().update(cx, |tool, cx| {
             match tool {
@@ -11986,10 +12043,18 @@ pub(crate) fn find_obj_path(
     if path.is_empty() {
         panic!("need non-empty object path");
     }
+    // Past the first hop, the path reads a child cell's objects through an
+    // instance, which sees only its public fields.
+    let mut in_child = false;
+    let name_of = |scope: ScopeAddress, in_child: bool, obj: ObjectId| {
+        if in_child {
+            cell.output.reachable_field_name(scope.cell, obj)
+        } else {
+            cell.output.reachable_obj_name(scope.cell, scope.scope, obj)
+        }
+    };
     for obj in &path[0..path.len() - 1] {
-        if let Some(name) =
-            cell.output
-                .reachable_obj_name(current_scope.cell, current_scope.scope, *obj)
+        if let Some(name) = name_of(current_scope, in_child, *obj)
             && let Some(inst) = cell.output.cells[&current_scope.cell].objects[obj].get_instance()
         {
             string_path.push(name);
@@ -11997,23 +12062,21 @@ pub(crate) fn find_obj_path(
                 cell: inst.cell,
                 scope: cell.output.cells[&inst.cell].root,
             };
+            in_child = true;
         } else {
             reachable = false;
             break;
         }
     }
     let obj = path.last().unwrap();
-    if let Some(name) =
-        cell.output
-            .reachable_obj_name(current_scope.cell, current_scope.scope, *obj)
-    {
+    if let Some(name) = name_of(current_scope, in_child, *obj) {
         match &cell.output.cells[&current_scope.cell].objects[obj] {
             SolvedValue::Rect(_) | SolvedValue::Polygon(_) | SolvedValue::Path(_) => {
                 string_path.push(name)
             }
             SolvedValue::Instance(_) => {
                 string_path.push(name);
-                string_path = vec![format!("bbox({})", string_path.join("."))];
+                string_path = vec![format!("std::layout::bbox({})", string_path.join("."))];
             }
             _ => reachable = false,
         }
@@ -12486,7 +12549,8 @@ mod tests {
         let source_path = directory.path().join("lib.ar");
         std::fs::write(
             &source_path,
-            r#"cell top() {
+            r#"use std::layout::rect;
+cell top() {
     rect("met1", x0=0., y0=0., x1=100., y1=1.);
 }
 "#,
@@ -12545,6 +12609,7 @@ mod tests {
         std::fs::write(
             &source_path,
             r#"
+use std::layout::rect;
 cell top() {
     rect("met1", x0=0., y0=0., x1=1., y1=1.);
     rect("met1", x0=2., y0=0., x1=3., y1=1.);
@@ -12585,6 +12650,7 @@ cell top() {
         std::fs::write(
             &source_path,
             r#"
+use std::layout::{inst, path, rect};
 cell bit() {
     let body = rect("met1", x0=0., y0=0., x1=8., y1=20.);
     let route = path("met1", 3,
@@ -13531,6 +13597,7 @@ cell top() {
         std::fs::write(
             &source,
             r#"
+use std::layout::{inst, rect};
 cell free() { let r = rect("met1", x0i=10., y0i=10., x1i=90., y1i=90.)!; }
 cell partial() { let r = rect("met1", x0i=10., y0i=10., x1=90., y1=90.)!; }
 cell fixed() { let r = rect("met1", x0=10., y0=10., x1=90., y1=90.); }
@@ -14105,7 +14172,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         let source = directory.path().join("lib.ar");
         std::fs::write(
             &source,
-            "cell child() { let r = rect(\"met2\", x0=0., y0=0., x1=10., y1=10.); } \
+            "use std::layout::{inst, rect}; cell child() { let r = rect(\"met2\", x0=0., y0=0., x1=10., y1=10.); } \
              cell top() { let c = inst(child(), x=0., y=0.); \
              let r = rect(\"met1\", x0=20., y0=0., x1=30., y1=10.); }",
         )
@@ -14404,6 +14471,50 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                 DrawSegmentConstraint::DiagonalNegative(0)
             )
         );
+    }
+
+    #[test]
+    fn undoing_draw_points_drops_their_snapped_constraints() {
+        let mut points = vec![
+            Point::new(0., 0.),
+            Point::new(8., 0.),
+            Point::new(8., 8.),
+            Point::new(4., 8.),
+        ];
+        let mut constraints = vec![
+            DrawSegmentConstraint::Horizontal(1),
+            DrawSegmentConstraint::Vertical(2),
+        ];
+
+        // The unconstrained final point leaves both constraints in place.
+        undo_last_draw_point(&mut points, &mut constraints);
+        assert_eq!(
+            points,
+            [Point::new(0., 0.), Point::new(8., 0.), Point::new(8., 8.)]
+        );
+        assert_eq!(
+            constraints,
+            [
+                DrawSegmentConstraint::Horizontal(1),
+                DrawSegmentConstraint::Vertical(2)
+            ]
+        );
+
+        undo_last_draw_point(&mut points, &mut constraints);
+        assert_eq!(points, [Point::new(0., 0.), Point::new(8., 0.)]);
+        assert_eq!(constraints, [DrawSegmentConstraint::Horizontal(1)]);
+
+        undo_last_draw_point(&mut points, &mut constraints);
+        assert_eq!(points, [Point::new(0., 0.)]);
+        assert!(constraints.is_empty());
+
+        undo_last_draw_point(&mut points, &mut constraints);
+        assert!(points.is_empty());
+
+        // Undoing with nothing left to remove is a no-op.
+        undo_last_draw_point(&mut points, &mut constraints);
+        assert!(points.is_empty());
+        assert!(constraints.is_empty());
     }
 
     #[test]
@@ -14768,7 +14879,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         let source = directory.path().join("lib.ar");
         std::fs::write(
             &source,
-            "cell top() { let r = rect(\"met1\", x0i=0., y0i=0., x1i=10., y1i=10.)!; }",
+            "use std::layout::rect; cell top() { let r = rect(\"met1\", x0i=0., y0i=0., x1i=10., y1i=10.)!; }",
         )
         .unwrap();
         let ast = argonc::parse::parse_workspace_with_std(&source).ast();
@@ -14948,7 +15059,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         let source_path = directory.path().join("lib.ar");
         std::fs::write(
             &source_path,
-            "cell top() {\n    let shape = rect(\"met1\", x0i=1.2, y0i=0., x1i=10.3, y1i=10.)!;\n}\n",
+            "use std::layout::rect;\ncell top() {\n    let shape = rect(\"met1\", x0i=1.2, y0i=0., x1i=10.3, y1i=10.)!;\n}\n",
         )
         .unwrap();
         let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
@@ -15074,6 +15185,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
         std::fs::write(
             &source_path,
             r#"
+use std::layout::{inst, rect};
 cell leaf(width: Float) {
     let shape = rect("met1", x0=0., y0=0., x1=width, y1=5.)!;
 }
@@ -15122,8 +15234,10 @@ cell top() {
         std::fs::write(
             &source_path,
             r#"
+use std::layout::{inst, rect};
 cell child() {
-    let shape = rect("met1", x0=0., y0=0., x1=10., y1=5.);
+    pub let shape = rect("met1", x0=0., y0=0., x1=10., y1=5.);
+    let hidden = rect("met1", x0=20., y0=0., x1=30., y1=5.);
 }
 cell top() {
     let child_instance = inst(child(), x=3., y=4.);
@@ -15150,11 +15264,16 @@ cell top() {
             .unwrap();
         let instance_id = instance.id;
         let child_cell = &output.cells[&instance.cell];
-        let child_rect_id = child_cell
-            .objects
-            .values()
-            .find_map(|object| object.get_rect().map(|rect| rect.id))
-            .unwrap();
+        let child_rect_at = |x0: f64| {
+            child_cell
+                .objects
+                .values()
+                .find_map(|object| object.get_rect().filter(|rect| rect.x0.0 == x0))
+                .map(|rect| rect.id)
+                .unwrap()
+        };
+        let child_rect_id = child_rect_at(0.);
+        let hidden_rect_id = child_rect_at(20.);
         let scope = ScopeAddress {
             cell: top,
             scope: top_root,
@@ -15168,12 +15287,15 @@ cell top() {
 
         assert_eq!(
             find_obj_path(&[instance_id], &state, scope),
-            (true, vec!["bbox(child_instance)".to_owned()])
+            (true, vec!["std::layout::bbox(child_instance)".to_owned()])
         );
         assert_eq!(
             find_obj_path(&[instance_id, child_rect_id], &state, scope),
             (true, vec!["child_instance".to_owned(), "shape".to_owned()])
         );
+        // An instance reads only public fields, so a private one is not a
+        // path the GUI may write into source.
+        assert!(!find_obj_path(&[instance_id, hidden_rect_id], &state, scope).0);
         assert_eq!(
             exact_object_bounds(&[instance_id, child_rect_id], &state, scope),
             Some(ExactLayoutBounds {

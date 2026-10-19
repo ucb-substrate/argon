@@ -1,3 +1,5 @@
+use std::layout::{inst, rect};
+
 fn lat_sd_port_raw(x: Float, w: Float, row: Int, length: Float) -> Rect {
     let cy = row as Float * (length + 280.);
     let nx = if w < 800. { 1 } else { 2 };
@@ -363,8 +365,8 @@ cell diff_latch() {
         lib::columns::util::draw_box("psdm.drawing", lib::columns::util::rect_union(lat_finv_layer_bbox(2, 0., yoff), lat_finv_layer_bbox(2, 2070., yoff)));
     }
 
-    let dout1 = lat_finv_inst_port(1, 0., -7900.);
-    let dout2 = lat_finv_inst_port(1, 2070., -7900.);
+    pub let dout1 = lat_finv_inst_port(1, 0., -7900.);
+    pub let dout2 = lat_finv_inst_port(1, 2070., -7900.);
     lib::columns::util::draw_box("li1.pin", dout1);
     lib::columns::util::draw_box("li1.pin", dout2);
 }

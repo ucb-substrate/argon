@@ -39,7 +39,7 @@ fn li(r: Rect) -> Rect { lib::columns::util::draw_box("li1.drawing", r) }
 // An M1-M2 via array; `longer` uses the longer-direction expansion policy.
 fn via12(bot: Rect, top: Rect, longer: Bool) -> Shapes {
     let v = lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", bot, top, 0, 0, longer);
-    Shapes { m1: list(v.0), m2: list(v.1) }
+    Shapes { m1: [v.0], m2: [v.1] }
 }
 
 // An LI-M1 contact array, returned with its M1 landing.
@@ -89,13 +89,13 @@ fn route_hvh(g: Grid, start: Rect, end: Rect, m2_a: Int, m1_i: Int, m2_b: Int) -
     let middle = m1(from_spans(x_mid, span_union(y_a, y_b)));
     let last = m2(from_spans(span_union(x_mid, hspan(end)), y_b));
     let end_expanded = m1(with_vspan(end, span_union(vspan(end), y_b)));
-    join_all(list(
-            Shapes { m1: list(start_expanded, middle, end_expanded), m2: list(first, last) },
+    join_all([
+            Shapes { m1: [start_expanded, middle, end_expanded], m2: [first, last] },
             via12(start_expanded, first, false),
             via12(middle, first, false),
             via12(middle, last, false),
             via12(end_expanded, last, false),
-    ))
+    ])
 }
 
 // M1 to M1 over one M2 track.
@@ -104,11 +104,11 @@ fn route_h_m1(g: Grid, start: Rect, end: Rect, m2_j: Int) -> Shapes {
     let start_expanded = m1(with_vspan(start, span_union(vspan(start), track)));
     let end_expanded = m1(with_vspan(end, span_union(vspan(end), track)));
     let horizontal = m2(from_spans(span_union(hspan(start), hspan(end)), track));
-    join_all(list(
-            Shapes { m1: list(start_expanded, end_expanded), m2: list(horizontal) },
+    join_all([
+            Shapes { m1: [start_expanded, end_expanded], m2: [horizontal] },
             via12(start_expanded, horizontal, false),
             via12(end_expanded, horizontal, false),
-    ))
+    ])
 }
 
 // M2 to M1 over an M1 track, then along an M2 track when the end is off it.
@@ -118,10 +118,10 @@ fn route_v_m2_to_m1(g: Grid, start: Rect, end: Rect, m1_i: Int, m2_j: Int) -> Sh
     let start_expanded = m2(with_hspan(start, span_union(hspan(start), vertical_track)));
     let vertical = m1(from_spans(vertical_track, span_union(vspan(start), horizontal_track)));
     let end_expanded = m1(with_vspan(end, span_union(vspan(end), horizontal_track)));
-    let base = join(Shapes { m1: list(vertical, end_expanded), m2: list(start_expanded) }, via12(vertical, start_expanded, false));
+    let base = join(Shapes { m1: [vertical, end_expanded], m2: [start_expanded] }, via12(vertical, start_expanded, false));
     if (end.x1 < vertical.x0 || end.x0 > vertical.x1) {
         let horizontal = m2(from_spans(span_union(vertical_track, hspan(end)), horizontal_track));
-        join_all(list(base, on_m2(list(horizontal)), via12(vertical, horizontal, false), via12(end_expanded, horizontal, false)))
+        join_all([base, on_m2([horizontal]), via12(vertical, horizontal, false), via12(end_expanded, horizontal, false)])
     } else {
         base
     }
@@ -135,11 +135,11 @@ fn route_vh_m1(g: Grid, start: Rect, end: Rect, m1_i: Int, m2_j: Int) -> Shapes 
     let vertical = m1(from_spans(x_track, span_union(vspan(start), y_track)));
     let horizontal = m2(from_spans(span_union(x_track, hspan(end)), y_track));
     let end_expanded = m1(with_vspan(end, span_union(vspan(end), y_track)));
-    join_all(list(
-            Shapes { m1: list(start_expanded, vertical, end_expanded), m2: list(horizontal) },
+    join_all([
+            Shapes { m1: [start_expanded, vertical, end_expanded], m2: [horizontal] },
             via12(vertical, horizontal, false),
             via12(end_expanded, horizontal, false),
-    ))
+    ])
 }
 
 // M2 to M2 over one M1 track.
@@ -148,11 +148,11 @@ fn route_v_m2(g: Grid, start: Rect, end: Rect, m1_i: Int) -> Shapes {
     let start_expanded = m2(with_hspan(start, span_union(hspan(start), track)));
     let end_expanded = m2(with_hspan(end, span_union(hspan(end), track)));
     let vertical = m1(from_spans(track, span_union(vspan(start), vspan(end))));
-    join_all(list(
-            Shapes { m1: list(vertical), m2: list(start_expanded, end_expanded) },
+    join_all([
+            Shapes { m1: [vertical], m2: [start_expanded, end_expanded] },
             via12(vertical, start_expanded, false),
             via12(vertical, end_expanded, false),
-    ))
+    ])
 }
 
 // M1 to M2 over an M2 track, then an M1 track.
@@ -163,12 +163,12 @@ fn route_hv_m1_to_m2(g: Grid, start: Rect, end: Rect, m2_j: Int, m1_i: Int) -> S
     let horizontal = m2(from_spans(span_union(hspan(start), vertical_track), horizontal_track));
     let vertical = m1(from_spans(vertical_track, span_union(horizontal_track, vspan(end))));
     let end_expanded = m2(with_hspan(end, span_union(hspan(end), vertical_track)));
-    join_all(list(
-            Shapes { m1: list(start_expanded, vertical), m2: list(horizontal, end_expanded) },
+    join_all([
+            Shapes { m1: [start_expanded, vertical], m2: [horizontal, end_expanded] },
             via12(start_expanded, horizontal, false),
             via12(vertical, horizontal, false),
             via12(vertical, end_expanded, false),
-    ))
+    ])
 }
 
 // Bitlines from the column peripherals straight up to the array.
@@ -196,12 +196,12 @@ fn draw_wordlines(dec: Any, bitcells: Any, rows: Int) -> Rect {
 // The replica column's bitlines to the replica precharge.
 fn draw_replica_bitlines(rbl: Any, rpc: Any) -> Shapes {
     Shapes {
-        m1: list(
+        m1: [
             m1(lib::columns::util::rect_union(rbl.bl[0], rpc.bl_in[0])),
             m1(lib::columns::util::rect_union(rbl.br[0], rpc.br_in[0])),
             m1(lib::columns::util::rect_union(rbl.bl[1], rpc.bl_in[1])),
             m1(lib::columns::util::rect_union(rbl.br[1], rpc.br_in[1])),
-        ),
+        ],
         m2: [],
     }
 }
@@ -218,7 +218,7 @@ fn draw_dff_pins(g: Grid, dffs: Any, i: Int, n: Int) -> Shapes {
         let pin = m1(dff_pin(g, dffs, k));
         let via = mcon(src, src, true);
         let landing = m1(with_hspan(via, span_union(hspan(via), hspan(pin))));
-        on_m1(list(pin, landing))
+        on_m1([pin, landing])
     }])
 }
 
@@ -244,7 +244,7 @@ fn draw_predecode_routes(g: Grid, f: SramFloorplan, gate: Any, dec: Any, idx: In
         let final_m2 = m2_starts_after(g, predecode.y0) + same_bus_before(dec.predecode, k, 0);
         let jog_m2 = m2_nearest(g, output.y1);
         let vertical = if final_m2 < jog_m2 { first_vertical + k } else { first_vertical + n - 1 - k };
-        join(on_m1(list(via)), route_hvh(g, via, predecode, jog_m2, vertical, final_m2))
+        join(on_m1([via]), route_hvh(g, via, predecode, jog_m2, vertical, final_m2))
     }])
 }
 
@@ -264,11 +264,11 @@ fn draw_buffer_column_route(track: (Float, Float), outputs: [Rect], ports: [Rect
     let column_vspan = span_union(vspan(head(ports)), vspan(std::last(ports)));
     let vertical = m1(from_spans(track, span_union(output_vspan, column_vspan)));
     let keepout = from_spans(add_point(track, output_right), output_vspan);
-    join_all(list(stubs, column, pieces, on_m1(list(vertical, keepout))))
+    join_all([stubs, column, pieces, on_m1([vertical, keepout])])
 }
 
 fn draw_buffer_stubs(outputs: [Rect]) -> Shapes {
-    join_all([for o in outputs { on_m1(list(m1(cbox(o.x0, o.y0, o.x1 + 200., o.y1)))) }])
+    join_all([for o in outputs { on_m1([m1(cbox(o.x0, o.y0, o.x1 + 200., o.y1))]) }])
 }
 
 fn draw_column_control_ports(track: (Float, Float), ports: [Rect], on_m1_layer: Bool) -> Shapes {
@@ -276,7 +276,7 @@ fn draw_column_control_ports(track: (Float, Float), ports: [Rect], on_m1_layer: 
         let horizontal = m2(from_spans(add_point(track, column.x0 + 1400.), vspan(column)));
         let at_track = via12(from_spans(track, vspan(horizontal)), horizontal, true);
         let down = if on_m1_layer { via12(column, horizontal, true) } else { none() };
-        join_all(list(on_m2(list(horizontal)), at_track, down))
+        join_all([on_m2([horizontal]), at_track, down])
     }])
 }
 
@@ -284,7 +284,7 @@ fn draw_buffer_pieces(track: (Float, Float), output_vspan: (Float, Float), outpu
     join_all([for i in range_full(index, chunks, 1) {
         let y0 = output_vspan.0 + i as Float * 4000.;
         let y1 = min_float(y0 + 2000., output_vspan.1);
-        if y1 - y0 > 140. { on_m1(list(m1(from_spans(add_point(track, output_right), (y0, y1,))))) } else { none() }
+        if y1 - y0 > 140. { on_m1([m1(from_spans(add_point(track, output_right), (y0, y1,)))]) } else { none() }
     }])
 }
 
@@ -306,11 +306,11 @@ fn draw_buffer_column_routes(p: SramLayoutParams, g: Grid, f: SramFloorplan, col
     let pc_b_first = if first_sense { start + t.sense_en } else { start };
     let sense_first_track = if first_sense { start } else { start + t.pc_b };
     let write_last = m1_ends_before(g, f.boxes.cols.x0 - 5400.);
-    join_all(list(
+    join_all([
             draw_buffer_column_route(m1_tracks(g, pc_b_first, t.pc_b), pc_b.outputs, cols.pc_b, false),
-            draw_buffer_column_route(m1_tracks(g, sense_first_track, t.sense_en), sense.outputs, list(cols.sense_en[1]), false),
-            draw_buffer_column_route(m1_tracks(g, write_last - t.write_driver_en + 1, t.write_driver_en), write.outputs, list(cols.we), true),
-    ))
+            draw_buffer_column_route(m1_tracks(g, sense_first_track, t.sense_en), sense.outputs, [cols.sense_en[1]], false),
+            draw_buffer_column_route(m1_tracks(g, write_last - t.write_driver_en + 1, t.write_driver_en), write.outputs, [cols.we], true),
+    ])
 }
 
 // Column decoder outputs to the mux select rails, each on its own M1 bus.
@@ -323,11 +323,11 @@ fn draw_col_select_folds(track: (Float, Float), folds: [Rect]) -> Shapes {
     join_all([for y in folds {
         let expanded = m1(cbox(y.x0, y.y0, y.x1 + 1620., y.y1));
         let horizontal = m2(from_spans(span_union(lib::columns::util::span_with_stop_and_length(expanded.x1, 1400.), track), vspan(expanded)));
-        join_all(list(
-                Shapes { m1: list(expanded), m2: list(horizontal) },
+        join_all([
+                Shapes { m1: [expanded], m2: [horizontal] },
                 via12(expanded, horizontal, true),
                 via12(from_spans(track, vspan(horizontal)), horizontal, true),
-        ))
+        ])
     }])
 }
 
@@ -335,11 +335,11 @@ fn draw_col_select_route(track: (Float, Float), folds: [Rect], sel: Rect) -> Sha
     let route = m2(from_spans(span_union(track, hspan(sel)), vspan(sel)));
     let folds_vspan = span_union(vspan(head(folds)), vspan(std::last(folds)));
     let vertical = m1(from_spans(track, span_union(folds_vspan, vspan(sel))));
-    join_all(list(
+    join_all([
             draw_col_select_folds(track, folds),
-            Shapes { m1: list(vertical), m2: list(route) },
+            Shapes { m1: [vertical], m2: [route] },
             via12(from_spans(track, vspan(route)), route, true),
-    ))
+    ])
 }
 
 fn draw_col_select_routes(p: SramLayoutParams, g: Grid, f: SramFloorplan, col_dec: Any, cols: Any, select: Int) -> Shapes {
@@ -371,21 +371,21 @@ fn draw_clock_reset_routes(p: SramLayoutParams, g: Grid, f: SramFloorplan, contr
     let right = m1_ends_before(g, f.boxes.cols.x0 - 300.);
     let left = m1_starts_after(g, f.boxes.dffs.x1);
     let control_track = control_m2_start(p, g, f);
-    join_all(list(
+    join_all([
             draw_clock_reset_route(g, clock_pin(g, f, 0), control.clk, dffs.clk, cols.clk, left, right, control_track, connect),
             draw_clock_reset_route(g, clock_pin(g, f, 1), control.rstb, dffs.rstb, cols.rstb, left + 1, right - 1, control_track + 1, connect - 1),
-    ))
+    ])
 }
 
 fn draw_clock_reset_route(g: Grid, pin: Rect, control_port: Rect, dff_port: Rect, col_ports: [Rect], left: Int, right: Int, control_track: Int, connect: Int) -> Shapes {
     m1(pin);
-    join_all(list(
-            on_m1(list(pin)),
+    join_all([
+            on_m1([pin]),
             route_h_m1(g, control_port, pin, control_track),
             route_v_m2_to_m1(g, dff_port, pin, left, connect),
             route_v_m2_to_m1(g, col_ports[0], pin, right, connect),
             route_v_m2_to_m1(g, col_ports[1], pin, right, connect),
-    ))
+    ])
 }
 
 // The chip-enable and write-enable DFF outputs to the control logic.
@@ -397,7 +397,7 @@ fn draw_ce_we_routes(p: SramLayoutParams, g: Grid, f: SramFloorplan, control: An
 
 fn draw_ce_we_route(g: Grid, q: Rect, port: Rect, m2_j: Int) -> Shapes {
     let via = mcon(q, q, true);
-    join(on_m1(list(via)), route_vh_m1(g, via, port, m1_nearest(g, lib::columns::util::rect_cx(via)), m2_j))
+    join(on_m1([via]), route_vh_m1(g, via, port, m1_nearest(g, lib::columns::util::rect_cx(via)), m2_j))
 }
 
 // The replica bitline to the replica load devices and metal load.
@@ -406,14 +406,14 @@ fn draw_replica_load_route(rpc: Any, nmos: Any, routing: Any) -> Shapes {
     let left = head(routing.bl);
     let horizontal = m2(with_hspan(rbl, span_union(hspan(left), hspan(rbl))));
     let loads = draw_replica_loads(routing.bl, horizontal);
-    join_all(list(Shapes { m1: [], m2: list(horizontal) }, loads, draw_replica_units(nmos.bl, horizontal)))
+    join_all([Shapes { m1: [], m2: [horizontal] }, loads, draw_replica_units(nmos.bl, horizontal)])
 }
 
 // Each replica load unit's bitline, run up to the replica bitline.
 fn draw_replica_units(units: [Rect], horizontal: Rect) -> Shapes {
     join_all([for bl in units {
         let mos = m1(with_vspan(bl, span_union(vspan(bl), vspan(horizontal))));
-        join(Shapes { m1: list(mos), m2: [] }, via12(mos, horizontal, true))
+        join(Shapes { m1: [mos], m2: [] }, via12(mos, horizontal, true))
     }])
 }
 
@@ -429,12 +429,12 @@ fn draw_replica_control_routes(p: SramLayoutParams, g: Grid, control: Any, rbl: 
     let rwl_track = m1_ends_before(g, control.rwl.x1);
     let rbl_m2 = replica_m2_start(g, control);
     let rbl_m1 = m1_starts_after(g, rpc.rbl.x1);
-    join_all(list(
+    join_all([
             route_v_m2(g, control.rwl, wl, rwl_track),
             route_hv_m1_to_m2(g, control.rbl, rpc.rbl, rbl_m2, rbl_m1),
             route_hv_m1_to_m2(g, control.pc_b, rpc.en_b[0], rbl_m2 + 1, rbl_m1 + 1),
             route_hv_m1_to_m2(g, control.pc_b, rpc.en_b[1], rbl_m2 + 1, rbl_m1 + 1),
-    ))
+    ])
 }
 
 // The wordline enable to its buffer and on to the address gate, and the
@@ -451,11 +451,11 @@ fn draw_enable_routes(g: Grid, control: Any, wlen: Any, gate: Any, pc_b: Any) ->
     let rise = m1(cbox(y.x0, y.y0, y.x1, jog_top));
     let across = m1(cbox(rail.x0, jog_bottom, y.x1, jog_top));
     let up = m1(cbox(rail.x0, jog_bottom, rail.x1, rail.y1));
-    join_all(list(
+    join_all([
             route_hv_m1_to_m2(g, control.wlen, wlen.input, rbl_m2 + 2, wlen_m1),
-            on_m1(list(rise, across, up)),
+            on_m1([rise, across, up]),
             route_h_m1(g, control.pc_b, pc_b.input, rbl_m2 + 1),
-    ))
+    ])
 }
 
 // The sense and write-driver enables from the control logic to their
@@ -466,7 +466,7 @@ fn write_m1_track(g: Grid, f: SramFloorplan) -> Int { m1_starts_after(g, f.boxes
 fn draw_buffer_enable_route(g: Grid, buffer_port: Rect, control_port: Rect, m1_i: Int) -> Shapes {
     if (buffer_port.y0 <= control_port.y0 && control_port.y1 <= buffer_port.y1) {
         let horizontal = m2(with_hspan(control_port, span_union(hspan(control_port), hspan(buffer_port))));
-        join(on_m2(list(horizontal)), via12(buffer_port, horizontal, true))
+        join(on_m2([horizontal]), via12(buffer_port, horizontal, true))
     } else {
         let m2_j = if buffer_port.y0 > control_port.y0 { m2_starts_after(g, buffer_port.y0) } else { m2_ends_before(g, buffer_port.y1) };
         route_hv_m1_to_m2(g, buffer_port, control_port, m2_j, m1_i)
@@ -485,7 +485,7 @@ fn dff_output_port(g: Grid, rect: Rect, from_left: Bool) -> Shapes {
     let track = if from_left { m1_track(g, m1_starts_after(g, rect.x0 + 140.)) } else { m1_track(g, m1_ends_before(g, rect.x1 - 140.)) };
     let m0 = with_hspan(rect, track);
     let via = lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", m0, m0, 0, 0, false);
-    on_m1(list(via.1, m1(from_spans(track, vspan(via.1)))))
+    on_m1([via.1, m1(from_spans(track, vspan(via.1)))])
 }
 
 // Column select address bits from their DFFs to the column decoder.
@@ -535,7 +535,7 @@ fn draw_row_address_routes(p: SramLayoutParams, g: Grid, f: SramFloorplan, gate:
         let up = m1(from_spans(route_x, span_union(vspan(jog), dff_bus)));
         let across = m1(from_spans(span_union(route_x, hspan(dff_port)), dff_bus));
         let down = m1(from_spans(hspan(dff_port), span_union(dff_bus, vspan(dff_port))));
-        join_all(list(port, Shapes { m1: list(contact, up, across, down), m2: list(jog) }, gate_via, route_via))
+        join_all([port, Shapes { m1: [contact, up, across, down], m2: [jog] }, gate_via, route_via])
     }])
 }
 
@@ -559,7 +559,7 @@ fn draw_din_dout_pins(g: Grid, cols: Any, i: Int, n: Int) -> Shapes {
         let pin = m1(data_pin(g, dout));
         let jog = m2(with_vspan(dout, (pin.y1 - 320., pin.y1 - 320. + 800.,)));
         let rise = m1(with_vspan(dout, (jog.y1 - 320., dout.y0,)));
-        join_all(list(Shapes { m1: list(din, pin, rise), m2: list(jog) }, via12(rise, jog, true), via12(pin, jog, true)))
+        join_all([Shapes { m1: [din, pin, rise], m2: [jog] }, via12(rise, jog, true), via12(pin, jog, true)])
     }])
 }
 
@@ -568,6 +568,6 @@ fn draw_wmask_pins(g: Grid, cols: Any, i: Int, n: Int) -> Shapes {
         let wmask = cols.wmask[k];
         let jog = m2(with_vspan(wmask, (wmask.y0 - 480., wmask.y0 + 320.,)));
         let pin = m1(wmask_pin(g, wmask));
-        join_all(list(Shapes { m1: list(pin), m2: list(jog) }, via12(wmask, jog, true), via12(pin, jog, true)))
+        join_all([Shapes { m1: [pin], m2: [jog] }, via12(wmask, jog, true), via12(pin, jog, true)])
     }])
 }

@@ -1,12 +1,14 @@
+use std::layout::{crect, inst, rect};
+
 cell sense_amp_macro() {
     let base = inst(lib::columns::sense_macro::macro_top(), x=0., y=0.);
     let outp = lib::columns::util::cbox(520., 20850., 800., 25230.);
     let outn = lib::columns::util::cbox(4000., 20850., 4280., 25230.);
-    let inp = lib::columns::util::cbox(100., 8400., 380., 25230.);
-    let inn = lib::columns::util::cbox(4420., 8400., 4700., 25230.);
+    pub let inp = lib::columns::util::cbox(100., 8400., 380., 25230.);
+    pub let inn = lib::columns::util::cbox(4420., 8400., 4700., 25230.);
     let vdd = lib::columns::util::cbox(0., 22400., 4800., 22690.);
     let vss = lib::columns::util::cbox(0., 9840., 4800., 10130.);
-    let clk = lib::columns::util::cbox(0., 8400., 4800., 8690.);
+    pub let clk = lib::columns::util::cbox(0., 8400., 4800., 8690.);
     let outline = crect(x0=0., y0=8385., x1=4800., y1=25230.);
 }
 

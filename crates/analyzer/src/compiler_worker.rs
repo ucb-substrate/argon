@@ -522,7 +522,7 @@ mod tests {
             "name = \"worker-preview-test\"\ntech = \"tech.toml\"\n",
         )
         .unwrap();
-        let original = "cell leaf(w: Int) { let r = rect(\"met1\", x0=0., y0=0., x1=w as Float, y1=10.); } cell top() { let child = inst(leaf(10), x=0., y=0.); }";
+        let original = "use std::layout::{inst, rect}; cell leaf(w: Int) { let r = rect(\"met1\", x0=0., y0=0., x1=w as Float, y1=10.); } cell top() { let child = inst(leaf(10), x=0., y=0.); }";
         std::fs::write(&root, original).unwrap();
         let worker = CompilerWorker::new();
         let first = worker

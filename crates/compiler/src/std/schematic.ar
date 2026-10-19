@@ -1,0 +1,9 @@
+// The kind of a device placed with `device`, which picks its netlist element.
+enum DeviceKind {
+    Mos,
+    Res,
+    Cap,
+    Diode,
+    Bjt,
+    Subckt,
+}

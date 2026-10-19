@@ -1,3 +1,5 @@
+use std::layout::{inst, rect};
+
 // Cells take keyword parameters too. Omitted keywords are filled from their
 // defaults at the call site, so `child(w)` and `child(w, h=w)` receive the same
 // arguments.

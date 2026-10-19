@@ -1,3 +1,5 @@
+use std::layout::rect;
+
 // Parameters with defaults are keyword parameters: they are passed by name and
 // may be omitted. A default may refer to the parameters declared before it.
 fn scaled(x: Float, scale: Float = 2., offset: Float = x) -> Float {

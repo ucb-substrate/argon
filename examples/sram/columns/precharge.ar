@@ -1,3 +1,4 @@
+use std::layout::{crect, inst};
 use lib::params::PrechargeParams;
 
 fn precharge_xf(r: Rect) -> Rect {
@@ -204,7 +205,7 @@ cell precharge_exact(p: PrechargeParams) {
     lib::columns::util::draw_contact_clip(0, "li1.drawing", "met1.drawing", gate_top, lib::columns::util::rect_expand_vert(gate_x, -80.), 0, 0, true, width);
 
     let stripe = lib::columns::util::rect_from_spans((-width, 2. * width,), pc_power_span(p));
-    let vdd = lib::columns::util::draw_clip("met2.drawing", stripe, width);
+    pub let vdd = lib::columns::util::draw_clip("met2.drawing", stripe, width);
     lib::columns::util::draw_clip("met2.pin", stripe, width);
     lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", lib::columns::util::double_left(r0), stripe, 0, 0, true, width);
     lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", lib::columns::util::double_right(r3), stripe, 0, 0, true, width);
@@ -249,10 +250,10 @@ cell precharge_exact(p: PrechargeParams) {
     lib::columns::util::draw_clip("met1.pin", br_out, width);
     lib::columns::util::draw_clip("met1.pin", bl_out, width);
 
-    let en_b = list(gate_bot_draw, gate_top_draw);
-    let br = list(br_out, br_in);
-    let bl = list(bl_out, bl_in);
-    let outline = crect(x0=0., y0=pc_outline_bottom(p), x1=width, y1=pc_outline_top(p));
+    pub let en_b = [gate_bot_draw, gate_top_draw];
+    pub let br = [br_out, br_in];
+    pub let bl = [bl_out, bl_in];
+    pub let outline = crect(x0=0., y0=pc_outline_bottom(p), x1=width, y1=pc_outline_top(p));
 }
 
 fn draw_precharge_tap_contact(p: PrechargeParams, outline_top: Float) -> Rect {
@@ -378,7 +379,7 @@ cell precharge_tap(p: PrechargeParams, both_sides: Bool, via_top: Bool) {
     let power = lib::columns::util::rect_from_spans((0., 1300.,), pc_power_span(p));
     let en0 = lib::columns::util::draw_box("met2.drawing", gate_bot);
     let en1 = lib::columns::util::draw_box("met2.drawing", gate_top);
-    let vdd = lib::columns::util::draw_box("met2.drawing", power);
+    pub let vdd = lib::columns::util::draw_box("met2.drawing", power);
     lib::columns::util::draw_box("met2.pin", gate_bot);
     lib::columns::util::draw_box("met2.pin", gate_top);
     lib::columns::util::draw_box("met2.pin", power);
@@ -389,8 +390,8 @@ cell precharge_tap(p: PrechargeParams, both_sides: Bool, via_top: Bool) {
         crect(x0=0., y0=0., x1=0., y1=0.);
     };
     draw_precharge_side_power_via(p, true, power);
-    let en_b = list(en0, en1);
-    let outline = crect(x0=0., y0=pc_outline_bottom(p), x1=1300., y1=top);
+    pub let en_b = [en0, en1];
+    pub let outline = crect(x0=0., y0=pc_outline_bottom(p), x1=1300., y1=top);
 }
 
 cell precharge(p: PrechargeParams) {
@@ -442,18 +443,18 @@ cell replica_precharge(p: PrechargeParams) {
     let upper_en = lib::columns::util::rect_from_spans(full_hspan, lib::columns::util::rect_vspan(pc0.en_b[1]));
     let en_b0 = lib::columns::util::met2_port(lower_en.x0, lower_en.y0, lower_en.x1, lower_en.y1);
     let en_b1 = lib::columns::util::met2_port(upper_en.x0, upper_en.y0, upper_en.x1, upper_en.y1);
-    let vdd = lib::columns::util::met2_port(0., pc0.vdd.y0, 5000., pc0.vdd.y1);
+    pub let vdd = lib::columns::util::met2_port(0., pc0.vdd.y0, 5000., pc0.vdd.y1);
 
     let rbl_span = replica_track_below(lower_en, 1);
     let rbr_span = replica_track_below(lower_en, 2);
-    let rbl = lib::columns::util::met2_port(0., rbl_span.0, 5000., rbl_span.1);
+    pub let rbl = lib::columns::util::met2_port(0., rbl_span.0, 5000., rbl_span.1);
     let rbr = lib::columns::util::met2_port(0., rbr_span.0, 5000., rbr_span.1);
     draw_replica_output_route(pc0.bl[0], rbl_span);
     draw_replica_output_route(pc1.bl[0], rbl_span);
     draw_replica_output_route(pc0.br[0], rbr_span);
     draw_replica_output_route(pc1.br[0], rbr_span);
-    let bl_in = list(pc0.bl[1], pc1.bl[1]);
-    let br_in = list(pc0.br[1], pc1.br[1]);
-    let en_b = list(en_b0, en_b1);
+    pub let bl_in = [pc0.bl[1], pc1.bl[1]];
+    pub let br_in = [pc0.br[1], pc1.br[1]];
+    pub let en_b = [en_b0, en_b1];
     let outline = crect(x0=0., y0=placed_y - 90., x1=5000., y1=placed_y + cell_top);
 }

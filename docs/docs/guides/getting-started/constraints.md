@@ -28,9 +28,11 @@ eq(inner.y1, outer.y1 - 50.);
 
 ## Make width and height parameters
 
-Give the cell two arguments and constrain the outer rectangle to them:
+Give the cell two arguments and constrain the outer rectangle to them. The `use` line at the top imports `rect`, so the cell can call it without the `std::layout::` prefix the GUI wrote:
 
-```argon
+```argon title="lib.ar"
+use std::layout::rect;
+
 cell inset_rect(w: Float, h: Float) {
     let outer = rect("met1", x0=0., y0=0.);
     eq(outer.w, w);

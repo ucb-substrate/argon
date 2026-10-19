@@ -1,3 +1,5 @@
+use std::layout::{inst, rect};
+
 fn make_list(base: Float) -> [Rect] {
     cons(
         rect("met1", x0=base, y0=0., w=100., h=100.),
@@ -20,8 +22,8 @@ fn elem11(arr: [[Rect]]) -> Rect {
 }
 
 cell bot(input: [Float]) {
-    let arr = make_array();
-    let v = elem12(arr)!;
+    pub let arr = make_array();
+    pub let v = elem12(arr)!;
     let r = rect("met2", x0=0., y0=200., x1=100., y1=head(tail(input)))!;
 }
 

@@ -90,12 +90,41 @@ impl<'a> Lexer<'a> {
         self.tok(kind, start, self.pos)
     }
 
+    /// Digits, optionally followed by an exponent, which makes an `ExpLit`. An
+    /// `e` without exponent digits is left to the next token (`2em`).
     fn lex_int(&mut self, start: usize) -> Token {
-        self.pos += 1;
-        while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
-            self.pos += 1;
+        self.pos = self.digits_end(start + 1);
+        let kind = match self.exponent_end() {
+            Some(end) => {
+                self.pos = end;
+                TokenKind::ExpLit
+            }
+            None => TokenKind::IntLit,
+        };
+        self.tok(kind, start, self.pos)
+    }
+
+    /// The end of the run of ASCII digits starting at `pos`.
+    fn digits_end(&self, mut pos: usize) -> usize {
+        while pos < self.src.len() && self.src[pos].is_ascii_digit() {
+            pos += 1;
         }
-        self.tok(TokenKind::IntLit, start, self.pos)
+        pos
+    }
+
+    /// The end of an exponent (`e` or `E`, an optional sign, and at least one
+    /// digit) starting at the current position, if there is one.
+    fn exponent_end(&self) -> Option<usize> {
+        let mut pos = self.pos;
+        if !matches!(self.src.get(pos), Some(b'e' | b'E')) {
+            return None;
+        }
+        pos += 1;
+        if matches!(self.src.get(pos), Some(b'+' | b'-')) {
+            pos += 1;
+        }
+        let end = self.digits_end(pos);
+        (end > pos).then_some(end)
     }
 
     fn lex_string(&mut self, start: usize) -> Token {

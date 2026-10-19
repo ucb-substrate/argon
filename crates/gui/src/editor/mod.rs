@@ -1353,6 +1353,7 @@ mod tests {
         std::fs::write(
             &source,
             r#"
+use std::layout::rect;
 fn nest(n: Int) -> Rect {
     if n == 0 {
         rect("met1", x0=0., y0=0., x1=1., y1=1.)

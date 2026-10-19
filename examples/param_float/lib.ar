@@ -1,3 +1,5 @@
+use std::layout::{inst, rect};
+
 cell bot(x: Float, y: Float) {
     let met1 = rect("met1", x0=0., y0=0., x1=x, y1=y);
 }

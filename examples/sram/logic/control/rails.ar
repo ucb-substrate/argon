@@ -3,6 +3,8 @@
 // chains and of the SR latches' output inverters; each connected span of
 // exposed rail is one pin.
 
+use std::layout::{rect, text};
+
 fn concat(a: [(Float, Float)], b: [(Float, Float)]) -> [(Float, Float)] {
     if a == [] { b } else { cons(head(a), concat(tail(a), b)) }
 }

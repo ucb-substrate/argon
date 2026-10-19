@@ -156,8 +156,9 @@ pub(super) fn compare(
         (Value::Bool(vl), Value::Bool(vr)) => equality(vl == vr),
         (Value::Enum(_), Value::Enum(_)) => values_equal(left, right).and_then(equality),
         (Value::Nil, Value::Nil) => equality(true),
-        (Value::SeqNil, Value::SeqNil) => equality(true),
-        (Value::Seq(x), Value::SeqNil) | (Value::SeqNil, Value::Seq(x)) => equality(x.is_empty()),
+        (Value::Seq(x), Value::Seq(y)) if x.is_empty() || y.is_empty() => {
+            equality(x.is_empty() && y.is_empty())
+        }
         _ => None,
     };
     res.ok_or_else(|| error(ExecErrorKind::InvalidType))
@@ -280,52 +281,63 @@ pub(super) fn index(base: &Value, index: &Value) -> OpResult {
         .ok_or_else(|| error(ExecErrorKind::IndexOutOfBounds))
 }
 
-/// A struct literal's value. `explicit` gives the value of each field the
-/// literal names; the rest come from `base`.
+/// A struct literal's value, or a variant's with named fields. `explicit`
+/// gives the value of each field the literal names; the rest come from `base`.
 pub(super) fn struct_lit<'v>(
     defs: &TypeDefs,
-    ty: &StructTy,
+    target: &StructLitTarget,
     explicit: impl Fn(&str) -> Option<&'v Value>,
     base: Option<&Value>,
 ) -> OpResult {
     // The static check proved the base to be this struct unless it was typed
-    // `Any`.
-    let base = match base {
-        None => None,
-        Some(Value::Struct(value)) if value.name == ty.name => Some(&value.fields),
-        Some(_) => return Err(OpFailure::Error(ExecErrorKind::InvalidType, ErrorAt::Base)),
+    // `Any`. A variant literal has no base.
+    let base = match (base, target) {
+        (None, _) => None,
+        (Some(Value::Struct(value)), StructLitTarget::Struct(ty)) if value.name == ty.name => {
+            Some(&value.fields)
+        }
+        (Some(_), _) => return Err(OpFailure::Error(ExecErrorKind::InvalidType, ErrorAt::Base)),
     };
-    let def = defs
-        .get(&ty.def)
-        .and_then(AdtDef::as_struct)
-        .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
     // Declaration order, whatever order the literal used: `CellArg::Struct`
     // fields are matched pairwise against the type's.
-    let fields = def
-        .fields
-        .keys()
-        .map(|name| {
-            let value = match explicit(name) {
-                Some(value) => Some(value.clone()),
-                None => base.and_then(|base| base.get(name).cloned()),
-            };
-            value.map(|value| (name.clone(), value))
-        })
-        .collect::<Option<FxIndexMap<_, _>>>()
-        .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
-    Ok(Value::Struct(Arc::new(StructValue {
-        name: ty.name.clone(),
-        fields,
-    })))
+    let declared = match target {
+        StructLitTarget::Struct(ty) => defs
+            .get(&ty.def)
+            .and_then(AdtDef::as_struct)
+            .map(|def| Either::Left(def.fields.keys())),
+        StructLitTarget::Variant { ty, variant } => defs
+            .get(&ty.def)
+            .and_then(AdtDef::as_enum)
+            .and_then(|def| def.variants.get(variant))
+            .and_then(|variant| match &variant.payload {
+                VariantTys::Struct(fields) => Some(Either::Right(fields.keys())),
+                VariantTys::Tuple(_) => None,
+            }),
+    }
+    .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
+    let fields = Iterator::map(declared, |name| {
+        let value = match explicit(name) {
+            Some(value) => Some(value.clone()),
+            None => base.and_then(|base| base.get(name).cloned()),
+        };
+        value.map(|value| (name.clone(), value))
+    })
+    .collect::<Option<FxIndexMap<_, _>>>()
+    .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
+    Ok(match target {
+        StructLitTarget::Struct(ty) => Value::Struct(Arc::new(StructValue {
+            name: ty.name.clone(),
+            fields,
+        })),
+        StructLitTarget::Variant { variant, .. } => Value::Enum(Arc::new(EnumValue {
+            variant: variant.clone(),
+            payload: VariantValues::Struct(fields),
+        })),
+    })
 }
 
 pub(super) fn cons(head: &Value, tail: &Value) -> OpResult {
     let seq = match tail {
-        Value::SeqNil => {
-            let mut seq = Seq::new();
-            seq.push_back(head.clone());
-            seq
-        }
         Value::Seq(seq) => {
             let mut seq = (**seq).clone();
             seq.push_front(head.clone());
@@ -334,10 +346,6 @@ pub(super) fn cons(head: &Value, tail: &Value) -> OpResult {
         _ => return Err(error(ExecErrorKind::InvalidType)),
     };
     Ok(Value::Seq(Arc::new(seq)))
-}
-
-pub(super) fn list<'v>(items: impl IntoIterator<Item = &'v Value>) -> Value {
-    Value::Seq(Arc::new(items.into_iter().cloned().collect()))
 }
 
 pub(super) fn range_full(start: &Value, stop: &Value, step: &Value) -> OpResult {
@@ -370,7 +378,6 @@ pub(super) fn range_full(start: &Value, stop: &Value, step: &Value) -> OpResult 
 
 pub(super) fn head(list: &Value) -> OpResult {
     match list {
-        Value::SeqNil => Err(error(ExecErrorKind::HeadEmptyList)),
         Value::Seq(seq) => seq
             .front()
             .cloned()
@@ -386,7 +393,7 @@ pub(super) fn tail(list: &Value) -> OpResult {
             seq.pop_front();
             Ok(Value::Seq(Arc::new(seq)))
         }
-        Value::SeqNil | Value::Seq(_) => Err(error(ExecErrorKind::TailEmptyList)),
+        Value::Seq(_) => Err(error(ExecErrorKind::TailEmptyList)),
         _ => Err(error(ExecErrorKind::InvalidType)),
     }
 }

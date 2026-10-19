@@ -14,7 +14,9 @@ const MANIFEST_FILE: &str = "Argon.toml";
 const SOURCE_FILE: &str = "lib.ar";
 const TECH_FILE: &str = "tech.toml";
 
-const STARTER_SOURCE: &str = r#"cell top() {
+const STARTER_SOURCE: &str = r#"use std::layout::text;
+
+cell top() {
     text("Hello world!", "text.label", 0., 0.);
 }
 "#;
@@ -543,25 +545,79 @@ mod tests {
         let source = r#"
 cell top() {
   // A comment containing } does not close the cell.
- let values = list(
+ let values = [
  "a { string",
- cons(
- 1,
- []));
+ head(
+ [
+ "x"]),
+ ];
 }
 "#;
         assert_eq!(
             format_source(source),
             r#"cell top() {
     // A comment containing } does not close the cell.
-    let values = list(
+    let values = [
         "a { string",
-        cons(
-            1,
-            []));
+        head(
+            [
+                "x"]),
+    ];
 }
 "#
         );
+    }
+
+    /// A variant's braces nest like any other, so a declaration and a pattern
+    /// that spans lines indent from the enclosing block.
+    #[test]
+    fn formats_struct_variant_braces() {
+        let source = r#"
+enum Shape {
+ Circle { r: Float },
+ Box {
+ w: Float,
+ h: Float,
+ },
+}
+
+fn width(s: Shape) -> Float {
+ match s {
+ Shape::Circle { r } => r,
+ Shape::Box { w, .. } => w,
+ }
+}
+"#;
+        assert_eq!(
+            format_source(source),
+            r#"enum Shape {
+    Circle { r: Float },
+    Box {
+        w: Float,
+        h: Float,
+    },
+}
+
+fn width(s: Shape) -> Float {
+    match s {
+        Shape::Circle { r } => r,
+        Shape::Box { w, .. } => w,
+    }
+}
+"#
+        );
+    }
+
+    #[test]
+    fn grouped_use_round_trips() {
+        let source = "use a::{b, c as d};\nuse std::layout::{\n    crect,\n    rect as r,\n};\n";
+        assert_eq!(format_source(source), source);
+    }
+
+    #[test]
+    fn exponent_literals_round_trip() {
+        let source = "cell top() {\n    let c = 1.0E+6;\n    let d = 1e-12;\n}\n";
+        assert_eq!(format_source(source), source);
     }
 
     #[test]
@@ -647,7 +703,7 @@ cell top() {
         );
         assert_eq!(
             fs::read_to_string(&library.root).unwrap(),
-            "cell top() {\n    text(\"Hello world!\", \"text.label\", 0., 0.);\n}\n"
+            "use std::layout::text;\n\ncell top() {\n    text(\"Hello world!\", \"text.label\", 0., 0.);\n}\n"
         );
 
         let tech = library

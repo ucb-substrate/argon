@@ -9,9 +9,10 @@ use crate::{
     WorkspaceConfig, artifact,
     compile::{self, CompileOutput},
     diagnostics::{self, Diagnostic},
+    netlist::{NetlistFormat, NetlistOptions},
     parse::{self, CellInvocation, parse_workspace_with_config},
 };
-use clap::{Parser, ValueEnum};
+use clap::{ArgGroup, Parser, ValueEnum};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ErrorFormat {
@@ -21,6 +22,7 @@ enum ErrorFormat {
 
 #[derive(Debug, Parser)]
 #[command(version, about = "The Argon compiler")]
+#[command(group(ArgGroup::new("netlist").multiple(true)))]
 struct Args {
     /// Argon library root. May be a directory or its lib.ar file.
     root: PathBuf,
@@ -54,8 +56,23 @@ struct Args {
     #[arg(long, requires = "gds", conflicts_with = "output")]
     gds_only: bool,
 
+    /// Also write a SPICE netlist to this path.
+    #[arg(long, value_name = "PATH", requires = "cell", group = "netlist")]
+    spice: Option<PathBuf>,
+
+    /// Also write a Spectre netlist to this path.
+    #[arg(long, value_name = "PATH", requires = "cell", group = "netlist")]
+    spectre: Option<PathBuf>,
+
+    /// Wrap netlist lines longer than this many columns; 0 disables wrapping.
+    #[arg(long, value_name = "COLS", default_value_t = 80, requires = "netlist")]
+    netlist_width: usize,
+
     /// Run all non-executing compiler stages, then stop.
-    #[arg(long, conflicts_with_all = ["cell", "tech", "output", "gds"])]
+    #[arg(
+        long,
+        conflicts_with_all = ["cell", "tech", "output", "gds", "spice", "spectre", "netlist_width"]
+    )]
     check: bool,
 
     /// Diagnostic output format.
@@ -224,6 +241,26 @@ fn execute(args: Args) -> Result<(), Failed> {
             )
         })?;
     }
+
+    let options = NetlistOptions {
+        width: args.netlist_width,
+    };
+    for (path, netlist_format) in [
+        (args.spice, NetlistFormat::Spice),
+        (args.spectre, NetlistFormat::Spectre),
+    ] {
+        let Some(path) = path else {
+            continue;
+        };
+        output
+            .to_netlist(&path, netlist_format, &options)
+            .map_err(|error| {
+                fail(
+                    format,
+                    format!("could not write `{}`: {error}", path.display()),
+                )
+            })?;
+    }
     // The process exits next, so freeing the output would only take time.
     std::mem::forget(output);
     Ok(())
@@ -287,7 +324,7 @@ fn compile_failed(
 mod tests {
     use std::{
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -296,7 +333,7 @@ mod tests {
         compile::{CompileOutput, Rect},
         solver::LinearExpr,
     };
-    use clap::{CommandFactory, Parser};
+    use clap::{CommandFactory, Parser, error::ErrorKind};
     use gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPath, GdsPoint, GdsStruct};
 
     use super::{Args, ErrorFormat, Failed, execute};
@@ -403,6 +440,9 @@ mod tests {
             output: None,
             gds: None,
             gds_only: false,
+            spice: None,
+            spectre: None,
+            netlist_width: 80,
             check: true,
             error_format: ErrorFormat::Human,
         }
@@ -418,6 +458,9 @@ mod tests {
             output: None,
             gds: None,
             gds_only: false,
+            spice: None,
+            spectre: None,
+            netlist_width: 80,
             check: false,
             error_format: ErrorFormat::Human,
         }
@@ -491,7 +534,7 @@ mod tests {
     fn execution_writes_binary_output_without_gds_by_default() {
         let source = temp_source(
             "run",
-            "cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=20.); }\n",
+            "use std::layout::rect;\ncell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=20.); }\n",
         );
         let directory = source.parent().expect("source should have a parent");
         let artifact_path = directory.join("top.bin");
@@ -507,15 +550,117 @@ mod tests {
         assert!(!implicit_gds_path.exists());
     }
 
+    /// Runs `inv(2., 1., 2)` from the inverter example with the outputs that
+    /// `configure` requests, and returns the fresh directory they go in.
+    fn run_inverter(name: &str, configure: impl FnOnce(&mut Args, &Path)) -> PathBuf {
+        let directory = temp_source(name, "")
+            .parent()
+            .expect("source should have a parent")
+            .to_owned();
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/schematic_inverter");
+        let mut args = execution_args(root, "inv(2., 1., 2)", basic_tech());
+        args.output = Some(directory.join("inv.bin"));
+        configure(&mut args, &directory);
+        if let Err(error) = execute(args) {
+            panic!("the inverter should compile: {}", render_failed(error));
+        }
+        directory
+    }
+
+    #[test]
+    fn execution_writes_the_requested_netlists() {
+        const SPICE: &str = "* SPICE netlist generated by Argon.\n";
+        const SPECTRE: &str = "// Spectre netlist generated by Argon.\n";
+        let read = |path: PathBuf| fs::read_to_string(path).expect("netlist should be written");
+
+        let directory = run_inverter("spice", |args, directory| {
+            args.spice = Some(directory.join("inv.spice"));
+        });
+        assert!(read(directory.join("inv.spice")).starts_with(SPICE));
+        assert!(!directory.join("inv.scs").exists());
+
+        let directory = run_inverter("spectre", |args, directory| {
+            args.spectre = Some(directory.join("inv.scs"));
+        });
+        assert!(read(directory.join("inv.scs")).starts_with(SPECTRE));
+        assert!(!directory.join("inv.spice").exists());
+
+        let directory = run_inverter("netlists", |args, directory| {
+            args.spice = Some(directory.join("inv.spice"));
+            args.spectre = Some(directory.join("inv.scs"));
+        });
+        assert!(read(directory.join("inv.spice")).starts_with(SPICE));
+        assert!(read(directory.join("inv.scs")).starts_with(SPECTRE));
+    }
+
+    #[test]
+    fn netlist_width_changes_the_wrapping() {
+        let spice = |width| {
+            let directory = run_inverter("netlist-width", |args, directory| {
+                args.spice = Some(directory.join("inv.spice"));
+                args.netlist_width = width;
+            });
+            fs::read_to_string(directory.join("inv.spice")).expect("netlist should be written")
+        };
+        assert!(!spice(80).contains("\n+ "));
+        let narrow = spice(20);
+        assert!(
+            narrow.contains("\n.subckt inv a out\n+ vdd vss\n"),
+            "{narrow}"
+        );
+    }
+
+    #[test]
+    fn netlist_flags_require_a_cell_and_conflict_with_check() {
+        let parse = |args: &[&str]| Args::try_parse_from(["argonc", "."].iter().chain(args));
+        let kind = |args: &[&str]| {
+            parse(args)
+                .expect_err("the arguments should be rejected")
+                .kind()
+        };
+        for flag in ["--spice", "--spectre"] {
+            assert_eq!(kind(&[flag, "out", "--check"]), ErrorKind::ArgumentConflict);
+            assert_eq!(kind(&[flag, "out"]), ErrorKind::MissingRequiredArgument);
+        }
+        assert_eq!(
+            kind(&["--check", "--netlist-width", "100"]),
+            ErrorKind::ArgumentConflict
+        );
+        assert_eq!(
+            kind(&["--cell", "top()", "--netlist-width", "100"]),
+            ErrorKind::MissingRequiredArgument
+        );
+
+        let args = parse(&[
+            "--cell",
+            "top()",
+            "--spice",
+            "a.spice",
+            "--spectre",
+            "a.scs",
+            "--netlist-width",
+            "0",
+        ])
+        .expect("both netlists may be requested together");
+        assert_eq!(args.spice, Some(PathBuf::from("a.spice")));
+        assert_eq!(args.spectre, Some(PathBuf::from("a.scs")));
+        assert_eq!(args.netlist_width, 0);
+        let args = parse(&["--check"]).expect("--check alone is valid");
+        assert_eq!(args.netlist_width, 80);
+    }
+
     #[test]
     fn gds_only_writes_the_same_gds_and_no_binary_output() {
-        let program = r#"fn shifted(r: Rect, dx: Float) -> Rect {
+        let program = r#"use std::layout::{inst, rect};
+
+fn shifted(r: Rect, dx: Float) -> Rect {
     rect("met1", x0=r.x0 + dx, y0=r.y0, x1=r.x1 + dx, y1=r.y1)
 }
 
 cell child(n: Int) {
-    let base = rect("met1", x0=0., y0=0., x1=5., y1=5.);
-    let copies = [for i in std::range(n) if i > 0 { shifted(base, i as Float * 10.) }];
+    pub let base = rect("met1", x0=0., y0=0., x1=5., y1=5.);
+    pub let copies = [for i in std::range(n) if i > 0 { shifted(base, i as Float * 10.) }];
 }
 
 cell top() {
@@ -550,7 +695,8 @@ cell top() {
         let source = temp_source("bool-root", "");
         let dependency = temp_source(
             "bool-dependency",
-            r#"cell device(enabled: Bool, w: Float, count: Int) {
+            r#"use std::layout::rect;
+cell device(enabled: Bool, w: Float, count: Int) {
     if enabled {
         rect("met1", x0=0., y0=0., w=w, h=10.);
     } else {
@@ -594,7 +740,8 @@ cell top() {
     fn execution_evaluates_arithmetic_cell_arguments() {
         let source = temp_source(
             "arithmetic-args",
-            "cell top(x: Float, n: Int, flag: Bool) {\n\
+            "use std::layout::rect;\n\
+             cell top(x: Float, n: Int, flag: Bool) {\n\
              let h = if flag { 10. } else { 20. };\n\
              let r = rect(\"met1\", x0=x, y0=n as Float, x1=x + 10., y1=n as Float + h);\n\
              }\n",
@@ -609,7 +756,8 @@ cell top() {
     fn float_to_int_cast_does_not_snap_to_the_layout_grid() {
         let source = temp_source(
             "float-to-int-exact",
-            "cell top() {\n\
+            "use std::layout::rect;\n\
+             cell top() {\n\
              let n = 7.9 as Int;\n\
              let r = rect(\"met1\", x0=0., y0=0., x1=n as Float, y1=10.);\n\
              }\n",
@@ -622,7 +770,8 @@ cell top() {
     fn execution_evaluates_a_function_call_and_string_cell_argument() {
         let source = temp_source(
             "call-args",
-            "fn double(x: Float) -> Float { 2. * x }\n\
+            "use std::layout::rect;\n\
+             fn double(x: Float) -> Float { 2. * x }\n\
              cell top(layer: String, w: Float) {\n\
              let r = rect(layer, x0=0., y0=0., x1=w, y1=10.);\n\
              }\n",
@@ -636,7 +785,8 @@ cell top() {
     fn execution_evaluates_a_sequence_cell_argument() {
         let source = temp_source(
             "seq-args",
-            "cell top(items: [Float]) {\n\
+            "use std::layout::rect;\n\
+             cell top(items: [Float]) {\n\
              let r = rect(\"met1\", x0=0., y0=0., x1=head(items), y1=10.);\n\
              }\n",
         );
@@ -648,7 +798,8 @@ cell top() {
     fn execution_accepts_an_empty_sequence_cell_argument() {
         let source = temp_source(
             "empty-seq-args",
-            "cell top(items: [Float]) {\n\
+            "use std::layout::rect;\n\
+             cell top(items: [Float]) {\n\
              let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=20.);\n\
              }\n",
         );
@@ -660,7 +811,8 @@ cell top() {
     fn execution_evaluates_an_enum_cell_argument() {
         let source = temp_source(
             "enum-args",
-            "enum Mode { Fast, Slow, }\n\
+            "use std::layout::rect;\n\
+             enum Mode { Fast, Slow, }\n\
              cell top(m: Mode) {\n\
              let w = match m { Mode::Fast => 10., Mode::Slow => 20., };\n\
              let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=10.);\n\
@@ -671,10 +823,30 @@ cell top() {
     }
 
     #[test]
+    fn execution_evaluates_a_struct_variant_cell_argument() {
+        let source = temp_source(
+            "struct-variant-args",
+            "use std::layout::rect;\n\
+             enum Mode { Sized { w: Float, h: Float }, Fast, }\n\
+             cell top(m: Mode) {\n\
+             let w = match m { Mode::Sized { w, .. } => w, Mode::Fast => 10., };\n\
+             let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=10.);\n\
+             }\n",
+        );
+        let rect = compiled_rect(
+            "struct-variant",
+            source,
+            "top(Mode::Sized { h: 1., w: 40. })",
+        );
+        assert_eq!(rect.x1.0, 40.);
+    }
+
+    #[test]
     fn execution_evaluates_an_option_cell_argument() {
         let source = temp_source(
             "option-args",
-            "cell top(w: Float, n: Option<Int> = None) {\n\
+            "use std::layout::rect;\n\
+             cell top(w: Float, n: Option<Int> = None) {\n\
              let count = std::unwrap_or(n, 1);\n\
              let r = rect(\"met1\", x0=0., y0=0., x1=w * (count as Float), y1=w);\n\
              }\n",
@@ -689,7 +861,8 @@ cell top() {
     fn execution_accepts_keyword_cell_arguments() {
         let source = temp_source(
             "kwargs",
-            "cell top(w: Float = 100., h: Float = w) {\n\
+            "use std::layout::rect;\n\
+             cell top(w: Float = 100., h: Float = w) {\n\
              let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=h);\n\
              }\n",
         );
@@ -750,6 +923,7 @@ cell top() {
         let source = temp_source(
             "gds-root",
             "use lib::macros::sram;\n\
+             use std::layout::inst;\n\
              cell top() {\n\
              let imported = inst(sram(), x=0., y=0.);\n\
              eq(imported.gds_rect_0.x0, 0.);\n\
@@ -787,7 +961,8 @@ cell top() {
     fn imports_and_reexports_a_non_rounded_gds_path() {
         let source = temp_source(
             "gds-path-root",
-            "cell top() {\n\
+            "use std::layout::inst;\n\
+             cell top() {\n\
              let imported = inst(routes(), x=0., y=0.);\n\
              eq(imported.gds_path_0.width, 20.);\n\
              eq(imported.gds_path_0.begin_extension, 10.);\n\
@@ -845,7 +1020,8 @@ cell top() {
     fn constrains_an_imported_gds_shape_field() {
         let source = temp_source(
             "gds-shape-constraint",
-            "cell top() {\n\
+            "use std::layout::inst;\n\
+             cell top() {\n\
              let imported = inst(sram());\n\
              eq(imported.gds_rect_0.x0, 100.);\n\
              eq(imported.y, 0.);\n\
@@ -882,7 +1058,8 @@ cell top() {
     fn constrains_a_shape_through_imported_gds_hierarchy() {
         let source = temp_source(
             "nested-gds-shape-constraint",
-            "cell top() {\n\
+            "use std::layout::inst;\n\
+             cell top() {\n\
              let imported = inst(sram());\n\
              eq(imported.gds_inst_0.gds_rect_0.x0, 100.);\n\
              eq(imported.y, 0.);\n\
@@ -919,7 +1096,7 @@ cell top() {
     fn gds_cells_are_declared_before_source_cells() {
         let source = temp_source(
             "gds-declaration-order",
-            "cell top() { let imported = inst(sram(), x=0., y=0.); }\n",
+            "use std::layout::inst;\ncell top() { let imported = inst(sram(), x=0., y=0.); }\n",
         );
         let directory = source.parent().expect("source should have a parent");
         let artifact_path = directory.join("imported.bin");
@@ -996,7 +1173,7 @@ cell top() {
     fn missing_text_layer_is_reported_cleanly() {
         let source = temp_source(
             "missing-text-layer",
-            "cell top() {\n    text(\"label\", \"missing.label\", 0., 0.);\n}\n",
+            "use std::layout::text;\ncell top() {\n    text(\"label\", \"missing.label\", 0., 0.);\n}\n",
         );
         let tech = basic_tech();
         let diagnostic = render_failed(failed(execution_args(source, "top()", tech.clone())));
@@ -1013,9 +1190,10 @@ cell top() {
     fn standard_library_errors_show_embedded_source_lines() {
         let source = temp_source(
             "std-diagnostic",
-            r#"cell top() {
+            r#"use std::layout::crect;
+cell top() {
     let r = crect(layer="missing.drawing", x0=0., y0=0., w=10., h=10.);
-    std::array(r, 2, 20., 0.);
+    std::layout::array(r, 2, 20., 0.);
 }
 "#,
         );
@@ -1029,14 +1207,14 @@ cell top() {
             "{diagnostic}"
         );
         assert!(
-            diagnostic.contains("--> <argon-std>/lib.ar:"),
+            diagnostic.contains("--> <argon-std>/layout.ar:"),
             "{diagnostic}"
         );
         assert!(
             diagnostic.contains("let first_rect = rect(r.layer);"),
             "{diagnostic}"
         );
-        assert!(!diagnostic.contains("<argon-std>/lib.ar:1:1"));
+        assert!(!diagnostic.contains("<argon-std>/layout.ar:1:1"));
     }
 
     #[test]

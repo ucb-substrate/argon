@@ -1,6 +1,7 @@
 // Block placement for the SRAM: each block is aligned to blocks placed before it.
 // Each position is the translation applied to a block after its orientation.
 
+use std::layout::{bbox, inst};
 use lib::params::SramLayoutParams;
 use lib::params::AndStageSizing;
 use lib::params::PrimitiveGateParams;

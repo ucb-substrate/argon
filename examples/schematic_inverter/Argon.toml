@@ -1,2 +1,2 @@
-name = "testing"
+name = "schematic_inverter"
 tech = "../tech/basic.tech.toml"

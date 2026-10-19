@@ -6,6 +6,8 @@
 // draw geometry and add constraints, that is a statement about what gets built,
 // not only about speed -- nothing in a skipped operand is constructed.
 
+use std::layout::{inst, rect};
+
 // A strap is wide enough to take a via only if it clears the minimum in both
 // directions, and vias are skipped entirely on a cell marked as a dummy.
 cell strap(w: Float, h: Float, dummy: Bool) {

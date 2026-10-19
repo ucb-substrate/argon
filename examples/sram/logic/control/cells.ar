@@ -1,6 +1,8 @@
 // Native transcriptions of the sky130_fd_sc_hs standard cells and SVT inverters used by
 // the control logic. Each cell exports its outline and pin rectangles; Y and X outputs are named out.
 
+use std::layout::{crect, polygon, rect};
+
 cell sky130_fd_sc_hs__tap_2() {
     rect("nwell.pin", x0=0., y0=3085., x1=960., y1=3330.);
     rect("nwell.drawing", x0=-190., y0=1660., x1=1150., y1=3520.);
@@ -95,8 +97,8 @@ cell sky130_fd_sc_hs__inv_2() {
     rect("lvtn.drawing", x0=190., y0=190., x1=1250., y1=1300.);
     rect("layout_boundary.boundary", x0=0., y0=0., x1=1440., y1=3330.);
     let outline = crect(x0=0., y0=0., x1=1440., y1=3330.);
-    let a = crect(layer="li1.drawing", x0=105., y0=1300., x1=435., y1=1780.);
-    let out = crect(layer="li1.drawing", x0=605., y0=350., x1=890., y1=2980.);
+    pub let a = crect(layer="li1.drawing", x0=105., y0=1300., x1=435., y1=1780.);
+    pub let out = crect(layer="li1.drawing", x0=605., y0=350., x1=890., y1=2980.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=1440., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=1440., y1=3575.);
 }
@@ -166,8 +168,8 @@ cell sky130_fd_sc_hs__inv_4() {
     rect("lvtn.drawing", x0=190., y0=190., x1=2210., y1=1300.);
     rect("layout_boundary.boundary", x0=0., y0=0., x1=2400., y1=3330.);
     let outline = crect(x0=0., y0=0., x1=2400., y1=3330.);
-    let a = crect(layer="li1.drawing", x0=125., y0=1350., x1=1800., y1=1780.);
-    let out = crect(layer="li1.drawing", x0=2045., y0=1180., x1=2275., y1=1950.);
+    pub let a = crect(layer="li1.drawing", x0=125., y0=1350., x1=1800., y1=1780.);
+    pub let out = crect(layer="li1.drawing", x0=2045., y0=1180., x1=2275., y1=1950.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=2400., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=2400., y1=3575.);
 }
@@ -358,8 +360,8 @@ cell sky130_fd_sc_hs__inv_16() {
     rect("lvtn.drawing", x0=190., y0=190., x1=7970., y1=1300.);
     rect("layout_boundary.boundary", x0=0., y0=0., x1=8160., y1=3330.);
     let outline = crect(x0=0., y0=0., x1=8160., y1=3330.);
-    let a = crect(layer="met1.drawing", x0=1085., y0=1550., x1=7070., y1=1780.);
-    let out = crect(layer="met1.drawing", x0=585., y0=1920., x1=7575., y1=2150.);
+    pub let a = crect(layer="met1.drawing", x0=1085., y0=1550., x1=7070., y1=1780.);
+    pub let out = crect(layer="met1.drawing", x0=585., y0=1920., x1=7575., y1=2150.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=8160., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=8160., y1=3575.);
 }
@@ -431,9 +433,9 @@ cell sky130_fd_sc_hs__and2_2() {
     rect("lvtn.drawing", x0=190., y0=190., x1=2210., y1=1300.);
     rect("layout_boundary.boundary", x0=0., y0=0., x1=2400., y1=3330.);
     let outline = crect(x0=0., y0=0., x1=2400., y1=3330.);
-    let a = crect(layer="li1.drawing", x0=105., y0=1300., x1=435., y1=1780.);
-    let b = crect(layer="li1.drawing", x0=605., y0=1300., x1=1085., y1=1780.);
-    let out = crect(layer="li1.drawing", x0=1840., y0=1020., x1=2010., y1=1720.);
+    pub let a = crect(layer="li1.drawing", x0=105., y0=1300., x1=435., y1=1780.);
+    pub let b = crect(layer="li1.drawing", x0=605., y0=1300., x1=1085., y1=1780.);
+    pub let out = crect(layer="li1.drawing", x0=1840., y0=1020., x1=2010., y1=1720.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=2400., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=2400., y1=3575.);
 }
@@ -535,9 +537,9 @@ cell sky130_fd_sc_hs__and2_4() {
     polygon("lvtn.drawing", 8, x0=190., y0=190., x1=190., y1=1300., x2=240., y2=1300., x3=240., y3=1415., x4=4080., y4=1415., x5=4080., y5=1300., x6=4130., y6=1300., x7=4130., y7=190.);
     rect("layout_boundary.boundary", x0=0., y0=0., x1=4320., y1=3330.);
     let outline = crect(x0=0., y0=0., x1=4320., y1=3330.);
-    let a = crect(layer="li1.drawing", x0=2925., y0=1450., x1=3255., y1=1780.);
-    let b = crect(layer="li1.drawing", x0=2255., y0=1345., x1=2755., y1=1780.);
-    let out = crect(layer="li1.drawing", x0=545., y0=1550., x1=815., y1=2015.);
+    pub let a = crect(layer="li1.drawing", x0=2925., y0=1450., x1=3255., y1=1780.);
+    pub let b = crect(layer="li1.drawing", x0=2255., y0=1345., x1=2755., y1=1780.);
+    pub let out = crect(layer="li1.drawing", x0=545., y0=1550., x1=815., y1=2015.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=4320., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=4320., y1=3575.);
 }
@@ -653,9 +655,9 @@ cell sky130_fd_sc_hs__nand2_4() {
     rect("lvtn.drawing", x0=190., y0=190., x1=4130., y1=1300.);
     rect("layout_boundary.boundary", x0=0., y0=0., x1=4320., y1=3330.);
     let outline = crect(x0=0., y0=0., x1=4320., y1=3330.);
-    let a = crect(layer="li1.drawing", x0=3515., y0=1580., x1=3685., y1=1750.);
-    let b = crect(layer="li1.drawing", x0=2075., y0=1580., x1=2245., y1=1750.);
-    let out = crect(layer="li1.drawing", x0=3995., y0=1580., x1=4165., y1=1750.);
+    pub let a = crect(layer="li1.drawing", x0=3515., y0=1580., x1=3685., y1=1750.);
+    pub let b = crect(layer="li1.drawing", x0=2075., y0=1580., x1=2245., y1=1750.);
+    pub let out = crect(layer="li1.drawing", x0=3995., y0=1580., x1=4165., y1=1750.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=4320., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=4320., y1=3575.);
 }
@@ -813,9 +815,9 @@ cell sky130_fd_sc_hs__nand2_8() {
     rect("lvtn.drawing", x0=190., y0=190., x1=7970., y1=1300.);
     rect("layout_boundary.boundary", x0=0., y0=0., x1=8160., y1=3330.);
     let outline = crect(x0=0., y0=0., x1=8160., y1=3330.);
-    let a = crect(layer="li1.drawing", x0=5965., y0=1220., x1=7555., y1=1780.);
-    let b = crect(layer="li1.drawing", x0=2045., y0=1350., x1=4195., y1=1780.);
-    let out = crect(layer="li1.drawing", x0=4380., y0=1130., x1=4710., y1=2120.);
+    pub let a = crect(layer="li1.drawing", x0=5965., y0=1220., x1=7555., y1=1780.);
+    pub let b = crect(layer="li1.drawing", x0=2045., y0=1350., x1=4195., y1=1780.);
+    pub let out = crect(layer="li1.drawing", x0=4380., y0=1130., x1=4710., y1=2120.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=8160., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=8160., y1=3575.);
 }
@@ -922,9 +924,9 @@ cell sky130_fd_sc_hs__nor2_4() {
     rect("lvtn.drawing", x0=190., y0=190., x1=4130., y1=1300.);
     rect("layout_boundary.boundary", x0=0., y0=0., x1=4320., y1=3330.);
     let outline = crect(x0=0., y0=0., x1=4320., y1=3330.);
-    let a = crect(layer="li1.drawing", x0=125., y0=1180., x1=1795., y1=1550.);
-    let b = crect(layer="li1.drawing", x0=3005., y0=1180., x1=4195., y1=1550.);
-    let out = crect(layer="li1.drawing", x0=2365., y0=1180., x1=2755., y1=1410.);
+    pub let a = crect(layer="li1.drawing", x0=125., y0=1180., x1=1795., y1=1550.);
+    pub let b = crect(layer="li1.drawing", x0=3005., y0=1180., x1=4195., y1=1550.);
+    pub let out = crect(layer="li1.drawing", x0=2365., y0=1180., x1=2755., y1=1410.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=4320., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=4320., y1=3575.);
 }
@@ -1069,10 +1071,10 @@ cell sky130_fd_sc_hs__mux2_4() {
     polygon("lvtn.drawing", 10, x0=190., y0=190., x1=190., y1=1300., x2=395., y2=1300., x3=395., y3=1310., x4=3215., y4=1310., x5=3215., y5=1415., x6=5295., y6=1415., x7=5295., y7=1300., x8=8450., y8=1300., x9=8450., y9=190.);
     rect("layout_boundary.boundary", x0=0., y0=0., x1=8640., y1=3330.);
     let outline = crect(x0=0., y0=0., x1=8640., y1=3330.);
-    let a0 = crect(layer="li1.drawing", x0=6640., y0=1450., x1=7075., y1=1780.);
-    let a1 = crect(layer="li1.drawing", x0=7325., y0=1450., x1=8175., y1=1780.);
-    let out = crect(layer="li1.drawing", x0=1085., y0=1370., x1=2755., y1=1880.);
-    let s = crect(layer="li1.drawing", x0=425., y0=1350., x1=835., y1=1780.);
+    pub let a0 = crect(layer="li1.drawing", x0=6640., y0=1450., x1=7075., y1=1780.);
+    pub let a1 = crect(layer="li1.drawing", x0=7325., y0=1450., x1=8175., y1=1780.);
+    pub let out = crect(layer="li1.drawing", x0=1085., y0=1370., x1=2755., y1=1880.);
+    pub let s = crect(layer="li1.drawing", x0=425., y0=1350., x1=835., y1=1780.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=8640., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=8640., y1=3575.);
 }
@@ -1308,8 +1310,8 @@ cell sky130_fd_sc_hs__buf_16() {
     rect("lvtn.drawing", x0=190., y0=190., x1=10370., y1=1300.);
     rect("layout_boundary.boundary", x0=0., y0=0., x1=10560., y1=3330.);
     let outline = crect(x0=0., y0=0., x1=10560., y1=3330.);
-    let a = crect(layer="li1.drawing", x0=7775., y0=1350., x1=10435., y1=1780.);
-    let out = crect(layer="met1.drawing", x0=575., y0=1920., x1=7255., y1=2150.);
+    pub let a = crect(layer="li1.drawing", x0=7775., y0=1350., x1=10435., y1=1780.);
+    pub let out = crect(layer="met1.drawing", x0=575., y0=1920., x1=7255., y1=2150.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=10560., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=10560., y1=3575.);
 }

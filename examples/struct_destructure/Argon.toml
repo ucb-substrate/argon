@@ -1,2 +1,2 @@
-name = "defer"
+name = "struct_destructure"
 tech = "../tech/basic.tech.toml"

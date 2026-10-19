@@ -1,5 +1,6 @@
 mod geom;
 
+use std::layout::{inst, rect};
 use lib::geom::Size;
 
 struct ViaParams {

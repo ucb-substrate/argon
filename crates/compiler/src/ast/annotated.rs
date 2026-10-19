@@ -141,7 +141,7 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         &mut self,
         input: &super::EnumVariant<Self::InputS, Self::InputMetadata>,
         _name: &super::Ident<Self::OutputS, Self::OutputMetadata>,
-        _payload: &[super::TySpec<Self::OutputS, Self::OutputMetadata>],
+        _payload: &super::VariantPayload<Self::OutputS, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::EnumVariant {
         input.metadata.clone()
     }
@@ -283,6 +283,14 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         input: &super::TupleExpr<Self::InputS, Self::InputMetadata>,
         _items: &[super::Expr<Self::OutputS, Self::OutputMetadata>],
     ) -> <Self::OutputMetadata as AstMetadata>::TupleExpr {
+        input.metadata.clone()
+    }
+
+    fn dispatch_seq_expr(
+        &mut self,
+        input: &super::SeqLiteral<Self::InputS, Self::InputMetadata>,
+        _items: &[super::Expr<Self::OutputS, Self::OutputMetadata>],
+    ) -> <Self::OutputMetadata as AstMetadata>::SeqExpr {
         input.metadata.clone()
     }
 

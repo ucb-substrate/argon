@@ -44,7 +44,7 @@ const GENERATED_PREFIX: &str = "__argon";
 const OPEN_CELL_PREFIX: &str = "cell __argon_complete__() { let __argon_argument__ = ";
 
 /// The statement `inst` inserts, whose argument sits one call deeper.
-const INST_PREFIX: &str = "cell __argon_complete__() { let __argon_argument__ = inst(";
+const INST_PREFIX: &str = "cell __argon_complete__() { let __argon_argument__ = std::layout::inst(";
 
 /// A `:Argon` subcommand whose argument is a cell invocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,15 +273,16 @@ mod tests {
 
     use argonc::{
         compile::static_compile,
-        parse::{STD_PATH, STD_SOURCE, parse_source_text},
+        parse::{parse_source_text, with_std},
     };
-    use indexmap::IndexMap;
 
     use super::*;
 
     const ROOT: &str = "/virtual/lib.ar";
 
     const SOURCE: &str = "\
+use std::layout::{inst, rect};
+
 fn double(x: Float) -> Float { 2. * x }
 
 cell child(w: Float, h: Float = w, layer: String = \"met1\") {
@@ -297,8 +298,7 @@ cell top(w: Float = 100.) {
     /// end of its root module as `openCell` would be.
     fn fixture() -> (NavIndex, Anchor) {
         let root = parse_source_text(SOURCE.to_owned(), PathBuf::from(ROOT)).unwrap();
-        let std = parse_source_text(STD_SOURCE, PathBuf::from(STD_PATH)).unwrap();
-        let ast = IndexMap::from([(Vec::new(), root), (vec!["std".to_owned()], std)]);
+        let ast = with_std(root);
         let (typed, errors) = static_compile(&ast).unwrap();
         assert!(errors.errors.is_empty(), "{:?}", errors.errors);
         let index = NavIndex::build(&typed);
@@ -339,9 +339,11 @@ cell top(w: Float = 100.) {
         let labels = labels("");
         assert!(labels.iter().any(|label| label == "child"));
         assert!(labels.iter().any(|label| label == "top"));
-        // A function, a builtin, and a keyword cannot open a cell invocation.
+        // A function, an imported native, a builtin, and a keyword cannot
+        // open a cell invocation.
         assert!(!labels.iter().any(|label| label == "double"));
         assert!(!labels.iter().any(|label| label == "rect"));
+        assert!(!labels.iter().any(|label| label == "eq"));
         assert!(!labels.iter().any(|label| label == "true"));
     }
 
@@ -364,7 +366,10 @@ cell top(w: Float = 100.) {
     fn arguments_offer_expressions_rather_than_only_cells() {
         let labels = labels("child(");
         assert!(labels.iter().any(|label| label == "double"));
+        assert!(labels.iter().any(|label| label == "eq"));
+        // A native is offered once imported, and not before.
         assert!(labels.iter().any(|label| label == "rect"));
+        assert!(!labels.iter().any(|label| label == "crect"));
         // Declaration keywords and type names are not expressions.
         assert!(!labels.iter().any(|label| label == "cell"));
         assert!(!labels.iter().any(|label| label == "Float"));
@@ -373,7 +378,30 @@ cell top(w: Float = 100.) {
     #[test]
     fn a_qualified_path_offers_the_modules_items() {
         assert!(!labels("child(std::").is_empty());
+        let layout = labels("child(std::layout::");
+        assert!(layout.iter().any(|label| label == "rect"));
+        assert!(layout.iter().any(|label| label == "crect"));
         assert!(labels("child(nonexistent::").is_empty());
+    }
+
+    /// `inst` splices its argument inside a placement call, which must still
+    /// read as an expression position.
+    #[test]
+    fn inst_completes_inside_its_placement_call() {
+        let inserted = |text: &str, label: &str| {
+            items(CellExpressionCommand::Inst, text)
+                .into_iter()
+                .find(|item| item.label == label)
+                .and_then(|item| item.insert_text)
+        };
+        assert_eq!(inserted("", "child").as_deref(), Some("child("));
+        assert_eq!(inserted("to", "top").as_deref(), Some("top("));
+        assert_eq!(inserted("child(1., ", "h").as_deref(), Some("h="));
+        assert!(
+            !items(CellExpressionCommand::Inst, "")
+                .iter()
+                .any(|item| item.label == "double")
+        );
     }
 
     #[test]

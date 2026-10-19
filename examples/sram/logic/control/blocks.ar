@@ -2,6 +2,8 @@
 // and the NAND SR latch. Each block is one 3330 nm standard-cell row with
 // VGND at y = 0 and exports its outline and signal pins.
 
+use std::layout::{crect, inst, rect};
+
 fn row_h() -> Float { 3330. }
 fn tap_w() -> Float { 960. }
 
@@ -68,8 +70,8 @@ cell inv_chain(n: Int, svt: Bool) {
         rect("li1.drawing", x0=inv_chain_x(i) + inv2.out.x0, y0=y0, x1=inv_chain_x(i + 1) + a_x1, y1=y0 + 170.);
     }
     let x_last = inv_chain_x(n - 1);
-    let din = crect(layer="li1.drawing", x0=inv2.a.x0, y0=inv2.a.y0, x1=inv2.a.x1, y1=inv2.a.y1);
-    let dout = crect(layer="li1.drawing", x0=x_last + inv4.out.x0, y0=inv4.out.y0, x1=x_last + inv4.out.x1, y1=inv4.out.y1);
+    pub let din = crect(layer="li1.drawing", x0=inv2.a.x0, y0=inv2.a.y0, x1=inv2.a.x1, y1=inv2.a.y1);
+    pub let dout = crect(layer="li1.drawing", x0=x_last + inv4.out.x0, y0=inv4.out.y0, x1=x_last + inv4.out.x1, y1=inv4.out.y1);
     let outline = crect(x0=0., y0=0., x1=inv_chain_w(n), y1=row_h());
 }
 
@@ -94,8 +96,8 @@ cell edge_detector() {
     m1_elbow(a, a.x0, din_cx, din_cy);
     m1_elbow(dout, dout.x1, and2.b.x0 + 115., b_cy);
 
-    let din = chain.din;
-    let out = and2.out;
+    pub let din = chain.din;
+    pub let out = and2.out;
     let outline = crect(x0=0., y0=0., x1=edge_detector_w(), y1=row_h());
 }
 
@@ -125,9 +127,9 @@ cell sr_latch() {
     m1_elbow(q0b, q0b.x0, (q0b_set.x0 + q0b_set.x1) / 2., (q0b_set.y0 + q0b_set.y1) / 2.);
     m1_elbow(q0b, q0b.x0, (q0b_inv.x0 + q0b_inv.x1) / 2., (q0b_inv.y0 + q0b_inv.y1) / 2.);
 
-    let sb = nand_set.b;
-    let rb = nand_reset.b;
-    let q = q_inv.out;
-    let qb = qb_inv.out;
+    pub let sb = nand_set.b;
+    pub let rb = nand_reset.b;
+    pub let q = q_inv.out;
+    pub let qb = qb_inv.out;
     let outline = crect(x0=0., y0=0., x1=sr_latch_w(), y1=row_h());
 }

@@ -4,6 +4,7 @@
 mod params;
 mod generated;
 
+use std::layout::inst;
 use lib::params::ColParams;
 use lib::params::SramLayoutParams;
 

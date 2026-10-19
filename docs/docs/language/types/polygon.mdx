@@ -7,7 +7,7 @@ import {FieldTable} from '@site/src/components/ApiReference';
 
 # `Polygon`
 
-`Polygon` is a fixed number of vertices on a layer. Create one with [`polygon`](/language/builtins/geometry#polygon).
+`Polygon` is a fixed number of vertices on a layer. Create one with [`std::layout::polygon`](/language/std-layout#polygon).
 
 ## Fields
 
@@ -21,7 +21,7 @@ import {FieldTable} from '@site/src/components/ApiReference';
 `shape.x2` and `shape.points[2].x` refer to the same coordinate.
 
 ```argon
-let triangle = polygon(
+let triangle = std::layout::polygon(
     "met1", 3,
     x0=0., y0=0.,
     x1=100., y1=0.,

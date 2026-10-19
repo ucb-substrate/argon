@@ -34,7 +34,7 @@ eq(center, (bounds.x0 + bounds.x1) / 2.);
 Keyword arguments ending in `i`, such as `x0i`, `y1i`, `widthi`, or `x2i`, are initial values. The GUI uses them for any coordinate that no constraint determines:
 
 ```argon
-let shape = rect("met1", x0i=20., y0i=30., x1i=120., y1i=90.);
+let shape = std::layout::rect("met1", x0i=20., y0i=30., x1i=120., y1i=90.);
 ```
 
 - Dashed edges are under-constrained.
@@ -46,4 +46,4 @@ You don't need to write initial values by hand. The first time you drag a shape,
 
 ## Dimensions
 
-The Dimension tool writes [`dimension`](/language/builtins/constraints#dimension) calls, which record both the constraint and where its label sits. Create them from the canvas; their arguments are tedious to write by hand.
+The Dimension tool writes [`std::layout::dimension`](/language/std-layout#dimension) calls, which record both the constraint and where its label sits. Create them from the canvas; their arguments are tedious to write by hand.

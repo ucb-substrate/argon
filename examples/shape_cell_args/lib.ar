@@ -3,12 +3,14 @@
 // way a `Float` argument arrives as a number. Constraints written here cannot
 // move the caller's geometry; share live geometry with a `fn` instead.
 
+use std::layout::{crect, inst, polygon, rect};
+
 // Fills `region` with square vias on a pitch, centered in the region. The
 // region is construction geometry inside this cell: it is not drawn, but its
 // edges constrain the array.
 cell via_array(region: Rect, size: Float, pitch: Float) {
     let via = crect(layer="via1", x0=0., y0=0., w=size, h=size);
-    let vias = std::max_array(via, region.w, region.h, pitch, pitch);
+    let vias = std::layout::max_array(via, region.w, region.h, pitch, pitch);
     eq(vias.x0 - region.x0, region.x1 - vias.x1);
     eq(vias.y0 - region.y0, region.y1 - vias.y1);
 }
@@ -24,7 +26,7 @@ cell outline(shape: Polygon, corner: Point, guide: Rect) {
 cell top() {
     let met1 = rect("met1", x0=0., y0=0., w=100., h=50.);
     let met2 = rect("met2", x0=10., y0=5., w=80., h=40.);
-    let overlap = std::intersection(met1, met2);
+    let overlap = std::layout::intersection(met1, met2);
     let vias = inst(via_array(overlap, 10., 20.), x=0., y=0.);
 
     let tri = polygon("met1", 3, x0=0., y0=0., x1=40., y1=0., x2=20., y2=30.);

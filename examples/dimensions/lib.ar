@@ -1,3 +1,5 @@
+use std::layout::{dimension, rect};
+
 cell top() {
     let met1 = rect("met1")!;
     dimension(met1.x1, met1.x0, 200., 100., 0., 0., true);

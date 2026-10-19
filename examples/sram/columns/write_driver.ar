@@ -1,3 +1,4 @@
+use std::layout::{inst, rect};
 use lib::params::WriteDriverParams;
 
 fn wdrv_diff_perp(length: Float) -> Float {
@@ -285,8 +286,8 @@ cell write_driver(p: WriteDriverParams) {
     let brinv = inst(tristate_inv_exact(p), x=530., y=0., reflect=true, angle=90);
     let bl = draw_wdrv_bitline(p, false);
     let br = draw_wdrv_bitline(p, true);
-    let en = draw_wdrv_en_route(p, false);
-    let en_b = draw_wdrv_en_route(p, true);
+    pub let en = draw_wdrv_en_route(p, false);
+    pub let en_b = draw_wdrv_en_route(p, true);
     let vdd = draw_wdrv_power(p, true);
     let vss = draw_wdrv_power(p, false);
     let data_b = wdrv_inst_port(p, true, 0, 0, false);

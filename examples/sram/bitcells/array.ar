@@ -1,5 +1,8 @@
 // SRAM22 uses a four-row body-contact pitch and a mux-ratio-wide column tile.
 // The fixed dimensions below are the published Sky130 SRAM macro boundaries.
+
+use std::layout::{crect, inst};
+
 fn bitcell_width() -> Float { 1200. }
 fn bitcell_height() -> Float { 1580. }
 fn rowend_width() -> Float { 1300. }
@@ -196,12 +199,12 @@ cell sp_cell_array(rows: Int, cols: Int, mux_ratio: Int) {
     }
     let ur = inst(corner_ur(), x=left_width + groups as Float * group_width, y=top_y);
     let outline = crect(x0=0., y0=0., x1=array_width(cols, mux_ratio), y1=array_height(rows));
-    let bl = array_bitline_ports(0, cols, mux_ratio, false);
-    let br = array_bitline_ports(0, cols, mux_ratio, true);
-    let wl = array_wordline_ports(0, rows);
+    pub let bl = array_bitline_ports(0, cols, mux_ratio, false);
+    pub let br = array_bitline_ports(0, cols, mux_ratio, true);
+    pub let wl = array_wordline_ports(0, rows);
     let right_edge = left_width + groups as Float * group_width + 2. * rowend_width() + bitcell_width();
-    let vdd_rails = array_power_rails(right_edge, row_groups, true);
-    let vss_rails = array_power_rails(right_edge, row_groups, false);
+    pub let vdd_rails = array_power_rails(right_edge, row_groups, true);
+    pub let vss_rails = array_power_rails(right_edge, row_groups, false);
 }
 
 // Bitline landing pads on the bottom edge of the array. Bitcells alternate in
@@ -234,31 +237,31 @@ fn array_wordline_ports(idx: Int, rows: Int) -> [Rect] { [for i in range_full(id
 // (bottom, top) offsets. Well-tie rails count with the supply they tie to.
 fn array_top_rail_spans(vdd: Bool) -> [(Float, Float)] {
     if vdd {
-        list((2760., 3040.,), (2160., 2610.,), (295., 555.,))
+        [(2760., 3040.,), (2160., 2610.,), (295., 555.,)]
     } else {
-        list((3180., 3635.,), (1600., 1985.,), (725., 945.,))
+        [(3180., 3635.,), (1600., 1985.,), (725., 945.,)]
     }
 }
 
 fn array_bottom_rail_spans(vdd: Bool) -> [(Float, Float)] {
-    if vdd { list((1025., 1475.,), (595., 875.,)) } else { list((1650., 2035.,), (0., 455.,)) }
+    if vdd { [(1025., 1475.,), (595., 875.,)] } else { [(1650., 2035.,), (0., 455.,)] }
 }
 
 // Rails of one strap group relative to its well-tie rail. These also exist
 // below the lowest group.
 fn array_strap_rail_spans(vdd: Bool) -> [(Float, Float)] {
     if vdd {
-        list((-820., -560.,), (-1670., -1410.,))
+        [(-820., -560.,), (-1670., -1410.,)]
     } else {
-        list((0., 170.,), (-390., -170.,), (-2060., -1840.,))
+        [(0., 170.,), (-390., -170.,), (-2060., -1840.,)]
     }
 }
 
 fn array_row_rail_spans(vdd: Bool) -> [(Float, Float)] {
     if vdd {
-        list((-3980., -3720.,), (-4830., -4570.,), (-7140., -6880.,))
+        [(-3980., -3720.,), (-4830., -4570.,), (-7140., -6880.,)]
     } else {
-        list((-3550., -3330.,), (-5220., -5000.,), (-6710., -6490.,))
+        [(-3550., -3330.,), (-5220., -5000.,), (-6710., -6490.,)]
     }
 }
 
@@ -379,12 +382,12 @@ cell replica_cell_array(rows: Int, cols: Int) {
         let top = inst(replica_top(), x=rowend_width() + col as Float * replica_pair_width(), y=top_y);
     }
     let ur = inst(replica_corner_top(), x=right_x, y=top_y, reflect=true, angle=180);
-    let bl = list(replica_bitline_port(0, false), replica_bitline_port(1, false));
-    let br = list(replica_bitline_port(0, true), replica_bitline_port(1, true));
-    let wl = array_wordline_ports(0, rows);
+    pub let bl = [replica_bitline_port(0, false), replica_bitline_port(1, false)];
+    pub let br = [replica_bitline_port(0, true), replica_bitline_port(1, true)];
+    pub let wl = array_wordline_ports(0, rows);
     // One cell supply rail of each kind on the left edge, plus every substrate-tie rail.
-    let vdd_rails = list(crect(x0=0., y0=top_y + 2160., x1=rowend_width(), y1=top_y + 2610.));
-    let vss_rails = cons(
+    pub let vdd_rails = [crect(x0=0., y0=top_y + 2160., x1=rowend_width(), y1=top_y + 2610.)];
+    pub let vss_rails = cons(
         crect(x0=0., y0=top_y + 3180., x1=rowend_width(), y1=top_y + 3635.),
         cons(crect(x0=0., y0=top_y + 1600., x1=rowend_width(), y1=top_y + 1985.), cons(crect(x0=0., y0=1650., x1=rowend_width(), y1=2035.), replica_tie_rails(0, row_groups))),
     );

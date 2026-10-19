@@ -1,6 +1,8 @@
 // An `if` with no `else` is a statement: it produces no value, so it is only
 // allowed where a statement is expected.
 
+use std::layout::{inst, rect};
+
 // One rect always, plus a marker chosen by `wide`. The last `if` in the body
 // needs no `;`, being a statement rather than a tail expression.
 cell strap(w: Float, wide: Bool) {

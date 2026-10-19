@@ -6,6 +6,7 @@ mod blocks;
 mod tracks;
 mod rails;
 
+use std::layout::{inst, rect};
 use lib::logic::control::tracks::m1_h;
 use lib::logic::control::tracks::m2_v;
 use lib::logic::control::tracks::m2_v_to_pin;
@@ -201,8 +202,8 @@ cell control_logic_replica_v2(p: ControlLogicParams) {
     // supply feeders across the block there.
     let right = max_float(max_float(inv_rbl_x + 1440. + t, wl_ctl_x + lib::logic::control::blocks::sr_latch_w() + t), max_float(wrdrven_ctl_x + lib::logic::control::blocks::sr_latch_w() + t, pc_b_buf_x + 10560. + t));
     let rh = lib::logic::control::blocks::row_h();
-    let vdd_rails = list(rail_rect(0., right), rail_rect(y2 + rh, right), rail_rect(y4 + rh, right));
-    let vss_rails = list(rail_rect(y0, right), rail_rect(y2, right), rail_rect(y4, right));
+    pub let vdd_rails = [rail_rect(0., right), rail_rect(y2 + rh, right), rail_rect(y4 + rh, right)];
+    pub let vss_rails = [rail_rect(y0, right), rail_rect(y2, right), rail_rect(y4, right)];
     // The right pins go on the first column that starts 3.2 um past the cell
     // bbox, whose nwell extends 190 nm past the last row.
     let pin_j = col_starting_after(right + 190. + 3200.);
@@ -211,23 +212,23 @@ cell control_logic_replica_v2(p: ControlLogicParams) {
     let feed_j = pin_j - 1;
     // Fixed met2 columns crossing row 1 (rbl_b, wlen, rwl), and those crossing
     // row 0, which also include clkp_b's and rbl_b's risers there.
-    let row1_cross = list(71, 83, 101);
-    let row0_cross = list(71, 83, 101, 146, 162);
+    let row1_cross = [71, 83, 101];
+    let row0_cross = [71, 83, 101, 146, 162];
 
     // rstb
-    let rstb = m1_pin("rstb", -9, -9);
+    pub let rstb = m1_pin("rstb", -9, -9);
     m1_h(-9, -9, -1);
     m2_v(-1, -9, -5);
     m1_h(-5, -1, 5);
     m1_access(reset_inv.a, 5, -5);
     // clk
-    let clk = m1_pin("clk", -9, -3);
+    pub let clk = m1_pin("clk", -9, -3);
     m1_h(-3, -9, -2);
     m2_v(-2, -3, -2);
     m1_h(-2, -2, 22);
     li1_access(clk_delay.din, 22, -2);
     // ce
-    let ce = m1_pin("ce", -9, -5);
+    pub let ce = m1_pin("ce", -9, -5);
     m1_h(-5, -9, -3);
     m2_v(-3, -5, -6);
     m1_h(-6, -3, 67);
@@ -255,9 +256,9 @@ cell control_logic_replica_v2(p: ControlLogicParams) {
     // rbl
     li1_access(inv_rbl.a, 164, -5);
     m1_h(-5, 164, pin_j);
-    let rbl = m1_pin("rbl", pin_j, -5);
+    pub let rbl = m1_pin("rbl", pin_j, -5);
     // we
-    let we = m1_pin("we", -9, -7);
+    pub let we = m1_pin("we", -9, -7);
     m1_h(-7, -9, -4);
     m2_v(-4, -19, -7);
     m1_h(-19, -4, 2);
@@ -276,7 +277,7 @@ cell control_logic_replica_v2(p: ControlLogicParams) {
     m2_v(-6, 1, -11);
     m1_h(-11, -6, 2);
     li1_access(clkp_delay.din, 2, -11);
-    let clkp_b_j = free_col(pin_col(pc_ctl.rb), 1, list(31, 35, 43, 48, 50, pin_col(wrdrven_ctl.rb), pin_col_right(wrdrven_ctl.q)));
+    let clkp_b_j = free_col(pin_col(pc_ctl.rb), 1, [31, 35, 43, 48, 50, pin_col(wrdrven_ctl.rb), pin_col_right(wrdrven_ctl.q)]);
     m2_v(-6, -11, -41);
     m1_h(-41, -6, clkp_b_j);
     m2_v(clkp_b_j, -41, -33);
@@ -284,7 +285,7 @@ cell control_logic_replica_v2(p: ControlLogicParams) {
     // rbl_b
     li1_access(inv_rbl.out, 162, -2);
     m2_v(162, -2, 6);
-    let rbl_b_j = free_col(pin_col_right(mux_wlen_rst.a0), 1, list(83, 101, 146, 162));
+    let rbl_b_j = free_col(pin_col_right(mux_wlen_rst.a0), 1, [83, 101, 146, 162]);
     m1_h(6, min_int(71, rbl_b_j), max_int(162, rbl_b_j));
     m2_v(71, 6, -18);
     li1_access(nand_wlendb_web.a, 71, -18);
@@ -385,23 +386,23 @@ cell control_logic_replica_v2(p: ControlLogicParams) {
     m1_h(5, 83, feed_j);
     m2_v(feed_j, 5, -3);
     m1_h(-3, feed_j, pin_j);
-    let wlen = m1_pin("wlen", pin_j, -3);
+    pub let wlen = m1_pin("wlen", pin_j, -3);
     // rwl
     m1_access(rwl_buf.out, 101, -17);
     m2_v_to_pin(101, -17, 9);
-    let rwl = m2_pin("rwl", 101, 9);
+    pub let rwl = m2_pin("rwl", 101, 9);
     // saen
     li1_access(saen_ctl.q, 43, -27);
     m2_v(43, -27, -38);
     m1_h(-38, 43, 50);
     m2_v_to_pin(50, -38, -46);
-    let saen = m2_pin("saen", 50, -46);
+    pub let saen = m2_pin("saen", 50, -46);
     // wrdrven
     li1_access(wrdrven_ctl.q, pin_col_right(wrdrven_ctl.q), -28);
     m2_v(pin_col_right(wrdrven_ctl.q), -28, -40);
     m1_h(-40, 48, pin_col_right(wrdrven_ctl.q));
     m2_v_to_pin(48, -40, -46);
-    let wrdrven = m2_pin("wrdrven", 48, -46);
+    pub let wrdrven = m2_pin("wrdrven", 48, -46);
     // wrdrven_set_b
     li1_access(wrdrven_set_delay.dout, pin_col(wrdrven_set_delay.dout), -25);
     m1_h(-25, pin_col(wrdrven_set_delay.dout), pin_col(wrdrven_ctl.sb));
@@ -415,5 +416,5 @@ cell control_logic_replica_v2(p: ControlLogicParams) {
     m1_h(-31, pin_col(pc_b_buf.out), feed_j);
     m2_v(feed_j, -31, -7);
     m1_h(-7, feed_j, pin_j);
-    let pc_b = m1_pin("pc_b", pin_j, -7);
+    pub let pc_b = m1_pin("pc_b", pin_j, -7);
 }

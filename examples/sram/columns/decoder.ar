@@ -1,3 +1,4 @@
+use std::layout::{bbox, crect, inst, rect};
 use lib::params::DecoderParams;
 use lib::params::PrimitiveGateParams;
 use lib::params::BufferSizing;
@@ -131,15 +132,15 @@ cell dec_nand2_raw(nw: Int, pw: Int, draw: Int) {
     let sd_1_0 = dec_sd_port_raw(p0, pw as Float, 0);
     let sd_1_1 = dec_sd_port_raw(p0, pw as Float, 1);
     let sd_1_2 = dec_sd_port_raw(p0, pw as Float, 2);
-    let y_out = lib::columns::util::rect_union(sd_0_2, sd_1_2);
-    let vss = sd_0_0;
-    let vdd = sd_1_1;
-    let a = gate_0;
-    let b = gate_1;
-    let nwell_bbox = dec_nwell(nw, pw);
-    let nsdm_bbox = dec_nsdm(nw);
-    let psdm_bbox = dec_psdm(nw, pw);
-    let outline = dec_raw_bbox(nw, pw);
+    pub let y_out = lib::columns::util::rect_union(sd_0_2, sd_1_2);
+    pub let vss = sd_0_0;
+    pub let vdd = sd_1_1;
+    pub let a = gate_0;
+    pub let b = gate_1;
+    pub let nwell_bbox = dec_nwell(nw, pw);
+    pub let nsdm_bbox = dec_nsdm(nw);
+    pub let psdm_bbox = dec_psdm(nw, pw);
+    pub let outline = dec_raw_bbox(nw, pw);
     if draw == 1 {
         let bbox = draw_dec_base_diff_poly(nw, pw);
         draw_dec_gate_contact(0);
@@ -190,17 +191,17 @@ cell dec_nand3_raw(nw: Int, pw: Int, draw: Int) {
     let sd_1_1 = dec_sd_port_raw(p0, pw as Float, 1);
     let sd_1_2 = dec_sd_port_raw(p0, pw as Float, 2);
     let sd_1_3 = dec_sd_port_raw(p0, pw as Float, 3);
-    let y_out = lib::columns::util::rect_union(sd_0_3, sd_1_3);
-    let vss = sd_0_0;
-    let vdd = sd_1_0;
-    let vdd1 = sd_1_2;
-    let a = dec_nand3_gate_contact_raw(0);
-    let b = dec_nand3_gate_contact_raw(1);
-    let c = dec_nand3_gate_contact_raw(2);
-    let nwell_bbox = lib::columns::util::cbox(p0 - 180., -180., p0 + pw as Float + 180., 1720.);
-    let nsdm_bbox = lib::columns::util::cbox(-125., -125., nw as Float + 125., 1665.);
-    let psdm_bbox = lib::columns::util::cbox(p0 - 125., -125., p0 + pw as Float + 125., 1665.);
-    let outline = dec_nand3_raw_bbox(nw, pw);
+    pub let y_out = lib::columns::util::rect_union(sd_0_3, sd_1_3);
+    pub let vss = sd_0_0;
+    pub let vdd = sd_1_0;
+    pub let vdd1 = sd_1_2;
+    pub let a = dec_nand3_gate_contact_raw(0);
+    pub let b = dec_nand3_gate_contact_raw(1);
+    pub let c = dec_nand3_gate_contact_raw(2);
+    pub let nwell_bbox = lib::columns::util::cbox(p0 - 180., -180., p0 + pw as Float + 180., 1720.);
+    pub let nsdm_bbox = lib::columns::util::cbox(-125., -125., nw as Float + 125., 1665.);
+    pub let psdm_bbox = lib::columns::util::cbox(p0 - 125., -125., p0 + pw as Float + 125., 1665.);
+    pub let outline = dec_nand3_raw_bbox(nw, pw);
     if draw == 1 {
         lib::columns::util::draw_box("nsdm.drawing", nsdm_bbox);
         lib::columns::util::draw_box("psdm.drawing", psdm_bbox);
@@ -240,16 +241,16 @@ cell dec_inv_raw(nw: Int, pw: Int, draw: Int) {
     let sd_1_0 = dec_sd_port_raw(p0, hp as Float, 0);
     let sd_1_1 = dec_sd_port_raw(p0, hp as Float, 1);
     let sd_1_2 = dec_sd_port_raw(p0, hp as Float, 2);
-    let y_out = lib::columns::util::rect_union(sd_0_1, sd_1_1);
-    let vss0 = sd_0_0;
-    let vss1 = sd_0_2;
-    let vdd0 = sd_1_0;
-    let vdd1 = sd_1_2;
-    let a = gate;
-    let nwell_bbox = dec_nwell(hn, hp);
-    let nsdm_bbox = dec_nsdm(hn);
-    let psdm_bbox = dec_psdm(hn, hp);
-    let outline = dec_raw_bbox(hn, hp);
+    pub let y_out = lib::columns::util::rect_union(sd_0_1, sd_1_1);
+    pub let vss0 = sd_0_0;
+    pub let vss1 = sd_0_2;
+    pub let vdd0 = sd_1_0;
+    pub let vdd1 = sd_1_2;
+    pub let a = gate;
+    pub let nwell_bbox = dec_nwell(hn, hp);
+    pub let nsdm_bbox = dec_nsdm(hn);
+    pub let psdm_bbox = dec_psdm(hn, hp);
+    pub let outline = dec_raw_bbox(hn, hp);
     if draw == 1 {
         let bbox = draw_dec_base_diff_poly(hn, hp);
         draw_dec_sd_contact(0., hn as Float, 0);
@@ -304,9 +305,9 @@ cell dec_mf_device_raw(nf: Int, pmos: Bool, draw: Int, pins: Int) {
     let gate_top = -15. + 430. * nf as Float;
     let gate_area = lib::columns::util::cbox(-520., 265., -190., gate_top);
     let gate_cut_bbox = lib::columns::util::contact_cut_bbox_later(3, gate_area, gate_area, 0, 0, true);
-    let gate_contact = lib::columns::util::contact_top_bbox_later(3, gate_area, gate_area, 0, 0, true);
-    let sd_even = dec_mf_sd_bbox(nf, false);
-    let sd_odd = dec_mf_sd_bbox(nf, true);
+    pub let gate_contact = lib::columns::util::contact_top_bbox_later(3, gate_area, gate_area, 0, 0, true);
+    pub let sd_even = dec_mf_sd_bbox(nf, false);
+    pub let sd_odd = dec_mf_sd_bbox(nf, true);
     if draw == 1 {
         lib::columns::util::draw_box("diff.drawing", lib::columns::util::cbox(0., 0., 700., diff_top));
         if pmos {
@@ -347,10 +348,10 @@ cell dec_multifinger_inv_raw(nw: Int, pw: Int, draw: Int, pins: Int) {
     let pdx = dec_mf_pmos_dx(pnf);
     let nmos = inst(dec_mf_device_raw(nnf, false, draw, pins), x=0., y=0., angle=90);
     let pmos = inst(dec_mf_device_raw(pnf, true, draw, pins), x=pdx, y=0., angle=90);
-    let a = lib::columns::util::rect_union(nmos.gate_contact, pmos.gate_contact);
-    let y_out = lib::columns::util::rect_union(nmos.sd_odd, pmos.sd_odd);
-    let vss = nmos.sd_even;
-    let vdd = pmos.sd_even;
+    pub let a = lib::columns::util::rect_union(nmos.gate_contact, pmos.gate_contact);
+    pub let y_out = lib::columns::util::rect_union(nmos.sd_odd, pmos.sd_odd);
+    pub let vss = nmos.sd_even;
+    pub let vdd = pmos.sd_even;
     if draw == 1 {
         lib::columns::util::draw_box("li1.drawing", a);
         if pins == 1 {
@@ -586,7 +587,7 @@ cell dec_multifinger_inv_tap(nw: Int, pw: Int, tap_width: Int, gate_width: Int) 
     dec_mf_draw_tap_region(true, lib::columns::util::rect_vspan(p_implant), tap_width);
     dec_mf_draw_tap_power(lib::columns::util::rect_vspan(n_implant), tap_width);
     dec_mf_draw_tap_power(lib::columns::util::rect_vspan(p_implant), tap_width);
-    let outline = rect(
+    pub let outline = rect(
         "layout_boundary.boundary",
         x0=0.,
         y0=min_float(n_implant.y0, p_nwell.y0),
@@ -685,8 +686,8 @@ cell dec_nand2_gate_w(nw: Int, pw: Int, filler: Int, width: Int, signal_pins: In
     let psdm_bbox = lib::columns::util::draw_box("psdm.drawing", lib::columns::util::rect_from_spans((0., width as Float,), lib::columns::util::rect_vspan(raw.psdm_bbox)));
     draw_dec_straps_1_w(lib::columns::util::rect_vspan(raw.nsdm_bbox), raw.vss, filler == 0, width);
     draw_dec_straps_1_w(lib::columns::util::rect_vspan(raw.psdm_bbox), raw.vdd, filler == 0, width);
-    let vss_strap = lib::columns::util::rect_from_spans((0., width as Float,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
-    let vdd_strap = lib::columns::util::rect_from_spans((0., width as Float,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
+    pub let vss_strap = lib::columns::util::rect_from_spans((0., width as Float,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
+    pub let vdd_strap = lib::columns::util::rect_from_spans((0., width as Float,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
     let a = raw.a;
     let b = raw.b;
     let y_out = raw.y_out;
@@ -729,8 +730,8 @@ cell dec_nand3_gate_w(nw: Int, pw: Int, filler: Int, width: Int, boundary: Int) 
     let psdm_bbox = lib::columns::util::draw_box("psdm.drawing", lib::columns::util::rect_from_spans((0., width as Float,), lib::columns::util::rect_vspan(raw.psdm_bbox)));
     draw_dec_straps_1_w(lib::columns::util::rect_vspan(raw.nsdm_bbox), raw.vss, filler == 0, width);
     draw_dec_straps_2_w(lib::columns::util::rect_vspan(raw.psdm_bbox), raw.vdd, raw.vdd1, filler == 0, width);
-    let vss_strap = lib::columns::util::rect_from_spans((0., width as Float,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
-    let vdd_strap = lib::columns::util::rect_from_spans((0., width as Float,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
+    pub let vss_strap = lib::columns::util::rect_from_spans((0., width as Float,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
+    pub let vdd_strap = lib::columns::util::rect_from_spans((0., width as Float,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
     let a = raw.a;
     let b = raw.b;
     let c = raw.c;
@@ -777,14 +778,14 @@ cell dec_nand2_gate(nw: Int, pw: Int, filler: Int) {
     let psdm_bbox = lib::columns::util::draw_box("psdm.drawing", lib::columns::util::rect_from_spans((0., 1580.,), lib::columns::util::rect_vspan(raw.psdm_bbox)));
     draw_dec_straps_1(lib::columns::util::rect_vspan(raw.nsdm_bbox), raw.vss, filler == 0);
     draw_dec_straps_1(lib::columns::util::rect_vspan(raw.psdm_bbox), raw.vdd, filler == 0);
-    let vss_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
-    let vdd_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
-    let a = raw.a;
-    let b = raw.b;
-    let y_out = raw.y_out;
+    pub let vss_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
+    pub let vdd_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
+    pub let a = raw.a;
+    pub let b = raw.b;
+    pub let y_out = raw.y_out;
     let vss = raw.vss;
     let vdd = raw.vdd;
-    let outline = rect("layout_boundary.boundary", x0=0., y0=raw.outline.y0, x1=1580., y1=raw.outline.y1);
+    pub let outline = rect("layout_boundary.boundary", x0=0., y0=raw.outline.y0, x1=1580., y1=raw.outline.y1);
 }
 
 cell dec_inv_gate(nw: Int, pw: Int, filler: Int) {
@@ -794,15 +795,15 @@ cell dec_inv_gate(nw: Int, pw: Int, filler: Int) {
     let psdm_bbox = lib::columns::util::draw_box("psdm.drawing", lib::columns::util::rect_from_spans((0., 1580.,), lib::columns::util::rect_vspan(raw.psdm_bbox)));
     draw_dec_straps_2(lib::columns::util::rect_vspan(raw.nsdm_bbox), raw.vss0, raw.vss1, filler == 0);
     draw_dec_straps_2(lib::columns::util::rect_vspan(raw.psdm_bbox), raw.vdd0, raw.vdd1, filler == 0);
-    let vss_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
-    let vdd_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
+    pub let vss_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
+    pub let vdd_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
     let a = raw.a;
-    let y_out = raw.y_out;
+    pub let y_out = raw.y_out;
     let vss0 = raw.vss0;
     let vss1 = raw.vss1;
     let vdd0 = raw.vdd0;
     let vdd1 = raw.vdd1;
-    let outline = rect("layout_boundary.boundary", x0=0., y0=raw.outline.y0, x1=1580., y1=raw.outline.y1);
+    pub let outline = rect("layout_boundary.boundary", x0=0., y0=raw.outline.y0, x1=1580., y1=raw.outline.y1);
 }
 
 // The vertical driver style keeps device access on LI/M1, but moves the
@@ -837,8 +838,8 @@ cell dec_inv_gate_vertical(nw: Int, pw: Int, filler: Int) {
     let psdm_bbox = lib::columns::util::draw_box("psdm.drawing", lib::columns::util::rect_from_spans((0., 1580.,), lib::columns::util::rect_vspan(raw.psdm_bbox)));
     draw_dec_straps_2_vertical(lib::columns::util::rect_vspan(raw.nsdm_bbox), raw.vss0, raw.vss1, filler == 0);
     draw_dec_straps_2_vertical(lib::columns::util::rect_vspan(raw.psdm_bbox), raw.vdd0, raw.vdd1, filler == 0);
-    let vss_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
-    let vdd_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
+    pub let vss_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
+    pub let vdd_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
     let a = raw.a;
     let y_out = raw.y_out;
     let vss0 = raw.vss0;
@@ -907,13 +908,13 @@ cell dec_and2_gate(nand_nw: Int, nand_pw: Int, inv_nw: Int, inv_pw: Int, filler:
         crect(x0=0., y0=-540., x1=1580., y1=inv_x + inv_right)
     };
     let a = nand.a;
-    let b = nand.b;
+    pub let b = nand.b;
     let y_b = nand.y_out;
-    let y_out = inv.y_out;
+    pub let y_out = inv.y_out;
     let nand_vss = nand.vss_strap;
     let nand_vdd = nand.vdd_strap;
-    let inv_vss = inv.vss_strap;
-    let inv_vdd = inv.vdd_strap;
+    pub let inv_vss = inv.vss_strap;
+    pub let inv_vdd = inv.vdd_strap;
 }
 
 // Rust performs logical-effort and transistor sizing. These accessors only
@@ -1218,7 +1219,7 @@ cell dec_primitive_tap(nw: Int, pw: Int, is_inv: Bool, tap_width: Int, gate_widt
     let xf_psdm = if is_inv { dec_inv_gate_xf(dec_psdm(hn, hp), nw, pw) } else { dec_gate_xf_w(dec_psdm(nw, pw), nw, pw, gate_width) };
     let raw_bbox = if is_inv { dec_inv_raw_bbox(nw, pw) } else { dec_raw_bbox(nw, pw) };
     let nwell = lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans((0., tap_width as Float,), lib::columns::util::rect_vspan(xf_nwell)));
-    let outline = if boundary == 1 {
+    pub let outline = if boundary == 1 {
         rect("layout_boundary.boundary", x0=0., y0=raw_bbox.x0, x1=tap_width as Float, y1=raw_bbox.x1)
     } else {
         crect(x0=0., y0=raw_bbox.x0, x1=tap_width as Float, y1=raw_bbox.x1)
@@ -1254,7 +1255,7 @@ cell dec_primitive_tap_vertical(nw: Int, pw: Int, tap_width: Int, gate_width: In
     let xf_psdm = dec_inv_gate_xf(dec_psdm(hn, hp), nw, pw);
     let raw_bbox = dec_inv_raw_bbox(nw, pw);
     let nwell = lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans((0., tap_width as Float,), lib::columns::util::rect_vspan(xf_nwell)));
-    let outline = if boundary == 1 {
+    pub let outline = if boundary == 1 {
         rect("layout_boundary.boundary", x0=0., y0=raw_bbox.x0, x1=tap_width as Float, y1=raw_bbox.x1)
     } else {
         crect(x0=0., y0=raw_bbox.x0, x1=tap_width as Float, y1=raw_bbox.x1)
@@ -1292,7 +1293,7 @@ cell dec_and2_tap(nand_nw: Int, nand_pw: Int, inv_nw: Int, inv_pw: Int, tap_widt
     let nand = inst(dec_primitive_tap(nand_nw, nand_pw, false, tap_width, 1580, 1), x=0., y=0.);
     let inv = inst(dec_primitive_tap(inv_nw, inv_pw, true, tap_width, 1580, 1), x=0., y=inv_x);
     let inv_right = dec_total_x(dec_inv_half_nw(inv_nw), dec_inv_half_pw(inv_pw)) as Float + 180.;
-    let outline = if boundary == 1 {
+    pub let outline = if boundary == 1 {
         rect("layout_boundary.boundary", x0=0., y0=-540., x1=tap_width as Float, y1=inv_x + inv_right)
     } else {
         crect(x0=0., y0=-540., x1=tap_width as Float, y1=inv_x + inv_right)
@@ -1328,10 +1329,10 @@ cell address_gate_stage(num: Int) {
     } else { crect(x0=0., y0=0., x1=0., y1=0.); };
 
     let right = -left;
-    let wl_en = lib::columns::util::met1_port(left, -160., right, 160.);
+    pub let wl_en = lib::columns::util::met1_port(left, -160., right, 160.);
     let proto = inst(dec_and2_gate(2000, 2500, 4000, 10000, 0, 1, 1), x=0., y=840., construction=true);
-    let outputs = address_gate_ports(num, 0, proto.y_out);
-    let inputs = address_gate_ports(num, 0, proto.b);
+    pub let outputs = address_gate_ports(num, 0, proto.y_out);
+    pub let inputs = address_gate_ports(num, 0, proto.b);
     let vdd = lib::columns::util::rect_with_hspan(proto.inv_vdd, (left, right,));
     let vss = lib::columns::util::rect_with_hspan(proto.inv_vss, (left, right,));
     for index in std::range(num) {
@@ -1696,7 +1697,7 @@ cell row_decoder_stage(s: NodeStage) {
     } else {
         draw_child_rows(s);
     }
-    let tracks = node_track_list(s, 0);
+    pub let tracks = node_track_list(s, 0);
     for t in tracks {
         lib::columns::util::draw_box("met1.drawing", t);
         if s.leaf {
@@ -1716,10 +1717,10 @@ cell row_decoder_stage(s: NodeStage) {
             }
         }
     }
-    let outputs = node_outputs(s, 0);
-    let vdd = node_m1_rails(s, true);
-    let vss = node_m1_rails(s, false);
-    let taps = node_tap_columns(s, 0, node_top(s));
+    pub let outputs = node_outputs(s, 0);
+    pub let vdd = node_m1_rails(s, true);
+    pub let vss = node_m1_rails(s, false);
+    pub let taps = node_tap_columns(s, 0, node_top(s));
 }
 
 // Lowest rail of a list.
@@ -1815,18 +1816,18 @@ cell row_decoder_node(r: RowDecoderSizing, index: Int, max_width: Int) {
     // The root's own taps carry no ties.
     let tied = if index == 0 { [] } else { stage.taps };
     let below = place_children(r, n, s, 0, 0., share, stage.vdd, stage.vss, tied);
-    let outputs = stage.outputs;
-    let predecode = if n.children == [] { stage.tracks } else { below };
-    let vdd = stage.vdd;
-    let vss = stage.vss;
-    let taps = stage.taps;
+    pub let outputs = stage.outputs;
+    pub let predecode = if n.children == [] { stage.tracks } else { below };
+    pub let vdd = stage.vdd;
+    pub let vss = stage.vss;
+    pub let taps = stage.taps;
 }
 
 // The row decoder, placed by its root stage's lower-right corner.
 cell row_decoder(r: RowDecoderSizing) {
     let tree = inst(row_decoder_node(r, 0, 0), x=0., y=0.);
-    let outputs = first_folds(tree.outputs);
-    let predecode = tree.predecode;
+    pub let outputs = first_folds(tree.outputs);
+    pub let predecode = tree.predecode;
     let vdd = tree.vdd;
     let vss = tree.vss;
 }
@@ -2037,8 +2038,8 @@ cell column_decoder_stage(c: ColDecoderLayout, embedded: Int) {
     let nw0 = col_stage_nw(c, 0);
     let pw0 = col_stage_pw(c, 0);
     let straps = if c.inputs == 3 { nand3_straps(nw0, pw0, col_stage_y(c, 0)) } else { nand2_straps(nw0, pw0, col_stage_y(c, 0)) };
-    let vdd = lib::columns::util::rect_with_hspan(straps.0, (col_stage_left(c), -col_stage_left(c),));
-    let vss = lib::columns::util::rect_with_hspan(straps.1, (col_stage_left(c), -col_stage_left(c),));
+    pub let vdd = lib::columns::util::rect_with_hspan(straps.0, (col_stage_left(c), -col_stage_left(c),));
+    pub let vss = lib::columns::util::rect_with_hspan(straps.1, (col_stage_left(c), -col_stage_left(c),));
     for track in std::range(2 * c.inputs) {
         let predecode = col_stage_track(c, track);
         lib::columns::util::draw_box("met1.drawing", predecode);
@@ -2050,7 +2051,7 @@ cell column_decoder_stage(c: ColDecoderLayout, embedded: Int) {
             for i in std::range(c.inputs) {
                 let raw = if c.inputs == 3 { dec_nand3_gate_contact_raw(i) } else { dec_gate_contact_raw(i) };
                 let port = lib::columns::util::rect_translate(col_nand_xf(c, raw), col_stage_gate_x(c, output, fold), col_stage_y(c, 0));
-                draw_row_leaf_input(port, col_stage_track(c, 2 * i + group_value(output, list(2, 2, 2), i)));
+                draw_row_leaf_input(port, col_stage_track(c, 2 * i + group_value(output, [2, 2, 2], i)));
             }
         }
     }
@@ -2060,11 +2061,11 @@ cell column_decoder_stage(c: ColDecoderLayout, embedded: Int) {
 // corner at the origin, above its predecode tracks.
 cell column_decoder(c: ColDecoderLayout) {
     let stage = inst(column_decoder_stage(c, 1), x=col_stage_left(c), y=col_stage_dy(c));
-    let outputs = col_decoder_outputs(c, 0, false);
-    let outputs_b = col_decoder_outputs(c, 0, true);
-    let predecode = col_decoder_predecodes(c, 0);
-    let vdd = stage.vdd;
-    let vss = stage.vss;
+    pub let outputs = col_decoder_outputs(c, 0, false);
+    pub let outputs_b = col_decoder_outputs(c, 0, true);
+    pub let predecode = col_decoder_predecodes(c, 0);
+    pub let vdd = stage.vdd;
+    pub let vss = stage.vss;
 }
 
 // A column decoder's power rails in its own coordinates: the NAND row's M1
@@ -2381,7 +2382,7 @@ cell fanout_buffer(b: BufferLayout) {
         draw_buffer_connection(b, stage);
     }
     draw_buffer_final_folds(b);
-    let input = lib::columns::util::cbox(buffer_left(b), -160., -buffer_left(b), 160.);
+    pub let input = lib::columns::util::cbox(buffer_left(b), -160., -buffer_left(b), 160.);
     if b.vertical {
         lib::columns::util::draw_box("met2.drawing", input);
         lib::columns::util::draw_box("met2.pin", input);
@@ -2390,10 +2391,10 @@ cell fanout_buffer(b: BufferLayout) {
         lib::columns::util::draw_box("met1.pin", input);
     };
     let port = lib::columns::util::rect_translate(dec_inv_gate_xf(lib::columns::util::cbox(-520., 470., -190., 640.), buffer_stage_nw(b, 0), buffer_stage_pw(b, 0)), buffer_gate_x(b, 0), buffer_stage_y(b, 0));
-    let outputs = buffer_outputs(b, 0);
+    pub let outputs = buffer_outputs(b, 0);
     let span = (buffer_left(b), -buffer_left(b),);
-    let vdd = cons(lib::columns::util::rect_with_hspan(buffer_first_strap(b, true), span), buffer_stage_rails(b, 1, true));
-    let vss = cons(lib::columns::util::rect_with_hspan(buffer_first_strap(b, false), span), buffer_stage_rails(b, 1, false));
+    pub let vdd = cons(lib::columns::util::rect_with_hspan(buffer_first_strap(b, true), span), buffer_stage_rails(b, 1, true));
+    pub let vss = cons(lib::columns::util::rect_with_hspan(buffer_first_strap(b, false), span), buffer_stage_rails(b, 1, false));
     if b.vertical {
         let crossing = lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(port), lib::columns::util::rect_vspan(input));
         let li_m1 = lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", crossing, crossing, 0, 0, true);

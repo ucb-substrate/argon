@@ -42,16 +42,17 @@ directory name is also the URL prefix.
 | Directory | Sidebar | Contents |
 | --- | --- | --- |
 | `docs/guides/` | Guides | `index.md` lists the guides; each guide is a subdirectory, currently only `getting-started/` |
-| `docs/language/` | Language | Language chapters, then `builtins/`, `std.mdx`, and `types/` for the reference |
+| `docs/language/` | Language | Language chapters, then `builtins/`, `std.mdx`, `std-layout.mdx`, and `types/` for the reference |
 | `docs/gui/` | GUI | The visual editor |
 | `docs/tools/` | Tools | `arc`, `argone`, `argonc`, and the Neovim plugin |
 
 Sidebar entries in `sidebars.ts` are paths relative to `docs/docs/`. Links within
 pages use absolute URL paths such as `/language/types/rect`.
 
-`static/img/gui.png` is a screenshot of the GUI with `diff_vco_top()` from
-`pdks/sky130` open in dark mode, cropped to remove the window title bar. Retake
-it after visible GUI changes.
+`static/img/gui-light.png` and `static/img/gui.png` show `diff_vco_top()` from
+`pdks/sky130` in light and dark mode. The front page follows the site's theme.
+Retake both after visible GUI changes, keeping the same dimensions and framing
+and excluding the window title bar.
 
 ## Contributor notes
 

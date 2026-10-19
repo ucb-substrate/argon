@@ -60,7 +60,7 @@ fn minimap_keeps_its_previous_image_until_replacement_is_ready(cx: &mut gpui::Te
     let source = directory.path().join("lib.ar");
     std::fs::write(
         &source,
-        "cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }",
+        "use std::layout::rect; cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }",
     )
     .unwrap();
     let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
@@ -118,7 +118,7 @@ fn sse_keeps_the_moved_preview_until_its_source_edit_is_acknowledged(
     let source = directory.path().join("lib.ar");
     std::fs::write(
         &source,
-        "cell top() { let r = rect(\"met1\", x0i=1., y0i=0., x1i=10., y1i=10.)!; }",
+        "use std::layout::rect; cell top() { let r = rect(\"met1\", x0i=1., y0i=0., x1i=10., y1i=10.)!; }",
     )
     .unwrap();
     let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
@@ -169,7 +169,7 @@ fn sse_drags_continue_from_a_drag_that_is_still_persisting(cx: &mut gpui::TestAp
     let source = directory.path().join("lib.ar");
     std::fs::write(
         &source,
-        "cell top() { let r = rect(\"met1\", x0i=1., y0i=0., x1i=10., y1i=10.)!; }",
+        "use std::layout::rect; cell top() { let r = rect(\"met1\", x0i=1., y0i=0., x1i=10., y1i=10.)!; }",
     )
     .unwrap();
     let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
@@ -255,7 +255,7 @@ fn focused_preview_changes_canvas_geometry_without_retargeting_source_edits(
     let canvas = test_canvas(cx);
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("lib.ar");
-    let original = "cell leaf(w: Int) { let r = rect(\"met1\", x0=0., y0=0., x1=w as Float, y1=10.); } cell top() { let child = inst(leaf(10), x=0., y=0.); }";
+    let original = "use std::layout::{inst, rect}; cell leaf(w: Int) { let r = rect(\"met1\", x0=0., y0=0., x1=w as Float, y1=10.); } cell top() { let child = inst(leaf(10), x=0., y=0.); }";
     std::fs::write(&source, original).unwrap();
     let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
@@ -381,7 +381,7 @@ fn direct_views_can_request_a_new_density_decision(cx: &mut gpui::TestAppContext
     let source = directory.path().join("lib.ar");
     std::fs::write(
         &source,
-        "cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }",
+        "use std::layout::rect;\ncell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }",
     )
     .unwrap();
     let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
@@ -672,6 +672,7 @@ fn instance_lod_preserves_hidden_descendants_and_hierarchy_cutoffs() {
     std::fs::write(
         &source,
         r#"
+use std::layout::{inst, rect};
 cell leaf() { let shape = rect("met1", x0=0., y0=0., x1=1., y1=1.); }
 cell branch() { let child = inst(leaf(), x=0., y=0.); }
 cell top() { let child = inst(branch(), x=0., y=0.); }
@@ -747,6 +748,7 @@ fn cold_pan_defers_expansion_and_keeps_the_rendering_indicator(cx: &mut gpui::Te
     std::fs::write(
         &source,
         r#"
+use std::layout::{inst, rect};
 cell leaf() { let shape = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
 cell top() {
     for row in std::range(100) {
@@ -882,7 +884,7 @@ fn recentering_keeps_tiles_used_by_the_last_presented_camera(cx: &mut gpui::Test
 fn interleaved_layers_coalesce_before_visiting_sram_leaf_shapes() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("lib.ar");
-    let mut program = String::from("cell top() {\n");
+    let mut program = String::from("use std::layout::rect;\ncell top() {\n");
     for y in 0..32 {
         for x in 0..32 {
             for layer in ["met1", "met2"] {
@@ -942,6 +944,7 @@ fn fully_visible_render_index_skips_execution_scope_tree(cx: &mut gpui::TestAppC
     std::fs::write(
         &source,
         r#"
+use std::layout::rect;
 cell top() {
     for row in std::range(8) {
         for col in std::range(8) {
@@ -1106,7 +1109,7 @@ fn early_sse_cell_preview_is_applied_as_soon_as_neovim_acknowledges_the_edit(
     let editor = test_editor(&canvas, cx);
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("lib.ar");
-    let original = "cell top() { let r = rect(\"met1\", x0i=0., y0i=0., x1i=10., y1i=10.)!; }";
+    let original = "use std::layout::rect; cell top() { let r = rect(\"met1\", x0i=0., y0i=0., x1i=10., y1i=10.)!; }";
     std::fs::write(&source, original).unwrap();
     let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
@@ -1220,12 +1223,198 @@ fn rendering_indicator_does_not_resize_the_canvas(cx: &mut gpui::TestAppContext)
 }
 
 #[gpui::test]
+fn resizing_keeps_the_retained_layout_visible(cx: &mut gpui::TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    std::fs::write(
+        &source,
+        r#"
+use std::layout::{inst, rect};
+cell leaf() { let shape = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
+cell top() {
+    for row in std::range(64) {
+        for col in std::range(64) {
+            let child = inst(leaf(), x=(col as Float)*12., y=(row as Float)*12.);
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml"),
+    ));
+    let (solved, layers) = prepare(&source, &config);
+    let canvas = test_canvas(cx);
+    load_canvas(&canvas, solved, layers, cx);
+    let editor = test_editor(&canvas, cx);
+    let cx = cx.add_empty_window();
+    let draw = |cx: &mut gpui::VisualTestContext, size: Size<Pixels>| {
+        editor.update(cx, |_, cx| cx.notify());
+        cx.draw(
+            Point::default(),
+            size.map(gpui::AvailableSpace::Definite),
+            |_, _| div().size_full().child(editor.clone()),
+        );
+    };
+    let initial_size = Size::new(px(1200.), px(800.));
+    draw(cx, initial_size);
+    cx.run_until_parked();
+    draw(cx, initial_size);
+    let initial_display = canvas.read_with(cx, |canvas, _| {
+        assert!(canvas.painted_complete_frame);
+        assert!(!canvas.raster_worker_active);
+        canvas.last_presented_raster.get().unwrap()
+    });
+
+    for (width, height) in [(1201., 800.), (1280., 850.), (1100., 700.), (1400., 900.)] {
+        let size = Size::new(px(width), px(height));
+        // Several live-resize paints can arrive before the worker gets a turn.
+        for _ in 0..3 {
+            draw(cx, size);
+            canvas.update(cx, |canvas, _| {
+                assert!(canvas.painted_complete_frame, "resize blanked the layout");
+                assert_eq!(canvas.last_presented_raster.get(), Some(initial_display));
+                assert!(raster_tiles_cover_bounds(
+                    canvas.raster_tiles.as_ref().unwrap(),
+                    canvas.screen_bounds,
+                    canvas.screen_bounds,
+                    initial_display.scale,
+                    initial_display.offset,
+                ));
+            });
+        }
+        assert!(cx.dispatcher.tick(false));
+    }
+
+    let final_size = Size::new(px(1400.), px(900.));
+    for _ in 0..1024 {
+        draw(cx, final_size);
+        let pending = canvas.read_with(cx, |canvas, _| {
+            assert!(
+                canvas.painted_complete_frame,
+                "resize handoff blanked the layout"
+            );
+            assert_eq!(canvas.last_presented_raster.get(), Some(initial_display));
+            canvas.raster_worker_active
+                || canvas.raster_decision_refinement.is_some()
+                || canvas.raster_overview_requested_revision.is_some()
+        });
+        if !pending {
+            let generation = canvas.read_with(cx, |canvas, cx| {
+                assert!(!canvas.state.read(cx).rendering);
+                assert_eq!(
+                    canvas.raster_tiles.as_ref().unwrap().screen_viewport,
+                    canvas.screen_bounds.size,
+                );
+                canvas.raster_generation
+            });
+            for _ in 0..3 {
+                draw(cx, final_size);
+                assert_eq!(
+                    canvas.read_with(cx, |canvas, _| canvas.raster_generation),
+                    generation
+                );
+            }
+            return;
+        }
+        assert!(cx.dispatcher.tick(false), "resize renderer stalled");
+    }
+    panic!("resize renderer never settled");
+}
+
+#[gpui::test]
+fn resizing_before_overscan_finishes_preserves_the_presented_tiles(cx: &mut gpui::TestAppContext) {
+    let canvas = test_canvas(cx);
+    let initial_size = Size::new(px(100.), px(80.));
+    let initial_image = Arc::new(RenderImage::new(vec![image::Frame::new(
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255])),
+    )]));
+    let cache = LayoutRasterCache {
+        image: initial_image.clone(),
+        scale_safe_lod: true,
+        texts: Arc::from([]),
+        scope_labels: Arc::from([]),
+        viewport: initial_size,
+        screen_viewport: initial_size,
+        scale: 1.,
+        offset: Point::default(),
+        content_revision: 0,
+    };
+    canvas.update(cx, |canvas, _| {
+        canvas.pending_init = false;
+        canvas.screen_bounds = Bounds::new(Point::default(), initial_size);
+        canvas.scale = 1.;
+        canvas.offset = Point::default();
+        canvas.raster_cache_enabled = true;
+        canvas.raster_worker_active = true;
+        canvas.prepare_navigation_tile_target();
+        let target = canvas.raster_tile_target.unwrap();
+        canvas.install_navigation_tile(target, target.center, cache.clone());
+    });
+    let cx = cx.add_empty_window();
+    let draw = |cx: &mut gpui::VisualTestContext, size: Size<Pixels>| {
+        cx.draw(
+            Point::default(),
+            size.map(gpui::AvailableSpace::Definite),
+            |_, _| CanvasElement {
+                inner: canvas.clone(),
+            },
+        );
+        assert!(canvas.read_with(cx, |canvas, _| canvas.painted_complete_frame));
+    };
+    draw(cx, initial_size);
+    draw(cx, Size::new(px(200.), px(160.)));
+    let target = canvas.update(cx, |canvas, _| {
+        canvas.advance_raster_generation();
+        canvas.prepare_navigation_tile_target();
+        canvas.raster_tile_target.unwrap()
+    });
+    let final_size = Size::new(px(240.), px(180.));
+    draw(cx, final_size);
+    let mut replacement = cache;
+    replacement.image = Arc::new(RenderImage::new(vec![image::Frame::new(
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 255, 0, 255])),
+    )]));
+    replacement.viewport = target.tile_size;
+    replacement.screen_viewport = target.screen_viewport;
+    canvas.update(cx, |canvas, _| {
+        canvas.install_navigation_tile(target, target.center, replacement.clone());
+        assert_eq!(
+            canvas.raster_tiles.as_ref().unwrap().tiles[&target.center].image,
+            initial_image,
+            "an incomplete resize replacement must remain staged"
+        );
+        assert!(canvas.raster_staging_tiles.is_some());
+    });
+    draw(cx, final_size);
+    for index in navigation_tile_order(target.center).into_iter().skip(1) {
+        let mut tile = replacement.clone();
+        tile.offset = raster_tile_offset(target.anchor_offset, target.tile_size, index);
+        canvas.update(cx, |canvas, _| {
+            canvas.install_navigation_tile(target, index, tile)
+        });
+        draw(cx, final_size);
+    }
+    canvas.update(cx, |canvas, _| {
+        assert!(canvas.raster_staging_tiles.is_none());
+        assert!(canvas.raster_tiles_cover_canvas());
+        assert_eq!(
+            canvas.raster_tiles.as_ref().unwrap().tiles[&target.center].image,
+            replacement.image,
+        );
+    });
+}
+
+#[gpui::test]
 fn full_editor_pan_and_zoom_settle_without_presentation_oscillation(cx: &mut gpui::TestAppContext) {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("lib.ar");
     std::fs::write(
         &source,
         r#"
+use std::layout::{inst, rect};
 cell leaf() { let shape = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
 cell top() {
     for row in std::range(128) {
@@ -1353,6 +1542,7 @@ fn edits_and_small_zoom_steps_keep_a_complete_frame(cx: &mut gpui::TestAppContex
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("lib.ar");
     let program = r#"
+use std::layout::{inst, rect};
 cell leaf() { let shape = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
 cell top() {
     for row in std::range(96) {
@@ -1504,7 +1694,7 @@ cell top() {
 fn direct_frame_stays_visible_until_the_first_pan_raster_arrives(cx: &mut gpui::TestAppContext) {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("lib.ar");
-    let mut program = String::from("cell top() {\n");
+    let mut program = String::from("use std::layout::rect;\ncell top() {\n");
     for i in 0..3000 {
         let x = (i % 60) * 10;
         let y = (i / 60) * 10;
@@ -1550,7 +1740,7 @@ fn direct_frame_stays_visible_until_the_first_pan_raster_arrives(cx: &mut gpui::
         canvas.raster_decision_refinement = None;
     });
     let cx = cx.add_empty_window();
-    let draw = |cx: &mut gpui::VisualTestContext| {
+    let draw = |cx: &mut gpui::VisualTestContext, size: Size<Pixels>| {
         cx.draw(
             Point::default(),
             size.map(gpui::AvailableSpace::Definite),
@@ -1559,22 +1749,23 @@ fn direct_frame_stays_visible_until_the_first_pan_raster_arrives(cx: &mut gpui::
             },
         );
     };
-    draw(cx);
+    draw(cx, size);
     let frame = canvas.read_with(cx, |canvas, _| {
         assert!(canvas.painted_complete_frame);
         assert_eq!(canvas.rects.len(), 3000);
         assert!(canvas.raster_worker_active);
         canvas.retained_direct_frame.clone().unwrap()
     });
-    // Repainting before the first tile used to clear the previously visible
-    // direct layout. A pan outrunning the worker must keep it as well.
-    for delta in [0., 4500., -4468.] {
+    // A pending first raster must retain the direct frame through repaints,
+    // resizing, and pans that outrun the worker.
+    let resized = Size::new(px(1240.), px(840.));
+    for (delta, size) in [(0., size), (0., resized), (4500., resized), (-4468., size)] {
         if delta != 0. {
             canvas.update(cx, |canvas, cx| {
                 canvas.pan_view(Point::new(px(delta), px(0.)), cx)
             });
         }
-        draw(cx);
+        draw(cx, size);
         canvas.update(cx, |canvas, _| {
             assert!(
                 canvas.painted_complete_frame,
@@ -1594,7 +1785,7 @@ fn direct_frame_stays_visible_until_the_first_pan_raster_arrives(cx: &mut gpui::
         });
     }
     for _ in 0..1024 {
-        draw(cx);
+        draw(cx, size);
         let pending = canvas.read_with(cx, |canvas, _| {
             assert!(
                 canvas.painted_complete_frame,
@@ -1627,6 +1818,7 @@ fn reused_render_indexes_invalidate_changed_children_and_match_fresh_pixels() {
     std::fs::write(
         &source,
         r#"
+use std::layout::{inst, rect};
 cell leaf() { let r = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
 cell unchanged() { let r = rect("met2", x0=0., y0=0., x1=10., y1=10.); }
 cell top() { let a = inst(leaf(), x=0., y=0.); let b = inst(unchanged(), x=70., y=0.); }
@@ -1746,13 +1938,14 @@ fn rectangle_placement_handoff(cx: &mut gpui::TestAppContext, dense: bool) {
     let layer_name = "met1";
     let program = if dense {
         r#"
+use std::layout::{inst, rect};
 cell leaf() { let shape = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
 cell top() { for row in std::range(96) { for col in std::range(96) {
     let child = inst(leaf(), x=(col as Float)*12., y=(row as Float)*12.);
 } } }
 "#
     } else {
-        "cell top() { let existing = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.); }"
+        "use std::layout::rect;\ncell top() { let existing = rect(\"met1\", x0=0., y0=0., x1=100., y1=100.); }"
     };
     std::fs::write(&source, program).unwrap();
     let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
@@ -1917,7 +2110,7 @@ cell top() { for row in std::range(96) { for col in std::range(96) {
     let edited = program.replace(
         "cell top() {",
         &format!(
-            "cell top() {{ let {var_name} = rect(\"{layer_name}\", x0i={}, y0i={}, x1i={}, y1i={})!;",
+            "cell top() {{ let {var_name} = std::layout::rect(\"{layer_name}\", x0i={}, y0i={}, x1i={}, y1i={})!;",
             compile::format_initial_condition(rect.x0, 0.1),
             compile::format_initial_condition(rect.y0, 0.1),
             compile::format_initial_condition(rect.x1, 0.1),

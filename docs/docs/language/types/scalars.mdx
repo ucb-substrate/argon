@@ -8,9 +8,9 @@ sidebar_label: Scalars
 
 ## `Float` {#float}
 
-`Float` is the type of coordinates, distances, and other solver expressions. A float literal has a decimal point: `12.` or `-0.5`.
+`Float` is the type of coordinates, distances, and other solver expressions. A float literal has a decimal point, an exponent, or both: `12.`, `-0.5`, `1e-12`, or `2.5e3`.
 
-Used by the [geometry constructors](/language/builtins/geometry), [constraints](/language/builtins/constraints), and instance positions.
+Used by the [geometry constructors](/language/std-layout#geometry), [constraints](/language/builtins/constraints), and instance positions.
 
 :::warning
 `12` is an `Int`. Write `12.` for a float.
@@ -24,15 +24,15 @@ Cast to a float with `value as Float`.
 
 ## `Bool` {#bool}
 
-`Bool` is `true` or `false`. Conditions must be booleans, and built-ins use them for flags such as `reflect` and `construction`.
+`Bool` is `true` or `false`. Conditions must be booleans, and [`inst`](/language/std-layout#inst) uses them for flags such as `reflect` and `construction`.
 
 ## `String` {#string}
 
 `String` is text. Layer names and labels are strings.
 
 ```argon
-rect("met1");
-text("VDD", "text.label", 0., 0.);
+std::layout::rect("met1");
+std::layout::text("VDD", "text.label", 0., 0.);
 ```
 
 ## `Any` {#any}

@@ -1,3 +1,5 @@
+use std::layout::rect;
+
 fn make_list(base: Float) -> [Float] {
     cons(base, cons(base + 100., cons(base + 200., cons(base + 250., cons(base + 400., [])))))
 }

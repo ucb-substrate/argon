@@ -847,6 +847,15 @@ fn hash_cell_args(args: &[CellArg], hasher: &mut impl Hasher) {
                 variant.hash(hasher);
                 hash_cell_args(payload, hasher);
             }
+            CellArg::StructVariant { variant, fields } => {
+                12_u8.hash(hasher);
+                variant.hash(hasher);
+                fields.len().hash(hasher);
+                for (field, value) in fields {
+                    field.hash(hasher);
+                    hash_cell_args(std::slice::from_ref(value), hasher);
+                }
+            }
             CellArg::Seq(values) => {
                 5_u8.hash(hasher);
                 hash_cell_args(values, hasher);
@@ -1404,7 +1413,8 @@ mod tests {
     fn rebasing_moves_spans_onto_identical_text() {
         use crate::fingerprint::{ItemIndex, SpanRebase};
 
-        let source = "cell leaf() {\n    \
+        let source = "use std::layout::{inst, rect};\n\
+                      cell leaf() {\n    \
                       let r = rect(\"met1\", x0i = 1., y0i = 2., x1i = 30., y1i = 40.);\n}\n\
                       cell top() {\n    let i = inst(leaf(), x = 0., y = 0.);\n}\n";
         let (_dir, config) = scratch_workspace(source);
@@ -1478,7 +1488,8 @@ mod tests {
     /// however many times the compile instantiates it.
     #[test]
     fn reuse_reports_a_cells_diagnostics_once() {
-        let source = "cell child() {\n    let r = rect(\"met1\", x0i = 1., y0i = 2., x1i = 30., y1i = 40.);\n}\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell child() {\n    let r = rect(\"met1\", x0i = 1., y0i = 2., x1i = 30., y1i = 40.);\n}\n\
                       cell parent() {\n    for i in std::range(3) {\n        inst(child(), x = 0., y = 0.);\n    }\n}\n";
         let (_dir, config) = scratch_workspace(source);
         let root = config.root_lib().to_path_buf();
@@ -1518,7 +1529,8 @@ mod tests {
     /// would: children before the cells that instantiate them.
     #[test]
     fn reinstated_cells_keep_a_fresh_compiles_order() {
-        let source = "cell b() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell b() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell a() { inst(b(), x = 0., y = 0.); inst(b(), x = 2., y = 0.); }\n\
                       cell r() { inst(a(), x = 0., y = 0.); inst(b(), x = 0., y = 10.); }\n";
         let (_dir, config) = scratch_workspace(source);
@@ -1554,7 +1566,8 @@ mod tests {
     fn an_edit_that_moves_nothing_needs_no_rebase() {
         use crate::fingerprint::{ItemIndex, SpanRebase};
 
-        let source = "cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell top() { let i = inst(leaf(), x = 0., y = 0.); }\n";
         let (_dir, config) = scratch_workspace(source);
         let root = config.root_lib().to_path_buf();
@@ -1583,7 +1596,8 @@ mod tests {
     /// one revision is still recognisable in the next.
     #[test]
     fn moving_a_declaration_preserves_its_cell_id() {
-        let source = "cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell top() { let i = inst(leaf(), x = 0., y = 0.); }\n";
         let (_dir, config) = scratch_workspace(source);
         let root = config.root_lib().to_path_buf();
@@ -1628,7 +1642,8 @@ mod tests {
 
     #[test]
     fn obsolete_source_cell_versions_are_pruned_after_an_edit() {
-        let source = "cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell top() { let i = inst(leaf(), x = 0., y = 0.); }\n";
         let (_dir, config) = scratch_workspace(source);
         let tech =
@@ -1662,7 +1677,8 @@ mod tests {
     /// `ExecPass::source_cell_id`.
     #[test]
     fn source_cells_are_named_by_content() {
-        let source = "cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell top() { let i = inst(leaf(), x = 0., y = 0.); }\n";
         let (_dir, config) = scratch_workspace(source);
         let tech =
@@ -1687,7 +1703,8 @@ mod tests {
     /// change what they compile to.
     #[test]
     fn editing_a_parent_reuses_unchanged_children() {
-        let source = "cell child_a() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell child_a() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell child_b() { let r = rect(\"met1\", x0 = 2., y0 = 0., x1 = 3., y1 = 1.); }\n\
                       cell parent() {\n    let a = inst(child_a(), x = 0., y = 0.);\n    \
                       let b = inst(child_b(), x = 10., y = 0.);\n}\n";
@@ -1724,7 +1741,8 @@ mod tests {
     /// is how the GUI recognizes it as unchanged.
     #[test]
     fn reuse_keeps_the_allocation_of_cells_whose_spans_did_not_move() {
-        let source = "cell before() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell before() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell parent() {\n    let a = inst(before(), x = 0., y = 0.);\n    \
                       let b = inst(after(), x = 10., y = 0.);\n}\n\
                       cell after() { let r = rect(\"met1\", x0 = 2., y0 = 0., x1 = 3., y1 = 1.); }\n";
@@ -1767,10 +1785,150 @@ mod tests {
         assert_eq!(spans_of(&second), spans_of(&uncached));
     }
 
+    /// Every cell's schematic, with instances naming their cell, sorted.
+    fn schematics(output: &CompileOutput) -> Vec<String> {
+        let CompileOutput::Valid(data) = output else {
+            panic!("unexpected compile output: {output:?}");
+        };
+        let mut cells = data
+            .cells
+            .values()
+            .map(|cell| {
+                let schematic = &cell.schematic;
+                let instances = schematic
+                    .instances
+                    .iter()
+                    .map(|instance| {
+                        let child = &data.cells[&instance.cell];
+                        format!("{} {} {:?}", instance.name, child.name, instance.terminals)
+                    })
+                    .collect::<Vec<_>>();
+                format!(
+                    "{} nets={:?} ports={:?} {instances:?}",
+                    cell.name, schematic.nets, schematic.ports
+                )
+            })
+            .collect::<Vec<_>>();
+        cells.sort();
+        cells
+    }
+
+    /// A reused cell brings along the cells it places only in its schematic.
+    #[test]
+    fn reusing_a_cell_reinstates_its_schematic_children() {
+        let source = "use std::schematic::{Signal, connect};\n\
+                      use std::schematic::inst as sinst;\n\
+                      cell leaf() { pub let a = Signal(); }\n\
+                      cell child() {\n    pub let a = Signal();\n    \
+                      let l = sinst(leaf());\n    connect(a, l.a);\n}\n\
+                      cell parent() {\n    let c = sinst(child());\n    \
+                      let n = Signal();\n    connect(n, c.a);\n}\n";
+        let (_dir, config) = scratch_workspace(source);
+        let root = config.root_lib().to_path_buf();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = config.with_tech(Some(tech));
+        let cell = vec!["parent".to_owned()];
+
+        let mut session = IncrementalCompiler::new();
+        session.set_source_text(root.clone(), source);
+        let first = session.compile_cell(&config, &cell, Vec::new());
+
+        let edited = source.replace(
+            "let n = Signal();\n    connect(n,",
+            "let net = Signal();\n    connect(net,",
+        );
+        assert_ne!(edited, source);
+        session.set_source_text(root.clone(), edited.clone());
+        let second = session.compile_cell(&config, &cell, Vec::new());
+        assert!(session.stats().cell_cache.hits > 0, "`child` is reused");
+
+        let mut fresh = IncrementalCompiler::new();
+        fresh.set_source_text(root, edited);
+        let uncached = fresh.compile_cell(&config, &cell, Vec::new());
+        assert_eq!(schematics(&second), schematics(&uncached));
+        assert_ne!(
+            schematics(&first),
+            schematics(&second),
+            "the edit took effect"
+        );
+    }
+
+    /// A reused cell brings along a cell it holds in a field but never
+    /// instantiates, so that its parent can still place it.
+    #[test]
+    fn reusing_a_cell_reinstates_the_cells_its_fields_hold() {
+        let source = "use std::layout::{inst, rect};\n\
+                      cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+                      cell holder() { pub let c = leaf(); }\n\
+                      cell parent() {\n    let h = inst(holder(), x = 0., y = 0.);\n    \
+                      let l = inst(h.c, x = 10., y = 0.);\n}\n";
+        let (_dir, config) = scratch_workspace(source);
+        let root = config.root_lib().to_path_buf();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = config.with_tech(Some(tech));
+        let cell = vec!["parent".to_owned()];
+
+        let mut session = IncrementalCompiler::new();
+        session.set_source_text(root.clone(), source);
+        session.compile_cell(&config, &cell, Vec::new());
+
+        let edited = source.replace("x = 10., y = 0.", "x = 20., y = 0.");
+        assert_ne!(edited, source);
+        session.set_source_text(root.clone(), edited.clone());
+        let second = session.compile_cell(&config, &cell, Vec::new());
+        assert!(session.stats().cell_cache.hits > 0, "`holder` is reused");
+
+        let mut fresh = IncrementalCompiler::new();
+        fresh.set_source_text(root, edited);
+        assert_eq!(
+            geometry(&second),
+            geometry(&fresh.compile_cell(&config, &cell, Vec::new()))
+        );
+    }
+
+    /// A reused cell still tells a private field from a missing one, so a read
+    /// through `Any` reports the same error whether or not the cell is reused.
+    #[test]
+    fn a_reused_cell_still_reports_its_private_fields() {
+        let source = "use std::layout::{inst, rect};\n\
+                      fn width(i: Any) -> Any { i.secret.w }\n\
+                      cell pad() { let secret = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+                      cell parent() {\n    let p = inst(pad(), x = 0., y = 0.);\n    \
+                      let r = rect(\"met2\", x0 = 0., y0 = 0., w = width(p), h = 1.);\n}\n";
+        let (_dir, config) = scratch_workspace(source);
+        let root = config.root_lib().to_path_buf();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = config.with_tech(Some(tech));
+        let cell = vec!["parent".to_owned()];
+        let private_field = |output: &CompileOutput| match output {
+            CompileOutput::ExecErrors(errors) => errors.errors.iter().any(|error| {
+                matches!(&error.kind, compile::ExecErrorKind::PrivateField { field, cell }
+                    if field == "secret" && cell == "pad")
+            }),
+            _ => false,
+        };
+
+        let mut session = IncrementalCompiler::new();
+        session.set_source_text(root.clone(), source);
+        let first = session.compile_cell(&config, &cell, Vec::new());
+        assert!(private_field(&first), "{first:?}");
+
+        let edited = source.replace("h = 1.", "h = 2.");
+        assert_ne!(edited, source);
+        session.set_source_text(root, edited);
+        let second = session.compile_cell(&config, &cell, Vec::new());
+        assert!(session.stats().cell_cache.hits > 0, "`pad` is reused");
+        assert!(private_field(&second), "{second:?}");
+    }
+
     /// A child that actually changed must be re-executed, and only it.
     #[test]
     fn changing_a_child_re_executes_only_that_child() {
-        let source = "cell child_a() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+        let source = "use std::layout::{inst, rect};\n\
+                      cell child_a() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
                       cell child_b() { let r = rect(\"met1\", x0 = 2., y0 = 0., x1 = 3., y1 = 1.); }\n\
                       cell parent() {\n    let a = inst(child_a(), x = 0., y = 0.);\n    \
                       let b = inst(child_b(), x = 10., y = 0.);\n}\n";
@@ -1809,7 +1967,8 @@ mod tests {
     /// cache rather than in isolation.
     #[test]
     fn reuse_after_a_shift_keeps_spans_pointing_at_the_same_text() {
-        let source = "cell child() {\n    \
+        let source = "use std::layout::{inst, rect};\n\
+                      cell child() {\n    \
                       let r = rect(\"met1\", x0i = 1., y0i = 2., x1i = 30., y1i = 40.);\n}\n\
                       cell parent() {\n    let i = inst(child(), x = 0., y = 0.);\n}\n";
         let (_dir, config) = scratch_workspace(source);
@@ -1851,7 +2010,8 @@ mod tests {
     /// reusing the import must not change the compiled geometry.
     #[test]
     fn editing_source_reuses_the_imported_gds() {
-        let source = "cell top() {\n    let i = inst(child(), x = 0., y = 0.);\n}\n";
+        let source =
+            "use std::layout::inst;\ncell top() {\n    let i = inst(child(), x = 0., y = 0.);\n}\n";
         let (_dir, config, _gds) = scratch_gds_workspace(source);
         let root = config.root_lib().to_path_buf();
         let cell = vec!["top".to_owned()];
@@ -1863,7 +2023,8 @@ mod tests {
         assert_eq!(session.stats().gds_cache.hits, 0);
 
         // What the GUI writes when someone draws a rectangle beside it.
-        let edited = "cell top() {\n    let i = inst(child(), x = 0., y = 0.);\n    \
+        let edited = "use std::layout::{inst, rect};\n\
+                      cell top() {\n    let i = inst(child(), x = 0., y = 0.);\n    \
                       rect(\"met1\", x0i = 0., y0i = 0., x1i = 5., y1i = 5.);\n}\n";
         session.set_source_text(root.clone(), edited);
         let second = session.compile_cell(&config, &cell, Vec::new());
@@ -1893,7 +2054,8 @@ mod tests {
     fn a_same_length_gds_rewrite_is_still_detected() {
         use ::gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
 
-        let source = "cell top() {\n    let i = inst(child(), x = 0., y = 0.);\n}\n";
+        let source =
+            "use std::layout::inst;\ncell top() {\n    let i = inst(child(), x = 0., y = 0.);\n}\n";
         let (_dir, config, gds) = scratch_gds_workspace(source);
         let root = config.root_lib().to_path_buf();
         let cell = vec!["top".to_owned()];
@@ -1941,7 +2103,8 @@ mod tests {
     fn rewriting_the_gds_file_retires_the_import() {
         use ::gds::{GdsBoundary, GdsElement, GdsLibrary, GdsPoint, GdsStruct};
 
-        let source = "cell top() {\n    let i = inst(child(), x = 0., y = 0.);\n}\n";
+        let source =
+            "use std::layout::inst;\ncell top() {\n    let i = inst(child(), x = 0., y = 0.);\n}\n";
         let (_dir, config, gds) = scratch_gds_workspace(source);
         let root = config.root_lib().to_path_buf();
         let cell = vec!["top".to_owned()];
@@ -2206,10 +2369,10 @@ mod tests {
         let leaf = workspace.path().join("leaf.ar");
         std::fs::write(
             &leaf,
-            "cell leaf() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }\n",
+            "use std::layout::rect;\ncell leaf() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }\n",
         )
         .unwrap();
-        let base = "mod leaf;\ncell top() { let child = inst(leaf::leaf(), x=0., y=0.); }\n";
+        let base = "use std::layout::{inst, rect};\nmod leaf;\ncell top() { let child = inst(leaf::leaf(), x=0., y=0.); }\n";
         std::fs::write(&root, base).unwrap();
         let config = WorkspaceConfig::new(&root).with_tech(Some(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
@@ -2222,8 +2385,8 @@ mod tests {
         compiler.set_source_text(
             root,
             base.replace(
-                "cell top() {",
-                "cell top() { let added = rect(\"met2\", x0=0., y0=0., x1=5., y1=5.);",
+                "x=0., y=0.); }",
+                "x=0., y=0.); let added = rect(\"met2\", x0=0., y0=0., x1=5., y1=5.); }",
             ),
         );
         let after = compiler
@@ -2250,14 +2413,14 @@ mod tests {
         let stable = workspace.path().join("stable.ar");
         std::fs::write(
             &root,
-            "mod leaf; mod stable; cell top() { let a = inst(leaf::leaf(), x=0., y=0.); let b = inst(stable::stable(), x=20., y=0.); }",
+            "use std::layout::inst; mod leaf; mod stable; cell top() { let a = inst(leaf::leaf(), x=0., y=0.); let b = inst(stable::stable(), x=20., y=0.); }",
         )
         .unwrap();
-        let original = "cell leaf() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }";
+        let original = "use std::layout::rect; cell leaf() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }";
         std::fs::write(&leaf, original).unwrap();
         std::fs::write(
             &stable,
-            "cell stable() { let r = rect(\"met2\", x0=0., y0=0., x1=5., y1=5.); }",
+            "use std::layout::rect; cell stable() { let r = rect(\"met2\", x0=0., y0=0., x1=5., y1=5.); }",
         )
         .unwrap();
         let config = WorkspaceConfig::new(&root).with_tech(Some(

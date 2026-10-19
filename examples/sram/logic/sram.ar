@@ -1,6 +1,7 @@
 // The assembled SRAM: blocks placed by the floorplan, signal routes, power,
 // guard rings, and pins.
 
+use std::layout::{inst, text};
 use lib::params::SramLayoutParams;
 use lib::logic::floorplan::Grid;
 use lib::logic::floorplan::SramFloorplan;
@@ -30,7 +31,7 @@ fn draw_signal_routes(
     let words = p.sram.data_width;
     lib::logic::routing::draw_bitlines(cols, bitcells, p.col.cols);
     lib::logic::routing::draw_wordlines(dec, bitcells, p.sram.num_words / p.sram.mux_ratio);
-    lib::logic::routing::join_all(list(
+    lib::logic::routing::join_all([
             lib::logic::routing::draw_replica_bitlines(rbl, rpc),
             lib::logic::routing::draw_replica_load_route(rpc, nmos, routing),
             lib::logic::routing::draw_dff_pins(g, dffs, 0, p.address_dff_count),
@@ -45,7 +46,7 @@ fn draw_signal_routes(
             lib::logic::routing::draw_col_address_routes(p, g, f, col_dec, dffs, 0),
             lib::logic::routing::draw_row_address_routes(p, g, f, gate, dffs, 0),
             lib::logic::routing::draw_data_pins(g, cols, words, words / p.sram.wmask_granularity),
-    ))
+    ])
 }
 
 // The signal routes alone, drawn against construction copies of the blocks.
@@ -132,7 +133,7 @@ fn draw_ring_ties(g: Grid) -> Rect {
         let vertical = lib::logic::routing::m1(lib::columns::util::rect_from_spans(lib::logic::routing::m1_track(g, lib::logic::power::left_bank(supply)), lib::columns::util::span_union(bottom, top)));
         power_via(vertical, lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(vertical), bottom));
         power_via(vertical, lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(vertical), top));
-        for t in list(lib::logic::power::bottom_bank(supply), lib::logic::power::top_bank(g, supply)) {
+        for t in [lib::logic::power::bottom_bank(supply), lib::logic::power::top_bank(g, supply)] {
             let feed = lib::logic::routing::m2(lib::columns::util::rect_from_spans(lib::columns::util::span_union(left, right), lib::logic::routing::m2_track(g, t)));
             power_via(lib::columns::util::rect_from_spans(left, lib::columns::util::rect_vspan(feed)), feed);
             power_via(lib::columns::util::rect_from_spans(right, lib::columns::util::rect_vspan(feed)), feed);
@@ -169,22 +170,22 @@ cell sram(p: SramLayoutParams, with_control: Bool) {
     let cols = inst(lib::columns::top::column_peripherals_exact(p.col), x=f.cols.0, y=f.cols.1, construction=true);
     let n = p.address_dff_count;
     let dff = dff_pins(g, dffs, 0, n);
-    let addr = reverse(dff_pins(g, dffs, 0, n - 2));
-    let ce = dff[n - 2];
-    let we = dff[n - 1];
-    let clk = pin_down(g, lib::columns::util::rect_hspan(lib::logic::routing::clock_pin(g, f, 0)));
-    let rstb = pin_down(g, lib::columns::util::rect_hspan(lib::logic::routing::clock_pin(g, f, 1)));
-    let din = pins_down(g, cols.din, 0);
-    let dout = pins_down(g, cols.dout, 0);
-    let wmask = pins_down(g, cols.wmask, 0);
+    pub let addr = reverse(dff_pins(g, dffs, 0, n - 2));
+    pub let ce = dff[n - 2];
+    pub let we = dff[n - 1];
+    pub let clk = pin_down(g, lib::columns::util::rect_hspan(lib::logic::routing::clock_pin(g, f, 0)));
+    pub let rstb = pin_down(g, lib::columns::util::rect_hspan(lib::logic::routing::clock_pin(g, f, 1)));
+    pub let din = pins_down(g, cols.din, 0);
+    pub let dout = pins_down(g, cols.dout, 0);
+    pub let wmask = pins_down(g, cols.wmask, 0);
     // Compact supply pins on the left bank, and the rings' left sides.
     for supply in std::range(2) {
         let track = lib::logic::routing::m1_track(g, lib::logic::power::left_bank(supply));
         lib::columns::util::met1_port(track.0, g.y0 + 1200., track.1, g.y0 + 2200.);
         text(if supply == 0 { "vdd" } else { "vss" }, "met1.label", (track.0 + track.1) / 2., g.y0 + 1700.);
     }
-    let vdd = lib::columns::util::met1_port(hole.x0 - 4080., hole.y0 - 4080., hole.x0 - 2720., hole.y1 + 4080.);
-    let vss = lib::columns::util::met1_port(hole.x0 - 1360., hole.y0 - 1360., hole.x0, hole.y1 + 1360.);
+    pub let vdd = lib::columns::util::met1_port(hole.x0 - 4080., hole.y0 - 4080., hole.x0 - 2720., hole.y1 + 4080.);
+    pub let vss = lib::columns::util::met1_port(hole.x0 - 1360., hole.y0 - 1360., hole.x0, hole.y1 + 1360.);
 }
 
 // The SRAM with its lower-left corner at the origin.
@@ -193,14 +194,14 @@ cell sram_macro(p: SramLayoutParams, with_control: Bool) {
     let g = lib::logic::floorplan::sram_grid(p, f);
     let b = macro_bounds(g);
     let native = inst(sram(p, with_control), x=0. - b.x0, y=0. - b.y0);
-    let addr = native.addr;
-    let ce = native.ce;
-    let we = native.we;
-    let clk = native.clk;
-    let rstb = native.rstb;
-    let din = native.din;
-    let dout = native.dout;
-    let wmask = native.wmask;
-    let vdd = native.vdd;
-    let vss = native.vss;
+    pub let addr = native.addr;
+    pub let ce = native.ce;
+    pub let we = native.we;
+    pub let clk = native.clk;
+    pub let rstb = native.rstb;
+    pub let din = native.din;
+    pub let dout = native.dout;
+    pub let wmask = native.wmask;
+    pub let vdd = native.vdd;
+    pub let vss = native.vss;
 }

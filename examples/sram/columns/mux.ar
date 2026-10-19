@@ -1,3 +1,4 @@
+use std::layout::{crect, inst, rect};
 use lib::params::TGateMuxParams;
 
 fn centered_span_gridded(center: Float, span: Float, grid: Float) -> (Float, Float) {
@@ -511,7 +512,7 @@ cell tgate_mux_tap(p: TGateMuxParams, end: Bool) {
 
     lib::columns::util::draw_box("nwell.drawing", ntap_bounds);
     lib::columns::util::draw_box("nsdm.drawing", ntap_bounds);
-    let outline = rect("layout_boundary.boundary", x0=0., y0=ov.0, x1=width, y1=ov.1);
+    pub let outline = rect("layout_boundary.boundary", x0=0., y0=ov.0, x1=width, y1=ov.1);
 }
 
 cell tgate_mux_group(p: TGateMuxParams) {
@@ -535,7 +536,7 @@ cell tgate_mux_group(p: TGateMuxParams) {
     let brm1 = lib::columns::util::cbox(x0 - 140., 0., x0 + 140., blbr_top);
     let brm2 = lib::columns::util::cbox(0., 500., width, 820.);
     lib::columns::util::draw_box("met1.drawing", brm1);
-    let br_out = lib::columns::util::draw_box("met2.drawing", brm2);
+    pub let br_out = lib::columns::util::draw_box("met2.drawing", brm2);
     lib::columns::util::draw_box("met2.pin", brm2);
     lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", brm1, brm2, 0, 0, true, 1000000000.);
 
@@ -543,7 +544,7 @@ cell tgate_mux_group(p: TGateMuxParams) {
     let blm1 = lib::columns::util::cbox(x1 - 140., 0., x1 + 140., blbr_top);
     let blm2 = lib::columns::util::cbox(0., 0., width, 320.);
     lib::columns::util::draw_box("met1.drawing", blm1);
-    let bl_out = lib::columns::util::draw_box("met2.drawing", blm2);
+    pub let bl_out = lib::columns::util::draw_box("met2.drawing", blm2);
     lib::columns::util::draw_box("met2.pin", blm2);
     lib::columns::util::draw_contact_clip(1, "met1.drawing", "met2.drawing", blm1, blm2, 0, 0, true, 1000000000.);
 

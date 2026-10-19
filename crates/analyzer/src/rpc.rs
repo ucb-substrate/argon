@@ -8,7 +8,7 @@ use std::{
 };
 
 use argonc::{
-    ast::Span,
+    ast::{Decl, Span},
     compile::{BasicRect, CellId, CompileOutput, CompiledData, PreviewGeometry},
     parse::{AnnotatedParseAst, WorkspaceParseAst},
 };
@@ -510,6 +510,21 @@ pub(crate) fn insert_statement(
     }
 }
 
+/// The start of a `let` binding `name` in `scope`. Bindings at the top level
+/// of a cell are `pub`, so that a parent can read them through an instance.
+fn let_prefix(ast: &AnnotatedParseAst, scope: cfgrammar::Span, name: &str) -> String {
+    let cell_body = ast
+        .ast
+        .decls
+        .iter()
+        .any(|decl| matches!(decl, Decl::Cell(cell) if cell.scope.span == scope));
+    if cell_body {
+        format!("pub let {name} = ")
+    } else {
+        format!("let {name} = ")
+    }
+}
+
 fn polygon_expression(polygon: &PolygonParams) -> String {
     let coordinates = polygon
         .points
@@ -519,7 +534,7 @@ fn polygon_expression(polygon: &PolygonParams) -> String {
         .collect::<Vec<_>>()
         .join("\n        ");
     format!(
-        "polygon({:?}, {},\n        {}\n    )",
+        "std::layout::polygon({:?}, {},\n        {}\n    )",
         polygon.layer,
         polygon.points.len(),
         coordinates
@@ -535,7 +550,7 @@ fn path_expression(path: &PathParams) -> String {
         .collect::<Vec<_>>()
         .join("\n        ");
     format!(
-        "path({:?}, {},\n        widthi = {:?},\n        {}\n    )",
+        "std::layout::path({:?}, {},\n        widthi = {:?},\n        {}\n    )",
         path.layer,
         path.points.len(),
         path.width,
@@ -616,7 +631,7 @@ fn missing_initial_condition_edit(
 }
 
 fn instance_placement_expression(invocation: &str, x: f64, y: f64) -> String {
-    format!("inst({invocation}, xi={x:?}, yi={y:?})")
+    format!("std::layout::inst({invocation}, xi={x:?}, yi={y:?})")
 }
 
 impl State {
@@ -917,7 +932,7 @@ impl LangServer for State {
         let document = self.document(&ast.source_text);
         let grid = self.technology_grid().await;
         let expression = format!(
-            "rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})",
+            "std::layout::rect({}x0i = {}, y0i = {}, x1i = {}, y1i = {})",
             rect.layer
                 .as_ref()
                 .map(|layer| format!("\"{layer}\", "))
@@ -927,7 +942,7 @@ impl LangServer for State {
             argonc::compile::format_initial_condition(rect.x1, grid),
             argonc::compile::format_initial_condition(rect.y1, grid),
         );
-        let prefix = format!("let {var_name} = ");
+        let prefix = let_prefix(&ast, scope.span, &var_name);
         let insertion = insert_statement(
             &document,
             scope.span,
@@ -975,7 +990,7 @@ impl LangServer for State {
         let scope = ast.span2scope.get(&scope_span)?;
         let document = self.document(&ast.source_text);
         let expression = polygon_expression(&polygon);
-        let prefix = format!("let {var_name} = ");
+        let prefix = let_prefix(ast, scope.span, &var_name);
         let constraints = segment_constraint_statements(&var_name, &polygon.constraints);
         let insertion = insert_statement(
             &document,
@@ -1019,7 +1034,7 @@ impl LangServer for State {
         let scope = ast.span2scope.get(&scope_span)?;
         let document = self.document(&ast.source_text);
         let expression = path_expression(&path);
-        let prefix = format!("let {var_name} = ");
+        let prefix = let_prefix(ast, scope.span, &var_name);
         let constraints = segment_constraint_statements(&var_name, &path.constraints);
         let insertion = insert_statement(
             &document,
@@ -1063,16 +1078,14 @@ impl LangServer for State {
         let names = scope
             .stmts
             .iter()
-            .filter_map(|statement| match statement {
-                argonc::ast::Statement::LetBinding(binding) => Some(binding.name.name.as_str()),
-                _ => None,
-            })
+            .flat_map(|statement| statement.let_names())
+            .map(|name| name.name.as_str())
             .collect::<std::collections::HashSet<_>>();
         let var_name = (0..)
             .map(|index| format!("inst{index}"))
             .find(|name| !names.contains(name.as_str()))?;
         let expression = instance_placement_expression(&invocation, x, y);
-        let prefix = format!("let {var_name} = ");
+        let prefix = let_prefix(ast, scope.span, &var_name);
         let insertion = insert_statement(
             &document,
             scope.span,
@@ -1116,7 +1129,7 @@ impl LangServer for State {
         let scope = ast.span2scope.get(&scope_span)?;
         let document = self.document(&ast.source_text);
         let expression = format!(
-            "dimension({}, {}, {}, {}, {}, {}, {})",
+            "std::layout::dimension({}, {}, {}, {}, {}, {}, {})",
             params.p,
             params.n,
             params.value,
@@ -1485,6 +1498,7 @@ mod tests {
         std::fs::write(
             &source,
             r#"
+use std::layout::{inst, rect};
 cell leaf() { let r = rect("met1", x0=0., y0=0., x1=10., y1=5.); }
 cell top() { let a = inst(leaf(), x=0., y=0.); }
 "#,
@@ -1602,6 +1616,7 @@ cell top() { let a = inst(leaf(), x=0., y=0.); }
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("lib.ar");
         let original = r#"
+use std::layout::{inst, rect};
 cell leaf() { let r = rect("met1", x0=0., y0=0., x1=10., y1=5.); }
 cell mid() { let a = inst(leaf(), x=0., y=0.); }
 cell top() { let m = inst(mid(), x=0., y=0.); }
@@ -1666,9 +1681,9 @@ cell top() { let m = inst(mid(), x=0., y=0.); }
     use tower_lsp_server::ls_types::{Position, Uri};
 
     use super::{
-        Document, DrawSegmentConstraint, PathParams, PolygonParams,
+        Document, DrawSegmentConstraint, PathBuf, PathParams, PolygonParams,
         READ_ONLY_GENERATED_SOURCE_MESSAGE, editor_buffers_are_current, insert_statement,
-        instance_placement_expression, missing_initial_condition_edit, path_expression,
+        instance_placement_expression, let_prefix, missing_initial_condition_edit, path_expression,
         polygon_expression, segment_constraint_statements, source_edit_error,
     };
     use crate::{PublishedState, SourceState, document::PositionEncoding};
@@ -1742,37 +1757,74 @@ cell top() { let m = inst(mid(), x=0., y=0.); }
         assert!(editor_buffers_are_current(&source_state, &compiled));
     }
 
+    /// Inserts `statement` into the body of `top`, in a module with no `use`
+    /// declarations, the way the drawing requests do, and asserts that the
+    /// result type-checks.
+    fn assert_compiles_without_imports(statement: &str) {
+        let path = PathBuf::from("/virtual/lib.ar");
+        let source = "cell child(w: Float) {}\ncell top() {\n}\n";
+        let ast = parse::parse_source_text(source, path.clone()).unwrap();
+        let body = source.rfind('{').unwrap();
+        let scope = ast
+            .span2scope
+            .values()
+            .find(|scope| scope.span.start() == body)
+            .expect("the body of top should be indexed");
+        let insertion = insert_statement(
+            &Document::new(source, 0, PositionEncoding::Utf8),
+            scope.span,
+            None,
+            statement,
+            0..0,
+        );
+        let mut edited = source.to_owned();
+        edited.insert_str(insertion.offset, &insertion.edit.new_text);
+        let root = parse::parse_source_text(edited.clone(), path).unwrap();
+        let (_, errors) = argonc::compile::static_compile(&parse::with_std(root)).unwrap();
+        assert!(errors.errors.is_empty(), "{edited}\n{:?}", errors.errors);
+    }
+
     #[test]
     fn placed_instances_use_initial_conditions() {
+        let expression = instance_placement_expression("child(10.)", 12.5, -4.0);
         assert_eq!(
-            instance_placement_expression("child(10.)", 12.5, -4.0),
-            "inst(child(10.), xi=12.5, yi=-4.0)"
+            expression,
+            "std::layout::inst(child(10.), xi=12.5, yi=-4.0)"
         );
+        assert_compiles_without_imports(&format!("pub let inst0 = {expression};"));
     }
 
     #[test]
     fn drawn_polygons_use_numbered_initial_conditions() {
+        let expression = polygon_expression(&PolygonParams {
+            layer: "met1".to_owned(),
+            points: vec![(0., 1.), (20.5, 1.), (10., 30.)],
+            constraints: vec![],
+        });
         assert_eq!(
-            polygon_expression(&PolygonParams {
-                layer: "met1".to_owned(),
-                points: vec![(0., 1.), (20.5, 1.), (10., 30.)],
-                constraints: vec![],
-            }),
-            "polygon(\"met1\", 3,\n        x0i = 0.0, y0i = 1.0,\n        x1i = 20.5, y1i = 1.0,\n        x2i = 10.0, y2i = 30.0,\n    )"
+            expression,
+            "std::layout::polygon(\"met1\", 3,\n        x0i = 0.0, y0i = 1.0,\n        x1i = 20.5, y1i = 1.0,\n        x2i = 10.0, y2i = 30.0,\n    )"
         );
+        let constraints =
+            segment_constraint_statements("polygon0", &[DrawSegmentConstraint::Horizontal(1)]);
+        assert_compiles_without_imports(&format!("pub let polygon0 = {expression}!;{constraints}"));
     }
 
     #[test]
     fn drawn_paths_use_numbered_initial_conditions() {
+        let expression = path_expression(&PathParams {
+            layer: "met1".to_owned(),
+            width: 20.,
+            points: vec![(0., 1.), (20.5, 1.), (10., 30.)],
+            constraints: vec![],
+        });
         assert_eq!(
-            path_expression(&PathParams {
-                layer: "met1".to_owned(),
-                width: 20.,
-                points: vec![(0., 1.), (20.5, 1.), (10., 30.)],
-                constraints: vec![],
-            }),
-            "path(\"met1\", 3,\n        widthi = 20.0,\n        x0i = 0.0, y0i = 1.0,\n        x1i = 20.5, y1i = 1.0,\n        x2i = 10.0, y2i = 30.0,\n    )"
+            expression,
+            "std::layout::path(\"met1\", 3,\n        widthi = 20.0,\n        x0i = 0.0, y0i = 1.0,\n        x1i = 20.5, y1i = 1.0,\n        x2i = 10.0, y2i = 30.0,\n    )"
         );
+        let constraints =
+            segment_constraint_statements("path0", &[DrawSegmentConstraint::Vertical(2)]);
+        assert_compiles_without_imports(&format!("pub let path0 = {expression}!;{constraints}"));
     }
 
     #[test]
@@ -1846,6 +1898,25 @@ cell top() { let m = inst(mid(), x=0., y=0.); }
             ),
             "cell top() {\n    let r = rect(\"met1\",\n        x0=0.,\n        x1i=20., y1i=30.,\n    );\n}"
         );
+    }
+
+    #[test]
+    fn only_a_binding_at_the_top_level_of_a_cell_is_public() {
+        let source = "cell top() {\n    for i in std::range(2) {\n    }\n}\nfn f() {\n}\n";
+        let ast = parse::parse_source_text(source, PathBuf::from("/virtual/lib.ar"))
+            .expect("source should parse");
+        let prefix_at = |brace: usize| {
+            let scope = ast
+                .span2scope
+                .values()
+                .find(|scope| scope.span.start() == brace)
+                .expect("scope should be indexed");
+            let_prefix(&ast, scope.span, "r")
+        };
+
+        assert_eq!(prefix_at(source.find('{').unwrap()), "pub let r = ");
+        assert_eq!(prefix_at(source.find("2) {").unwrap() + 3), "let r = ");
+        assert_eq!(prefix_at(source.find("f() {").unwrap() + 4), "let r = ");
     }
 
     #[test]

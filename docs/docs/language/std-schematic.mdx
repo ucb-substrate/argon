@@ -1,0 +1,110 @@
+---
+title: "std::schematic"
+description: Signals, connections, devices, and schematic instances.
+sidebar_label: "std::schematic"
+---
+
+import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReference';
+
+# `std::schematic`
+
+`std::schematic` is the standard library module that builds a cell's schematic: signals, the connections between them, devices, and schematic instances of other cells. See [Schematics](/language/schematic) for how these fit together.
+
+## Importing
+
+Nothing in `std::schematic` is in scope by default. Import the names a module uses:
+
+```argon
+use std::schematic::{DeviceKind, Signal, connect, device};
+use std::schematic::inst as sinst;
+```
+
+`std::layout` also has an `inst`, so a module that places cells in both views imports at least one of them under another name, or calls it by full path. A name such as `Signal` is only in scope once imported, in type position as well as in calls.
+
+`Signal`, `connect`, `device`, and `inst` are implemented by the compiler. They can only be called, so a reference that isn't a call, such as `let f = connect;`, is an error. `DeviceKind` is an ordinary enum.
+
+## `Signal` {#signal}
+
+<ApiItem id="signal" name="std::schematic::Signal" signature={'Signal() -> Signal'} summary={<>Creates a signal of the current cell.</>}>
+
+<Returns type="Signal" href="/language/schematic#signals-and-nets">A new signal, on a net of its own until it is connected.</Returns>
+
+```argon
+pub let vdd = Signal();
+```
+
+`Signal` is also the type of a signal, as in `fn tie(s: Signal)`.
+
+</ApiItem>
+
+## `connect` {#connect}
+
+<ApiItem id="connect" name="std::schematic::connect" signature={'connect(a: Signal, b: Signal) -> ()'} summary={<>Joins the nets of two signals.</>}>
+
+<ParameterTable rows={[
+  {name: 'a', type: 'Signal', typeHref: '#signal', requirement: 'Required, positional', description: 'A signal of the current cell.'},
+  {name: 'b', type: 'Signal', typeHref: '#signal', requirement: 'Required, positional', description: 'A signal of the current cell.'},
+]} />
+
+<Returns type="()">Nothing; the two nets become one.</Returns>
+
+```argon
+connect(out, nmos.d);
+```
+
+</ApiItem>
+
+## `device` {#device}
+
+<ApiItem id="device" name="std::schematic::device" signature={'device(kind: DeviceKind, terminals: [Signal], model: String, <name>=Float | Int | String, …) -> ()'} summary={<>Adds a primitive device to the current cell.</>}>
+
+<ParameterTable rows={[
+  {name: 'kind', type: 'DeviceKind', typeHref: '#devicekind', requirement: 'Required, positional', description: 'The kind of device, which decides its terminals and whether it needs a model.'},
+  {name: 'terminals', type: '[Signal]', typeHref: '#signal', requirement: 'Required, positional', description: 'The signals the device connects to, in the order its kind expects.'},
+  {name: 'model', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: 'The model name, without whitespace, or "" for none.'},
+  {name: 'value', type: 'Float | Int | String', requirement: 'Optional keyword', description: 'The value of a Res or Cap device, in any case (VALUE also works). Other kinds do not take it.'},
+  {name: '<name>', type: 'Float | Int | String', requirement: 'Optional keyword', description: 'A device parameter, kept in the order written. Names must differ other than in case. A Float must be solved to a finite number.'},
+]} />
+
+<Returns type="()">Nothing; the device is added to the cell.</Returns>
+
+```argon
+device(DeviceKind::Mos, [d, g, s, b], "nch", w=2., l=0.15, nf=2);
+device(DeviceKind::Res, [top, bottom], "", value=1000.);
+```
+
+The [device table](/language/schematic#devices) lists the terminals and model each kind requires.
+
+</ApiItem>
+
+## `inst` {#inst}
+
+<ApiItem id="inst" name="std::schematic::inst" signature={'inst(cell: Cell) -> SchematicInst'} summary={<>Places a cell in the current cell's schematic.</>}>
+
+<ParameterTable rows={[
+  {name: 'cell', type: 'Cell', typeHref: '/language/types/instance#cell-values', requirement: 'Required, positional', description: 'The cell value to place, such as inv(2., 1., 2).'},
+]} />
+
+<Returns type="SchematicInst" href="/language/types/instance#schematic-instances">The instance, whose ports read as its terminals.</Returns>
+
+```argon
+let nmos = std::schematic::inst(mos(true, 1., 2));
+connect(a, nmos.g);
+```
+
+</ApiItem>
+
+## `DeviceKind` {#devicekind}
+
+```argon
+enum DeviceKind {
+    Mos,
+    Res,
+    Cap,
+    Diode,
+    Bjt,
+    Subckt,
+}
+```
+
+The kind of a device placed with [`device`](#device): a MOSFET, a resistor, a capacitor, a diode, a bipolar transistor, or an instance of a subcircuit the cell does not define, such as a PDK model.

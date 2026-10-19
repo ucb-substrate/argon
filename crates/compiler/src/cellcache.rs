@@ -30,8 +30,9 @@ pub(crate) struct CachedCell {
     /// Exact arguments used by the parent. A focused preview must retain the
     /// same parameterization even when the source invocation is generated.
     pub invocation_args: Vec<CellArg>,
-    /// Cells this one instantiates. Reinstating a cell means reinstating all
-    /// of them, since a compiled cell names its children by [`CellId`].
+    /// Cells this one instantiates or holds in a field. Reinstating a cell
+    /// means reinstating all of them, since a compiled cell names its children
+    /// by [`CellId`].
     pub children: Vec<CellId>,
     /// Diagnostics this cell produced, replayed on a hit so that reuse does
     /// not drop a diagnostic the user is looking at.

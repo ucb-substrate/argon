@@ -1,7 +1,9 @@
+use std::layout::{dimension, inst, rect};
+
 cell bot() {
-    let met1 = rect("met1", x0=0., y0=0., x1=100., y1=100.);
-    let met2 = rect("met1", x0=100., y0=0., x1=200., y1=100.);
-    let met3 = make_rect(); let met4 = emit_rect();
+    pub let met1 = rect("met1", x0=0., y0=0., x1=100., y1=100.);
+    pub let met2 = rect("met1", x0=100., y0=0., x1=200., y1=100.);
+    pub let met3 = make_rect(); let met4 = emit_rect();
 }
 
 fn make_rect() -> Rect {
@@ -13,7 +15,7 @@ fn emit_rect() -> Rect {
 }
 
 cell middle() {
-    let bot = inst(bot());
+    pub let bot = inst(bot());
     eq(bot.x, 0.);
     eq(bot.y, 0.);
 }
