@@ -169,15 +169,13 @@ pub(super) fn cast(solver: &Solver, value: &Value, ty: &Ty) -> OpResult {
         (Value::Int(x), Ty::Float) => Ok(Value::Linear(LinearExpr::from(*x as f64))),
         (x @ Value::Int(_), Ty::Int) => Ok(x.clone()),
         (Value::Linear(expr), Ty::Int) => {
-            // `f64 as i64` saturates rather than failing, so a non-finite
-            // input would silently become `i64::MAX`.
-            if let Some(val) = solver.eval_expr(expr)
-                && !val.is_finite()
-            {
-                return Err(error(ExecErrorKind::NonFiniteValue));
-            }
+            // A count is not a coordinate, so it is evaluated exactly rather
+            // than snapped to the grid. `f64 as i64` saturates rather than
+            // failing, so a non-finite input would silently become
+            // `i64::MAX`.
             match solver.eval_expr_exact(expr) {
-                Some(val) => Ok(Value::Int(val as i64)),
+                Some(val) if !val.is_finite() => Err(error(ExecErrorKind::NonFiniteValue)),
+                Some(val) => Ok(Value::Int(super::truncate_to_int(val))),
                 None => Err(wait([expr])),
             }
         }

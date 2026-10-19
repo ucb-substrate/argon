@@ -1,5 +1,6 @@
 local M = {}
 
+local agent = require('argon.agent')
 local client = require('argon.client')
 local config = require('argon.config').config
 local commands = require('argon.commands')
@@ -133,12 +134,15 @@ vim.api.nvim_create_autocmd('LspDetach', {
     end,
 })
 
-for _, lhs in ipairs({ '<C-\\>', string.char(28) }) do
-    vim.keymap.set({ 'n', 'i', 'v', 'c', 't' }, lhs, focus.gui, {
-        desc = 'Focus Argon GUI',
-        silent = true,
-        nowait = true,
-    })
+-- The embedded GUI switches focus with Cmd-\, leaving <C-\> to Neovim.
+if not vim.g.argon_embedded_gui then
+    for _, lhs in ipairs({ '<C-\\>', string.char(28) }) do
+        vim.keymap.set({ 'n', 'i', 'v', 'c', 't' }, lhs, focus.gui, {
+            desc = 'Focus Argon GUI',
+            silent = true,
+            nowait = true,
+        })
+    end
 end
 
 ---LSP restart internal implementations
@@ -284,6 +288,9 @@ M.start = function(bufnr)
             tostring(vim.g.argon_analyzer_relay),
         })
     end
+    if type(analyzer_cmd) == 'table' and vim.g.argon_embedded_gui then
+        table.insert(analyzer_cmd, '--embedded-gui')
+    end
     local lsp_start_config = {
         name = 'argon',
         cmd = analyzer_cmd,
@@ -330,6 +337,15 @@ M.start = function(bufnr)
                     focus.editor(params.command, { return_to_gui = params.return_to_gui })
                 end)
             end,
+            ['custom/ensureBuffer'] = function(_, params, ctx)
+                return agent.ensure_buffer(params, ctx)
+            end,
+            ['custom/applyAgentEdit'] = function(_, params, ctx)
+                return agent.apply_edit(params, ctx)
+            end,
+            ['custom/reloadBuffer'] = function(_, params, ctx)
+                return agent.reload_buffer(params, ctx)
+            end,
         },
         root_dir = root_dir
     }
@@ -345,6 +361,9 @@ M.start = function(bufnr)
                 lsp_client:request('custom/startGui', nil, client.print_error, bufnr)
             end)
         end
+        vim.schedule(function()
+            agent.on_init(lsp_client)
+        end)
         schedule_workspace_modified(lsp_client.id)
     end
 

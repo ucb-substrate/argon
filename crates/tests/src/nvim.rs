@@ -31,6 +31,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embedded_gui_leaves_ctrl_backslash_and_flags_the_analyzer() {
+        let mut command = crate::nvim_command();
+        command
+            .arg("-l")
+            .arg(crate::repository_root().join("crates/tests/fixtures/nvim/embedded.lua"));
+        let child = command.spawn().expect("start headless Neovim");
+        crate::finish_nvim(child).await;
+    }
+
+    #[tokio::test]
     async fn command_arguments_complete_against_the_analyzer() {
         let mut command = crate::nvim_command();
         command.arg("-l").arg(

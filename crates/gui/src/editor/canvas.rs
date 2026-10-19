@@ -129,6 +129,8 @@ impl ShapeFill {
 }
 
 const SELECT_WIDTH: Pixels = px(3.);
+/// Outline color for objects an agent edit just changed.
+const AGENT_EDIT_COLOR: u32 = 0x00d8ff;
 const DEFAULT_BORDER_WIDTH: Pixels = px(2.);
 /// Above this visible primitive count, retain a viewport raster for interactive
 /// redraws. Sparse and screen-space-aggregated views stay on the geometry path
@@ -6093,6 +6095,7 @@ impl Element for CanvasElement {
         let state = inner.state.read(cx);
         let pattern_tiles = inner.pattern_tiles.clone();
         let tool = state.tool.read(cx).clone();
+        let agent_highlight = state.visible_agent_highlight().map(<[Span]>::to_vec);
         let coalesced_lod_display = inner.raster_tiles.as_ref().and_then(|tiles| {
             (raster_tiles_visible_lod_is_scale_safe(tiles, bounds, inner.scale, inner.offset))
                 .then(|| inner.raster_display_transform_for_current_view())
@@ -8268,6 +8271,48 @@ impl Element for CanvasElement {
                         }
                     }
                     let inner = self.inner.read(cx);
+                    if let Some(spans) = &agent_highlight {
+                        // Outline the objects an agent edit just changed.
+                        let changed = |id: &Option<Span>| {
+                            id.as_ref().is_some_and(|id| {
+                                spans.iter().any(|span| {
+                                    span.path == id.path
+                                        && span.span.start() < id.span.end()
+                                        && id.span.start() < span.span.end()
+                                })
+                            })
+                        };
+                        let color = rgb(AGENT_EDIT_COLOR);
+                        let changed_rects = rects
+                            .iter()
+                            .map(|(rect, _)| rect)
+                            .chain(scope_rects.iter().map(|scope| &scope.rect))
+                            .filter(|rect| changed(&rect.id));
+                        for rect in changed_rects {
+                            window.paint_quad(get_paint_quad(
+                                get_rect_bounds(rect, bounds, scale, offset),
+                                ShapeFill::Solid,
+                                Rgba { a: 0., ..color },
+                                color,
+                                Edges::all(SELECT_WIDTH),
+                                rect.border_styles,
+                            ));
+                        }
+                        for (polygon, _) in polygons.iter().filter(|(polygon, _)| changed(&polygon.id)) {
+                            let points = polygon
+                                .points
+                                .iter()
+                                .map(|point| inner.layout_to_px(*point))
+                                .collect::<Vec<_>>();
+                            paint_polygon_border(
+                                window,
+                                &points,
+                                &polygon.edge_styles,
+                                SELECT_WIDTH,
+                                color,
+                            );
+                        }
+                    }
                     // highlight hover edges
                     // TODO: reduce repeat code from on_left_mouse_down
                     match tool {
@@ -8616,7 +8661,7 @@ impl Render for LayoutCanvas {
             .flex()
             .flex_1()
             .relative()
-            .key_context("LayoutCanvas")
+            .key_context("Canvas LayoutCanvas")
             .track_focus(&self.focus_handle(cx))
             .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_mouse_down))
@@ -11029,7 +11074,7 @@ impl LayoutCanvas {
                                 .state
                                 .read(cx)
                                 .lang_server_client
-                                .select_rect(span.clone());
+                                .select_span(span.clone());
                         } else {
                             select_tool.selected_obj = None;
                         }

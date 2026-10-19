@@ -1,9 +1,18 @@
+pub mod agent;
 mod cell_edit;
+mod cell_list;
 mod command_completion;
 mod compiler_worker;
 pub mod document;
+pub mod hook;
+pub mod mcp;
 mod navigation;
+mod recents;
 pub mod rpc;
+mod schematic_edit;
+pub mod session;
+pub mod transport;
+mod watcher;
 
 pub mod cli;
 
@@ -25,7 +34,7 @@ use argonc::{
     WorkspaceConfig,
     ast::Span,
     compile::{
-        self, Arrayed, CompileOutput, ExecErrorCompileOutput, StaticErrorCompileOutput,
+        self, Arrayed, CompileOutput, DeviceKind, ExecErrorCompileOutput, StaticErrorCompileOutput,
         TypedWorkspace,
     },
     diagnostics,
@@ -35,8 +44,8 @@ use argonc::{
 use futures::prelude::*;
 use indexmap::IndexMap;
 use rpc::{
-    CompilationSnapshot, CompressedCompilationUpdate, FocusedCellPreview, GuiClient,
-    InstancePreview, LangServer, insert_statement,
+    CompilationSnapshot, CompressedCompilationUpdate, DevicePreview, FocusedCellPreview, GuiClient,
+    InstancePreview, LangServer, SchematicInstancePreview, insert_statement,
 };
 use serde::{Deserialize, Serialize};
 use tarpc::{context, server::Channel, tokio_serde::formats::Bincode};
@@ -110,8 +119,26 @@ static LOG_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new
 #[serde(default, deny_unknown_fields)]
 pub struct ArgonConfig {
     pub analyzer: AnalyzerConfig,
+    pub agent: AgentConfig,
     pub gui: GuiConfig,
     pub log: LogConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentConfig {
+    pub approval: ApprovalMode,
+}
+
+/// Whether the user confirms each agent edit in Neovim before it is applied.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalMode {
+    /// Agent edits apply immediately and Neovim is never asked to confirm.
+    #[default]
+    Never,
+    /// Neovim shows each agent edit and applies it only if the user accepts.
+    Always,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +167,8 @@ pub struct GuiConfig {
     /// Global GUI font-size override in logical pixels.
     #[serde(default, deserialize_with = "deserialize_gui_size")]
     pub font_size: Option<f32>,
+    /// Whether Option acts as Meta in the GUI's Neovim pane on macOS.
+    pub option_as_meta: bool,
 }
 
 impl Default for GuiConfig {
@@ -149,6 +178,7 @@ impl Default for GuiConfig {
             hierarchy_depth: None,
             icon_size: None,
             font_size: None,
+            option_as_meta: false,
         }
     }
 }
@@ -220,6 +250,24 @@ pub fn argon_config_path() -> Option<PathBuf> {
 
 pub fn argon_state_dir() -> Option<PathBuf> {
     argon_xdg_dir("XDG_STATE_HOME", ".local/state")
+}
+
+/// Creates `directory` and its missing parents readable only by the current
+/// user, as the XDG base directory specification asks. Existing directories
+/// keep their permissions.
+pub(crate) fn create_private_dir_all(directory: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(directory)
+    }
 }
 
 pub fn argon_cache_dir() -> Option<PathBuf> {
@@ -351,7 +399,7 @@ pub fn init_logging() {
     let Some(log_dir) = argon_state_dir() else {
         return;
     };
-    if let Err(error) = fs::create_dir_all(&log_dir) {
+    if let Err(error) = create_private_dir_all(&log_dir) {
         eprintln!(
             "argon: could not create log directory '{}': {error}",
             log_dir.display()
@@ -377,19 +425,56 @@ pub fn reload_log_filter(level: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// How long the editor may take to report all of an analyzer edit it applied.
+/// Neovim reports the edits after the first one together, once its change
+/// debounce passes.
+pub(crate) const PENDING_EDIT_TIMEOUT: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Default)]
 pub(crate) struct SourceState {
     pub(crate) revision: u64,
     pub(crate) cell: Option<String>,
+    /// An invocation the user opened, to record as recent once it compiles.
+    pub(crate) pending_recent: Option<String>,
     pub(crate) editor_files: IndexMap<Uri, Document>,
-    pub(crate) pending_workspace_edits: IndexMap<Uri, usize>,
+    /// The text each file will have once the editor reports all of the
+    /// analyzer's edit to it.
+    pub(crate) pending_workspace_edits: IndexMap<Uri, String>,
     pub(crate) workspace_modified: bool,
+}
+
+/// What a change to an editor file means for an analyzer edit to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditProgress {
+    /// No analyzer edit to the file is in flight.
+    Unrelated,
+    /// The editor has reported part of the edit, and the rest is to come.
+    Partial,
+    /// The editor has reported all of the edit.
+    Complete,
 }
 
 impl SourceState {
     fn advance_revision(&mut self) -> u64 {
         self.revision = self.revision.saturating_add(1);
         self.revision
+    }
+
+    /// How much of the analyzer's edit to `uri` the editor has reported,
+    /// retiring the edit once all of it has arrived.
+    fn edit_progress(&mut self, uri: &Uri) -> EditProgress {
+        let Some(expected) = self.pending_workspace_edits.get(uri) else {
+            return EditProgress::Unrelated;
+        };
+        if self
+            .editor_files
+            .get(uri)
+            .is_none_or(|document| document.contents() != expected)
+        {
+            return EditProgress::Partial;
+        }
+        self.pending_workspace_edits.shift_remove(uri);
+        EditProgress::Complete
     }
 
     fn compile_identity(&self) -> CompileIdentity {
@@ -415,6 +500,10 @@ pub(crate) struct PublishedState {
     pub(crate) prev_diagnostics: IndexMap<Uri, Vec<Diagnostic>>,
     pub(crate) compiled_revision: u64,
     pub(crate) compiled_cell: Option<String>,
+    /// Compiler messages that accompanied the latest committed result.
+    pub(crate) messages: Vec<String>,
+    /// The latest committed result, summarized on demand for agents.
+    pub(crate) latest: Option<agent::LatestCompile>,
 }
 
 #[derive(Clone, Debug)]
@@ -422,6 +511,8 @@ struct GuiConnection {
     id: u64,
     client: GuiClient,
     snapshot: Arc<tokio::sync::Mutex<Option<CompilationSnapshot>>>,
+    /// The library's cells as last sent to this GUI.
+    cells: Arc<tokio::sync::Mutex<Option<Vec<rpc::CellEntry>>>>,
 }
 
 #[derive(Debug, Default)]
@@ -658,10 +749,32 @@ pub struct State {
     gui: Arc<Mutex<GuiState>>,
     next_compilation_activity_id: Arc<AtomicU64>,
     app_config: Arc<RwLock<ArgonConfig>>,
+    /// Secret that every RPC connection must present.
+    token: transport::SessionToken,
+    session_file: Arc<std::sync::Mutex<Option<session::SessionFile>>>,
+    /// Bumped whenever an editor document opens, changes, or closes.
+    source_changes: Arc<tokio::sync::watch::Sender<u64>>,
+    /// The source revision of the latest committed compilation.
+    compiled_revisions: Arc<tokio::sync::watch::Sender<u64>>,
+    /// Whether Neovim has a follow window for agent edits.
+    follow_mode: Arc<std::sync::atomic::AtomicBool>,
+    /// Serializes agent edits so each resolves against settled text.
+    agent_edits: Arc<Mutex<()>>,
+    watcher: Arc<std::sync::Mutex<Option<watcher::WorkspaceWatcher>>>,
+    /// Whether the GUI embeds this analyzer's Neovim.
+    embedded: bool,
+    /// The library's recently opened invocations, most recent first. Held
+    /// while the recents file is updated, so updates don't interleave.
+    recents: Arc<Mutex<Vec<String>>>,
 }
 
 impl State {
-    fn new(server_addr: SocketAddr, editor_client: Client) -> Self {
+    fn new(
+        server_addr: SocketAddr,
+        editor_client: Client,
+        token: transport::SessionToken,
+        embedded: bool,
+    ) -> Self {
         let config = read_config().unwrap_or_else(|error| {
             error!("{error}; using default configuration");
             ArgonConfig::default()
@@ -679,6 +792,40 @@ impl State {
             gui: Default::default(),
             next_compilation_activity_id: Default::default(),
             app_config: Arc::new(RwLock::new(config)),
+            token,
+            session_file: Default::default(),
+            source_changes: Arc::new(tokio::sync::watch::Sender::new(0)),
+            compiled_revisions: Arc::new(tokio::sync::watch::Sender::new(0)),
+            follow_mode: Default::default(),
+            agent_edits: Default::default(),
+            watcher: Default::default(),
+            embedded,
+            recents: Default::default(),
+        }
+    }
+
+    pub(crate) fn notify_source_changed(&self) {
+        self.source_changes
+            .send_modify(|count| *count = count.wrapping_add(1));
+    }
+
+    /// Waits up to `timeout` for `found` to return a value for the source
+    /// state, which is rechecked each time an editor document changes.
+    pub(crate) async fn wait_for_source<T>(
+        &self,
+        timeout: Duration,
+        found: impl Fn(&SourceState) -> Option<T>,
+    ) -> Option<T> {
+        let mut changes = self.source_changes.subscribe();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Some(value) = found(&*self.source_state.lock().await) {
+                return Some(value);
+            }
+            match tokio::time::timeout_at(deadline, changes.changed()).await {
+                Ok(Ok(())) => {}
+                _ => return None,
+            }
         }
     }
 
@@ -768,9 +915,38 @@ impl State {
             id: gui.next_connection_id,
             client,
             snapshot: Arc::default(),
+            cells: Arc::default(),
         };
         gui.connection = Some(connection.clone());
         connection
+    }
+
+    /// Records this analyzer in the user's session directory so local
+    /// clients, such as the agent bridge, can find and authenticate to it.
+    fn publish_session(&self, root_dir: &Path) {
+        let info = session::SessionInfo {
+            pid: std::process::id(),
+            root: root_dir.to_path_buf(),
+            port: self.server_addr.port(),
+            token: self.token.to_hex(),
+        };
+        match session::publish(&info) {
+            Ok(file) => {
+                *self.session_file.lock().unwrap_or_else(|p| p.into_inner()) = Some(file);
+            }
+            Err(error) => error!("could not publish the analyzer session: {error}"),
+        }
+    }
+
+    fn retire_session(&self) {
+        self.session_file
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        self.watcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
     }
 
     async fn take_gui_process(&self) -> Option<Child> {
@@ -821,6 +997,67 @@ impl State {
                 self.clear_gui_connection(connection.id).await;
             }
         }
+    }
+
+    /// Sends the library's cells to the GUI if they changed since the last send.
+    async fn publish_cells(&self, connection: Option<GuiConnection>) {
+        let Some(connection) = connection else {
+            return;
+        };
+        let mut sent = connection.cells.lock().await;
+        let cells = {
+            let compiled = self.published_state.lock().await;
+            cell_list::library_cells(&compiled.ast, &compiled.config, sent.as_deref())
+        };
+        let Some(cells) = cells.filter(|cells| sent.as_ref() != Some(cells)) else {
+            return;
+        };
+        match connection
+            .client
+            .set_cells(context::current(), cells.clone())
+            .await
+        {
+            Ok(()) => *sent = Some(cells),
+            Err(error) => {
+                if is_gui_disconnected(&error) {
+                    self.clear_gui_connection(connection.id).await;
+                }
+            }
+        }
+    }
+
+    /// Sends the library's recent cells to the GUI.
+    async fn publish_recent_cells(&self, connection: Option<GuiConnection>) {
+        let Some(connection) = connection else {
+            return;
+        };
+        // Holding the list while sending keeps a stale list from arriving last.
+        let recents = self.recents.lock().await;
+        let cells = recents.iter().cloned().map(rpc::RecentCell::new).collect();
+        if let Err(error) = connection
+            .client
+            .set_recent_cells(context::current(), cells)
+            .await
+            && is_gui_disconnected(&error)
+        {
+            self.clear_gui_connection(connection.id).await;
+        }
+    }
+
+    /// Replaces the recent cells with what `update` returns for the library
+    /// root, off the async runtime, then sends them to the GUI.
+    async fn update_recents(&self, update: impl FnOnce(&Path) -> Vec<String> + Send + 'static) {
+        let Some(root_dir) = self.root_dir.get().cloned() else {
+            return;
+        };
+        {
+            let mut recents = self.recents.lock().await;
+            match tokio::task::spawn_blocking(move || update(&root_dir)).await {
+                Ok(cells) => *recents = cells,
+                Err(error) => error!("could not update the recent cells: {error}"),
+            }
+        }
+        self.publish_recent_cells(self.gui_connection().await).await;
     }
 
     async fn publish_workspace_path(&self, connection: Option<GuiConnection>) -> bool {
@@ -890,16 +1127,37 @@ impl Backend {
     }
 
     fn compile_after_debounce(&self, identity: CompileIdentity) {
-        let backend = self.clone();
         let delay = self.state.config().analyzer.compile_debounce_ms;
+        self.compile_after(identity, Duration::from_millis(delay));
+    }
+
+    /// Compiles `identity` after `delay`, unless the source or cell changes
+    /// first.
+    fn compile_after(&self, identity: CompileIdentity, delay: Duration) {
+        let backend = self.clone();
         tokio::spawn(async move {
-            if delay > 0 {
-                tokio::time::sleep(Duration::from_millis(delay)).await;
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
             }
             if backend.state.is_latest_compile_request(&identity).await {
                 backend.update_cell(identity).await;
             }
         });
+    }
+
+    /// Compiles `identity` after an editor document changed: at once when the
+    /// change completes an analyzer edit, and after the debounce otherwise. A
+    /// partly reported edit waits for the rest, up to `PENDING_EDIT_TIMEOUT`.
+    ///
+    /// The compilation runs on its own task, so a didChange notification
+    /// releases its LSP service slot as soon as the source is recorded; the
+    /// GUI update can be much slower than the edit.
+    fn compile_after_change(&self, progress: EditProgress, identity: CompileIdentity) {
+        match progress {
+            EditProgress::Complete => self.compile_after(identity, Duration::ZERO),
+            EditProgress::Partial => self.compile_after(identity, PENDING_EDIT_TIMEOUT),
+            EditProgress::Unrelated => self.compile_after_debounce(identity),
+        }
     }
 
     /// Compile and publish diagnostics for an exact source/cell identity.
@@ -947,6 +1205,11 @@ impl Backend {
             result.output.as_ref(),
             self.state.position_encoding(),
         );
+        // Cells are shared, so this copy costs one pointer per cell.
+        let latest = result.output.clone().map(|output| agent::LatestCompile {
+            cell: identity.cell.clone(),
+            output,
+        });
         // The compiled GDS can contain millions of geometry values. Move it
         // into the RPC snapshot after diagnostics have borrowed it instead of
         // deep-cloning the complete layout immediately before serialization.
@@ -954,10 +1217,10 @@ impl Backend {
             revision: identity.revision,
             output,
         });
-        {
+        let recent = {
             // The freshness check and commit are atomic with respect to source
             // and cell changes because they take this same lock.
-            let source = self.state.source_state.lock().await;
+            let mut source = self.state.source_state.lock().await;
             let mut compiled = self.state.published_state.lock().await;
             if source.compile_identity() != identity {
                 return None;
@@ -978,6 +1241,27 @@ impl Backend {
             }
             compiled.compiled_revision = identity.revision;
             compiled.compiled_cell = identity.cell.clone();
+            compiled.messages = result.messages.clone();
+            compiled.latest = latest;
+            let drawable = snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.data().is_some());
+            if drawable && source.pending_recent == identity.cell {
+                source.pending_recent.take()
+            } else {
+                None
+            }
+        };
+        self.state
+            .compiled_revisions
+            .send_replace(identity.revision);
+        self.state
+            .publish_cells(self.state.gui_connection().await)
+            .await;
+        if let Some(invocation) = recent {
+            self.state
+                .update_recents(move |root| recents::record(root, &invocation))
+                .await;
         }
 
         for message in result.messages {
@@ -1396,7 +1680,13 @@ impl LanguageServer for Backend {
         let root_uri = root_uri.or(params.root_uri);
         let root_dir = root_uri.and_then(|root| root.to_file_path().map(|path| path.into_owned()));
         if let Some(root_dir) = root_dir {
-            let _ = self.state.root_dir.set(root_dir);
+            let _ = self.state.root_dir.set(root_dir.clone());
+            self.state.update_recents(recents::load).await;
+            self.state.publish_session(&root_dir);
+            // A recursive watch walks the whole tree on some platforms.
+            let backend = self.clone();
+            let watched = root_dir.clone();
+            tokio::task::spawn_blocking(move || backend.start_watcher(&watched));
             let connection = self.state.gui_connection().await;
             self.state.publish_workspace_path(connection).await;
         }
@@ -1453,29 +1743,17 @@ impl LanguageServer for Backend {
                 .compiler
                 .set_source_text(path, doc.contents().to_owned());
         }
-        source.editor_files.insert(uri, doc);
+        source.editor_files.insert(uri.clone(), doc);
         source.advance_revision();
+        let progress = source.edit_progress(&uri);
         let identity = source.compile_identity();
         drop(source);
-        self.compile_after_debounce(identity);
+        self.state.notify_source_changed();
+        self.compile_after_change(progress, identity);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         let mut source = self.state.source_state.lock().await;
-        let analyzer_edit = source
-            .pending_workspace_edits
-            .contains_key(&params.text_document.uri);
-        if let Some(count) = source
-            .pending_workspace_edits
-            .get_mut(&params.text_document.uri)
-        {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                source
-                    .pending_workspace_edits
-                    .shift_remove(&params.text_document.uri);
-            }
-        }
         let mut changed_source = None;
         if let Some(doc) = source.editor_files.get_mut(&params.text_document.uri) {
             let previous = doc.contents().to_owned();
@@ -1508,22 +1786,11 @@ impl LanguageServer for Backend {
             self.state.compiler.set_source_text(path, contents);
             source.advance_revision();
         }
+        let progress = source.edit_progress(&params.text_document.uri);
         let identity = source.compile_identity();
         drop(source);
-        if analyzer_edit {
-            // A didChange notification must release its LSP service slot as
-            // soon as the source is recorded. The GUI update can be much
-            // slower than the source edit, and waiting here exhausts the
-            // server's four concurrent request slots during rapid drawing.
-            let backend = self.clone();
-            tokio::spawn(async move {
-                if backend.state.is_latest_compile_request(&identity).await {
-                    backend.update_cell(identity).await;
-                }
-            });
-        } else {
-            self.compile_after_debounce(identity);
-        }
+        self.state.notify_source_changed();
+        self.compile_after_change(progress, identity);
     }
 
     async fn goto_definition(
@@ -1620,10 +1887,12 @@ impl LanguageServer for Backend {
         source.advance_revision();
         let identity = source.compile_identity();
         drop(source);
+        self.state.notify_source_changed();
         self.compile_after_debounce(identity);
     }
 
     async fn shutdown(&self) -> Result<()> {
+        self.state.retire_session();
         if let Some(mut gui) = self.state.take_gui_process().await {
             let _ = gui.kill().await;
         }
@@ -1642,12 +1911,100 @@ struct InstantiateParams {
 }
 
 #[derive(Serialize, Deserialize)]
+struct DeviceCommandParams {
+    /// The command's argument text: `<Kind> [<count>] <model and parameters>`.
+    args: String,
+}
+
+#[derive(Serialize, Deserialize)]
 struct CellNameParams {
     name: String,
     uri: Uri,
 }
 
 const PREVIEW_BINDING_PREFIX: &str = "__argon_preview_instance";
+
+/// The instance the schematic preview placed at `call`, with what the GUI
+/// draws for it.
+fn schematic_instance_preview(
+    output: &compile::CompiledData,
+    call: &Span,
+    invocation: String,
+) -> Option<SchematicInstancePreview> {
+    let instance = output.cells.values().find_map(|cell| {
+        cell.schematic
+            .instances
+            .iter()
+            .find(|instance| instance.span.as_ref() == Some(call))
+    })?;
+    let child = output.cells.get(&instance.cell)?;
+    let symbol = child
+        .symbol
+        .clone()
+        .unwrap_or_else(|| compile::generated_box(&child.schematic, &child.name));
+    let pin_names = (0..child.schematic.ports.len())
+        .map(|port| child.schematic.port_name(port).to_owned())
+        .collect();
+    Some(SchematicInstancePreview {
+        invocation,
+        cell_name: child.name.clone(),
+        symbol,
+        pin_names,
+    })
+}
+
+/// Reads `<Kind> [<count>] <model and parameters>`: the kind by its
+/// variant name in any case, the terminal count when the kind needs one,
+/// and the rest as argument text.
+fn parse_device_command(text: &str) -> std::result::Result<(DeviceKind, usize, String), String> {
+    let text = text.trim();
+    let (kind_name, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    if kind_name.is_empty() {
+        return Err("expected a device kind, such as `Nmos`".to_owned());
+    }
+    let kind = DeviceKind::ALL
+        .into_iter()
+        .find(|kind| kind.name().eq_ignore_ascii_case(kind_name))
+        .ok_or_else(|| {
+            format!(
+                "`{kind_name}` is not a device kind; expected one of {}",
+                DeviceKind::ALL
+                    .iter()
+                    .map(|kind| kind.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+    let rest = rest.trim_start();
+    let (count, args) = match rest.split_once(char::is_whitespace).unwrap_or((rest, "")) {
+        (first, args) if first.parse::<usize>().is_ok() => {
+            (Some(first.parse::<usize>().expect("checked")), args)
+        }
+        _ => (None, rest),
+    };
+    let terminals = match (count, kind.base()) {
+        (Some(count), _) => count,
+        (None, DeviceKind::Mos) => 4,
+        (None, DeviceKind::Res | DeviceKind::Cap | DeviceKind::Diode) => 2,
+        (None, DeviceKind::Bjt) => 3,
+        (None, _) => {
+            return Err(format!(
+                "a `{}` device needs a terminal count: `:Argon device {} 3 \"model\"`",
+                kind.name(),
+                kind.name()
+            ));
+        }
+    };
+    kind.check_terminals(terminals)
+        .map_err(|error| format!("a `{}` device {error}", kind.name()))?;
+    let args = schematic_edit::device_args(args);
+    let call = format!(
+        "std::schematic::device(std::schematic::DeviceKind::{}, std::schematic::signals({terminals}), {args})",
+        kind.name()
+    );
+    parse::parse_cell(&call).map_err(|error| format!("the arguments do not parse: {error}"))?;
+    Ok((kind, terminals, args))
+}
 
 fn preview_instance_cell(
     output: &compile::CompiledData,
@@ -1704,6 +2061,13 @@ impl Backend {
                 }
             }
         }
+        if self.state.embedded {
+            self.state
+                .editor_client
+                .log_message(MessageType::INFO, "The GUI is still connecting")
+                .await;
+            return Ok(());
+        }
         let old_gui = self.state.take_gui_process().await;
         if let Some(mut gui) = old_gui {
             let _ = gui.kill().await;
@@ -1719,6 +2083,7 @@ impl Backend {
             match Command::new("argone")
                 .arg("gui")
                 .arg(format!("{}", state.server_addr))
+                .env(transport::TOKEN_ENV, state.token.to_hex())
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -1768,9 +2133,11 @@ impl Backend {
     }
 
     async fn select_and_open_cell(&self, cell: impl Into<String>) {
+        let cell = cell.into();
         let identity = {
             let mut source = self.state.source_state.lock().await;
-            source.cell = Some(cell.into());
+            source.pending_recent = Some(cell.clone());
+            source.cell = Some(cell);
             source.compile_identity()
         };
         self.open_cell_view(identity).await;
@@ -1834,10 +2201,14 @@ impl Backend {
         let invocation = format!("{}()", params.name);
         let previous = {
             let mut source = self.state.source_state.lock().await;
-            source.cell.replace(invocation)
+            (
+                source.cell.replace(invocation.clone()),
+                source.pending_recent.replace(invocation),
+            )
         };
         if !self.state.apply_source_edit(params.uri, edit).await {
-            self.state.source_state.lock().await.cell = previous;
+            let mut source = self.state.source_state.lock().await;
+            (source.cell, source.pending_recent) = previous;
         }
         Ok(())
     }
@@ -1856,7 +2227,7 @@ impl Backend {
                 .await;
             return Ok(());
         };
-        let rename = match cell_edit::rename_cell_edits(
+        let mut rename = match cell_edit::rename_cell_edits(
             &ast,
             &current_invocation,
             &params.name,
@@ -1868,13 +2239,374 @@ impl Backend {
                 return Ok(());
             }
         };
+        let renamed = |invocation: &str| {
+            rename
+                .rename_invocation(invocation)
+                .unwrap_or_else(|| invocation.to_owned())
+        };
         let previous = {
             let mut source = self.state.source_state.lock().await;
-            source.cell.replace(rename.invocation)
+            let pending_recent = source.pending_recent.as_deref().map(renamed);
+            (
+                source.cell.replace(renamed(&current_invocation)),
+                std::mem::replace(&mut source.pending_recent, pending_recent),
+            )
         };
-        if !self.state.apply_source_changes(rename.changes, None).await {
-            self.state.source_state.lock().await.cell = previous;
+        let changes = std::mem::take(&mut rename.changes);
+        if !self.state.apply_source_changes(changes, None).await {
+            let mut source = self.state.source_state.lock().await;
+            (source.cell, source.pending_recent) = previous;
+            return Ok(());
         }
+        self.state
+            .update_recents(move |root| {
+                recents::rewrite(root, |invocation| rename.rename_invocation(invocation))
+            })
+            .await;
+        Ok(())
+    }
+
+    /// Compiles the open cell with `expression` bound to a fresh name at the
+    /// end of `scope_span`, which must be the body of a cell or a scope in
+    /// one. Returns the output, the binding, and the span of the expression
+    /// in the preview source, or reports why the preview failed.
+    async fn compile_preview(
+        &self,
+        workspace_ast: &Arc<WorkspaceParseAst>,
+        workspace: &WorkspaceConfig,
+        open_cell: Option<String>,
+        scope_span: &Span,
+        expression: &str,
+        describe: &str,
+    ) -> Option<(compile::CompiledData, String, cfgrammar::Span)> {
+        let Some((module_path, ast)) = workspace_ast
+            .iter()
+            .find(|(_, ast)| ast.path == scope_span.path)
+            .map(|(module_path, ast)| (module_path.clone(), ast.clone()))
+        else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "The selected scope is not part of this Argon workspace",
+                )
+                .await;
+            return None;
+        };
+        let Some(scope) = ast.span2scope.get(scope_span) else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "The scope selected in the Argon GUI is not part of the current workspace",
+                )
+                .await;
+            return None;
+        };
+        let document = self.state.document(&ast.source_text);
+        let preview_binding = (0..)
+            .map(|index| format!("{PREVIEW_BINDING_PREFIX}{index}"))
+            .find(|name| {
+                workspace_ast
+                    .values()
+                    .all(|ast| !ast.text.contains(name.as_str()))
+            })
+            .expect("an unused preview binding always exists");
+        let statement = format!("let {preview_binding} = {expression};");
+        let tracked = statement.len() - expression.len() - 1..statement.len() - 1;
+        let insertion = insert_statement(
+            &document,
+            scope.span,
+            scope.tail.as_ref().map(|tail| tail.span().start()),
+            &statement,
+            tracked,
+        );
+        let mut preview_source = ast.text.to_string();
+        preview_source.insert_str(insertion.offset, &insertion.edit.new_text);
+        let mut preview_module =
+            match parse::parse_source_text(preview_source, scope_span.path.to_path_buf()) {
+                Ok(ast) => ast,
+                Err(error) => {
+                    self.state
+                        .editor_client
+                        .show_message(MessageType::ERROR, format!("Could not {describe}: {error}"))
+                        .await;
+                    return None;
+                }
+            };
+        preview_module.promote_last_declarations(ast.generated_declarations);
+        let mut preview_ast = (**workspace_ast).clone();
+        preview_ast.insert(module_path, preview_module);
+        let Some(open_cell) = open_cell else {
+            self.state
+                .editor_client
+                .show_message(MessageType::ERROR, "Open a cell before placing an instance")
+                .await;
+            return None;
+        };
+        // Recompile the open cell against the preview. Splicing its invocation
+        // before static analysis lets argument expressions use normal name
+        // resolution and type checking.
+        let invocation = match parse::splice_cell_invocation(&mut preview_ast, &open_cell) {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                self.state
+                    .editor_client
+                    .show_message(MessageType::ERROR, format!("Open cell is invalid: {error}"))
+                    .await;
+                return None;
+            }
+        };
+        let Some((typed_ast, static_output)) = compile::static_compile(&preview_ast) else {
+            self.state
+                .editor_client
+                .show_message(MessageType::ERROR, "Could not analyze the preview")
+                .await;
+            return None;
+        };
+        if !static_output.errors.is_empty() {
+            let message = static_output
+                .errors
+                .iter()
+                .map(|error| error.kind.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    format!("Could not {describe}: {message}"),
+                )
+                .await;
+            return None;
+        }
+        if workspace.tech.is_none() {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "The Argon library does not configure a technology file",
+                )
+                .await;
+            return None;
+        }
+        let compiled = compile_open_cell(&typed_ast, &invocation, workspace);
+        let output = match compiled {
+            CompileOutput::Valid(output) => output,
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                output: Some(output),
+                errors,
+            }) if !errors.iter().any(|error| error.kind.is_invalid_cell()) => output,
+            output => {
+                let messages = blocking_compile_error_messages(&output).join("\n");
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        format!("Could not {describe}: {messages}"),
+                    )
+                    .await;
+                return None;
+            }
+        };
+        Some((output, preview_binding, insertion.tracked_span))
+    }
+
+    /// The body of the cell the schematic view shows, from the GUI.
+    async fn schematic_target(&self, connection: &GuiConnection, action: &str) -> Option<Span> {
+        match connection.client.schematic_target(context::current()).await {
+            Ok(Some(target)) => Some(target),
+            Ok(None) => {
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        format!("Open a cell in the Argon GUI before {action}"),
+                    )
+                    .await;
+                None
+            }
+            Err(error) => {
+                let disconnected = is_gui_disconnected(&error);
+                if disconnected {
+                    self.state.clear_gui_connection(connection.id).await;
+                }
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        if disconnected {
+                            format!(
+                                "The Argon GUI is not connected; start it before {action} ({error})"
+                            )
+                        } else {
+                            format!("Could not query the GUI's schematic: {error}")
+                        },
+                    )
+                    .await;
+                None
+            }
+        }
+    }
+
+    /// The published workspace, open cell, and configuration, when the editor
+    /// buffers match what was compiled.
+    async fn preview_sources(
+        &self,
+    ) -> Option<(Arc<WorkspaceParseAst>, Option<String>, WorkspaceConfig)> {
+        let source = self.state.source_state.lock().await;
+        let compiled = self.state.published_state.lock().await;
+        if !rpc::editor_buffers_are_current(&source, &compiled) {
+            drop(compiled);
+            drop(source);
+            self.state
+                .editor_client
+                .show_message(MessageType::ERROR, rpc::OUT_OF_SYNC_MESSAGE)
+                .await;
+            return None;
+        }
+        Some((
+            compiled.ast.clone(),
+            source.cell.clone(),
+            compiled.config.clone(),
+        ))
+    }
+
+    /// `:Argon sinst <invocation>`: previews a schematic instance of a cell
+    /// in the cell on screen.
+    async fn schematic_instantiate(&self, params: InstantiateParams) -> Result<()> {
+        let Some(connection) = self.state.gui_connection().await else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "Start the Argon GUI before placing an instance",
+                )
+                .await;
+            return Ok(());
+        };
+        let Some(target) = self
+            .schematic_target(&connection, "placing an instance")
+            .await
+        else {
+            return Ok(());
+        };
+        let Some((workspace_ast, open_cell, workspace)) = self.preview_sources().await else {
+            return Ok(());
+        };
+        let Some((output, _, tracked)) = self
+            .compile_preview(
+                &workspace_ast,
+                &workspace,
+                open_cell,
+                &target,
+                &format!("std::schematic::inst({})", params.cell),
+                &format!("instantiate `{}`", params.cell),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+        let tracked = Span {
+            path: target.path.clone(),
+            span: tracked,
+        };
+        let Some(preview) = schematic_instance_preview(&output, &tracked, params.cell) else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "The preview instance did not execute while compiling the open cell",
+                )
+                .await;
+            return Ok(());
+        };
+        let result = connection
+            .client
+            .place_schematic_instance(context::current(), preview)
+            .await;
+        self.handle_gui_result(&connection, result).await;
+        Ok(())
+    }
+
+    /// `:Argon device <Kind> [<count>] <model and parameters>`: previews a
+    /// device in the cell on screen.
+    async fn device(&self, params: DeviceCommandParams) -> Result<()> {
+        let (kind, terminals, args) = match parse_device_command(&params.args) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                self.state
+                    .editor_client
+                    .show_message(MessageType::ERROR, format!("Argon device: {error}"))
+                    .await;
+                return Ok(());
+            }
+        };
+        let Some(connection) = self.state.gui_connection().await else {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "Start the Argon GUI before placing a device",
+                )
+                .await;
+            return Ok(());
+        };
+        let Some(target) = self.schematic_target(&connection, "placing a device").await else {
+            return Ok(());
+        };
+        let Some((workspace_ast, open_cell, workspace)) = self.preview_sources().await else {
+            return Ok(());
+        };
+        let expression = format!(
+            "std::schematic::device(std::schematic::DeviceKind::{}, std::schematic::signals({terminals}), {args})",
+            kind.name()
+        );
+        let Some((output, _, tracked)) = self
+            .compile_preview(
+                &workspace_ast,
+                &workspace,
+                open_cell,
+                &target,
+                &expression,
+                &format!("place a `{}` device", kind.name()),
+            )
+            .await
+        else {
+            return Ok(());
+        };
+        let tracked = Span {
+            path: target.path.clone(),
+            span: tracked,
+        };
+        let evaluated = output.cells.values().any(|cell| {
+            cell.schematic
+                .devices
+                .iter()
+                .any(|device| device.span.as_ref() == Some(&tracked))
+        });
+        if !evaluated {
+            self.state
+                .editor_client
+                .show_message(
+                    MessageType::ERROR,
+                    "The preview device did not execute while compiling the open cell",
+                )
+                .await;
+            return Ok(());
+        }
+        let result = connection
+            .client
+            .place_device(
+                context::current(),
+                DevicePreview {
+                    kind,
+                    terminals,
+                    args,
+                },
+            )
+            .await;
+        self.handle_gui_result(&connection, result).await;
         Ok(())
     }
 
@@ -1954,131 +2686,18 @@ impl Backend {
                 .await;
             return Ok(());
         };
-        let Some((module_path, ast)) = workspace_ast
-            .iter()
-            .find(|(_, ast)| ast.path == scope_span.path)
-            .map(|(module_path, ast)| (module_path.clone(), ast.clone()))
+        let Some((output, preview_binding, _)) = self
+            .compile_preview(
+                &workspace_ast,
+                &workspace,
+                open_cell,
+                &scope_span,
+                &format!("std::layout::inst({})", params.cell),
+                &format!("instantiate `{}`", params.cell),
+            )
+            .await
         else {
-            self.state
-                .editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    "The selected scope is not part of this Argon workspace",
-                )
-                .await;
             return Ok(());
-        };
-        let document = self.state.document(&ast.source_text);
-        let scope = &ast.span2scope[&scope_span];
-        let preview_binding = (0..)
-            .map(|index| format!("{PREVIEW_BINDING_PREFIX}{index}"))
-            .find(|name| {
-                workspace_ast
-                    .values()
-                    .all(|ast| !ast.text.contains(name.as_str()))
-            })
-            .expect("an unused preview binding always exists");
-        let statement = format!(
-            "let {preview_binding} = std::layout::inst({});",
-            params.cell
-        );
-        let insertion = insert_statement(
-            &document,
-            scope.span,
-            scope.tail.as_ref().map(|tail| tail.span().start()),
-            &statement,
-            0..statement.len(),
-        );
-        let mut preview_source = ast.text.to_string();
-        preview_source.insert_str(insertion.offset, &insertion.edit.new_text);
-        let mut preview_module =
-            match parse::parse_source_text(preview_source, scope_span.path.to_path_buf()) {
-                Ok(ast) => ast,
-                Err(error) => {
-                    self.state
-                        .editor_client
-                        .show_message(
-                            MessageType::ERROR,
-                            format!("Could not instantiate `{}`: {error}", params.cell),
-                        )
-                        .await;
-                    return Ok(());
-                }
-            };
-        preview_module.promote_last_declarations(ast.generated_declarations);
-        let mut preview_ast = (*workspace_ast).clone();
-        preview_ast.insert(module_path, preview_module);
-        let Some(open_cell) = open_cell else {
-            self.state
-                .editor_client
-                .show_message(MessageType::ERROR, "Open a cell before placing an instance")
-                .await;
-            return Ok(());
-        };
-        // Recompile the open cell against the preview. Splicing its invocation
-        // before static analysis lets argument expressions use normal name
-        // resolution and type checking.
-        let invocation = match parse::splice_cell_invocation(&mut preview_ast, &open_cell) {
-            Ok(invocation) => invocation,
-            Err(error) => {
-                self.state
-                    .editor_client
-                    .show_message(MessageType::ERROR, format!("Open cell is invalid: {error}"))
-                    .await;
-                return Ok(());
-            }
-        };
-        let Some((typed_ast, static_output)) = compile::static_compile(&preview_ast) else {
-            self.state
-                .editor_client
-                .show_message(MessageType::ERROR, "Could not analyze the preview instance")
-                .await;
-            return Ok(());
-        };
-        if !static_output.errors.is_empty() {
-            let message = static_output
-                .errors
-                .iter()
-                .map(|error| error.kind.to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            self.state
-                .editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    format!("Could not instantiate `{}`: {message}", params.cell),
-                )
-                .await;
-            return Ok(());
-        }
-        if workspace.tech.is_none() {
-            self.state
-                .editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    "The Argon library does not configure a technology file",
-                )
-                .await;
-            return Ok(());
-        }
-        let compiled = compile_open_cell(&typed_ast, &invocation, &workspace);
-        let output = match compiled {
-            CompileOutput::Valid(output) => output,
-            CompileOutput::ExecErrors(ExecErrorCompileOutput {
-                output: Some(output),
-                errors,
-            }) if !errors.iter().any(|error| error.kind.is_invalid_cell()) => output,
-            output => {
-                let messages = blocking_compile_error_messages(&output).join("\n");
-                self.state
-                    .editor_client
-                    .show_message(
-                        MessageType::ERROR,
-                        format!("Could not instantiate `{}`: {messages}", params.cell),
-                    )
-                    .await;
-                return Ok(());
-            }
         };
         let Some(cell) = preview_instance_cell(&output, &preview_binding) else {
             self.state
@@ -2203,44 +2822,98 @@ async fn spawn(fut: impl Future<Output = ()> + Send + 'static) {
     tokio::spawn(fut);
 }
 
+/// Most authenticated RPC connections served at once.
+const MAX_RPC_CONNECTIONS: usize = 10;
+
 #[cfg(unix)]
-fn announce_rpc_port(path: &Path, port: u16) -> io::Result<()> {
+fn announce_rpc_port(path: &Path, port: u16, token: &transport::SessionToken) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
 
     let mut stream = UnixStream::connect(path)?;
-    writeln!(stream, "{port}")?;
+    writeln!(stream, "{port} {}", token.to_hex())?;
     stream.flush()
 }
 
 #[cfg(not(unix))]
-fn announce_rpc_port(_: &Path, _: u16) -> io::Result<()> {
+fn announce_rpc_port(_: &Path, _: u16, _: &transport::SessionToken) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "relay requires a Unix-like remote host",
     ))
 }
 
-pub async fn main(rpc_port: Option<u16>, relay_socket: Option<PathBuf>) {
-    main_with_io(
-        rpc_port,
-        relay_socket,
-        tokio::io::stdin(),
-        tokio::io::stdout(),
-    )
-    .await;
+/// Accepts RPC connections, serving each one the service its role asked for
+/// once it has presented the session token.
+async fn serve_rpc(listener: tokio::net::TcpListener, state: State) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_RPC_CONNECTIONS));
+    loop {
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(error) => {
+                error!("could not accept an RPC connection: {error}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let state = state.clone();
+        let slots = slots.clone();
+        tokio::spawn(async move {
+            let (role, stream) = match transport::accept(stream, &state.token).await {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    info!("rejected an RPC connection: {error}");
+                    return;
+                }
+            };
+            let Ok(_slot) = slots.acquire_owned().await else {
+                return;
+            };
+            match role {
+                transport::Role::Gui => {
+                    let transport = tarpc::serde_transport::new(stream, Bincode::default());
+                    tarpc::server::BaseChannel::with_defaults(transport)
+                        .execute(state.serve())
+                        .for_each(spawn)
+                        .await;
+                }
+                transport::Role::GuiCallback => {
+                    let transport = tarpc::serde_transport::new(stream, Bincode::default());
+                    let client =
+                        GuiClient::new(tarpc::client::Config::default(), transport).spawn();
+                    state.connect_gui(client).await;
+                }
+                transport::Role::Agent => {
+                    let transport = tarpc::serde_transport::new(stream, Bincode::default());
+                    tarpc::server::BaseChannel::with_defaults(transport)
+                        .execute(agent::Agent::serve(Backend { state }))
+                        .for_each(spawn)
+                        .await;
+                }
+            }
+        });
+    }
+}
+
+/// How the analyzer finds and launches its GUI.
+#[derive(Clone, Debug, Default)]
+pub struct GuiLink {
+    /// Unix socket through which to report the RPC port and token.
+    pub relay_socket: Option<PathBuf>,
+    /// Whether the GUI embeds this analyzer's Neovim.
+    pub embedded: bool,
+}
+
+pub async fn main(rpc_port: Option<u16>, gui: GuiLink) {
+    main_with_io(rpc_port, gui, tokio::io::stdin(), tokio::io::stdout()).await;
 }
 
 /// Runs the analyzer over an arbitrary LSP transport.
 ///
 /// The production binary supplies stdin and stdout. Tests can supply a TCP
 /// stream without launching a second Cargo target.
-pub async fn main_with_io<I, O>(
-    rpc_port: Option<u16>,
-    relay_socket: Option<PathBuf>,
-    stdin: I,
-    stdout: O,
-) where
+pub async fn main_with_io<I, O>(rpc_port: Option<u16>, gui: GuiLink, stdin: I, stdout: O)
+where
     I: AsyncRead + Unpin,
     O: AsyncWrite,
 {
@@ -2253,33 +2926,39 @@ pub async fn main_with_io<I, O>(
             return;
         }
     };
-    main_with_io_on_listener(listener, relay_socket, stdin, stdout).await;
+    let token = match transport::SessionToken::generate() {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("failed to generate the analyzer session token: {error}");
+            return;
+        }
+    };
+    main_with_io_on_listener(listener, token, gui, stdin, stdout).await;
 }
 
 /// Runs the analyzer using pre-bound GUI RPC and LSP transports.
 ///
-/// Supplying the listener lets tests reserve the RPC address without a
-/// bind-release-bind race.
+/// Supplying the listener and token lets tests reserve the RPC address
+/// without a bind-release-bind race and authenticate their own clients.
 pub async fn main_with_io_on_listener<I, O>(
     rpc_listener: tokio::net::TcpListener,
-    relay_socket: Option<PathBuf>,
+    token: transport::SessionToken,
+    gui: GuiLink,
     stdin: I,
     stdout: O,
 ) where
     I: AsyncRead + Unpin,
     O: AsyncWrite,
 {
-    let mut listener =
-        match tarpc::serde_transport::tcp::listen_on(rpc_listener, Bincode::default).await {
-            Ok(listener) => listener,
-            Err(error) => {
-                eprintln!("failed to configure analyzer RPC listener: {error}");
-                return;
-            }
-        };
-    let server_addr = listener.local_addr();
-    if let Some(path) = relay_socket
-        && let Err(error) = announce_rpc_port(&path, server_addr.port())
+    let server_addr = match rpc_listener.local_addr() {
+        Ok(addr) => addr,
+        Err(error) => {
+            eprintln!("failed to read the analyzer RPC address: {error}");
+            return;
+        }
+    };
+    if let Some(path) = &gui.relay_socket
+        && let Err(error) = announce_rpc_port(path, server_addr.port(), &token)
     {
         eprintln!(
             "failed to announce analyzer RPC port through `{}`: {error}",
@@ -2290,7 +2969,7 @@ pub async fn main_with_io_on_listener<I, O>(
 
     let mut ext_state = None;
     let (service, socket) = LspService::build(|client| {
-        let state = State::new(server_addr, client);
+        let state = State::new(server_addr, client, token, gui.embedded);
         ext_state = Some(state.clone());
         Backend { state }
     })
@@ -2299,31 +2978,20 @@ pub async fn main_with_io_on_listener<I, O>(
     .custom_method("custom/newCell", Backend::new_cell)
     .custom_method("custom/renameCell", Backend::rename_cell)
     .custom_method("custom/inst", Backend::instantiate)
+    .custom_method("custom/sinst", Backend::schematic_instantiate)
+    .custom_method("custom/device", Backend::device)
     .custom_method("custom/commandCompletion", Backend::command_completion)
     .custom_method("custom/reloadConfig", Backend::reload_config)
     .custom_method("custom/setConfig", Backend::set_config)
     .custom_method("custom/saveConfig", Backend::save_config)
     .custom_method("custom/workspaceModified", Backend::workspace_modified)
+    .custom_method("custom/followMode", Backend::follow_mode)
     .finish();
     let Some(state) = ext_state else {
         eprintln!("failed to initialize analyzer state");
         return;
     };
-    listener.config_mut().max_frame_length(usize::MAX);
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        listener
-            // Ignore accept errors.
-            .filter_map(|r| futures::future::ready(r.ok()))
-            .map(tarpc::server::BaseChannel::with_defaults)
-            // serve is generated by the service attribute. It takes as input any type implementing
-            // the generated World trait.
-            .map(|channel| channel.execute(state_clone.clone().serve()).for_each(spawn))
-            // Max 10 channels.
-            .buffer_unordered(10)
-            .for_each(|_| async {})
-            .await;
-    });
+    tokio::spawn(serve_rpc(rpc_listener, state.clone()));
 
     state
         .editor_client
@@ -2337,6 +3005,7 @@ pub async fn main_with_io_on_listener<I, O>(
 
     // Start actual LSP server.
     Server::new(stdin, stdout, socket).serve(service).await;
+    state.retire_session();
 }
 
 #[cfg(test)]
@@ -2351,7 +3020,7 @@ mod tests {
     };
 
     use super::{
-        ArgonConfig, DEFAULT_LOG_LEVEL, GuiConfig, SourceState, config_with_key,
+        ArgonConfig, DEFAULT_LOG_LEVEL, DeviceKind, GuiConfig, SourceState, config_with_key,
         is_gui_disconnected, parse_config, preview_instance_cell, read_unpoisoned, write_config,
         write_unpoisoned,
     };
@@ -2529,6 +3198,35 @@ mod tests {
         assert_eq!(rect.x1.0, 50.);
     }
 
+    #[test]
+    fn the_device_command_reads_its_kind_count_and_arguments() {
+        let (kind, terminals, args) =
+            super::parse_device_command("Nmos \"nch\", w=1., l=0.15").unwrap();
+        assert_eq!(kind, DeviceKind::Nmos);
+        assert_eq!(terminals, 4);
+        assert_eq!(args, "\"nch\", w=1., l=0.15");
+        let (kind, terminals, args) = super::parse_device_command("subckt 3 \"opamp\"").unwrap();
+        assert_eq!(kind, DeviceKind::Subckt);
+        assert_eq!(terminals, 3);
+        assert_eq!(args, "\"opamp\"");
+        let (kind, terminals, args) = super::parse_device_command("Res value=1.").unwrap();
+        assert_eq!((kind, terminals), (DeviceKind::Res, 2));
+        assert_eq!(args, "\"\", value=1.", "a missing model is empty");
+        let (_, terminals, _) = super::parse_device_command("Npn 4 \"q\"").unwrap();
+        assert_eq!(terminals, 4);
+        assert!(super::parse_device_command("").is_err());
+        assert!(super::parse_device_command("Triode").is_err());
+        assert!(
+            super::parse_device_command("Subckt \"x\"").is_err(),
+            "needs a count"
+        );
+        assert!(
+            super::parse_device_command("Nmos 3 \"nch\"").is_err(),
+            "four terminals"
+        );
+        assert!(super::parse_device_command("Nmos \"nch\", w=").is_err());
+    }
+
     /// The preview binding is spelled as the analyzer inserts it, which needs
     /// no `use` declaration.
     #[test]
@@ -2570,7 +3268,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rpc_port_is_announced_through_a_unix_socket() {
+    fn private_dirs_are_owner_only_and_existing_parents_are_left_alone() {
+        use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+
+        let root = tempfile::tempdir().unwrap();
+        let existing = root.path().join("existing");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+        let directory = existing.join("state/argon");
+        super::create_private_dir_all(&directory).unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&existing), 0o755);
+        assert_eq!(mode(&existing.join("state")), 0o700);
+        assert_eq!(mode(&directory), 0o700);
+    }
+
+    #[tokio::test]
+    async fn an_embedded_analyzer_waits_for_its_gui_instead_of_starting_one() {
+        use futures::StreamExt;
+
+        let mut state = None;
+        let (_service, socket) = tower_lsp_server::LspService::build(|client| {
+            let token = super::transport::SessionToken::generate().unwrap();
+            let backend = super::Backend {
+                state: super::State::new("127.0.0.1:1".parse().unwrap(), client, token, true),
+            };
+            state = Some(backend.state.clone());
+            backend
+        })
+        .finish();
+        tokio::spawn(socket.for_each(|_| async {}));
+        let state = state.unwrap();
+
+        super::Backend {
+            state: state.clone(),
+        }
+        .start_gui()
+        .await
+        .unwrap();
+        assert!(state.take_gui_process().await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpc_port_and_token_are_announced_through_a_unix_socket() {
         use std::io::Read;
 
         let directory = tempfile::tempdir().unwrap();
@@ -2582,7 +3323,264 @@ mod tests {
             stream.read_to_string(&mut port).unwrap();
             port
         });
-        super::announce_rpc_port(&path, 43210).unwrap();
-        assert_eq!(receiver.join().unwrap(), "43210\n");
+        let token = super::transport::SessionToken::generate().unwrap();
+        super::announce_rpc_port(&path, 43210, &token).unwrap();
+        assert_eq!(
+            receiver.join().unwrap(),
+            format!("43210 {}\n", token.to_hex())
+        );
+    }
+
+    mod pending_edits {
+        use std::{collections::HashMap, time::Duration};
+
+        use futures::{SinkExt, StreamExt};
+        use serde_json::{Value, json};
+        use tokio::sync::mpsc;
+        use tower::{Service, ServiceExt};
+        use tower_lsp_server::{
+            LanguageServer, LspService,
+            jsonrpc::{Id, Request, Response},
+            ls_types::{
+                ApplyWorkspaceEditParams, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
+                Position, Range, TextDocumentContentChangeEvent, TextDocumentItem, TextEdit, Uri,
+                VersionedTextDocumentIdentifier,
+            },
+        };
+
+        use crate::{ArgonConfig, Backend, PENDING_EDIT_TIMEOUT, State, transport::SessionToken};
+
+        const BEFORE: &str = "cell top() {\n    let a = 1.;\n    let b = 2.;\n}\n";
+        const AFTER: &str = "cell top() {\n    let a = 3.;\n    let b = 4.;\n}\n";
+
+        /// An analyzer with `BEFORE` open as `lib.ar` in a workspace that
+        /// compiles, and the editor's side of its connection. The editor
+        /// answers every request but `workspace/applyEdit`, which the test
+        /// answers.
+        struct Editor {
+            backend: Backend,
+            uri: Uri,
+            workspace_edits: mpsc::UnboundedReceiver<(Id, ApplyWorkspaceEditParams)>,
+            responses: mpsc::UnboundedSender<Response>,
+            _service: LspService<Backend>,
+            _directory: tempfile::TempDir,
+        }
+
+        impl Editor {
+            async fn open() -> Self {
+                let directory = tempfile::tempdir().unwrap();
+                std::fs::copy(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../examples/tech/basic.tech.toml"),
+                    directory.path().join("tech.toml"),
+                )
+                .unwrap();
+                std::fs::write(
+                    directory.path().join("Argon.toml"),
+                    "name = \"pending-edits\"\ntech = \"tech.toml\"\n",
+                )
+                .unwrap();
+                let path = directory.path().join("lib.ar");
+                std::fs::write(&path, BEFORE).unwrap();
+
+                let mut backend = None;
+                let (mut service, mut socket) = LspService::build(|client| {
+                    let token = SessionToken::generate().unwrap();
+                    let built = Backend {
+                        state: State::new("127.0.0.1:1".parse().unwrap(), client, token, false),
+                    };
+                    backend = Some(built.clone());
+                    built
+                })
+                .finish();
+                let backend = backend.unwrap();
+                let initialize = Request::build("initialize")
+                    .params(json!({ "capabilities": {} }))
+                    .id(1)
+                    .finish();
+                service
+                    .ready()
+                    .await
+                    .unwrap()
+                    .call(initialize)
+                    .await
+                    .unwrap();
+                // Only the analyzer's own edits compile within a test.
+                let mut config = ArgonConfig::default();
+                config.analyzer.compile_debounce_ms = 60_000;
+                backend.state.apply_config(config);
+                backend
+                    .state
+                    .root_dir
+                    .set(directory.path().to_path_buf())
+                    .unwrap();
+                backend.state.source_state.lock().await.cell = Some("top()".to_owned());
+
+                let (edits, workspace_edits) = mpsc::unbounded_channel();
+                let (responses, mut outgoing) = mpsc::unbounded_channel::<Response>();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            request = socket.next() => {
+                                let Some(request) = request else {
+                                    break;
+                                };
+                                let (method, id, params) = request.into_parts();
+                                match id {
+                                    Some(id) if method == "workspace/applyEdit" => {
+                                        let params = serde_json::from_value(params.unwrap()).unwrap();
+                                        let _ = edits.send((id, params));
+                                    }
+                                    Some(id) => {
+                                        let _ = socket.send(Response::from_ok(id, Value::Null)).await;
+                                    }
+                                    None => {}
+                                }
+                            }
+                            Some(response) = outgoing.recv() => {
+                                let _ = socket.send(response).await;
+                            }
+                        }
+                    }
+                });
+
+                let uri = Uri::from_file_path(&path).unwrap();
+                backend
+                    .did_open(DidOpenTextDocumentParams {
+                        text_document: TextDocumentItem {
+                            uri: uri.clone(),
+                            language_id: "argon".to_owned(),
+                            version: 0,
+                            text: BEFORE.to_owned(),
+                        },
+                    })
+                    .await;
+                Self {
+                    backend,
+                    uri,
+                    workspace_edits,
+                    responses,
+                    _service: service,
+                    _directory: directory,
+                }
+            }
+
+            /// Asks the editor to set `a` to 3 and `b` to 4 in one edit,
+            /// returning whether it applied and the source revision once the
+            /// request returns.
+            fn edit(&self) -> tokio::task::JoinHandle<(bool, u64)> {
+                let replacement = |line| TextEdit {
+                    range: Range::new(Position::new(line, 12), Position::new(line, 14)),
+                    new_text: if line == 1 { "3." } else { "4." }.to_owned(),
+                };
+                let changes =
+                    HashMap::from([(self.uri.clone(), vec![replacement(1), replacement(2)])]);
+                let state = self.backend.state.clone();
+                tokio::spawn(async move {
+                    let applied = state.apply_source_changes(changes, None).await;
+                    (applied, state.source_state.lock().await.revision)
+                })
+            }
+
+            /// The edits of the next workspace edit the analyzer asks for.
+            async fn workspace_edit(&mut self) -> (Id, Vec<TextEdit>) {
+                let (id, params) = self.workspace_edits.recv().await.unwrap();
+                let mut changes = params.edit.changes.unwrap();
+                (id, changes.remove(&self.uri).unwrap())
+            }
+
+            fn applied(&self, id: Id) {
+                self.responses
+                    .send(Response::from_ok(id, json!({ "applied": true })))
+                    .unwrap();
+            }
+
+            /// Reports `edit` as the change that brought the buffer to `version`.
+            async fn change(&self, version: i32, edit: &TextEdit) {
+                self.backend
+                    .did_change(DidChangeTextDocumentParams {
+                        text_document: VersionedTextDocumentIdentifier {
+                            uri: self.uri.clone(),
+                            version,
+                        },
+                        content_changes: vec![TextDocumentContentChangeEvent {
+                            range: Some(edit.range),
+                            range_length: None,
+                            text: edit.new_text.clone(),
+                        }],
+                    })
+                    .await;
+            }
+
+            async fn compiled_revision(&self) -> u64 {
+                self.backend
+                    .state
+                    .published_state
+                    .lock()
+                    .await
+                    .compiled_revision
+            }
+        }
+
+        #[tokio::test]
+        async fn an_edit_reported_in_parts_compiles_once_all_of_it_arrives() {
+            let mut editor = Editor::open().await;
+            let edit = editor.edit();
+            let (id, edits) = editor.workspace_edit().await;
+            // Like Neovim, report the edit nearest the end at once, answer,
+            // and report the rest after a debounce.
+            editor.change(1, &edits[1]).await;
+            assert_eq!(editor.compiled_revision().await, 0);
+            editor.applied(id);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            editor.change(2, &edits[0]).await;
+
+            // Revision 1 opened the file and revision 2 had half the edit.
+            assert_eq!(edit.await.unwrap(), (true, 3));
+            let mut compiled = editor.backend.state.compiled_revisions.subscribe();
+            tokio::time::timeout(
+                PENDING_EDIT_TIMEOUT * 10,
+                compiled.wait_for(|&revision| revision >= 3),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(editor.compiled_revision().await, 3);
+            let published = editor.backend.state.published_state.lock().await;
+            assert!(
+                published
+                    .ast
+                    .values()
+                    .any(|module| module.source_text.as_str() == AFTER)
+            );
+        }
+
+        #[tokio::test]
+        async fn an_edit_never_reported_in_full_is_withdrawn_and_compiled_as_is() {
+            let mut editor = Editor::open().await;
+            let edit = editor.edit();
+            let (id, edits) = editor.workspace_edit().await;
+            editor.change(1, &edits[1]).await;
+            editor.applied(id);
+
+            assert_eq!(edit.await.unwrap(), (true, 2));
+            let state = &editor.backend.state;
+            assert!(
+                state
+                    .source_state
+                    .lock()
+                    .await
+                    .pending_workspace_edits
+                    .is_empty()
+            );
+            let mut compiled = state.compiled_revisions.subscribe();
+            tokio::time::timeout(
+                PENDING_EDIT_TIMEOUT * 10,
+                compiled.wait_for(|&revision| revision >= 2),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
     }
 }

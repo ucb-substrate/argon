@@ -44,6 +44,24 @@ function M.instantiate(cell)
     end
 end
 
+function M.schematic_instantiate(cell)
+    local client_found = client.buf_request(0, "custom/sinst", {
+        cell = cell
+    }, client.print_error)
+    if not client_found then
+        vim.notify('No Argon language server is attached to this buffer', vim.log.levels.ERROR)
+    end
+end
+
+function M.place_device(args)
+    local client_found = client.buf_request(0, "custom/device", {
+        args = args
+    }, client.print_error)
+    if not client_found then
+        vim.notify('No Argon language server is attached to this buffer', vim.log.levels.ERROR)
+    end
+end
+
 function M.reload_config()
     client.buf_request(0, "custom/reloadConfig", nil, client.print_error)
 end

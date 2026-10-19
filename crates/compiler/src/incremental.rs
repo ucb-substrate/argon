@@ -1403,7 +1403,43 @@ mod tests {
                     .iter()
                     .map(|fallback| fallback.span.clone()),
             );
+            let schematic = &cell.schematic;
+            spans.extend(schematic.instances.iter().flat_map(|i| i.span.clone()));
+            for device in &schematic.devices {
+                spans.extend(device.span.clone());
+                spans.extend(device.terminal_spans.iter().flatten().cloned());
+            }
+            spans.extend(
+                schematic
+                    .nodes
+                    .iter()
+                    .filter_map(|node| match &node.source {
+                        compile::NodeSource::Signal { span, .. } => Some(span.clone()),
+                        _ => None,
+                    }),
+            );
+            spans.extend(schematic.connections.iter().map(|c| c.span.clone()));
+            if let Some(symbol) = &cell.symbol {
+                let sites = symbol
+                    .items
+                    .iter()
+                    .filter_map(|item| item.site.as_ref())
+                    .chain(
+                        symbol
+                            .pins
+                            .iter()
+                            .flatten()
+                            .filter_map(|pin| pin.site.as_ref()),
+                    );
+                for site in sites {
+                    spans.push(site.span.clone());
+                    spans.extend(site.origin.clone());
+                }
+            }
         }
+        // A symbol helper draws from the embedded standard library, whose
+        // text is not the workspace's.
+        spans.retain(|span| crate::parse::virtual_source(&span.path).is_none());
         spans
     }
 
@@ -1414,9 +1450,14 @@ mod tests {
         use crate::fingerprint::{ItemIndex, SpanRebase};
 
         let source = "use std::layout::{inst, rect};\n\
+                      use std::schematic::{DeviceKind, Signal, connect, device};\n\
                       cell leaf() {\n    \
                       let r = rect(\"met1\", x0i = 1., y0i = 2., x1i = 30., y1i = 40.);\n}\n\
-                      cell top() {\n    let i = inst(leaf(), x = 0., y = 0.);\n}\n";
+                      cell sch() {\n    pub let a = Signal();\n    pub let b = Signal();\n    \
+                      device(DeviceKind::Res, [a, b], \"\", value=1.);\n    \
+                      std::symbol::res(a, b);\n    std::symbol::text(\"r\", x=1., y=1.);\n}\n\
+                      cell top() {\n    let i = inst(leaf(), x = 0., y = 0.);\n    \
+                      let s = std::schematic::inst(sch());\n    connect(s.a, Signal());\n}\n";
         let (_dir, config) = scratch_workspace(source);
         let root = config.root_lib().to_path_buf();
         let tech =

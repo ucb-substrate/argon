@@ -27,17 +27,24 @@ mod direct;
 mod ops;
 mod result;
 mod schematic;
+mod symbol;
 
 pub use result::{
     CompileOutput, ExecError, ExecErrorCompileOutput, ExecErrorKind, StaticError,
     StaticErrorCompileOutput, StaticErrorKind,
 };
 pub(crate) use schematic::Namer;
+use schematic::{ConnectRecord, DeviceRecord, NodeOrigin, SchInstRecord, SchematicState};
 pub use schematic::{
-    Detached, DetachedKind, DetachedReason, Device, DeviceKind, Element, Net, NetIdx, NodeId,
-    ParamValue, Schematic, SchematicInstValue, SchematicInstance, SignalRef,
+    Connection, Detached, DetachedKind, DetachedReason, Device, DeviceKind, DeviceValue, Element,
+    Net, NetIdx, Node, NodeId, NodeIdx, NodeSource, ParamValue, PathId, PathNode, PathSegment,
+    Placement, Schematic, SchematicInstValue, SchematicInstance, SignalRef,
 };
-use schematic::{DeviceRecord, NodeOrigin, SchInstRecord, SchematicState};
+pub use symbol::{
+    Align, Bounds, BoxSide, Pin, PinLabel, Site, Symbol, SymbolItem, SymbolItemKind, SymbolText,
+    box_sides, box_symbol, device_symbol, generated_box, pin_label,
+};
+use symbol::{ItemRecord, PinRecord, SymbolState};
 
 use crate::ast::ListCompExpr;
 use crate::ast::annotated::AnnotatedAst;
@@ -134,6 +141,10 @@ pub(crate) const MAX_TEXT_LEN: usize = 512;
 /// the literals directly and must be updated alongside this constant.
 pub const RESERVED_CELL_FIELDS: [&str; 2] = ["x", "y"];
 
+/// The keywords that place an element in a schematic, which `device` does not
+/// pass through as parameters.
+pub const PLACEMENT_KEYWORDS: [&str; 4] = ["x", "y", "angle", "reflect"];
+
 /// Functions the compiler implements that every module calls by bare name.
 pub const BUILTINS: [&str; 17] = [
     "cons",
@@ -200,6 +211,15 @@ enum Builtin {
     Connect,
     Device,
     SchematicInst,
+    SymbolLine,
+    SymbolPolygon,
+    SymbolRect,
+    SymbolCircle,
+    SymbolArc,
+    SymbolText,
+    SymbolInstName,
+    SymbolParam,
+    SymbolPin,
 }
 
 impl Builtin {
@@ -229,26 +249,57 @@ impl Builtin {
 
     /// Whether this builtin implements a native item rather than a bare name.
     fn is_native(self) -> bool {
-        matches!(
-            self,
-            Self::Crect
-                | Self::Rect
-                | Self::Polygon
-                | Self::Path
-                | Self::Text
-                | Self::Dimension
-                | Self::Inst
-                | Self::Bbox
-                | Self::Signal
-                | Self::Connect
-                | Self::Device
-                | Self::SchematicInst
-        )
+        self.native().is_some()
     }
 
-    /// The builtin that implements a native item.
-    fn from_native(native: Native) -> Self {
-        match native {
+    /// The native item this builtin implements, if any.
+    fn native(self) -> Option<Native> {
+        Some(match self {
+            Self::Rect => Native::Rect,
+            Self::Crect => Native::Crect,
+            Self::Polygon => Native::Polygon,
+            Self::Path => Native::Path,
+            Self::Text => Native::Text,
+            Self::Dimension => Native::Dimension,
+            Self::Inst => Native::LayoutInst,
+            Self::Bbox => Native::Bbox,
+            Self::Signal => Native::Signal,
+            Self::Connect => Native::Connect,
+            Self::Device => Native::Device,
+            Self::SchematicInst => Native::SchematicInst,
+            Self::SymbolLine => Native::SymbolLine,
+            Self::SymbolPolygon => Native::SymbolPolygon,
+            Self::SymbolRect => Native::SymbolRect,
+            Self::SymbolCircle => Native::SymbolCircle,
+            Self::SymbolArc => Native::SymbolArc,
+            Self::SymbolText => Native::SymbolText,
+            Self::SymbolInstName => Native::SymbolInstName,
+            Self::SymbolParam => Native::SymbolParam,
+            Self::SymbolPin => Native::SymbolPin,
+            Self::Cons
+            | Self::Head
+            | Self::Tail
+            | Self::RangeFull
+            | Self::SeqLen
+            | Self::SeqConcat
+            | Self::SeqFlatten
+            | Self::SeqSum
+            | Self::SeqAny
+            | Self::SeqAll
+            | Self::MaxFloat
+            | Self::MinFloat
+            | Self::MaxInt
+            | Self::MinInt
+            | Self::MaxViaArray
+            | Self::Float
+            | Self::Eq => return None,
+        })
+    }
+
+    /// The builtin that implements a native item; `None` for a native type,
+    /// which is never called.
+    fn from_native(native: Native) -> Option<Self> {
+        Some(match native {
             Native::Rect => Self::Rect,
             Native::Crect => Self::Crect,
             Native::Polygon => Self::Polygon,
@@ -261,7 +312,17 @@ impl Builtin {
             Native::Connect => Self::Connect,
             Native::Device => Self::Device,
             Native::SchematicInst => Self::SchematicInst,
-        }
+            Native::DeviceTy => return None,
+            Native::SymbolLine => Self::SymbolLine,
+            Native::SymbolPolygon => Self::SymbolPolygon,
+            Native::SymbolRect => Self::SymbolRect,
+            Native::SymbolCircle => Self::SymbolCircle,
+            Native::SymbolArc => Self::SymbolArc,
+            Native::SymbolText => Self::SymbolText,
+            Native::SymbolInstName => Self::SymbolInstName,
+            Native::SymbolParam => Self::SymbolParam,
+            Native::SymbolPin => Self::SymbolPin,
+        })
     }
 }
 
@@ -281,10 +342,21 @@ pub enum Native {
     Connect,
     Device,
     SchematicInst,
+    /// The `Device` type, which is only a name.
+    DeviceTy,
+    SymbolLine,
+    SymbolPolygon,
+    SymbolRect,
+    SymbolCircle,
+    SymbolArc,
+    SymbolText,
+    SymbolInstName,
+    SymbolParam,
+    SymbolPin,
 }
 
 impl Native {
-    pub const ALL: [Native; 12] = [
+    pub const ALL: [Native; 22] = [
         Native::Rect,
         Native::Crect,
         Native::Polygon,
@@ -297,6 +369,16 @@ impl Native {
         Native::Connect,
         Native::Device,
         Native::SchematicInst,
+        Native::DeviceTy,
+        Native::SymbolLine,
+        Native::SymbolPolygon,
+        Native::SymbolRect,
+        Native::SymbolCircle,
+        Native::SymbolArc,
+        Native::SymbolText,
+        Native::SymbolInstName,
+        Native::SymbolParam,
+        Native::SymbolPin,
     ];
 
     /// The module the native is bound in.
@@ -310,9 +392,20 @@ impl Native {
             | Native::Dimension
             | Native::LayoutInst
             | Native::Bbox => &["std", "layout"],
-            Native::Signal | Native::Connect | Native::Device | Native::SchematicInst => {
-                &["std", "schematic"]
-            }
+            Native::Signal
+            | Native::Connect
+            | Native::Device
+            | Native::SchematicInst
+            | Native::DeviceTy => &["std", "schematic"],
+            Native::SymbolLine
+            | Native::SymbolPolygon
+            | Native::SymbolRect
+            | Native::SymbolCircle
+            | Native::SymbolArc
+            | Native::SymbolText
+            | Native::SymbolInstName
+            | Native::SymbolParam
+            | Native::SymbolPin => &["std", "symbol"],
         }
     }
 
@@ -331,6 +424,36 @@ impl Native {
             Native::Connect => "connect",
             Native::Device => "device",
             Native::SchematicInst => "inst",
+            Native::DeviceTy => "Device",
+            Native::SymbolLine => "line",
+            Native::SymbolPolygon => "polygon",
+            Native::SymbolRect => "rect",
+            Native::SymbolCircle => "circle",
+            Native::SymbolArc => "arc",
+            Native::SymbolText => "text",
+            Native::SymbolInstName => "inst_name",
+            Native::SymbolParam => "param",
+            Native::SymbolPin => "pin",
+        }
+    }
+
+    /// The keyword arguments of a call of this native that the GUI rewrites,
+    /// which have to be literals for the call to be editable.
+    pub fn rewritten_keywords(self) -> &'static [&'static str] {
+        match self {
+            Native::Signal => &["x", "y", "angle"],
+            Native::Device | Native::SchematicInst => &PLACEMENT_KEYWORDS,
+            Native::Connect => &["route"],
+            Native::SymbolLine => &[],
+            Native::SymbolPolygon => &["fill"],
+            Native::SymbolRect => &["x0", "y0", "x1", "y1", "fill"],
+            Native::SymbolCircle => &["x", "y", "r", "fill"],
+            Native::SymbolArc => &["x", "y", "r", "start", "end"],
+            Native::SymbolText | Native::SymbolInstName | Native::SymbolParam => {
+                &["x", "y", "size", "align"]
+            }
+            Native::SymbolPin => &["x", "y", "label"],
+            _ => &[],
         }
     }
 
@@ -681,6 +804,21 @@ pub fn compile(
     };
 
     execute_cell(&ast, input, config)
+}
+
+/// Compiles a cell of `ast` that has no layout, without a technology file or
+/// output checks.
+pub(crate) fn compile_without_tech(
+    ast: &WorkspaceParseAst,
+    input: CompileInput<'_>,
+) -> CompileOutput {
+    let Some((ast, static_output)) = static_compile(ast) else {
+        return CompileOutput::FatalParseErrors;
+    };
+    if !static_output.errors.is_empty() {
+        return CompileOutput::StaticErrors(static_output);
+    }
+    ExecPass::new(&ast, Technology::empty(), &[]).execute(input)
 }
 
 type ModDag<'a> = IndexMap<&'a ModPath, IndexMap<&'a ModPath, cfgrammar::Span>>;
@@ -1761,6 +1899,8 @@ pub enum Ty {
     SchematicInst(Arc<CellTy>),
     /// A signal of a cell's schematic, made by `std::schematic::Signal()`.
     Signal,
+    /// A device of a cell's schematic, made by `std::schematic::device()`.
+    Device,
     Nil,
     Fn(Box<FnTy>),
     /// A user-declared `enum`: the declaring enum and its type arguments.
@@ -2072,6 +2212,7 @@ pub(crate) fn subst(ty: &Ty, map: &HashMap<VarId, Ty>) -> Ty {
         | Ty::Point
         | Ty::String
         | Ty::Signal
+        | Ty::Device
         | Ty::Nil
         | Ty::Infer(_)
         | Ty::Native(_) => ty.clone(),
@@ -2302,6 +2443,7 @@ impl std::fmt::Display for Ty {
             Ty::Inst(cell) => write!(f, "Inst({})", cell.name),
             Ty::SchematicInst(cell) => write!(f, "SchematicInst({})", cell.name),
             Ty::Signal => write!(f, "Signal"),
+            Ty::Device => write!(f, "Device"),
             Ty::CellFn(cell_fn) => {
                 write!(f, "cell {}", cell_fn.cell.name)?;
                 fmt_params(f, &cell_fn.params)?;
@@ -2357,6 +2499,7 @@ impl Ty {
             | Ty::Cell(_)
             | Ty::SchematicInst(_)
             | Ty::Signal
+            | Ty::Device
             | Ty::Nil
             | Ty::Fn(_)
             | Ty::Enum(_)
@@ -2368,12 +2511,18 @@ impl Ty {
         }
     }
 
-    /// Whether a value of this type may be a signal or schematic instance,
-    /// which a binding's name can name.
+    /// Whether a value of this type may be a signal, schematic instance, or
+    /// device, which a binding's name can name.
     fn may_be_schematic_node(&self) -> bool {
         matches!(
             self,
-            Ty::Signal | Ty::SchematicInst(_) | Ty::Unknown | Ty::Any | Ty::Param(_) | Ty::Infer(_)
+            Ty::Signal
+                | Ty::SchematicInst(_)
+                | Ty::Device
+                | Ty::Unknown
+                | Ty::Any
+                | Ty::Param(_)
+                | Ty::Infer(_)
         )
     }
 
@@ -2617,11 +2766,63 @@ mod builtin_sig {
             ("construction", Ty::Bool),
         ])
     });
-    pub(super) static CONNECT: LazyLock<Signature> =
-        LazyLock::new(|| Signature::positional([Ty::Signal, Ty::Signal]));
+    /// The placement keywords of a schematic element.
+    fn placement() -> impl Iterator<Item = (&'static str, Ty)> {
+        [("x", Ty::Int), ("y", Ty::Int), ("angle", Ty::Int)].into_iter()
+    }
+    pub(super) static SIGNAL: LazyLock<Signature> =
+        LazyLock::new(|| Signature::default().keywords(placement()));
+    pub(super) static CONNECT: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::positional([Ty::Signal, Ty::Signal]).keywords([(
+            "route",
+            Ty::Seq(Box::new(Ty::Tuple(vec![Ty::Int, Ty::Int]))),
+        )])
+    });
     /// Like [`INST`], the cell is checked by `assert_ty_is_cell`.
-    pub(super) static SCHEMATIC_INST: LazyLock<Signature> =
-        LazyLock::new(|| Signature::positional([Ty::Any]));
+    pub(super) static SCHEMATIC_INST: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::positional([Ty::Any]).keywords(placement().chain([("reflect", Ty::Bool)]))
+    });
+    /// Symbol shape coordinates, in grid units.
+    fn symbol_points() -> Ty {
+        Ty::Seq(Box::new(Ty::Tuple(vec![Ty::Float, Ty::Float])))
+    }
+    pub(super) static SYMBOL_LINE: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([symbol_points()]));
+    pub(super) static SYMBOL_POLYGON: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([symbol_points()]).keywords([("fill", Ty::Bool)]));
+    pub(super) static SYMBOL_RECT: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::default().keywords([
+            ("x0", Ty::Float),
+            ("y0", Ty::Float),
+            ("x1", Ty::Float),
+            ("y1", Ty::Float),
+            ("fill", Ty::Bool),
+        ])
+    });
+    pub(super) static SYMBOL_CIRCLE: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::default().keywords([
+            ("x", Ty::Float),
+            ("y", Ty::Float),
+            ("r", Ty::Float),
+            ("fill", Ty::Bool),
+        ])
+    });
+    pub(super) static SYMBOL_ARC: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::default().keywords([
+            ("x", Ty::Float),
+            ("y", Ty::Float),
+            ("r", Ty::Float),
+            ("start", Ty::Float),
+            ("end", Ty::Float),
+        ])
+    });
+    pub(super) static SYMBOL_PIN: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::positional([Ty::Signal]).keywords([
+            ("x", Ty::Int),
+            ("y", Ty::Int),
+            ("label", Ty::Bool),
+        ])
+    });
     /// A builtin that takes no arguments, and the empty keyword set that
     /// builtins with variadic positional arguments check against.
     pub(super) static NONE: LazyLock<Signature> = LazyLock::new(Signature::default);
@@ -4102,6 +4303,10 @@ impl<'a> VarIdTyPass<'a> {
                         self.check_ty_arg_arity(name.span, "Signal", 0, args.len());
                         return Ty::Signal;
                     }
+                    Ty::Native(Native::DeviceTy) => {
+                        self.check_ty_arg_arity(name.span, "Device", 0, args.len());
+                        return Ty::Device;
+                    }
                     Ty::Native(_) => {
                         self.errors.push(StaticError {
                             span: self.span(name.span),
@@ -4830,11 +5035,11 @@ impl<'a> VarIdTyPass<'a> {
                 }
             }
             Native::Signal => {
-                self.typecheck_args(call_span, args, &builtin_sig::NONE);
+                self.typecheck_schematic_args(call_span, args, &builtin_sig::SIGNAL);
                 Ty::Signal
             }
             Native::Connect => {
-                self.typecheck_args(call_span, args, &builtin_sig::CONNECT);
+                self.typecheck_schematic_args(call_span, args, &builtin_sig::CONNECT);
                 Ty::Nil
             }
             Native::Device => {
@@ -4846,10 +5051,88 @@ impl<'a> VarIdTyPass<'a> {
                 let terminals = Ty::Seq(Box::new(Ty::Signal));
                 self.typecheck_posargs(call_span, &args.posargs, &[kind, terminals, Ty::String]);
                 self.typecheck_device_params(&args.kwargs);
+                Ty::Device
+            }
+            Native::DeviceTy => {
+                self.errors.push(StaticError {
+                    span: self.span(call_span),
+                    kind: StaticErrorKind::TypeNotValue {
+                        name: Native::DeviceTy.name().to_owned(),
+                    },
+                });
+                Ty::Unknown
+            }
+            Native::SymbolLine => {
+                self.typecheck_args(call_span, args, &builtin_sig::SYMBOL_LINE);
+                Ty::Nil
+            }
+            Native::SymbolPolygon => {
+                self.typecheck_args(call_span, args, &builtin_sig::SYMBOL_POLYGON);
+                Ty::Nil
+            }
+            Native::SymbolRect => {
+                self.typecheck_args(call_span, args, &builtin_sig::SYMBOL_RECT);
+                self.require_kwargs(call_span, args, &["x0", "y0", "x1", "y1"]);
+                Ty::Nil
+            }
+            Native::SymbolCircle => {
+                self.typecheck_args(call_span, args, &builtin_sig::SYMBOL_CIRCLE);
+                self.require_kwargs(call_span, args, &["x", "y", "r"]);
+                Ty::Nil
+            }
+            Native::SymbolArc => {
+                self.typecheck_args(call_span, args, &builtin_sig::SYMBOL_ARC);
+                self.require_kwargs(call_span, args, &["x", "y", "r", "start", "end"]);
+                Ty::Nil
+            }
+            Native::SymbolText => {
+                let sig = Signature::positional([Ty::String]).keywords(self.symbol_text_keywords());
+                self.typecheck_args(call_span, args, &sig);
+                self.require_kwargs(call_span, args, &["x", "y"]);
+                Ty::Nil
+            }
+            Native::SymbolInstName => {
+                let sig = Signature::default().keywords(self.symbol_text_keywords());
+                self.typecheck_args(call_span, args, &sig);
+                self.require_kwargs(call_span, args, &["x", "y"]);
+                Ty::Nil
+            }
+            Native::SymbolParam => {
+                let sig = Signature::positional([Ty::String, Ty::Any])
+                    .keywords(self.symbol_text_keywords());
+                self.typecheck_args(call_span, args, &sig);
+                if let Some(value) = args.posargs.get(1) {
+                    let ty = self.shallow(&value.ty());
+                    if !(matches!(ty, Ty::Float | Ty::Int | Ty::String | Ty::Infer(_))
+                        || ty.is_wildcard())
+                    {
+                        self.errors.push(StaticError {
+                            span: self.span(value.span()),
+                            kind: StaticErrorKind::InvalidParamValueType {
+                                found: self.display(&ty),
+                            },
+                        });
+                    }
+                }
+                self.require_kwargs(call_span, args, &["x", "y"]);
+                Ty::Nil
+            }
+            Native::SymbolPin => {
+                // Pins sit on the grid, so a `Float` coordinate is the
+                // grid-unit mistake that placement reports.
+                self.typecheck_posargs(call_span, &args.posargs, &builtin_sig::SYMBOL_PIN.args);
+                let kwargs = args
+                    .kwargs
+                    .iter()
+                    .filter(|kwarg| !self.report_grid_units(kwarg))
+                    .cloned()
+                    .collect_vec();
+                self.typecheck_kwargs(&kwargs, &builtin_sig::SYMBOL_PIN.kwargs);
+                self.require_kwargs(call_span, args, &["x", "y"]);
                 Ty::Nil
             }
             Native::SchematicInst => {
-                self.typecheck_args(call_span, args, &builtin_sig::SCHEMATIC_INST);
+                self.typecheck_schematic_args(call_span, args, &builtin_sig::SCHEMATIC_INST);
                 if let Some(ty) = args.posargs.first() {
                     self.assert_ty_is_cell(ty.span(), &ty.ty());
                     match self.shallow(&ty.ty()) {
@@ -4864,18 +5147,138 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
-    /// Checks the keyword arguments of `device`, which are the device's
-    /// parameters: any names, distinct regardless of case as in a netlist,
-    /// each a `Float`, `Int`, or `String`.
+    /// Reports each of `required` that `args` leaves out.
+    fn require_kwargs(
+        &mut self,
+        call_span: cfgrammar::Span,
+        args: &crate::ast::Args<Substr, VarIdTyMetadata>,
+        required: &[&str],
+    ) {
+        for name in required {
+            if !args.kwargs.iter().any(|kwarg| kwarg.name.name == *name) {
+                self.errors.push(StaticError {
+                    span: self.span(call_span),
+                    kind: StaticErrorKind::MissingKwArg {
+                        name: (*name).to_owned(),
+                    },
+                });
+            }
+        }
+    }
+
+    /// The keywords of the symbol text natives: a position, a size, and an
+    /// `std::symbol::Align`.
+    fn symbol_text_keywords(&self) -> Vec<(&'static str, Ty)> {
+        let module = vec!["std".to_owned(), "symbol".to_owned()];
+        let align = match self.module_item(&module, "Align") {
+            Some((_, ty @ Ty::Enum(_))) => ty,
+            _ => Ty::Unknown,
+        };
+        vec![
+            ("x", Ty::Float),
+            ("y", Ty::Float),
+            ("size", Ty::Float),
+            ("align", align),
+        ]
+    }
+
+    /// Checks a schematic call's arguments against `sig`, reporting `Float`
+    /// coordinates as grid units and an `x` without a `y` or the reverse.
+    fn typecheck_schematic_args(
+        &mut self,
+        call_span: cfgrammar::Span,
+        args: &crate::ast::Args<Substr, VarIdTyMetadata>,
+        sig: &Signature,
+    ) {
+        self.typecheck_posargs(call_span, &args.posargs, &sig.args);
+        let kwargs = args
+            .kwargs
+            .iter()
+            .filter(|kwarg| !self.report_grid_units(kwarg))
+            .cloned()
+            .collect_vec();
+        self.typecheck_kwargs(&kwargs, &sig.kwargs);
+        self.check_coordinate_pair(&args.kwargs);
+    }
+
+    /// Reports a placement or route keyword given `Float` coordinates, which
+    /// are grid units, returning whether it did.
+    fn report_grid_units(&mut self, kwarg: &KwArgValue<Substr, VarIdTyMetadata>) -> bool {
+        let name = kwarg.name.name.as_str();
+        let ty = self.shallow(&kwarg.value.ty());
+        let hint = match name {
+            "x" | "y" | "angle" if ty == Ty::Float => format!("{name}=0"),
+            "route" => {
+                let Ty::Seq(inner) = ty else {
+                    return false;
+                };
+                let Ty::Tuple(items) = self.shallow(&inner) else {
+                    return false;
+                };
+                if !items.iter().any(|item| self.shallow(item) == Ty::Float) {
+                    return false;
+                }
+                "route=[(0, 0)]".to_owned()
+            }
+            _ => return false,
+        };
+        self.errors.push(StaticError {
+            span: self.span(kwarg.value.span()),
+            kind: StaticErrorKind::GridUnits { hint },
+        });
+        true
+    }
+
+    /// Reports an `x` without a `y`, or a `y` without an `x`, among `kwargs`.
+    fn check_coordinate_pair(&mut self, kwargs: &[KwArgValue<Substr, VarIdTyMetadata>]) {
+        let find = |name: &str| kwargs.iter().find(|kwarg| kwarg.name.name == name);
+        let (given, missing) = match (find("x"), find("y")) {
+            (Some(x), None) => (x, "y"),
+            (None, Some(y)) => (y, "x"),
+            _ => return,
+        };
+        self.errors.push(StaticError {
+            span: self.span(given.name.span),
+            kind: StaticErrorKind::UnpairedCoordinate {
+                given: given.name.name.to_string(),
+                missing: missing.to_owned(),
+            },
+        });
+    }
+
+    /// Checks the keyword arguments of `device`: `x`, `y`, `angle`, and
+    /// `reflect` place the device, and every other name is a parameter, a
+    /// `Float`, `Int`, or `String`. Names are distinct regardless of case, as
+    /// in a netlist, so the placement names are reserved in every case.
     fn typecheck_device_params(&mut self, kwargs: &[KwArgValue<Substr, VarIdTyMetadata>]) {
         let mut seen = IndexSet::new();
         for kwarg in kwargs {
             let name = kwarg.name.name.as_str();
-            if !seen.insert(name.to_ascii_lowercase()) {
+            let lower = name.to_ascii_lowercase();
+            if !seen.insert(lower.clone()) {
                 self.errors.push(StaticError {
                     span: self.span(kwarg.name.span),
                     kind: StaticErrorKind::DuplicateKwArg,
                 });
+                continue;
+            }
+            let placement = match lower.as_str() {
+                "x" | "y" | "angle" => Some(Ty::Int),
+                "reflect" => Some(Ty::Bool),
+                _ => None,
+            };
+            if let Some(expected) = placement {
+                if name != lower {
+                    self.errors.push(StaticError {
+                        span: self.span(kwarg.name.span),
+                        kind: StaticErrorKind::ReservedDeviceParam {
+                            name: name.to_owned(),
+                            lower,
+                        },
+                    });
+                } else if !self.report_grid_units(kwarg) {
+                    self.assert_eq_ty(kwarg.value.span(), &kwarg.value.ty(), &expected);
+                }
                 continue;
             }
             let ty = self.shallow(&kwarg.value.ty());
@@ -4890,6 +5293,7 @@ impl<'a> VarIdTyPass<'a> {
                 });
             }
         }
+        self.check_coordinate_pair(kwargs);
     }
 
     /// The first signal or schematic instance a value of type `ty` can hold,
@@ -4903,7 +5307,7 @@ impl<'a> VarIdTyPass<'a> {
             found.map(|(ty, path)| (ty, format!("{segment}{path}")))
         };
         match ty {
-            Ty::Signal | Ty::SchematicInst(_) => Some((ty.clone(), String::new())),
+            Ty::Signal | Ty::SchematicInst(_) | Ty::Device => Some((ty.clone(), String::new())),
             Ty::Seq(inner) => prefixed("[]".to_owned(), self.signal_path(inner, visited)),
             Ty::Tuple(items) => items.iter().enumerate().find_map(|(index, item)| {
                 prefixed(format!(".{index}"), self.signal_path(item, visited))
@@ -5049,6 +5453,7 @@ fn mentions_param(ty: &Ty, id: VarId) -> bool {
         | Ty::Point
         | Ty::String
         | Ty::Signal
+        | Ty::Device
         | Ty::Nil
         | Ty::Infer(_)
         | Ty::Native(_) => false,
@@ -5130,10 +5535,12 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             // A native is not a value; only a call reaches it, through
             // `dispatch_call_expr`.
             Some((_, Ty::Native(native))) => {
+                let name = native.name().to_owned();
                 self.errors.push(StaticError {
                     span: self.span(input.span),
-                    kind: StaticErrorKind::NativeNotCallable {
-                        name: native.name().to_owned(),
+                    kind: match native {
+                        Native::DeviceTy => StaticErrorKind::TypeNotValue { name },
+                        _ => StaticErrorKind::NativeNotCallable { name },
                     },
                 });
                 (None, Ty::Unknown)
@@ -5833,6 +6240,11 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             Ty::Point => match field.name.as_str() {
                 "x" | "y" => Ty::Float,
                 _ => self.no_field_on_ty(field, Ty::Point),
+            },
+            Ty::Device => match field.name.as_str() {
+                "terminals" => Ty::Seq(Box::new(Ty::Signal)),
+                name if DeviceKind::TERMINAL_FIELDS.contains(&name) => Ty::Signal,
+                _ => self.no_field_on_ty(field, Ty::Device),
             },
             // A schematic instance has no position.
             Ty::SchematicInst(_) if RESERVED_CELL_FIELDS.contains(&field.name.as_str()) => {
@@ -7588,6 +8000,31 @@ mod module_prefix_tests {
     }
 }
 
+/// Truncates toward zero, taking a value within float error of an integer as
+/// that integer.
+fn truncate_to_int(value: f64) -> i64 {
+    let nearest = value.round();
+    if (value - nearest).abs() <= 1e-9 * nearest.abs().max(1.) {
+        nearest as i64
+    } else {
+        value.trunc() as i64
+    }
+}
+
+#[cfg(test)]
+mod int_cast_tests {
+    use super::truncate_to_int;
+
+    #[test]
+    fn truncates_toward_zero_but_absorbs_float_error() {
+        assert_eq!(truncate_to_int(2.44), 2);
+        assert_eq!(truncate_to_int(19.38), 19);
+        assert_eq!(truncate_to_int(-2.7), -2);
+        assert_eq!(truncate_to_int(2.9999999999999996), 3);
+        assert_eq!(truncate_to_int(0.1 * 3. / 0.1), 3);
+    }
+}
+
 #[cfg(test)]
 mod size_tests {
     use super::{Object, Value};
@@ -8069,6 +8506,8 @@ struct CallSite {
     order: u64,
     /// The call's position in the chain; 0 for the first.
     step: u64,
+    /// The kind of the chain's first scope.
+    kind: ScopeKindId,
 }
 
 /// Dense, chunked storage for evaluator values.
@@ -8342,6 +8781,25 @@ struct ScopeMetadata {
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 struct ScopeMetadataId(u32);
 
+/// What an [`ExecScope`] runs.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum ScopeKind {
+    /// The cell body.
+    Root,
+    /// An `if` branch, a block, or a parameter default, which runs at most
+    /// once per run of its parent.
+    Body,
+    /// A function body, with the call that ran it or, in a chain of tail
+    /// calls, the chain's first call.
+    Fn { call: Span },
+    /// The body of a loop or comprehension.
+    Loop,
+}
+
+/// An index into a cell's interned [`ScopeKind`]s; the root's is 0.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct ScopeKindId(u32);
+
 /// A place in the AST that creates execution scopes, plus the dynamic part of
 /// their label. Every scope created at one site has the same name and span.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -8350,6 +8808,8 @@ struct ScopeSite {
     /// Address of the AST node that creates the scope.
     node: usize,
     index: u64,
+    /// For a tail call, the kind of its chain's first scope.
+    chain: ScopeKindId,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -8374,6 +8834,7 @@ impl ScopeSite {
             kind,
             node: std::ptr::from_ref(node) as usize,
             index,
+            chain: ScopeKindId(0),
         }
     }
 
@@ -8499,6 +8960,7 @@ struct ExecScope {
     /// this cell. Function and control-flow scopes repeat these values very
     /// heavily across invocations.
     metadata: ScopeMetadataId,
+    kind: ScopeKindId,
     /// Bindings are appended in source order and sequence numbers are unique
     /// within a scope. A hash table per dynamic invocation wastes substantial
     /// memory for the overwhelmingly common empty or one-binding case.
@@ -8552,8 +9014,9 @@ struct CellState {
     root_scope: ScopeId,
     scopes: FxIndexMap<ScopeId, ExecScope>,
     scope_metadata: FxIndexSet<ScopeMetadata>,
-    /// The label interned for each scope site seen in this cell.
-    scope_site_metadata: FxHashMap<ScopeSite, ScopeMetadataId>,
+    scope_kinds: FxIndexSet<ScopeKind>,
+    /// The label and kind interned for each scope site seen in this cell.
+    scope_site_metadata: FxHashMap<ScopeSite, (ScopeMetadataId, ScopeKindId)>,
     /// Without debug information, the one scope of each site.
     site_scopes: FxHashMap<ScopeSite, ScopeId>,
     fallback_constraints: BinaryHeap<FallbackConstraint>,
@@ -8585,6 +9048,9 @@ struct CellState {
     /// two apart once the emission list has been resolved to object IDs.
     proxy_objects: FxIndexSet<ObjectId>,
     schematic: SchematicState,
+    symbol: SymbolState,
+    /// The `let` statement that made each top-level binding.
+    field_spans: IndexMap<String, Span>,
 }
 
 impl CellState {
@@ -8862,7 +9328,7 @@ impl<'a> ExecPass<'a> {
             natives: workspace
                 .natives
                 .iter()
-                .map(|(id, native)| (*id, Builtin::from_native(*native)))
+                .filter_map(|(id, native)| Some((*id, Builtin::from_native(*native)?)))
                 .collect(),
             tech,
             gds_imports,
@@ -9016,6 +9482,404 @@ impl<'a> ExecPass<'a> {
                 Typed::Invalid
             }
         }
+    }
+
+    /// Whether the GUI may rewrite a call at `loc`: it is in the cell's own
+    /// body, outside every function and loop, and not in `std`.
+    fn editable_site(&self, loc: &DynLoc) -> bool {
+        let state = self.cell_state(loc.cell);
+        if crate::parse::virtual_source(&state.scope_span(loc.scope).path).is_some() {
+            return false;
+        }
+        let mut scope = &state.scopes[&loc.scope];
+        loop {
+            match state.scope_kinds[scope.kind.0 as usize] {
+                ScopeKind::Fn { .. } | ScopeKind::Loop => return false,
+                ScopeKind::Root => return true,
+                ScopeKind::Body => {}
+            }
+            let parent = scope
+                .parent
+                .expect("a scope that is not the root has a parent");
+            scope = &state.scopes[&parent];
+        }
+    }
+
+    /// Reads the `Int` keyword `name` of `call`, registering `dependent` if
+    /// it is not ready. `Ready(None)` when the call has no such keyword.
+    fn typed_int_kwarg(
+        &mut self,
+        dependent: ValueId,
+        loc: &DynLoc,
+        call: &PartialCallExpr<'a>,
+        name: &str,
+    ) -> Typed<Option<i64>> {
+        let Some((kwarg, arg)) = find_kwarg(call, name) else {
+            return Typed::Ready(None);
+        };
+        let span = self.span(loc, kwarg.value.span());
+        match self.typed_int(arg, dependent, loc.cell, &span) {
+            Typed::Ready(value) => Typed::Ready(Some(value)),
+            Typed::Pending => Typed::Pending,
+            Typed::Invalid => Typed::Invalid,
+        }
+    }
+
+    /// Reads the `Bool` keyword `name` of `call`, registering `dependent` if
+    /// it is not ready. `Ready(None)` when the call has no such keyword.
+    fn typed_bool_kwarg(
+        &mut self,
+        dependent: ValueId,
+        loc: &DynLoc,
+        call: &PartialCallExpr<'a>,
+        name: &str,
+    ) -> Typed<Option<bool>> {
+        let Some((kwarg, arg)) = find_kwarg(call, name) else {
+            return Typed::Ready(None);
+        };
+        let span = self.span(loc, kwarg.value.span());
+        match self.typed_bool(arg, dependent, loc.cell, &span) {
+            Typed::Ready(value) => Typed::Ready(Some(value)),
+            Typed::Pending => Typed::Pending,
+            Typed::Invalid => Typed::Invalid,
+        }
+    }
+
+    /// Reads the placement keywords of the schematic call `call`, whose value
+    /// is `vid`. `Ready(None)` when the call has none.
+    fn read_placement(
+        &mut self,
+        vid: ValueId,
+        loc: &DynLoc,
+        call: &PartialCallExpr<'a>,
+    ) -> Typed<Option<Placement>> {
+        let x = self.typed_int_kwarg(vid, loc, call, "x");
+        let y = self.typed_int_kwarg(vid, loc, call, "y");
+        let angle = self.typed_int_kwarg(vid, loc, call, "angle");
+        let reflect = self.typed_bool_kwarg(vid, loc, call, "reflect");
+        let (x, y, angle, reflect) = match (x, y, angle, reflect) {
+            (Typed::Ready(x), Typed::Ready(y), Typed::Ready(angle), Typed::Ready(reflect)) => {
+                (x, y, angle, reflect)
+            }
+            (Typed::Invalid, ..)
+            | (_, Typed::Invalid, ..)
+            | (_, _, Typed::Invalid, _)
+            | (_, _, _, Typed::Invalid) => return Typed::Invalid,
+            _ => return Typed::Pending,
+        };
+        if x.is_none() && y.is_none() && angle.is_none() && reflect.is_none() {
+            return Typed::Ready(None);
+        }
+        let angle = match angle {
+            None => Rotation::R0,
+            Some(degrees) => match degrees.rem_euclid(360) {
+                0 => Rotation::R0,
+                90 => Rotation::R90,
+                180 => Rotation::R180,
+                270 => Rotation::R270,
+                _ => {
+                    let (kwarg, _) = find_kwarg(call, "angle").expect("the angle was read");
+                    self.errors.push(ExecError {
+                        span: Some(self.span(loc, kwarg.value.span())),
+                        cell: loc.cell,
+                        kind: ExecErrorKind::InvalidRotation,
+                    });
+                    Rotation::R0
+                }
+            },
+        };
+        Typed::Ready(Some(Placement {
+            // A lone `x` or `y` is a static error.
+            position: x.zip(y),
+            angle,
+            reflect: reflect.unwrap_or(false),
+        }))
+    }
+
+    /// Reads the `route` keyword of the `connect` call `call`, whose value is
+    /// `vid`. `Ready(None)` when the call has none.
+    fn read_route(
+        &mut self,
+        vid: ValueId,
+        loc: &DynLoc,
+        call: &PartialCallExpr<'a>,
+    ) -> Typed<Option<Vec<(i64, i64)>>> {
+        let Some((kwarg, arg)) = find_kwarg(call, "route") else {
+            return Typed::Ready(None);
+        };
+        let Some(value) = self.values[&arg].get_ready() else {
+            self.add_value_dependent(arg, vid);
+            return Typed::Pending;
+        };
+        let corners = match value {
+            Value::Seq(items) => items
+                .iter()
+                .map(|item| match item {
+                    Value::Tuple(point) => match &point[..] {
+                        [Value::Int(x), Value::Int(y)] => Some((*x, *y)),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>(),
+            _ => None,
+        };
+        match corners {
+            Some(route) => Typed::Ready(Some(route)),
+            None => {
+                let span = self.span(loc, kwarg.value.span());
+                self.invalid_type(loc.cell, &span);
+                Typed::Invalid
+            }
+        }
+    }
+
+    /// Reads `arg` as a solved, finite `Float`, registering `dependent` on the
+    /// value or on the variables it waits for.
+    fn typed_float(
+        &mut self,
+        arg: ValueId,
+        dependent: ValueId,
+        cell_id: CellId,
+        span: &Span,
+    ) -> Typed<f64> {
+        let Some(value) = self.values[&arg].get_ready() else {
+            self.add_value_dependent(arg, dependent);
+            return Typed::Pending;
+        };
+        let Value::Linear(expr) = value else {
+            self.invalid_type(cell_id, span);
+            return Typed::Invalid;
+        };
+        let expr = expr.clone();
+        match self.cell_state(cell_id).solver.eval_expr_exact(&expr) {
+            Some(value) if value.is_finite() => Typed::Ready(value),
+            Some(_) => {
+                self.errors.push(ExecError {
+                    span: Some(span.clone()),
+                    cell: cell_id,
+                    kind: ExecErrorKind::InvalidSymbol("the value is not a finite number".into()),
+                });
+                Typed::Invalid
+            }
+            None => {
+                for (_, var) in expr.coeffs {
+                    self.add_var_dependent(cell_id, var, dependent);
+                }
+                Typed::Pending
+            }
+        }
+    }
+
+    /// Reads the `Float` keyword `name` of `call` with [`Self::typed_float`].
+    /// `Ready(None)` when the call has no such keyword.
+    fn typed_float_kwarg(
+        &mut self,
+        dependent: ValueId,
+        loc: &DynLoc,
+        call: &PartialCallExpr<'a>,
+        name: &str,
+    ) -> Typed<Option<f64>> {
+        let Some((kwarg, arg)) = find_kwarg(call, name) else {
+            return Typed::Ready(None);
+        };
+        let span = self.span(loc, kwarg.value.span());
+        match self.typed_float(arg, dependent, loc.cell, &span) {
+            Typed::Ready(value) => Typed::Ready(Some(value)),
+            Typed::Pending => Typed::Pending,
+            Typed::Invalid => Typed::Invalid,
+        }
+    }
+
+    /// Reads `arg` as a list of solved points, registering `dependent` on
+    /// whatever is not ready.
+    fn typed_points(
+        &mut self,
+        arg: ValueId,
+        dependent: ValueId,
+        cell_id: CellId,
+        span: &Span,
+    ) -> Typed<Vec<(f64, f64)>> {
+        let Some(value) = self.values[&arg].get_ready() else {
+            self.add_value_dependent(arg, dependent);
+            return Typed::Pending;
+        };
+        let Value::Seq(items) = value else {
+            self.invalid_type(cell_id, span);
+            return Typed::Invalid;
+        };
+        let mut exprs = Vec::with_capacity(items.len());
+        for item in items.iter() {
+            match item {
+                Value::Tuple(point) => match &point[..] {
+                    [Value::Linear(x), Value::Linear(y)] => exprs.push((x.clone(), y.clone())),
+                    _ => {
+                        self.invalid_type(cell_id, span);
+                        return Typed::Invalid;
+                    }
+                },
+                _ => {
+                    self.invalid_type(cell_id, span);
+                    return Typed::Invalid;
+                }
+            }
+        }
+        let mut points = Vec::with_capacity(exprs.len());
+        let mut pending = false;
+        for (x, y) in exprs {
+            let mut coords = [0.; 2];
+            for (coord, expr) in coords.iter_mut().zip([x, y]) {
+                match self.cell_state(cell_id).solver.eval_expr_exact(&expr) {
+                    Some(value) if value.is_finite() => *coord = value,
+                    Some(_) => {
+                        self.errors.push(ExecError {
+                            span: Some(span.clone()),
+                            cell: cell_id,
+                            kind: ExecErrorKind::InvalidSymbol(
+                                "a point is not a finite number".into(),
+                            ),
+                        });
+                        return Typed::Invalid;
+                    }
+                    None => {
+                        for (_, var) in expr.coeffs {
+                            self.add_var_dependent(cell_id, var, dependent);
+                        }
+                        pending = true;
+                    }
+                }
+            }
+            points.push((coords[0], coords[1]));
+        }
+        if pending {
+            Typed::Pending
+        } else {
+            Typed::Ready(points)
+        }
+    }
+
+    /// Reads the `align` keyword of `call`. `Ready(None)` when it has none.
+    fn typed_align_kwarg(
+        &mut self,
+        dependent: ValueId,
+        loc: &DynLoc,
+        call: &PartialCallExpr<'a>,
+    ) -> Typed<Option<Align>> {
+        let Some((kwarg, arg)) = find_kwarg(call, "align") else {
+            return Typed::Ready(None);
+        };
+        let Some(value) = self.values[&arg].get_ready() else {
+            self.add_value_dependent(arg, dependent);
+            return Typed::Pending;
+        };
+        let align = match value {
+            Value::Enum(value) if value.payload.is_empty() => Align::from_variant(&value.variant),
+            _ => None,
+        };
+        match align {
+            Some(align) => Typed::Ready(Some(align)),
+            None => {
+                let span = self.span(loc, kwarg.value.span());
+                self.invalid_type(loc.cell, &span);
+                Typed::Invalid
+            }
+        }
+    }
+
+    /// Reads `arg` as a device parameter value: a solved `Float`, an `Int`,
+    /// or a `String`.
+    fn typed_param(
+        &mut self,
+        arg: ValueId,
+        dependent: ValueId,
+        cell_id: CellId,
+        span: &Span,
+    ) -> Typed<ParamValue> {
+        let Some(value) = self.values[&arg].get_ready() else {
+            self.add_value_dependent(arg, dependent);
+            return Typed::Pending;
+        };
+        match value {
+            Value::Int(i) => Typed::Ready(ParamValue::Int(*i)),
+            Value::String(s) => Typed::Ready(ParamValue::String(s.clone())),
+            Value::Linear(_) => match self.typed_float(arg, dependent, cell_id, span) {
+                Typed::Ready(f) => Typed::Ready(ParamValue::Float(f)),
+                Typed::Pending => Typed::Pending,
+                Typed::Invalid => Typed::Invalid,
+            },
+            _ => {
+                self.invalid_type(cell_id, span);
+                Typed::Invalid
+            }
+        }
+    }
+
+    /// The call in the cell's body that a call at `loc` ran under, when it
+    /// ran inside a function.
+    fn origin(&self, loc: &DynLoc) -> Option<Span> {
+        let state = self.cell_state(loc.cell);
+        let mut scope = &state.scopes[&loc.scope];
+        let mut origin = None;
+        loop {
+            if let ScopeKind::Fn { call } = &state.scope_kinds[scope.kind.0 as usize] {
+                origin = Some(call.clone());
+            }
+            match scope.parent {
+                Some(parent) => scope = &state.scopes[&parent],
+                None => return origin,
+            }
+        }
+    }
+
+    /// Whether the GUI may rewrite the call `call` of `native` at `loc`: it
+    /// is an editable site whose rewritten keywords are literals.
+    fn editable_call(&self, loc: &DynLoc, native: Native, call: &PartialCallExpr<'a>) -> bool {
+        self.editable_site(loc) && literal_keywords(call, native)
+    }
+
+    /// The site of the `std::symbol` call `call` of `native` at `loc`.
+    fn symbol_site(&self, loc: &DynLoc, native: Native, call: &PartialCallExpr<'a>) -> Site {
+        Site {
+            span: self.span(loc, call.expr.span),
+            origin: self.origin(loc),
+            editable: self.editable_call(loc, native, call),
+        }
+    }
+
+    /// Records the symbol item `kind` drawn by the call `call` of `native`
+    /// at `loc`, whose value is `vid`.
+    fn add_symbol_item(
+        &mut self,
+        vid: ValueId,
+        loc: &DynLoc,
+        native: Native,
+        call: &PartialCallExpr<'a>,
+        kind: SymbolItemKind,
+    ) {
+        let site = self.symbol_site(loc, native, call);
+        self.cell_state_mut(loc.cell).symbol.add_item(ItemRecord {
+            order: vid,
+            kind,
+            site,
+        });
+    }
+
+    /// Reports that the symbol call `call` cannot be drawn because of `what`,
+    /// and poisons its value `vid`.
+    fn invalid_symbol(
+        &mut self,
+        cell_id: CellId,
+        vid: ValueId,
+        loc: &DynLoc,
+        call: &PartialCallExpr<'a>,
+        what: &str,
+    ) -> Result<bool, ()> {
+        self.errors.push(ExecError {
+            span: Some(self.span(loc, call.expr.span)),
+            cell: cell_id,
+            kind: ExecErrorKind::InvalidSymbol(what.to_owned()),
+        });
+        self.poison(vid)
     }
 
     pub(crate) fn lookup(&self, mut frame: FrameId, var: VarId) -> Option<ValueId> {
@@ -9486,6 +10350,7 @@ impl<'a> ExecPass<'a> {
             parent: None,
             static_parent: None,
             metadata: ScopeMetadataId(0),
+            kind: ScopeKindId(0),
             bindings: Default::default(),
         };
 
@@ -9524,6 +10389,7 @@ impl<'a> ExecPass<'a> {
                         deferred: Worklist::new(values_start),
                         scopes: FxIndexMap::from_iter([(root_scope_id, root_scope)]),
                         scope_metadata: FxIndexSet::from_iter([root_scope_metadata]),
+                        scope_kinds: FxIndexSet::from_iter([ScopeKind::Root]),
                         scope_site_metadata: FxHashMap::default(),
                         site_scopes: FxHashMap::default(),
                         fallback_constraints: Default::default(),
@@ -9538,6 +10404,8 @@ impl<'a> ExecPass<'a> {
                         var_dependents: FxIndexMap::default(),
                         proxy_objects: FxIndexSet::default(),
                         schematic: SchematicState::default(),
+                        symbol: SymbolState::default(),
+                        field_spans: IndexMap::new(),
                     }
                 )
                 .is_none()
@@ -10192,6 +11060,7 @@ impl<'a> ExecPass<'a> {
                     unsolved_vars: IndexSet::new(),
                     inconsistent_constraints: IndexSet::new(),
                     schematic: Schematic::default(),
+                    symbol: None,
                 }),
             );
         }
@@ -10457,6 +11326,7 @@ impl<'a> ExecPass<'a> {
                 Default::default(),
             ),
             schematic: Schematic::default(),
+            symbol: None,
         };
         if debug_info {
             for (id, scope) in state.scopes.iter() {
@@ -10551,6 +11421,15 @@ impl<'a> ExecPass<'a> {
             })
             .collect_vec();
         let (schematic, nets) = state.schematic.emit(cell, &fields, &self.compiled_cells);
+        // Reported after the objects' errors, once `emit_obj` is done.
+        let mut symbol_errors = Vec::new();
+        ccell.symbol = state.symbol.emit(
+            cell,
+            &schematic,
+            &nets,
+            &state.field_spans,
+            &mut symbol_errors,
+        );
         ccell.schematic = schematic;
         for (name, value, public) in &fields {
             if !public {
@@ -10615,6 +11494,7 @@ impl<'a> ExecPass<'a> {
         if !debug_info {
             ccell.objects.shrink_to_fit();
         }
+        self.errors.append(&mut symbol_errors);
 
         mark_emitted_proxies_as_layout(&mut ccell, &state.proxy_objects, &emitted);
 
@@ -10904,6 +11784,9 @@ impl<'a> ExecPass<'a> {
                 let field = top_level.then_some(binding.public.is_some());
                 let (id, ty) = &binding.metadata;
                 self.bind_let(loc, *id, ty, &binding.name.name, value, field);
+                if top_level {
+                    self.record_field_span(loc, &binding.name.name, binding.span);
+                }
                 loc.seq_num.next()
             }
             Statement::LetPattern(binding) => {
@@ -10931,6 +11814,9 @@ impl<'a> ExecPass<'a> {
                         }))
                     });
                     self.bind_let(loc, metadata.0, &metadata.1, &name.name, element, public);
+                    if top_level {
+                        self.record_field_span(loc, &name.name, binding.span);
+                    }
                     seq_num = seq_num.next();
                 }
                 seq_num
@@ -10944,6 +11830,15 @@ impl<'a> ExecPass<'a> {
                 loc.seq_num
             }
         }
+    }
+
+    /// Records the `let` statement at `span` that made the top-level binding
+    /// `name`, where a diagnostic about the field points.
+    fn record_field_span(&mut self, loc: DynLoc, name: &str, span: cfgrammar::Span) {
+        let span = self.span(&loc, span);
+        self.cell_state_mut(loc.cell)
+            .field_spans
+            .insert(name.to_owned(), span);
     }
 
     /// Binds the `let` name `name`, with id `id` and type `ty`, to `value` at
@@ -10994,15 +11889,15 @@ impl<'a> ExecPass<'a> {
 
     /// Create a new execution scope.
     ///
-    /// parent is the dynamic parent scope. `label` supplies the name and span
-    /// the first time `site` creates a scope in this cell.
+    /// parent is the dynamic parent scope. `label` supplies the name, span,
+    /// and kind the first time `site` creates a scope in this cell.
     fn create_exec_scope(
         &mut self,
         cell_id: CellId,
         parent: ScopeId,
         static_parent: Option<(ScopeId, SeqNum)>,
         site: ScopeSite,
-        label: impl FnOnce(&Self) -> (String, Span),
+        label: impl FnOnce(&Self) -> (String, Span, ScopeKind),
     ) -> ScopeId {
         // Without debug information, every scope a site creates is one scope,
         // which still names the site's source for diagnostics.
@@ -11020,18 +11915,20 @@ impl<'a> ExecPass<'a> {
             .scope_site_metadata
             .get(&site)
             .copied();
-        let metadata = match cached {
-            Some(metadata) => metadata,
+        let (metadata, kind) = match cached {
+            Some(cached) => cached,
             None => {
-                let (name, span) = label(self);
+                let (name, span, kind) = label(self);
                 let state = self.cell_state_mut(cell_id);
                 let (index, _) = state.scope_metadata.insert_full(ScopeMetadata {
                     name: name.into(),
                     span,
                 });
                 let metadata = ScopeMetadataId(index.try_into().expect("too many scope labels"));
-                state.scope_site_metadata.insert(site, metadata);
-                metadata
+                let (index, _) = state.scope_kinds.insert_full(kind);
+                let kind = ScopeKindId(index.try_into().expect("too many scope kinds"));
+                state.scope_site_metadata.insert(site, (metadata, kind));
+                (metadata, kind)
             }
         };
         let debug_info = self.debug_info;
@@ -11042,7 +11939,10 @@ impl<'a> ExecPass<'a> {
         } else {
             let id = ScopeId::semantic(
                 None,
-                &format!("{:?} {} {}", site.kind, site.node, site.index),
+                &format!(
+                    "{:?} {} {} {}",
+                    site.kind, site.node, site.index, site.chain.0
+                ),
             );
             state.site_scopes.insert(site, id);
             id
@@ -11057,6 +11957,7 @@ impl<'a> ExecPass<'a> {
                 parent: Some(parent),
                 static_parent,
                 metadata,
+                kind,
                 bindings: Default::default(),
             },
         );
@@ -11071,7 +11972,7 @@ impl<'a> ExecPass<'a> {
         &mut self,
         loc: DynLoc,
         site: ScopeSite,
-        label: impl FnOnce(&Self) -> (String, Span),
+        label: impl FnOnce(&Self) -> (String, Span, ScopeKind),
     ) -> ScopeId {
         self.create_exec_scope(
             loc.cell,
@@ -11195,6 +12096,7 @@ impl<'a> ExecPass<'a> {
                                         path: path.clone(),
                                         span: default.span(),
                                     },
+                                    ScopeKind::Body,
                                 )
                             },
                         );
@@ -11436,6 +12338,7 @@ impl<'a> ExecPass<'a> {
                                     parent: loc.scope,
                                     order: c.scope_order,
                                     step: 0,
+                                    kind: ScopeKindId(0),
                                 },
                             };
                             let site = if call.step == 0 {
@@ -11445,20 +12348,33 @@ impl<'a> ExecPass<'a> {
                                     std::ptr::from_ref(val) as u64,
                                 )
                             } else {
-                                ScopeSite::new(
-                                    ScopeSiteKind::TailCall,
-                                    c,
-                                    (call.order << 32) | call.step,
-                                )
+                                ScopeSite {
+                                    chain: call.kind,
+                                    ..ScopeSite::new(
+                                        ScopeSiteKind::TailCall,
+                                        c,
+                                        (call.order << 32) | call.step,
+                                    )
+                                }
                             };
                             let scope =
-                                self.create_exec_scope(loc.cell, call.parent, None, site, |_| {
+                                self.create_exec_scope(loc.cell, call.parent, None, site, |this| {
                                     let path =
                                         c.func.path.iter().map(|ident| &ident.name).join("::");
-                                    let name = if call.step == 0 {
-                                        format!("{} fn {path}", call.order)
+                                    let (name, kind) = if call.step == 0 {
+                                        (
+                                            format!("{} fn {path}", call.order),
+                                            ScopeKind::Fn {
+                                                call: this.span(&loc, c.span),
+                                            },
+                                        )
                                     } else {
-                                        format!("{} fn {path}[{}]", call.order, call.step)
+                                        (
+                                            format!("{} fn {path}[{}]", call.order, call.step),
+                                            this.cell_state(loc.cell).scope_kinds
+                                                [call.kind.0 as usize]
+                                                .clone(),
+                                        )
                                     };
                                     (
                                         name,
@@ -11466,8 +12382,13 @@ impl<'a> ExecPass<'a> {
                                             path: val.metadata.0.clone(),
                                             span: val.scope.span,
                                         },
+                                        kind,
                                     )
                                 });
+                            let call = CallSite {
+                                kind: self.cell_state(loc.cell).scopes[&scope].kind,
+                                ..call
+                            };
                             let fid = self.new_call_frame(Some(call));
                             // A `fn` body is inlined here and now, unlike an
                             // `if`/`match` branch, so a recursive call that is
@@ -11574,7 +12495,13 @@ impl<'a> ExecPass<'a> {
                 let scope = self.create_exec_scope_at_loc(
                     loc,
                     ScopeSite::new(ScopeSiteKind::Block, &**s, 0),
-                    |this| (format!("{} block", s.scope_order), this.span(&loc, s.span)),
+                    |this| {
+                        (
+                            format!("{} block", s.scope_order),
+                            this.span(&loc, s.span),
+                            ScopeKind::Body,
+                        )
+                    },
                 );
                 self.visit_scope_expr_inner(loc.cell, loc.frame, scope, s)
             }
@@ -12070,7 +12997,7 @@ impl<'a> ExecPass<'a> {
             Value::Poison => return Err(()),
             // A cell parameter cannot hold these, which the type checker
             // rejects unless the value arrived as `Any`.
-            Value::Signal(_) | Value::SchematicInst(_) => {
+            Value::Signal(_) | Value::SchematicInst(_) | Value::Device(_) => {
                 self.errors.push(ExecError {
                     span: Some(span.clone()),
                     cell: cell_id,
@@ -12267,23 +13194,9 @@ impl<'a> ExecPass<'a> {
             },
             PartialEvalState::UnaryOp(e) => e.expr.span,
             PartialEvalState::Call(call) if call.builtin.is_some_and(Builtin::is_native) => {
-                let posargs = call
-                    .state
-                    .posargs
-                    .iter()
-                    .zip(&call.expr.args.posargs)
-                    .map(|(arg, expr)| (*arg, expr.span()));
-                let kwargs = call
-                    .state
-                    .kwargs
-                    .iter()
-                    .zip(&call.expr.args.kwargs)
-                    .map(|(arg, kwarg)| (*arg, kwarg.value.span()));
-                posargs
-                    .chain(kwargs)
-                    .find(|(arg, _)| *arg == input)
-                    .map_or(call.expr.span, |(_, span)| span)
+                argument_span(call, input)
             }
+            PartialEvalState::DeviceParams(e) => argument_span(&e.call, input),
             PartialEvalState::Call(e) => e.expr.span,
             PartialEvalState::FieldAccess(e) => e.expr.span,
             PartialEvalState::IndexFieldAccess(e) => e.expr.span,
@@ -12317,15 +13230,17 @@ impl<'a> ExecPass<'a> {
         }
     }
 
-    /// Validates a ready `device` call at `loc`, whose value is `vid`, into a
-    /// record. `Ok(None)` means a parameter waits on the solver; `Err` means a
-    /// diagnostic has been recorded.
-    fn device_record(
+    /// Creates the handle of the `device` call at `loc`, whose value is `vid`,
+    /// once its kind, terminals, and placement are ready: the device's record
+    /// and its terminal nodes, each joined to the signal passed for it. The
+    /// parameters are read by [`Self::device_params`] once they are ready.
+    /// `Err` means a diagnostic has been recorded.
+    fn device_handle(
         &mut self,
         vid: ValueId,
         loc: &DynLoc,
         call: &PartialCallExpr<'a>,
-    ) -> Result<Option<DeviceRecord>, ()> {
+    ) -> Result<(), ()> {
         let cell_id = loc.cell;
         let arg = |this: &Self, index: usize| {
             this.values[&call.state.posargs[index]]
@@ -12351,7 +13266,7 @@ impl<'a> ExecPass<'a> {
             self.invalid_type(cell_id, &arg_span(self, 1));
             return Err(());
         };
-        let mut terminals = Vec::with_capacity(items.len());
+        let mut attached = Vec::with_capacity(items.len());
         for item in items.iter() {
             match item {
                 Value::Detached(detached) => {
@@ -12359,7 +13274,7 @@ impl<'a> ExecPass<'a> {
                     return Err(());
                 }
                 item => match self.local_node(cell_id, item) {
-                    Some(node) => terminals.push(node),
+                    Some(node) => attached.push(node),
                     None => {
                         self.invalid_type(cell_id, &arg_span(self, 1));
                         return Err(());
@@ -12367,14 +13282,106 @@ impl<'a> ExecPass<'a> {
                 },
             }
         }
+        let span = self.span(loc, call.expr.span);
+        if let Err(reason) = kind.check_terminals(attached.len()) {
+            self.errors.push(ExecError {
+                span: Some(span),
+                cell: cell_id,
+                kind: ExecErrorKind::InvalidDevice {
+                    kind: kind.name().to_owned(),
+                    reason,
+                },
+            });
+            return Err(());
+        }
+        let placement = match self.read_placement(vid, loc, call) {
+            Typed::Ready(placement) => placement,
+            Typed::Pending => unreachable!("the placement keywords are ready"),
+            Typed::Invalid => return Err(()),
+        };
+        let terminal_spans = match &call.expr.args.posargs[1] {
+            Expr::Seq(seq) => seq
+                .items
+                .iter()
+                .map(|item| Some(self.span(loc, item.span())))
+                .collect(),
+            _ => vec![None; attached.len()],
+        };
+        let editable = self.editable_call(loc, Native::Device, call);
+        let id = self.object_id();
+        let nodes = (0..attached.len())
+            .map(|_| NodeId(self.alloc_id()))
+            .collect_vec();
+        let schematic = &mut self.cell_state_mut(cell_id).schematic;
+        let device = schematic.next_device();
+        for (terminal, (node, attached)) in nodes.iter().zip(&attached).enumerate() {
+            schematic.add_node(
+                *node,
+                NodeOrigin::DeviceTerminal { device, terminal },
+                (vid, terminal),
+            );
+            schematic.connect(*node, *attached);
+        }
+        schematic.add_device(DeviceRecord {
+            order: vid,
+            id,
+            kind,
+            terminals: nodes.clone(),
+            attached,
+            terminal_spans,
+            model: None,
+            value: None,
+            params: Vec::new(),
+            span,
+            placement,
+            editable,
+        });
+        let terminals = nodes
+            .into_iter()
+            .map(|node| {
+                Value::Signal(SignalRef {
+                    cell: cell_id,
+                    node,
+                })
+            })
+            .collect();
+        let handle = DeviceValue {
+            id: Some(id),
+            kind,
+            terminals,
+        };
+        self.values
+            .insert(vid, Defer::Ready(Value::Device(Arc::new(handle))));
+        self.new_deferred_value(*loc, |_| {
+            PartialEvalState::DeviceParams(Box::new(PartialDeviceParams {
+                call: call.clone(),
+                device,
+            }))
+        });
+        Ok(())
+    }
 
-        let Value::String(model) = arg(self, 2) else {
-            self.invalid_type(cell_id, &arg_span(self, 2));
+    /// Reads the model and parameters of the `device` call `call`, recorded
+    /// at `device`, once they are ready. `Ok(false)` means a parameter waits
+    /// on the solver, with `vid` registered to retry; `Err` means a diagnostic
+    /// has been recorded.
+    fn device_params(
+        &mut self,
+        vid: ValueId,
+        loc: &DynLoc,
+        call: &PartialCallExpr<'a>,
+        device: usize,
+    ) -> Result<bool, ()> {
+        let cell_id = loc.cell;
+        let model_span = self.span(loc, call.expr.args.posargs[2].span());
+        let Some(Value::String(model)) = self.values[&call.state.posargs[2]].get_ready().cloned()
+        else {
+            self.invalid_type(cell_id, &model_span);
             return Err(());
         };
         if model.chars().any(|c| c.is_whitespace() || c.is_control()) {
             self.errors.push(ExecError {
-                span: Some(arg_span(self, 2)),
+                span: Some(model_span),
                 cell: cell_id,
                 kind: ExecErrorKind::InvalidDeviceModel { model },
             });
@@ -12387,6 +13394,9 @@ impl<'a> ExecPass<'a> {
         let mut pending = false;
         for (kwarg, arg) in call.expr.args.kwargs.iter().zip(&call.state.kwargs) {
             let name = kwarg.name.name.to_string();
+            if PLACEMENT_KEYWORDS.contains(&name.as_str()) {
+                continue;
+            }
             let invalid = |this: &mut Self, reason: String| {
                 this.errors.push(ExecError {
                     span: Some(this.span(loc, kwarg.value.span())),
@@ -12438,13 +13448,13 @@ impl<'a> ExecPass<'a> {
             }
         }
         if pending {
-            return Ok(None);
+            return Ok(false);
         }
 
-        let span = self.span(loc, call.expr.span);
-        if let Err(reason) = kind.check(terminals.len(), model.is_some(), value.is_some()) {
+        let kind = self.cell_state(cell_id).schematic.device(device).kind;
+        if let Err(reason) = kind.check_model(model.is_some(), value.is_some()) {
             self.errors.push(ExecError {
-                span: Some(span),
+                span: Some(self.span(loc, call.expr.span)),
                 cell: cell_id,
                 kind: ExecErrorKind::InvalidDevice {
                     kind: kind.name().to_owned(),
@@ -12453,15 +13463,11 @@ impl<'a> ExecPass<'a> {
             });
             return Err(());
         }
-        Ok(Some(DeviceRecord {
-            order: vid,
-            kind,
-            terminals,
-            model,
-            value,
-            params,
-            span,
-        }))
+        let record = self.cell_state_mut(cell_id).schematic.device_mut(device);
+        record.model = model;
+        record.value = value;
+        record.params = params;
+        Ok(true)
     }
 
     fn eval_partial(&mut self, cell_id: CellId, vid: ValueId) -> Result<bool, ()> {
@@ -13600,10 +14606,21 @@ impl<'a> ExecPass<'a> {
                     }
                 }
                 Some(Builtin::Signal) => {
+                    let placement = match self.read_placement(vid, &vref.loc, c) {
+                        Typed::Ready(placement) => placement,
+                        Typed::Pending => return Ok(false),
+                        Typed::Invalid => return self.poison(vid),
+                    };
+                    let span = self.span(&vref.loc, c.expr.span);
+                    let editable = self.editable_call(&vref.loc, Native::Signal, c);
                     let node = NodeId(self.alloc_id());
                     self.cell_state_mut(cell_id).schematic.add_node(
                         node,
-                        NodeOrigin::Local,
+                        NodeOrigin::Local {
+                            span,
+                            placement,
+                            editable,
+                        },
                         (vid, 0),
                     );
                     let signal = SignalRef {
@@ -13628,29 +14645,44 @@ impl<'a> ExecPass<'a> {
                         self.invalid_type(cell_id, &span);
                         return self.poison(vid);
                     };
-                    self.cell_state_mut(cell_id).schematic.connect(left, right);
+                    let route = match self.read_route(vid, &vref.loc, c) {
+                        Typed::Ready(route) => route,
+                        Typed::Pending => return Ok(false),
+                        Typed::Invalid => return self.poison(vid),
+                    };
+                    let span = self.span(&vref.loc, c.expr.span);
+                    let editable = self.editable_call(&vref.loc, Native::Connect, c);
+                    let schematic = &mut self.cell_state_mut(cell_id).schematic;
+                    schematic.connect(left, right);
+                    schematic.add_connection(ConnectRecord {
+                        order: vid,
+                        nodes: [left, right],
+                        span,
+                        route,
+                        editable,
+                    });
                     self.values.insert(vid, Defer::Ready(Value::Nil));
                     true
                 }
                 Some(Builtin::Device) => {
+                    // The handle needs the kind, the terminals, and the
+                    // placement; the parameters are read by a step of their
+                    // own, so a parameter that waits on the solver never
+                    // holds up a `connect` through a terminal.
                     if let Some(arg) = c
                         .state
                         .posargs
                         .iter()
-                        .chain(&c.state.kwargs)
+                        .take(2)
                         .copied()
+                        .chain(device_kwargs(c, true))
                         .find(|arg| !self.values[arg].is_ready())
                     {
                         self.add_value_dependent(arg, vid);
                         return Ok(false);
                     }
-                    match self.device_record(vid, &vref.loc, c) {
-                        Ok(Some(record)) => {
-                            self.cell_state_mut(cell_id).schematic.add_device(record);
-                            self.values.insert(vid, Defer::Ready(Value::Nil));
-                            true
-                        }
-                        Ok(None) => false,
+                    match self.device_handle(vid, &vref.loc, c) {
+                        Ok(()) => true,
                         Err(()) => return self.poison(vid),
                     }
                 }
@@ -13670,9 +14702,15 @@ impl<'a> ExecPass<'a> {
                         self.invalid_type(cell_id, &span);
                         return self.poison(vid);
                     };
+                    let placement = match self.read_placement(vid, &vref.loc, c) {
+                        Typed::Ready(placement) => placement,
+                        Typed::Pending => return Ok(false),
+                        Typed::Invalid => return self.poison(vid),
+                    };
                     let ports = self.compiled_cells[&child].schematic.ports.len();
                     let id = self.object_id();
                     let nodes = (0..ports).map(|_| NodeId(self.alloc_id())).collect_vec();
+                    let editable = self.editable_call(&vref.loc, Native::SchematicInst, c);
                     let schematic = &mut self.cell_state_mut(cell_id).schematic;
                     let instance = schematic.next_instance();
                     for (port, node) in nodes.iter().enumerate() {
@@ -13688,6 +14726,8 @@ impl<'a> ExecPass<'a> {
                         cell: child,
                         terminals: nodes.clone(),
                         span,
+                        placement,
+                        editable,
                     });
                     let terminals = nodes
                         .into_iter()
@@ -13707,8 +14747,276 @@ impl<'a> ExecPass<'a> {
                         .insert(vid, Defer::Ready(Value::SchematicInst(Arc::new(value))));
                     true
                 }
+                Some(builtin @ (Builtin::SymbolLine | Builtin::SymbolPolygon)) => {
+                    let native = builtin.native().expect("a symbol builtin is native");
+                    let span = self.span(&vref.loc, c.expr.args.posargs[0].span());
+                    let points = match self.typed_points(c.state.posargs[0], vid, cell_id, &span) {
+                        Typed::Ready(points) => points,
+                        Typed::Pending => return Ok(false),
+                        Typed::Invalid => return self.poison(vid),
+                    };
+                    let fill = match self.typed_bool_kwarg(vid, &vref.loc, c, "fill") {
+                        Typed::Ready(fill) => fill.unwrap_or(false),
+                        Typed::Pending => return Ok(false),
+                        Typed::Invalid => return self.poison(vid),
+                    };
+                    let (minimum, what) = match native {
+                        Native::SymbolLine => (2, "a line needs at least two points"),
+                        _ => (3, "a polygon needs at least three points"),
+                    };
+                    if points.len() < minimum {
+                        return self.invalid_symbol(cell_id, vid, &vref.loc, c, what);
+                    }
+                    let kind = match native {
+                        Native::SymbolLine => SymbolItemKind::Line { points },
+                        _ => SymbolItemKind::Polygon { points, fill },
+                    };
+                    self.add_symbol_item(vid, &vref.loc, native, c, kind);
+                    self.values.insert(vid, Defer::Ready(Value::Nil));
+                    true
+                }
+                Some(Builtin::SymbolRect) => {
+                    let native = Native::SymbolRect;
+                    let coords = ["x0", "y0", "x1", "y1"]
+                        .map(|name| self.typed_float_kwarg(vid, &vref.loc, c, name));
+                    let fill = self.typed_bool_kwarg(vid, &vref.loc, c, "fill");
+                    let (coords, fill) = match (all_ready(coords), fill) {
+                        (Typed::Ready(coords), Typed::Ready(fill)) => (coords, fill),
+                        (Typed::Invalid, _) | (_, Typed::Invalid) => {
+                            return self.poison(vid);
+                        }
+                        _ => return Ok(false),
+                    };
+                    let [x0, y0, x1, y1] = coords;
+                    self.add_symbol_item(
+                        vid,
+                        &vref.loc,
+                        native,
+                        c,
+                        SymbolItemKind::Rect {
+                            x0,
+                            y0,
+                            x1,
+                            y1,
+                            fill: fill.unwrap_or(false),
+                        },
+                    );
+                    self.values.insert(vid, Defer::Ready(Value::Nil));
+                    true
+                }
+                Some(Builtin::SymbolCircle) => {
+                    let native = Native::SymbolCircle;
+                    let coords =
+                        ["x", "y", "r"].map(|name| self.typed_float_kwarg(vid, &vref.loc, c, name));
+                    let fill = self.typed_bool_kwarg(vid, &vref.loc, c, "fill");
+                    let (coords, fill) = match (all_ready(coords), fill) {
+                        (Typed::Ready(coords), Typed::Ready(fill)) => (coords, fill),
+                        (Typed::Invalid, _) | (_, Typed::Invalid) => {
+                            return self.poison(vid);
+                        }
+                        _ => return Ok(false),
+                    };
+                    let [x, y, r] = coords;
+                    if r <= 0. {
+                        let what = "a circle's radius must be positive";
+                        return self.invalid_symbol(cell_id, vid, &vref.loc, c, what);
+                    }
+                    self.add_symbol_item(
+                        vid,
+                        &vref.loc,
+                        native,
+                        c,
+                        SymbolItemKind::Circle {
+                            x,
+                            y,
+                            r,
+                            fill: fill.unwrap_or(false),
+                        },
+                    );
+                    self.values.insert(vid, Defer::Ready(Value::Nil));
+                    true
+                }
+                Some(Builtin::SymbolArc) => {
+                    let native = Native::SymbolArc;
+                    let coords = ["x", "y", "r", "start", "end"]
+                        .map(|name| self.typed_float_kwarg(vid, &vref.loc, c, name));
+                    let coords = match all_ready(coords) {
+                        Typed::Ready(coords) => coords,
+                        Typed::Pending => return Ok(false),
+                        Typed::Invalid => return self.poison(vid),
+                    };
+                    let [x, y, r, start, end] = coords;
+                    if r <= 0. {
+                        let what = "an arc's radius must be positive";
+                        return self.invalid_symbol(cell_id, vid, &vref.loc, c, what);
+                    }
+                    self.add_symbol_item(
+                        vid,
+                        &vref.loc,
+                        native,
+                        c,
+                        SymbolItemKind::Arc {
+                            x,
+                            y,
+                            r,
+                            start,
+                            end,
+                        },
+                    );
+                    self.values.insert(vid, Defer::Ready(Value::Nil));
+                    true
+                }
+                Some(
+                    builtin
+                    @ (Builtin::SymbolText | Builtin::SymbolInstName | Builtin::SymbolParam),
+                ) => {
+                    let native = builtin.native().expect("a symbol builtin is native");
+                    let text = match native {
+                        Native::SymbolText => {
+                            let span = self.span(&vref.loc, c.expr.args.posargs[0].span());
+                            match self.typed_string(c.state.posargs[0], vid, cell_id, &span) {
+                                Typed::Ready(text) => Some(SymbolText::Literal(text)),
+                                Typed::Pending => None,
+                                Typed::Invalid => return self.poison(vid),
+                            }
+                        }
+                        Native::SymbolInstName => Some(SymbolText::InstName),
+                        _ => {
+                            let name_span = self.span(&vref.loc, c.expr.args.posargs[0].span());
+                            let name =
+                                self.typed_string(c.state.posargs[0], vid, cell_id, &name_span);
+                            let value_span = self.span(&vref.loc, c.expr.args.posargs[1].span());
+                            let value =
+                                self.typed_param(c.state.posargs[1], vid, cell_id, &value_span);
+                            match (name, value) {
+                                (Typed::Ready(name), Typed::Ready(value)) => {
+                                    Some(SymbolText::Param { name, value })
+                                }
+                                (Typed::Invalid, _) | (_, Typed::Invalid) => {
+                                    return self.poison(vid);
+                                }
+                                _ => None,
+                            }
+                        }
+                    };
+                    let position =
+                        ["x", "y"].map(|name| self.typed_float_kwarg(vid, &vref.loc, c, name));
+                    let size = self.typed_float_kwarg(vid, &vref.loc, c, "size");
+                    let align = self.typed_align_kwarg(vid, &vref.loc, c);
+                    let (text, position, size, align) =
+                        match (text, all_ready(position), size, align) {
+                            (
+                                Some(text),
+                                Typed::Ready(position),
+                                Typed::Ready(size),
+                                Typed::Ready(align),
+                            ) => (text, position, size, align),
+                            (_, Typed::Invalid, ..)
+                            | (_, _, Typed::Invalid, _)
+                            | (_, _, _, Typed::Invalid) => {
+                                return self.poison(vid);
+                            }
+                            _ => return Ok(false),
+                        };
+                    let [x, y] = position;
+                    let size = size.unwrap_or(1.);
+                    if size <= 0. {
+                        let what = "a text size must be positive";
+                        return self.invalid_symbol(cell_id, vid, &vref.loc, c, what);
+                    }
+                    self.add_symbol_item(
+                        vid,
+                        &vref.loc,
+                        native,
+                        c,
+                        SymbolItemKind::Text {
+                            text,
+                            x,
+                            y,
+                            size,
+                            align: align.unwrap_or_default(),
+                        },
+                    );
+                    self.values.insert(vid, Defer::Ready(Value::Nil));
+                    true
+                }
+                Some(Builtin::SymbolPin) => {
+                    let native = Native::SymbolPin;
+                    let signal = c.state.posargs[0];
+                    let Some(value) = self.values[&signal].get_ready() else {
+                        self.add_value_dependent(signal, vid);
+                        return Ok(false);
+                    };
+                    let signal_span = self.span(&vref.loc, c.expr.args.posargs[0].span());
+                    let node = match value {
+                        Value::Detached(detached) => {
+                            let detached = detached.clone();
+                            self.detached_value(cell_id, signal_span, detached);
+                            return self.poison(vid);
+                        }
+                        value => match self.local_node(cell_id, value) {
+                            Some(node) => node,
+                            None => {
+                                self.invalid_type(cell_id, &signal_span);
+                                return self.poison(vid);
+                            }
+                        },
+                    };
+                    let x = self.typed_int_kwarg(vid, &vref.loc, c, "x");
+                    let y = self.typed_int_kwarg(vid, &vref.loc, c, "y");
+                    let label = self.typed_bool_kwarg(vid, &vref.loc, c, "label");
+                    let (x, y, label) = match (x, y, label) {
+                        (Typed::Ready(Some(x)), Typed::Ready(Some(y)), Typed::Ready(label)) => {
+                            (x, y, label)
+                        }
+                        (Typed::Ready(None), ..) | (_, Typed::Ready(None), _) => {
+                            // Required statically; reached only through `Any`.
+                            let span = self.span(&vref.loc, c.expr.span);
+                            self.invalid_type(cell_id, &span);
+                            return self.poison(vid);
+                        }
+                        (Typed::Invalid, ..) | (_, Typed::Invalid, _) | (_, _, Typed::Invalid) => {
+                            return self.poison(vid);
+                        }
+                        _ => return Ok(false),
+                    };
+                    let site = self.symbol_site(&vref.loc, native, c);
+                    self.cell_state_mut(cell_id).symbol.add_pin(PinRecord {
+                        order: vid,
+                        node,
+                        x,
+                        y,
+                        label: label.unwrap_or(false),
+                        site,
+                    });
+                    self.values.insert(vid, Defer::Ready(Value::Nil));
+                    true
+                }
                 None => unreachable!("a cell call is evaluated by `eval_cell_call`"),
             },
+            PartialEvalState::DeviceParams(params) => {
+                let call = &params.call;
+                if let Some(arg) = call
+                    .state
+                    .posargs
+                    .get(2)
+                    .copied()
+                    .into_iter()
+                    .chain(device_kwargs(call, false))
+                    .find(|arg| !self.values[arg].is_ready())
+                {
+                    self.add_value_dependent(arg, vid);
+                    return Ok(false);
+                }
+                match self.device_params(vid, &vref.loc, call, params.device) {
+                    Ok(true) => {
+                        self.values.insert(vid, Defer::Ready(Value::Nil));
+                        true
+                    }
+                    Ok(false) => false,
+                    Err(()) => return self.poison(vid),
+                }
+            }
             PartialEvalState::Arith(arith) => {
                 if let (Defer::Ready(vl), Defer::Ready(vr)) =
                     (&self.values[&arith.left], &self.values[&arith.right])
@@ -13837,6 +15145,29 @@ impl<'a> ExecPass<'a> {
                             };
                             let val = field_value.read(&mut reader, &FieldPath::Field(field));
                             self.values.insert(vid, DeferValue::Ready(val));
+                            true
+                        }
+                        ValueRef::Device(device) => {
+                            let field = field_access_expr.expr.field.name.as_str();
+                            let value = match field {
+                                "terminals" => {
+                                    Some(seq_value(device.terminals.iter().cloned().collect()))
+                                }
+                                name => device.terminal(name).cloned(),
+                            };
+                            let Some(value) = value else {
+                                let span = self.span(&vref.loc, field_access_expr.expr.span);
+                                self.errors.push(ExecError {
+                                    span: Some(span),
+                                    cell: cell_id,
+                                    kind: ExecErrorKind::NoDeviceTerminal {
+                                        field: field.to_owned(),
+                                        kind: device.kind.name().to_owned(),
+                                    },
+                                });
+                                return self.poison(vid);
+                            };
+                            self.values.insert(vid, DeferValue::Ready(value));
                             true
                         }
                         _ => {
@@ -14123,6 +15454,7 @@ impl<'a> ExecPass<'a> {
                                 (
                                     format!("{} if", if_expr.scope_order),
                                     this.span(&loc, if_expr.then.span),
+                                    ScopeKind::Body,
                                 )
                             },
                         );
@@ -14143,6 +15475,7 @@ impl<'a> ExecPass<'a> {
                                 (
                                     format!("{} else", if_expr.scope_order),
                                     this.span(&loc, else_scope.span),
+                                    ScopeKind::Body,
                                 )
                             },
                         );
@@ -14429,6 +15762,7 @@ impl<'a> ExecPass<'a> {
                             (
                                 format!("{} for {}[{i}]", for_loop.scope_order, for_loop.var.name),
                                 this.span(&loc, for_loop.body.span),
+                                ScopeKind::Loop,
                             )
                         },
                     );
@@ -14641,6 +15975,9 @@ pub enum Value {
     /// A cell placed with `std::schematic::inst`, or one read through another
     /// schematic instance.
     SchematicInst(Arc<SchematicInstValue>),
+    /// A device placed with `std::schematic::device`, or one read through a
+    /// schematic instance.
+    Device(Arc<DeviceValue>),
     /// A placeholder read through an instance, which is an error to use. See
     /// [`Detached`].
     Detached(Arc<Detached>),
@@ -14691,6 +16028,7 @@ impl Value {
             Self::Inst(_) => "instance",
             Self::Signal(_) => "signal",
             Self::SchematicInst(_) => "schematic instance",
+            Self::Device(_) => "device",
             Self::Detached(_) => "detached value",
             Self::Seq(_) => "sequence",
             Self::Tuple(_) => "tuple",
@@ -15115,6 +16453,8 @@ pub struct CompiledCell {
     pub inconsistent_constraints: IndexSet<ConstraintId>,
     /// The cell's schematic view; empty for a cell with no schematic content.
     pub schematic: Schematic,
+    /// The cell's symbol; `None` when the cell made no `std::symbol` call.
+    pub symbol: Option<Symbol>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15184,6 +16524,11 @@ pub enum FieldValue {
     /// port of `cell`.
     SchematicInst {
         cell: CellId,
+        terminals: Vec<FieldValue>,
+    },
+    /// A device: one [`Self::Signal`] or [`Self::Detached`] per terminal.
+    Device {
+        kind: DeviceKind,
         terminals: Vec<FieldValue>,
     },
     /// A detached value, which reads back as itself through either kind of
@@ -15260,6 +16605,14 @@ impl FieldValue {
                     .map(solve)
                     .collect::<Result<_, _>>()?,
             },
+            Value::Device(device) => Self::Device {
+                kind: device.kind,
+                terminals: device
+                    .terminals
+                    .iter()
+                    .map(solve)
+                    .collect::<Result<_, _>>()?,
+            },
             Value::Detached(detached) => Self::Detached(detached.clone()),
             Value::Poison => return Err(Self::Poison),
             Value::Fn(_) | Value::CellFn(_) | Value::Ctor(_) => {
@@ -15329,6 +16682,7 @@ impl FieldValue {
             Self::SchematicInst { cell, terminals } => {
                 reader.schematic_inst(*cell, terminals, path)
             }
+            Self::Device { kind, terminals } => reader.device(*kind, terminals, path),
             Self::Detached(detached) => Value::Detached(detached.clone()),
             Self::Poison | Self::Unreadable(_) => Value::Poison,
         }
@@ -15343,6 +16697,9 @@ impl FieldValue {
             | Self::Tuple(items)
             | Self::Enum { payload: items, .. }
             | Self::SchematicInst {
+                terminals: items, ..
+            }
+            | Self::Device {
                 terminals: items, ..
             } => items
                 .iter_mut()
@@ -15373,6 +16730,9 @@ impl FieldValue {
             | Self::Enum { payload: items, .. }
             | Self::SchematicInst {
                 terminals: items, ..
+            }
+            | Self::Device {
+                terminals: items, ..
             } => items.iter().try_for_each(|item| item.for_each_span(f)),
             Self::Struct { fields, .. } | Self::StructVariant { fields, .. } => fields
                 .iter()
@@ -15400,6 +16760,9 @@ impl FieldValue {
             | Self::Enum { payload: items, .. }
             | Self::SchematicInst {
                 terminals: items, ..
+            }
+            | Self::Device {
+                terminals: items, ..
             } => items.iter().for_each(|item| item.for_each_object(f)),
             Self::Struct { fields, .. } | Self::StructVariant { fields, .. } => fields
                 .iter()
@@ -15423,9 +16786,12 @@ impl FieldValue {
         match self {
             Self::Cell(cell) => f(*cell),
             Self::SchematicInst { cell, .. } => f(*cell),
-            Self::Seq(items) | Self::Tuple(items) | Self::Enum { payload: items, .. } => {
-                items.iter().for_each(|item| item.for_each_cell(f))
-            }
+            Self::Seq(items)
+            | Self::Tuple(items)
+            | Self::Enum { payload: items, .. }
+            | Self::Device {
+                terminals: items, ..
+            } => items.iter().for_each(|item| item.for_each_cell(f)),
             Self::Struct { fields, .. } | Self::StructVariant { fields, .. } => {
                 fields.iter().for_each(|(_, field)| field.for_each_cell(f))
             }
@@ -15480,6 +16846,8 @@ trait FieldReader {
         terminals: &[FieldValue],
         path: &FieldPath<'_>,
     ) -> Value;
+    fn device(&mut self, kind: DeviceKind, terminals: &[FieldValue], path: &FieldPath<'_>)
+    -> Value;
 }
 
 /// A detached value for the field at `path` of `cell`, read at `span`.
@@ -15548,6 +16916,21 @@ impl FieldReader for LayoutReader<'_> {
     ) -> Value {
         detached(
             DetachedKind::SchematicInstance,
+            DetachedReason::ThroughLayoutInstance,
+            self.cell,
+            path,
+            self.span,
+        )
+    }
+
+    fn device(
+        &mut self,
+        _kind: DeviceKind,
+        _terminals: &[FieldValue],
+        path: &FieldPath<'_>,
+    ) -> Value {
+        detached(
+            DetachedKind::Device,
             DetachedReason::ThroughLayoutInstance,
             self.cell,
             path,
@@ -15636,6 +17019,32 @@ impl FieldReader for SchematicReader<'_> {
             terminals,
         }))
     }
+
+    fn device(
+        &mut self,
+        kind: DeviceKind,
+        terminals: &[FieldValue],
+        path: &FieldPath<'_>,
+    ) -> Value {
+        let count = terminals.len();
+        let terminals = terminals
+            .iter()
+            .enumerate()
+            .map(|(terminal, value)| {
+                let name = kind.terminal_label(terminal, count);
+                match value {
+                    FieldValue::Signal(net) => self.signal(*net, &FieldPath::Member(path, &name)),
+                    FieldValue::Detached(detached) => Value::Detached(detached.clone()),
+                    _ => Value::Poison,
+                }
+            })
+            .collect();
+        Value::Device(Arc::new(DeviceValue {
+            id: None,
+            kind,
+            terminals,
+        }))
+    }
 }
 
 /// The field `field` of `cell`, as an instance of it reads it. `Err(None)` is
@@ -15687,6 +17096,7 @@ impl CompiledData {
                     hasher.write_u32(fallback.span.span.end() as u32);
                 }
                 hash_schematic(&mut hasher, &cell.schematic, &self.cells);
+                hash_symbol(&mut hasher, cell.symbol.as_ref());
                 hasher.finish()
             })
             .collect::<Vec<_>>();
@@ -15732,11 +17142,48 @@ fn hash_schematic(
             hash_str(hasher, s);
         }
     };
+    let placement = |hasher: &mut fnv::FnvHasher, placement: Option<Placement>| match placement {
+        None => hasher.write_u8(0),
+        Some(placement) => {
+            hasher.write_u8(1);
+            match placement.position {
+                None => hasher.write_u8(0),
+                Some((x, y)) => {
+                    hasher.write_u8(1);
+                    hasher.write_i64(x);
+                    hasher.write_i64(y);
+                }
+            }
+            hasher.write_u8(placement.angle as u8);
+            hasher.write_u8(u8::from(placement.reflect));
+        }
+    };
     hasher.write_usize(schematic.nets.len());
     for net in &schematic.nets {
         hash_str(hasher, &net.name);
     }
     nets(hasher, &schematic.ports);
+    for node in &schematic.nodes {
+        if let NodeSource::Signal {
+            placement: placed, ..
+        } = &node.source
+        {
+            placement(hasher, *placed);
+        }
+    }
+    for connection in &schematic.connections {
+        match &connection.route {
+            None => hasher.write_u8(0),
+            Some(route) => {
+                hasher.write_u8(1);
+                hasher.write_usize(route.len());
+                for (x, y) in route {
+                    hasher.write_i64(*x);
+                    hasher.write_i64(*y);
+                }
+            }
+        }
+    }
     for element in &schematic.elements {
         match *element {
             Element::Instance(index) => {
@@ -15752,6 +17199,7 @@ fn hash_schematic(
                         .unwrap_or(""),
                 );
                 nets(hasher, &instance.terminals);
+                placement(hasher, instance.placement);
             }
             Element::Device(index) => {
                 let device = &schematic.devices[index];
@@ -15759,6 +17207,7 @@ fn hash_schematic(
                 hash_str(hasher, &device.name);
                 hash_str(hasher, device.kind.name());
                 nets(hasher, &device.terminals);
+                placement(hasher, device.placement);
                 hash_str(hasher, device.model.as_deref().unwrap_or(""));
                 hasher.write_u8(u8::from(device.value.is_some()));
                 if let Some(value) = &device.value {
@@ -15769,6 +17218,112 @@ fn hash_schematic(
                     hash_str(hasher, name);
                     param(hasher, value);
                 }
+            }
+        }
+    }
+}
+
+/// Hashes everything a symbol draws.
+fn hash_symbol(hasher: &mut fnv::FnvHasher, symbol: Option<&Symbol>) {
+    fn coord(hasher: &mut fnv::FnvHasher, v: f64) {
+        hasher.write_u64(v.to_bits());
+    }
+    fn points(hasher: &mut fnv::FnvHasher, points: &[(f64, f64)]) {
+        hasher.write_usize(points.len());
+        for (x, y) in points {
+            coord(hasher, *x);
+            coord(hasher, *y);
+        }
+    }
+    let Some(symbol) = symbol else {
+        hasher.write_u8(0);
+        return;
+    };
+    hasher.write_u8(1);
+    hasher.write_usize(symbol.items.len());
+    for item in &symbol.items {
+        match &item.kind {
+            SymbolItemKind::Line { points: p } => {
+                hasher.write_u8(0);
+                points(hasher, p);
+            }
+            SymbolItemKind::Polygon { points: p, fill } => {
+                hasher.write_u8(1);
+                points(hasher, p);
+                hasher.write_u8(u8::from(*fill));
+            }
+            SymbolItemKind::Rect {
+                x0,
+                y0,
+                x1,
+                y1,
+                fill,
+            } => {
+                hasher.write_u8(2);
+                for v in [x0, y0, x1, y1] {
+                    coord(hasher, *v);
+                }
+                hasher.write_u8(u8::from(*fill));
+            }
+            SymbolItemKind::Circle { x, y, r, fill } => {
+                hasher.write_u8(3);
+                for v in [x, y, r] {
+                    coord(hasher, *v);
+                }
+                hasher.write_u8(u8::from(*fill));
+            }
+            SymbolItemKind::Arc {
+                x,
+                y,
+                r,
+                start,
+                end,
+            } => {
+                hasher.write_u8(4);
+                for v in [x, y, r, start, end] {
+                    coord(hasher, *v);
+                }
+            }
+            SymbolItemKind::Text {
+                text,
+                x,
+                y,
+                size,
+                align,
+            } => {
+                hasher.write_u8(5);
+                match text {
+                    SymbolText::Literal(text) => {
+                        hasher.write_u8(0);
+                        hash_str(hasher, text);
+                    }
+                    SymbolText::InstName => hasher.write_u8(1),
+                    SymbolText::Param { name, value } => {
+                        hasher.write_u8(2);
+                        hash_str(hasher, name);
+                        match value {
+                            ParamValue::Float(f) => coord(hasher, *f),
+                            ParamValue::Int(i) => hasher.write_i64(*i),
+                            ParamValue::String(s) => hash_str(hasher, s),
+                        }
+                    }
+                }
+                coord(hasher, *x);
+                coord(hasher, *y);
+                coord(hasher, *size);
+                hasher.write_u8(*align as u8);
+            }
+        }
+    }
+    hasher.write_usize(symbol.pins.len());
+    for pin in &symbol.pins {
+        match pin {
+            None => hasher.write_u8(0),
+            Some(pin) => {
+                hasher.write_u8(1);
+                hasher.write_i64(pin.x);
+                hasher.write_i64(pin.y);
+                hasher.write_u8(u8::from(pin.label.is_some()));
             }
         }
     }
@@ -15902,6 +17457,7 @@ impl CompiledCell {
             unsolved_vars: _,
             inconsistent_constraints: _,
             schematic,
+            symbol,
         } = self;
 
         for metadata in scope_metadata {
@@ -15911,18 +17467,94 @@ impl CompiledCell {
         for field in fields.values_mut() {
             field.rebase_spans(rebase)?;
         }
+        if let Some(Symbol { items, pins }) = symbol {
+            let sites = items
+                .iter_mut()
+                .filter_map(|item| item.site.as_mut())
+                .chain(
+                    pins.iter_mut()
+                        .flatten()
+                        .filter_map(|pin| pin.site.as_mut()),
+                );
+            for Site {
+                span,
+                origin,
+                editable: _,
+            } in sites
+            {
+                rebase.rebase(span)?;
+                rebase.rebase_opt(origin)?;
+            }
+        }
         let Schematic {
             nets: _,
             ports: _,
             instances,
             devices,
             elements: _,
+            nodes,
+            connections,
+            paths: _,
+            port_paths: _,
         } = schematic;
-        for SchematicInstance { span, .. } in instances.iter_mut() {
+        for instance in instances.iter_mut() {
+            let SchematicInstance {
+                name: _,
+                cell: _,
+                terminals: _,
+                span,
+                placement: _,
+                editable: _,
+                path: _,
+                terminal_nodes: _,
+            } = instance;
             rebase.rebase_opt(span)?;
         }
-        for Device { span, .. } in devices.iter_mut() {
+        for device in devices.iter_mut() {
+            let Device {
+                name: _,
+                kind: _,
+                terminals: _,
+                model: _,
+                value: _,
+                params: _,
+                span,
+                placement: _,
+                editable: _,
+                path: _,
+                terminal_nodes: _,
+                attached_nodes: _,
+                terminal_spans,
+            } = device;
             rebase.rebase_opt(span)?;
+            for span in terminal_spans.iter_mut() {
+                rebase.rebase_opt(span)?;
+            }
+        }
+        for node in nodes.iter_mut() {
+            let Node {
+                net: _,
+                source,
+                path: _,
+                public: _,
+            } = node;
+            match source {
+                NodeSource::Signal {
+                    span,
+                    placement: _,
+                    editable: _,
+                } => rebase.rebase(span)?,
+                NodeSource::Terminal { .. } | NodeSource::DeviceTerminal { .. } => {}
+            }
+        }
+        for connection in connections.iter_mut() {
+            let Connection {
+                nodes: _,
+                span,
+                route: _,
+                editable: _,
+            } = connection;
+            rebase.rebase(span)?;
         }
 
         for scope in scopes.values_mut() {
@@ -15976,6 +17608,7 @@ impl CompiledCell {
             unsolved_vars: _,
             inconsistent_constraints: _,
             schematic,
+            symbol,
         } = self;
         let mut moved = false;
         let mut check = |span: &Span| -> Result<(), RebaseError> {
@@ -15989,22 +17622,93 @@ impl CompiledCell {
         for field in fields.values() {
             field.for_each_span(&mut check)?;
         }
+        if let Some(Symbol { items, pins }) = symbol {
+            let sites = items
+                .iter()
+                .filter_map(|item| item.site.as_ref())
+                .chain(pins.iter().flatten().filter_map(|pin| pin.site.as_ref()));
+            for Site {
+                span,
+                origin,
+                editable: _,
+            } in sites
+            {
+                check(span)?;
+                if let Some(origin) = origin {
+                    check(origin)?;
+                }
+            }
+        }
         let Schematic {
             nets: _,
             ports: _,
             instances,
             devices,
             elements: _,
+            nodes,
+            connections,
+            paths: _,
+            port_paths: _,
         } = schematic;
-        for SchematicInstance { span, .. } in instances {
+        for instance in instances {
+            let SchematicInstance {
+                name: _,
+                cell: _,
+                terminals: _,
+                span,
+                placement: _,
+                editable: _,
+                path: _,
+                terminal_nodes: _,
+            } = instance;
             if let Some(span) = span {
                 check(span)?;
             }
         }
-        for Device { span, .. } in devices {
-            if let Some(span) = span {
+        for device in devices {
+            let Device {
+                name: _,
+                kind: _,
+                terminals: _,
+                model: _,
+                value: _,
+                params: _,
+                span,
+                placement: _,
+                editable: _,
+                path: _,
+                terminal_nodes: _,
+                attached_nodes: _,
+                terminal_spans,
+            } = device;
+            for span in std::iter::once(span).chain(terminal_spans).flatten() {
                 check(span)?;
             }
+        }
+        for node in nodes {
+            let Node {
+                net: _,
+                source,
+                path: _,
+                public: _,
+            } = node;
+            match source {
+                NodeSource::Signal {
+                    span,
+                    placement: _,
+                    editable: _,
+                } => check(span)?,
+                NodeSource::Terminal { .. } | NodeSource::DeviceTerminal { .. } => {}
+            }
+        }
+        for connection in connections {
+            let Connection {
+                nodes: _,
+                span,
+                route: _,
+                editable: _,
+            } = connection;
+            check(span)?;
         }
 
         for scope in scopes.values() {
@@ -16289,6 +17993,8 @@ enum PartialEvalState<'a> {
     BoolOp(PartialBoolOp<'a>),
     UnaryOp(PartialUnaryOp<'a>),
     Call(PartialCallExpr<'a>),
+    /// The parameters of a `device` call whose handle is already made.
+    DeviceParams(Box<PartialDeviceParams<'a>>),
     FieldAccess(PartialFieldAccessExpr<'a>),
     IndexFieldAccess(PartialIndexFieldAccessExpr<'a>),
     Index(PartialIndexExpr<'a>),
@@ -16348,6 +18054,14 @@ impl PartialEvalState<'_> {
                 .posargs
                 .iter()
                 .chain(&e.state.kwargs)
+                .for_each(|v| f(*v)),
+            Self::DeviceParams(e) => e
+                .call
+                .state
+                .posargs
+                .get(2)
+                .into_iter()
+                .chain(&e.call.state.kwargs)
                 .for_each(|v| f(*v)),
             Self::FieldAccess(e) => f(e.state.base),
             Self::IndexFieldAccess(e) => f(e.state.base),
@@ -16415,6 +18129,14 @@ impl PartialEvalState<'_> {
                 .posargs
                 .iter()
                 .chain(e.state.kwargs.iter())
+                .any(|input| f(*input)),
+            Self::DeviceParams(e) => e
+                .call
+                .state
+                .posargs
+                .get(2)
+                .into_iter()
+                .chain(e.call.state.kwargs.iter())
                 .any(|input| f(*input)),
             Self::FieldAccess(e) => f(e.state.base),
             Self::IndexFieldAccess(e) => f(e.state.base),
@@ -16519,6 +18241,132 @@ struct PartialCallExpr<'a> {
     /// `None` for a cell call.
     builtin: Option<Builtin>,
     state: CallExprState,
+}
+
+/// The second step of a `device` call: its model and parameters, read once
+/// they are ready into the record at `device`.
+#[derive(Debug, Clone)]
+struct PartialDeviceParams<'a> {
+    call: PartialCallExpr<'a>,
+    device: usize,
+}
+
+/// Every reading ready, or the first that is not: `Invalid` wins over
+/// `Pending`, so a bad argument is reported rather than waited on.
+fn all_ready<T: Copy + Default, const N: usize>(readings: [Typed<Option<T>>; N]) -> Typed<[T; N]> {
+    let mut values = [T::default(); N];
+    let mut pending = false;
+    for (value, reading) in values.iter_mut().zip(readings) {
+        match reading {
+            Typed::Ready(Some(reading)) => *value = reading,
+            // Required statically; reached only through `Any`.
+            Typed::Ready(None) | Typed::Invalid => return Typed::Invalid,
+            Typed::Pending => pending = true,
+        }
+    }
+    if pending {
+        Typed::Pending
+    } else {
+        Typed::Ready(values)
+    }
+}
+
+/// Whether every keyword of `call` that the GUI rewrites for `native`, and
+/// the point list of a symbol shape, is a literal it can rewrite.
+fn literal_keywords(call: &PartialCallExpr<'_>, native: Native) -> bool {
+    let keywords = native.rewritten_keywords();
+    let kwargs = call
+        .expr
+        .args
+        .kwargs
+        .iter()
+        .filter(|kwarg| keywords.contains(&kwarg.name.name.as_str()))
+        .all(|kwarg| literal_expr(&kwarg.value, kwarg.name.name == "align"));
+    let points = match native {
+        Native::SymbolLine | Native::SymbolPolygon => call
+            .expr
+            .args
+            .posargs
+            .first()
+            .is_none_or(|points| literal_expr(points, false)),
+        _ => true,
+    };
+    kwargs && points
+}
+
+/// Whether `expr` is a literal the GUI can rewrite: a number, possibly
+/// negated, a `Bool`, a `String`, a list of tuples of numbers, or, when
+/// `path`, a bare path such as an `Align` variant.
+fn literal_expr<T: AstMetadata>(expr: &Expr<Substr, T>, path: bool) -> bool {
+    match expr {
+        Expr::IntLiteral(_)
+        | Expr::FloatLiteral(_)
+        | Expr::BoolLiteral(_)
+        | Expr::StringLiteral(_) => true,
+        Expr::UnaryOp(op) => {
+            op.op == UnaryOp::Neg
+                && matches!(op.operand, Expr::IntLiteral(_) | Expr::FloatLiteral(_))
+        }
+        Expr::IdentPath(_) => path,
+        Expr::Seq(seq) => seq.items.iter().all(|item| match item {
+            Expr::Tuple(tuple) => {
+                tuple.items.len() == 2 && tuple.items.iter().all(|item| literal_expr(item, false))
+            }
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
+/// The keyword argument `name` of `call`, with its value.
+fn find_kwarg<'c>(
+    call: &'c PartialCallExpr<'_>,
+    name: &str,
+) -> Option<(&'c KwArgValue<Substr, VarIdTyMetadata>, ValueId)> {
+    call.expr
+        .args
+        .kwargs
+        .iter()
+        .zip(&call.state.kwargs)
+        .find_map(|(kwarg, arg)| (kwarg.name.name == name).then_some((kwarg, *arg)))
+}
+
+/// The values of the keyword arguments of the `device` call `call`: its
+/// placement keywords when `placement`, and its parameters otherwise.
+fn device_kwargs<'c>(
+    call: &'c PartialCallExpr<'_>,
+    placement: bool,
+) -> impl Iterator<Item = ValueId> + 'c {
+    call.expr
+        .args
+        .kwargs
+        .iter()
+        .zip(&call.state.kwargs)
+        .filter(move |(kwarg, _)| {
+            PLACEMENT_KEYWORDS.contains(&kwarg.name.name.as_str()) == placement
+        })
+        .map(|(_, arg)| *arg)
+}
+
+/// Where `call` uses its argument `input`: the argument's expression, or the
+/// whole call when `input` is not an argument.
+fn argument_span(call: &PartialCallExpr<'_>, input: ValueId) -> cfgrammar::Span {
+    let posargs = call
+        .state
+        .posargs
+        .iter()
+        .zip(&call.expr.args.posargs)
+        .map(|(arg, expr)| (*arg, expr.span()));
+    let kwargs = call
+        .state
+        .kwargs
+        .iter()
+        .zip(&call.expr.args.kwargs)
+        .map(|(arg, kwarg)| (*arg, kwarg.value.span()));
+    posargs
+        .chain(kwargs)
+        .find(|(arg, _)| *arg == input)
+        .map_or(call.expr.span, |(_, span)| span)
 }
 
 #[derive(Debug, Clone)]
@@ -17165,6 +19013,44 @@ fn is_nameable(object: &SolvedValue) -> bool {
             | SolvedValue::Path(_)
             | SolvedValue::Instance(_)
     )
+}
+
+impl CompiledData {
+    /// The bounding box of `cell`'s layout geometry, instances included, in
+    /// `cell`'s own coordinate frame.
+    pub fn layout_bbox(&self, cell: CellId) -> Option<Rect<f64>> {
+        self.layout_bbox_memoized(cell, &mut HashMap::new())
+    }
+
+    fn layout_bbox_memoized(
+        &self,
+        cell: CellId,
+        memo: &mut HashMap<CellId, Option<Rect<f64>>>,
+    ) -> Option<Rect<f64>> {
+        if let Some(bbox) = memo.get(&cell) {
+            return bbox.clone();
+        }
+        let mut bbox = None;
+        for object in self.cells.get(&cell)?.objects.values() {
+            if !object.is_layout() {
+                continue;
+            }
+            match object {
+                SolvedValue::Rect(r) => bbox = bbox_union(bbox, Some(r.to_float())),
+                SolvedValue::Polygon(p) => bbox = bbox_union(bbox, p.bbox()),
+                SolvedValue::Path(p) => bbox = bbox_union(bbox, p.bbox()),
+                SolvedValue::Instance(i) => {
+                    let child = self
+                        .layout_bbox_memoized(i.cell, memo)
+                        .map(|r| r.transform(i.reflect, i.angle).translate(i.x, i.y));
+                    bbox = bbox_union(bbox, child);
+                }
+                _ => {}
+            }
+        }
+        memo.insert(cell, bbox.clone());
+        bbox
+    }
 }
 
 impl CompiledData {

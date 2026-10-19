@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::compile::CompileOutput;
 
-const MAGIC: &[u8; 8] = b"ARGON\0\0\x03";
+const MAGIC: &[u8; 8] = b"ARGON\0\0\x05";
 
 /// Writes a successful compiler result in Argon's versioned binary format.
 pub fn write(output: &CompileOutput, path: impl AsRef<Path>) -> Result<()> {

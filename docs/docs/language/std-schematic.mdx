@@ -1,6 +1,6 @@
 ---
 title: "std::schematic"
-description: Signals, connections, devices, and schematic instances.
+description: Signals, connections, devices, schematic instances, and placement.
 sidebar_label: "std::schematic"
 ---
 
@@ -15,22 +15,31 @@ import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReferenc
 Nothing in `std::schematic` is in scope by default. Import the names a module uses:
 
 ```argon
-use std::schematic::{DeviceKind, Signal, connect, device};
+use std::schematic::{Device, DeviceKind, Signal, connect, device, signals};
 use std::schematic::inst as sinst;
 ```
 
-`std::layout` also has an `inst`, so a module that places cells in both views imports at least one of them under another name, or calls it by full path. A name such as `Signal` is only in scope once imported, in type position as well as in calls.
+`std::layout` also has an `inst`, so a module that places cells in both views imports at least one of them under another name, or calls it by full path. A name such as `Signal` or `Device` is only in scope once imported, in type position as well as in calls.
 
-`Signal`, `connect`, `device`, and `inst` are implemented by the compiler. They can only be called, so a reference that isn't a call, such as `let f = connect;`, is an error. `DeviceKind` is an ordinary enum.
+`Signal`, `connect`, `device`, and `inst` are implemented by the compiler. They can only be called, so a reference that isn't a call, such as `let f = connect;`, is an error. `Device` is only a type. `DeviceKind` is an ordinary enum, and `signals` an ordinary function.
+
+The placement keywords `x`, `y`, `angle`, and `reflect`, and the `route` of a connection, are [grid units](/language/schematic#placement-and-routes) that only say where the GUI draws an element. None of them can be read back.
 
 ## `Signal` {#signal}
 
-<ApiItem id="signal" name="std::schematic::Signal" signature={'Signal() -> Signal'} summary={<>Creates a signal of the current cell.</>}>
+<ApiItem id="signal" name="std::schematic::Signal" signature={'Signal(x=Int, y=Int, angle=Int) -> Signal'} summary={<>Creates a signal of the current cell.</>}>
+
+<ParameterTable rows={[
+  {name: 'x', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Optional keyword, with y', description: 'Where the signal\'s pin or label is drawn, in grid units.'},
+  {name: 'y', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Optional keyword, with x', description: 'Where the signal\'s pin or label is drawn, in grid units.'},
+  {name: 'angle', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Optional keyword', description: 'Counterclockwise rotation of the pin or label in degrees, a multiple of 90.'},
+]} />
 
 <Returns type="Signal" href="/language/schematic#signals-and-nets">A new signal, on a net of its own until it is connected.</Returns>
 
 ```argon
 pub let vdd = Signal();
+pub let a = Signal(x=-8, y=0);
 ```
 
 `Signal` is also the type of a signal, as in `fn tie(s: Signal)`.
@@ -39,38 +48,45 @@ pub let vdd = Signal();
 
 ## `connect` {#connect}
 
-<ApiItem id="connect" name="std::schematic::connect" signature={'connect(a: Signal, b: Signal) -> ()'} summary={<>Joins the nets of two signals.</>}>
+<ApiItem id="connect" name="std::schematic::connect" signature={'connect(a: Signal, b: Signal, route=[(Int, Int)]) -> ()'} summary={<>Joins the nets of two signals.</>}>
 
 <ParameterTable rows={[
   {name: 'a', type: 'Signal', typeHref: '#signal', requirement: 'Required, positional', description: 'A signal of the current cell.'},
   {name: 'b', type: 'Signal', typeHref: '#signal', requirement: 'Required, positional', description: 'A signal of the current cell.'},
+  {name: 'route', type: '[(Int, Int)]', typeHref: '/language/schematic#placement-and-routes', requirement: 'Optional keyword', description: 'The corners of the wire that draws the connection, in grid units, from the pin of a to the pin of b. [] is a straight wire; without route, no wire is drawn.'},
 ]} />
 
 <Returns type="()">Nothing; the two nets become one.</Returns>
 
 ```argon
 connect(out, nmos.d);
+connect(a, nmos.g, route=[(-4, 0), (-4, -4)]);
 ```
 
 </ApiItem>
 
 ## `device` {#device}
 
-<ApiItem id="device" name="std::schematic::device" signature={'device(kind: DeviceKind, terminals: [Signal], model: String, <name>=Float | Int | String, …) -> ()'} summary={<>Adds a primitive device to the current cell.</>}>
+<ApiItem id="device" name="std::schematic::device" signature={'device(kind: DeviceKind, terminals: [Signal], model: String, <name>=Float | Int | String, …, x=Int, y=Int, angle=Int, reflect=Bool) -> Device'} summary={<>Adds a primitive device to the current cell.</>}>
 
 <ParameterTable rows={[
   {name: 'kind', type: 'DeviceKind', typeHref: '#devicekind', requirement: 'Required, positional', description: 'The kind of device, which decides its terminals and whether it needs a model.'},
-  {name: 'terminals', type: '[Signal]', typeHref: '#signal', requirement: 'Required, positional', description: 'The signals the device connects to, in the order its kind expects.'},
+  {name: 'terminals', type: '[Signal]', typeHref: '#signal', requirement: 'Required, positional', description: 'The signals the device connects to, in the order its kind expects. signals(n) makes fresh ones.'},
   {name: 'model', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: 'The model name, without whitespace, or "" for none.'},
   {name: 'value', type: 'Float | Int | String', requirement: 'Optional keyword', description: 'The value of a Res or Cap device, in any case (VALUE also works). Other kinds do not take it.'},
   {name: '<name>', type: 'Float | Int | String', requirement: 'Optional keyword', description: 'A device parameter, kept in the order written. Names must differ other than in case. A Float must be solved to a finite number.'},
+  {name: 'x, y', type: 'Int', typeHref: '/language/schematic#placement-and-routes', requirement: 'Optional keywords, together', description: 'Where the device is drawn, in grid units. Reserved in every case, so X=1 is an error rather than a parameter.'},
+  {name: 'angle', type: 'Int', typeHref: '/language/schematic#placement-and-routes', requirement: 'Optional keyword', description: 'Counterclockwise rotation in degrees, a multiple of 90.'},
+  {name: 'reflect', type: 'Bool', typeHref: '/language/types/scalars#bool', requirement: 'Optional keyword', description: 'Mirror about the x axis before rotating.'},
 ]} />
 
-<Returns type="()">Nothing; the device is added to the cell.</Returns>
+<Returns type="Device" href="#device-type">The device's handle, whose fields are its terminals.</Returns>
 
 ```argon
 device(DeviceKind::Mos, [d, g, s, b], "nch", w=2., l=0.15, nf=2);
 device(DeviceKind::Res, [top, bottom], "", value=1000.);
+let mn = device(DeviceKind::Nmos, signals(4), "nch", w=1., l=0.15, x=0, y=-4);
+connect(a, mn.g);
 ```
 
 The [device table](/language/schematic#devices) lists the terminals and model each kind requires.
@@ -79,32 +95,71 @@ The [device table](/language/schematic#devices) lists the terminals and model ea
 
 ## `inst` {#inst}
 
-<ApiItem id="inst" name="std::schematic::inst" signature={'inst(cell: Cell) -> SchematicInst'} summary={<>Places a cell in the current cell's schematic.</>}>
+<ApiItem id="inst" name="std::schematic::inst" signature={'inst(cell: Cell, x=Int, y=Int, angle=Int, reflect=Bool) -> SchematicInst'} summary={<>Places a cell in the current cell's schematic.</>}>
 
 <ParameterTable rows={[
   {name: 'cell', type: 'Cell', typeHref: '/language/types/instance#cell-values', requirement: 'Required, positional', description: 'The cell value to place, such as inv(2., 1., 2).'},
+  {name: 'x, y', type: 'Int', typeHref: '/language/schematic#placement-and-routes', requirement: 'Optional keywords, together', description: 'Where the instance is drawn, in grid units.'},
+  {name: 'angle', type: 'Int', typeHref: '/language/schematic#placement-and-routes', requirement: 'Optional keyword', description: 'Counterclockwise rotation in degrees, a multiple of 90.'},
+  {name: 'reflect', type: 'Bool', typeHref: '/language/types/scalars#bool', requirement: 'Optional keyword', description: 'Mirror about the x axis before rotating.'},
 ]} />
 
 <Returns type="SchematicInst" href="/language/types/instance#schematic-instances">The instance, whose ports read as its terminals.</Returns>
 
 ```argon
-let nmos = std::schematic::inst(mos(true, 1., 2));
+let nmos = std::schematic::inst(mos(true, 1., 2), x=0, y=-4);
 connect(a, nmos.g);
 ```
 
 </ApiItem>
+
+## `signals` {#signals}
+
+<ApiItem id="signals" name="std::schematic::signals" signature={'signals(n: Int) -> [Signal]'} summary={<>Creates fresh signals.</>}>
+
+<ParameterTable rows={[
+  {name: 'n', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required, positional', description: 'How many signals to create.'},
+]} />
+
+<Returns type="[Signal]" href="#signal">`n` new signals of the current cell, each on a net of its own.</Returns>
+
+```argon
+let mn = device(DeviceKind::Nmos, signals(4), "nch", w=1., l=0.15);
+```
+
+Written in Argon, so the signals belong to the cell that calls it. They have no placement of their own and draw nothing.
+
+</ApiItem>
+
+## `Device` {#device-type}
+
+The type of the handle [`device`](#device) returns. Its fields are the device's terminals, named by its kind, and `terminals`, every terminal in order:
+
+| Kind | Fields |
+| --- | --- |
+| `Mos`, `Nmos`, `Pmos` | `d`, `g`, `s`, `b` |
+| `Res`, `Cap`, `Diode` | `p`, `n` |
+| `Bjt`, `Npn`, `Pnp` | `c`, `b`, `e`, and `sub` with 4 terminals |
+| `Subckt` | none by name |
+| every kind | `terminals: [Signal]` |
+
+Every named field has type `Signal`. The names are checked against the device's kind when the cell runs, so `r.g` on a resistor is an error. See [device handles](/language/schematic#device-handles).
 
 ## `DeviceKind` {#devicekind}
 
 ```argon
 enum DeviceKind {
     Mos,
+    Nmos,
+    Pmos,
     Res,
     Cap,
     Diode,
     Bjt,
+    Npn,
+    Pnp,
     Subckt,
 }
 ```
 
-The kind of a device placed with [`device`](#device): a MOSFET, a resistor, a capacitor, a diode, a bipolar transistor, or an instance of a subcircuit the cell does not define, such as a PDK model.
+The kind of a device placed with [`device`](#device): a MOSFET, a resistor, a capacitor, a diode, a bipolar transistor, or an instance of a subcircuit the cell does not define, such as a PDK model. `Nmos` and `Pmos` are `Mos` devices, and `Npn` and `Pnp` are `Bjt` devices, drawn with a polarity symbol; they netlist as their base kind.

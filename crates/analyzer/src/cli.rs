@@ -14,6 +14,10 @@ struct Args {
     #[arg(long)]
     relay_socket: Option<PathBuf>,
 
+    /// The GUI embeds this analyzer's Neovim, so never start a separate GUI.
+    #[arg(long)]
+    embedded_gui: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -22,18 +26,48 @@ struct Args {
 enum Command {
     /// Coordinate startup with a local Argone SSH session.
     Relay,
+    /// Serve the Model Context Protocol, forwarding each tool call to one of
+    /// the user's running analyzers.
+    Mcp {
+        /// Directory to resolve relative paths against and to look for a
+        /// session in first, instead of the working directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Run as a Claude Code `PreToolUse` hook that redirects `.ar` file
+    /// tools to the analyzer while a session is running.
+    Hook,
 }
 
 #[tokio::main]
 pub async fn run() {
     let args = Args::parse();
-    if matches!(args.command, Some(Command::Relay)) {
-        if let Err(error) = run_relay().await {
-            eprintln!("argon-analyzer relay: {error}");
-            std::process::exit(1);
+    match args.command {
+        Some(Command::Relay) => {
+            if let Err(error) = run_relay().await {
+                eprintln!("argon-analyzer relay: {error}");
+                std::process::exit(1);
+            }
         }
-    } else {
-        crate::main(args.rpc_port, args.relay_socket).await;
+        Some(Command::Mcp { root }) => {
+            crate::init_logging();
+            if let Err(error) = crate::mcp::run(root).await {
+                eprintln!("argon-analyzer mcp: {error}");
+                std::process::exit(1);
+            }
+        }
+        Some(Command::Hook) => {
+            if let Err(error) = crate::hook::run().await {
+                eprintln!("argon-analyzer hook: {error}");
+            }
+        }
+        None => {
+            let gui = crate::GuiLink {
+                relay_socket: args.relay_socket,
+                embedded: args.embedded_gui,
+            };
+            crate::main(args.rpc_port, gui).await
+        }
     }
 }
 
@@ -49,16 +83,17 @@ async fn run_relay() -> io::Result<()> {
     stdout.flush().await?;
 
     let (stream, _) = listener.accept().await?;
-    let mut port = String::new();
-    BufReader::new(stream).read_line(&mut port).await?;
-    let port = port
-        .trim()
-        .parse::<u16>()
-        .ok()
-        .filter(|port| *port != 0)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid analyzer RPC port"))?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).await?;
+    let (port, token) = crate::transport::parse_announcement(&line).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid analyzer RPC announcement",
+        )
+    })?;
+    // Stdout is the SSH channel back to Argone, so the token stays private.
     stdout
-        .write_all(format!("ARGON_ANALYZER 1 {port}\n").as_bytes())
+        .write_all(format!("ARGON_ANALYZER 2 {port} {}\n", token.to_hex()).as_bytes())
         .await?;
     stdout.flush().await
 }

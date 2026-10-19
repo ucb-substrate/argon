@@ -14,7 +14,7 @@ local client = require('argon.client')
 local TIMEOUT_MS = 150
 
 --- Subcommands whose argument is a cell invocation.
-local CELL_EXPRESSION_COMMANDS = { 'openCell', 'inst' }
+local CELL_EXPRESSION_COMMANDS = { 'openCell', 'inst', 'sinst' }
 
 --- Last response per subcommand, keyed by the argument text preceding the
 --- identifier it completed. A later keystroke in the same position filters

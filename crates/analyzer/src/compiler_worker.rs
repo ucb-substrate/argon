@@ -107,7 +107,6 @@ impl CompilerWorker {
         self.send(Command::RemoveSource(path));
     }
 
-    #[cfg(test)]
     pub(crate) async fn compile(&self, request: CompileRequest) -> Option<CompileResult> {
         let (_, result) = self.compile_streamed(request);
         result.await.ok()

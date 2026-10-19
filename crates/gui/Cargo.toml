@@ -37,6 +37,7 @@ imbl = "7.0.1"
 image = { version = "0.25", default-features = false }
 rgb = { version = "0.8", features = ["serde"] }
 unicode-segmentation = "1"
+rmpv = "1"
 tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
 tempfile = { workspace = true }

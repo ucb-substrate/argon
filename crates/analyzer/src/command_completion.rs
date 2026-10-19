@@ -46,12 +46,18 @@ const OPEN_CELL_PREFIX: &str = "cell __argon_complete__() { let __argon_argument
 /// The statement `inst` inserts, whose argument sits one call deeper.
 const INST_PREFIX: &str = "cell __argon_complete__() { let __argon_argument__ = std::layout::inst(";
 
+/// The statement `sinst` inserts.
+const SINST_PREFIX: &str =
+    "cell __argon_complete__() { let __argon_argument__ = std::schematic::inst(";
+
 /// A `:Argon` subcommand whose argument is a cell invocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum CellExpressionCommand {
     OpenCell,
     Inst,
+    #[serde(rename = "sinst")]
+    SchematicInst,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -102,9 +108,12 @@ impl State {
     }
 
     async fn anchor(&self, command: CellExpressionCommand, index: &NavIndex) -> Option<Anchor> {
-        if command == CellExpressionCommand::Inst
-            && let Some(anchor) = self.selected_scope_anchor(index).await
-        {
+        let gui_anchor = match command {
+            CellExpressionCommand::OpenCell => None,
+            CellExpressionCommand::Inst => self.selected_scope_anchor(index).await,
+            CellExpressionCommand::SchematicInst => self.schematic_target_anchor(index).await,
+        };
+        if let Some(anchor) = gui_anchor {
             return Some(anchor);
         }
         self.root_module_anchor(index).await
@@ -144,6 +153,24 @@ impl State {
             offset,
         })
     }
+
+    /// The body of the cell on screen in the schematic view, where `sinst`
+    /// inserts its preview binding.
+    async fn schematic_target_anchor(&self, index: &NavIndex) -> Option<Anchor> {
+        let connection = self.gui_connection().await?;
+        let scope = timeout(
+            SELECTED_SCOPE_TIMEOUT,
+            connection.client.schematic_target(context::current()),
+        )
+        .await
+        .ok()?
+        .ok()??;
+        let offset = scope.span.end();
+        (offset <= index.source(&scope.path)?.len()).then_some(Anchor {
+            path: scope.path.to_path_buf(),
+            offset,
+        })
+    }
 }
 
 /// Classifies the cursor by parsing the argument inside the declaration the
@@ -157,6 +184,7 @@ fn argument_site(command: CellExpressionCommand, text: &str, cursor: usize) -> C
     let prefix = match command {
         CellExpressionCommand::OpenCell => OPEN_CELL_PREFIX,
         CellExpressionCommand::Inst => INST_PREFIX,
+        CellExpressionCommand::SchematicInst => SINST_PREFIX,
     };
     let source = format!("{prefix}{}", &text[..cursor]);
     completion_site(&source, source.len())
@@ -401,6 +429,29 @@ cell top(w: Float = 100.) {
             !items(CellExpressionCommand::Inst, "")
                 .iter()
                 .any(|item| item.label == "double")
+        );
+    }
+
+    #[test]
+    fn sinst_completes_inside_its_schematic_placement_call() {
+        let offered = items(CellExpressionCommand::SchematicInst, "");
+        let labels = offered
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"child"), "{labels:?}");
+        assert!(
+            !labels.contains(&"double"),
+            "a function cannot open an invocation"
+        );
+        let arguments = items(CellExpressionCommand::SchematicInst, "child(1., ");
+        assert!(
+            arguments.iter().any(|item| item.label == "h"),
+            "{arguments:?}"
+        );
+        assert!(
+            items(CellExpressionCommand::SchematicInst, "child(1., 2.)").is_empty(),
+            "a finished invocation offers nothing"
         );
     }
 

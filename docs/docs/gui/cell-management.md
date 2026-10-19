@@ -9,7 +9,7 @@ You can open, create, and rename cells from the GUI. Creating and renaming edit 
 
 ## Open a cell
 
-Press <kbd>O</kbd> and type a full invocation, arguments included. Opening only changes what the canvas shows; it doesn't touch the source.
+Press <kbd>O</kbd> and type a full invocation, arguments included. Before any cell is open, you can also click a cell on the [start screen](/gui/workspace#start-screen). Its **Recently opened** list reopens an invocation you opened before, arguments included. Opening only changes what the canvas shows; it doesn't touch the source.
 
 ## Create a cell
 

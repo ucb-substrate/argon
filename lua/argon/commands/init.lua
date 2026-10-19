@@ -8,12 +8,16 @@ local completion_group = 'argon_command_completion'
 local completion = require('argon.commands.completion')
 local gui = require('argon.commands.gui')
 local diagnostics = require('argon.diagnostics')
+--- The variants of `std::schematic::DeviceKind`, for `:Argon device`.
+local device_kinds = { 'Mos', 'Nmos', 'Pmos', 'Res', 'Cap', 'Diode', 'Bjt', 'Npn', 'Pnp', 'Subckt' }
 local config_keys = {
+  'agent.approval',
   'analyzer.compile_debounce_ms',
   'gui.dark_mode',
   'gui.font_size',
   'gui.hierarchy_depth',
   'gui.icon_size',
+  'gui.option_as_meta',
   'log.level',
 }
 
@@ -59,6 +63,30 @@ local argon_command_tbl = {
     end,
     complete = completion.cell_expression('inst'),
   },
+  sinst = {
+    impl = function(args, opts)
+      gui.schematic_instantiate(table.concat(args, " "))
+    end,
+    complete = completion.cell_expression('sinst'),
+  },
+  device = {
+    impl = function(args)
+      if #args == 0 then
+        vim.notify('Argon device: expected a device kind, such as `Nmos`', vim.log.levels.ERROR)
+        return
+      end
+      gui.place_device(table.concat(args, " "))
+    end,
+    complete = function(args)
+      local kind_lead = args:match('^%s*(%S*)$')
+      if not kind_lead then
+        return {}
+      end
+      return vim.tbl_filter(function(kind)
+        return vim.startswith(kind, kind_lead)
+      end, device_kinds)
+    end,
+  },
   reload = {
     impl = function()
       gui.reload_config()
@@ -98,6 +126,23 @@ local argon_command_tbl = {
   diagnostics = {
     impl = function()
       diagnostics.open()
+    end,
+  },
+  follow = {
+    impl = function(args)
+      local agent = require('argon.agent')
+      if #args == 0 or args[1] == 'on' then
+        agent.set_follow(true)
+      elseif args[1] == 'off' and #args == 1 then
+        agent.set_follow(false)
+      else
+        vim.notify('Argon follow: expected `on` or `off`', vim.log.levels.ERROR)
+      end
+    end,
+    complete = function(args)
+      return vim.tbl_filter(function(value)
+        return vim.startswith(value, args)
+      end, { 'on', 'off' })
     end,
   },
   log = {

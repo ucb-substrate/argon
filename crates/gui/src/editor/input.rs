@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::rc::Rc;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
@@ -14,7 +15,7 @@ use crate::{
     actions::*,
     editor::{
         EditorState, SOURCE_EDIT_REJECTED_MESSAGE,
-        canvas::{DrawDimToolState, EditDimToolState, LayoutCanvas, ToolState},
+        canvas::{DrawDimToolState, EditDimToolState, ToolState},
     },
 };
 
@@ -33,7 +34,16 @@ pub(crate) struct TextInput {
     pub(crate) cancel_handler: fn(&mut TextInput, &Cancel, &mut Window, &mut Context<TextInput>),
     pub(crate) state: Entity<EditorState>,
     pub(crate) px: f32,
+    /// What a prompt does with its text on Enter.
+    submit: Option<Submit>,
+    /// What a prompt does on Escape.
+    dismiss: Option<Dismiss>,
 }
+
+/// What a prompt does with its text on Enter.
+pub(crate) type Submit = Rc<dyn Fn(String, &mut Window, &mut App)>;
+/// What a prompt does on Escape.
+pub(crate) type Dismiss = Rc<dyn Fn(&mut Window, &mut App)>;
 
 impl TextInput {
     pub(crate) fn start_dimension_edit(&mut self, cx: &mut Context<Self>) {
@@ -67,18 +77,18 @@ impl TextInput {
             enter_handler: Self::dimension_enter,
             cancel_handler: Self::dimension_cancel,
             px: 8.,
+            submit: None,
+            dismiss: None,
         }
     }
     pub(crate) fn new_filter(
-        cx: &mut Context<Self>,
         focus_handle: FocusHandle,
+        canvas_focus_handle: FocusHandle,
         state: &Entity<EditorState>,
-        canvas: &Entity<LayoutCanvas>,
     ) -> Self {
-        let canvas = canvas.read(cx);
         TextInput {
             focus_handle,
-            canvas_focus_handle: canvas.focus_handle(cx),
+            canvas_focus_handle,
             content: "".into(),
             placeholder: "Filter by name...".into(),
             selected_range: 0..0,
@@ -91,6 +101,62 @@ impl TextInput {
             enter_handler: Self::filter_enter,
             cancel_handler: Self::filter_cancel,
             px: 4.,
+            submit: None,
+            dismiss: None,
+        }
+    }
+
+    /// A prompt that hands its text to `submit` on Enter and calls `dismiss`
+    /// on Escape.
+    pub(crate) fn new_prompt(
+        focus_handle: FocusHandle,
+        canvas_focus_handle: FocusHandle,
+        state: &Entity<EditorState>,
+        placeholder: &str,
+        submit: Submit,
+        dismiss: Dismiss,
+    ) -> Self {
+        TextInput {
+            focus_handle,
+            canvas_focus_handle,
+            content: "".into(),
+            placeholder: placeholder.to_owned().into(),
+            selected_range: 0..0,
+            selection_reversed: false,
+            marked_range: None,
+            last_layout: None,
+            last_bounds: None,
+            is_selecting: false,
+            state: state.clone(),
+            enter_handler: Self::prompt_enter,
+            cancel_handler: Self::prompt_cancel,
+            px: 4.,
+            submit: Some(submit),
+            dismiss: Some(dismiss),
+        }
+    }
+
+    /// Shows `text` selected, under `placeholder`, ready to be replaced.
+    pub(crate) fn show(&mut self, text: &str, placeholder: &str, cx: &mut Context<Self>) {
+        self.reset();
+        self.content = text.to_owned().into();
+        self.placeholder = placeholder.to_owned().into();
+        self.selected_range = 0..self.content.len();
+        cx.notify();
+    }
+
+    fn prompt_enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.content.to_string();
+        if let Some(submit) = self.submit.clone() {
+            submit(text, window, cx);
+        }
+    }
+
+    fn prompt_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        self.reset();
+        cx.notify();
+        if let Some(dismiss) = self.dismiss.clone() {
+            dismiss(window, cx);
         }
     }
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {

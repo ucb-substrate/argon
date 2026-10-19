@@ -2,26 +2,30 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
+use arcstr::Substr;
 use argonc::{
-    ast::{Decl, Span},
-    compile::{BasicRect, CellId, CompileOutput, CompiledData, PreviewGeometry},
-    parse::{AnnotatedParseAst, WorkspaceParseAst},
+    ast::{CellDecl, Decl, Span},
+    compile::{
+        Align, BasicRect, CellId, CompileOutput, CompiledData, DeviceKind, PreviewGeometry, Symbol,
+    },
+    parse::{self, AnnotatedParseAst, ParseMetadata, WorkspaceParseAst},
 };
 
 use serde::{Deserialize, Serialize};
-use tarpc::{context, tokio_serde::formats::Bincode};
+use tarpc::context;
 use tower_lsp_server::ls_types::{
     Diagnostic, DiagnosticSeverity, MessageType, Position, Range, ShowDocumentParams, TextEdit,
     Uri, WorkspaceEdit,
 };
 
 use crate::{
-    ArgonConfig, Backend, PublishedState, Redo, Save, SourceState, State, Undo, document::Document,
+    ArgonConfig, Backend, PENDING_EDIT_TIMEOUT, PublishedState, Redo, Save, SourceState, State,
+    Undo, document::Document, schematic_edit,
 };
 
 /// A single source rewrite: replace the text at `span` with `value`. Used to
@@ -193,6 +197,285 @@ pub struct RectangleEditResult {
     pub name: String,
 }
 
+/// A keyword to set on a call, or to remove when it has no value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeywordEdit {
+    pub name: String,
+    pub value: Option<String>,
+}
+
+/// The keyword edits of one call the GUI drew a schematic element or
+/// connection from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementEdit {
+    pub call: Span,
+    pub keywords: Vec<KeywordEdit>,
+}
+
+/// A schematic gesture: placement and route rewrites applied as one edit.
+/// `base_revision` is the snapshot the GUI drew the gesture on; the edit is
+/// refused unless it is the published one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaceRequest {
+    pub base_revision: u64,
+    pub edits: Vec<PlacementEdit>,
+}
+
+/// Receipt for an accepted schematic edit: the source revision it was
+/// applied to, and the span of each edited call afterward, in request order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditReceipt {
+    pub revision: u64,
+    pub spans: Vec<Span>,
+}
+
+/// Where a schematic gesture adds code: the body of the cell on screen, in
+/// the snapshot at `base_revision`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchematicTarget {
+    pub base_revision: u64,
+    /// The span of the cell body.
+    pub cell: Span,
+}
+
+/// How a new element is placed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElementPlacement {
+    pub at: (i64, i64),
+    /// Degrees counterclockwise: 0, 90, 180, or 270.
+    pub angle: i64,
+    pub reflect: bool,
+}
+
+/// Adds a port or a net label, connected to `connect_to` when given.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddSignalRequest {
+    pub target: SchematicTarget,
+    pub name: String,
+    pub port: bool,
+    pub at: (i64, i64),
+    /// The path of the pin or signal the new signal connects to.
+    pub connect_to: Option<String>,
+    pub route: Option<Vec<(i64, i64)>>,
+    /// Placements of other calls, applied in the same edit.
+    pub placements: Vec<PlacementEdit>,
+}
+
+/// Places an instance of a cell in the schematic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaceSchematicInstanceRequest {
+    pub target: SchematicTarget,
+    pub invocation: String,
+    pub placement: ElementPlacement,
+}
+
+/// Places a device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaceDeviceRequest {
+    pub target: SchematicTarget,
+    /// The `DeviceKind` variant.
+    pub kind: String,
+    pub terminals: usize,
+    /// The model and parameters, as argument text.
+    pub args: String,
+    pub placement: ElementPlacement,
+}
+
+/// Connects two pins or signals, named by their paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectRequest {
+    pub target: SchematicTarget,
+    pub a: String,
+    pub b: String,
+    pub route: Option<Vec<(i64, i64)>>,
+    /// Placements of other calls, applied in the same edit.
+    pub placements: Vec<PlacementEdit>,
+}
+
+/// Deletes elements, signals, and connections by the calls that created
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteRequest {
+    pub base_revision: u64,
+    pub targets: Vec<Span>,
+}
+
+/// A use of a deleted binding that the GUI cannot clean up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockingReference {
+    pub span: Span,
+    /// The zero-based line of the reference.
+    pub line: u32,
+    /// The source line, trimmed.
+    pub text: String,
+}
+
+/// What a deletion did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DeleteOutcome {
+    Applied(EditReceipt),
+    /// Nothing was deleted: these references must go first.
+    Blocked(Vec<BlockingReference>),
+}
+
+/// An argument of a call, by position or keyword.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallArgument {
+    Positional(usize),
+    Keyword(String),
+}
+
+/// Rewrites or inserts one argument of a call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetArgumentRequest {
+    pub base_revision: u64,
+    pub call: Span,
+    pub argument: CallArgument,
+    pub value: String,
+}
+
+/// The source text of a call's arguments.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallArguments {
+    pub positional: Vec<String>,
+    pub keywords: Vec<(String, String)>,
+}
+
+/// A symbol item to draw, in symbol coordinates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum NewSymbolItem {
+    Line {
+        points: Vec<(f64, f64)>,
+    },
+    Polygon {
+        points: Vec<(f64, f64)>,
+        fill: bool,
+    },
+    Rect {
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        fill: bool,
+    },
+    Circle {
+        x: f64,
+        y: f64,
+        r: f64,
+        fill: bool,
+    },
+    Arc {
+        x: f64,
+        y: f64,
+        r: f64,
+        start: f64,
+        end: f64,
+    },
+    Text {
+        text: String,
+        x: f64,
+        y: f64,
+        size: f64,
+        align: Align,
+    },
+    InstName {
+        x: f64,
+        y: f64,
+        size: f64,
+        align: Align,
+    },
+    /// `name=value` for the cell parameter `name`.
+    Param {
+        name: String,
+        x: f64,
+        y: f64,
+        size: f64,
+        align: Align,
+    },
+    /// The pin of the port at position `port`.
+    Pin {
+        port: usize,
+        x: i64,
+        y: i64,
+        label: bool,
+    },
+}
+
+/// Draws symbol items in the cell on screen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AddSymbolItemsRequest {
+    pub target: SchematicTarget,
+    pub items: Vec<NewSymbolItem>,
+}
+
+/// Writes the generated box of the cell on screen as `std::symbol` calls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateSymbolRequest {
+    pub target: SchematicTarget,
+}
+
+/// Renames the binding whose value is the call at `site`, with every
+/// reference to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenameRequest {
+    pub base_revision: u64,
+    pub site: Span,
+    pub name: String,
+}
+
+/// What a copied statement created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClipboardKind {
+    Signal,
+    Instance,
+    Device,
+    Connect,
+    Symbol,
+}
+
+/// A statement copied from a cell body, to be pasted with a fresh name and
+/// a shifted placement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardItem {
+    pub kind: ClipboardKind,
+    /// The binding, for a `let` statement.
+    pub name: Option<String>,
+    pub public: bool,
+    /// The call, as source text.
+    pub call: String,
+}
+
+/// Pastes copied statements into the cell on screen, moved by `offset`
+/// grid units in the schematic and `symbol_offset` in the symbol.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PasteRequest {
+    pub target: SchematicTarget,
+    pub items: Vec<ClipboardItem>,
+    pub offset: (i64, i64),
+    pub symbol_offset: (f64, f64),
+}
+
+/// A schematic instance ready to be placed: what the GUI draws while the
+/// invocation follows the cursor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchematicInstancePreview {
+    pub invocation: String,
+    pub cell_name: String,
+    /// The cell's symbol, or its generated box.
+    pub symbol: Symbol,
+    /// The port names, in port order.
+    pub pin_names: Vec<String>,
+}
+
+/// A device ready to be placed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevicePreview {
+    pub kind: DeviceKind,
+    pub terminals: usize,
+    /// The model and parameters, as argument text.
+    pub args: String,
+}
+
 /// A compiled GUI result tied to the exact analyzer source revision that
 /// produced it. Diagnostics continue to travel over LSP.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,10 +622,47 @@ pub struct FocusEditorParams {
     pub return_to_gui: bool,
 }
 
+/// A cell of the library that the GUI can open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellEntry {
+    /// The cell's path from the library root, such as `utils::pad`.
+    pub path: String,
+    /// The cell's parameter names, in order.
+    pub parameters: Vec<String>,
+    /// Whether some parameter has no default, so opening the cell needs arguments.
+    pub requires_arguments: bool,
+}
+
+/// A cell invocation recently opened in the library.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecentCell {
+    /// The invocation, such as `inverter(1200., 2000., 4)`.
+    pub invocation: String,
+    /// The invoked cell's path as written, without a leading `lib::`, such as
+    /// `utils::pad`. Empty if the invocation does not parse.
+    pub cell: String,
+}
+
+impl RecentCell {
+    pub(crate) fn new(invocation: String) -> Self {
+        let cell = parse::parse_cell(&invocation)
+            .map(|call| {
+                let path = call
+                    .func
+                    .path
+                    .iter()
+                    .map(|ident| ident.name)
+                    .collect::<Vec<_>>();
+                path.strip_prefix(&["lib"]).unwrap_or(&path).join("::")
+            })
+            .unwrap_or_default();
+        Self { invocation, cell }
+    }
+}
+
 #[tarpc::service]
 pub trait LangServer {
-    async fn register(addr: SocketAddr);
-    async fn select_rect(span: Span);
+    async fn select_span(span: Span);
     async fn draw_rect(
         scope_span: Span,
         var_name: String,
@@ -364,6 +684,24 @@ pub trait LangServer {
         base_revision: Option<u64>,
     ) -> Option<Vec<ValueEdit>>;
     async fn add_eq_constraint(scope_span: Span, lhs: String, rhs: String);
+    async fn place(request: PlaceRequest) -> Option<EditReceipt>;
+    async fn add_signal(request: AddSignalRequest) -> Option<EditReceipt>;
+    async fn place_schematic_instance(
+        request: PlaceSchematicInstanceRequest,
+    ) -> Option<EditReceipt>;
+    async fn place_device(request: PlaceDeviceRequest) -> Option<EditReceipt>;
+    async fn connect(request: ConnectRequest) -> Option<EditReceipt>;
+    async fn delete(request: DeleteRequest) -> Option<DeleteOutcome>;
+    async fn set_argument(request: SetArgumentRequest) -> Option<EditReceipt>;
+    async fn call_arguments(base_revision: u64, call: Span) -> Option<CallArguments>;
+    async fn add_symbol_items(request: AddSymbolItemsRequest) -> Option<EditReceipt>;
+    async fn create_symbol(request: CreateSymbolRequest) -> Option<EditReceipt>;
+    /// The parameter names of the cell whose body is `cell`.
+    async fn cell_parameters(base_revision: u64, cell: Span) -> Option<Vec<String>>;
+    async fn rename(request: RenameRequest) -> Option<EditReceipt>;
+    /// The statements that made `targets`, for pasting.
+    async fn copy_statements(base_revision: u64, targets: Vec<Span>) -> Option<Vec<ClipboardItem>>;
+    async fn paste(request: PasteRequest) -> Option<EditReceipt>;
     async fn open_cell(cell: String);
     async fn show_message(typ: MessageType, message: String);
     async fn dispatch_action(action: LangServerAction);
@@ -385,13 +723,30 @@ pub trait Gui {
     async fn selected_scope() -> Option<Span>;
     async fn selected_cell() -> Option<CellId>;
     async fn place_instance(preview: InstancePreview);
+    /// The body of the cell the schematic view shows.
+    async fn schematic_target() -> Option<Span>;
+    async fn place_schematic_instance(preview: SchematicInstancePreview);
+    async fn place_device(preview: DevicePreview);
     async fn configure(config: ArgonConfig);
     async fn activate();
+    /// Replaces the library's cells, which the GUI offers before a cell is open.
+    async fn set_cells(cells: Vec<CellEntry>);
+    /// Replaces the library's recently opened cells, most recent first.
+    async fn set_recent_cells(cells: Vec<RecentCell>);
+    /// Briefly outlines objects whose source overlaps `spans`, once the GUI
+    /// shows `revision` or later.
+    async fn highlight_spans(revision: u64, spans: Vec<Span>);
+    /// Shows what an agent is doing, or clears it with `None`.
+    async fn agent_activity(label: Option<String>);
 }
 
 pub(crate) const OUT_OF_SYNC_MESSAGE: &str = "Editor buffer state is inconsistent with GUI state.";
 pub(crate) const STALE_DRAG_MESSAGE: &str =
     "The source changed while dragging, so the drag was not applied. Drag again.";
+pub(crate) const STALE_SNAPSHOT_MESSAGE: &str =
+    "The schematic changed since this gesture began; it was not applied.";
+pub(crate) const PENDING_EDIT_MESSAGE: &str =
+    "An earlier edit is still being applied; try again in a moment.";
 pub(crate) const READ_ONLY_GENERATED_SOURCE_MESSAGE: &str =
     "Imported GDS cells are read-only in the GUI. Open an Argon source cell to edit geometry.";
 
@@ -593,38 +948,11 @@ fn missing_initial_condition_edit(
     call_span: &Span,
     values: Vec<(String, String)>,
 ) -> Option<ValueEdit> {
-    let insertion = call_span.span.end().checked_sub(1)?;
-    if source.as_bytes().get(insertion) != Some(&b')') {
-        return None;
-    }
-    let previous = source[..insertion]
-        .chars()
-        .rev()
-        .find(|character| !character.is_whitespace());
-    let line_start = source[..insertion]
-        .rfind('\n')
-        .map_or(0, |newline| newline + 1);
-    let closing_indent = &source[line_start..insertion];
-    let closing_on_own_line = closing_indent.chars().all(char::is_whitespace);
-    let separator = match (previous, closing_on_own_line) {
-        (Some('('), _) | (Some(','), true) => "",
-        (Some(','), false) => " ",
-        _ => ", ",
-    };
-    let coordinates = values
-        .into_iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let value = if closing_on_own_line {
-        format!("    {separator}{coordinates},\n{closing_indent}")
-    } else {
-        format!("{separator}{coordinates}")
-    };
+    let (range, value) = schematic_edit::ensure_keywords(source, call_span.span, &values)?;
     Some(ValueEdit {
         span: Span {
             path: call_span.path.clone(),
-            span: cfgrammar::Span::new(insertion, insertion),
+            span: cfgrammar::Span::new(range.start, range.end),
         },
         value,
     })
@@ -715,20 +1043,93 @@ impl State {
         }
     }
 
+    /// Marks an analyzer edit to `uri` as in flight until the editor reports
+    /// `expected`, the file's text with all of the edit applied.
+    pub(crate) async fn begin_pending_edit(&self, uri: &Uri, expected: String) {
+        self.source_state
+            .lock()
+            .await
+            .pending_workspace_edits
+            .insert(uri.clone(), expected);
+    }
+
+    /// Withdraws the in-flight edit that leaves `uri` as `expected`, unless
+    /// it has completed or a newer edit replaced it. Returns whether it was
+    /// still in flight.
+    pub(crate) async fn end_pending_edit(&self, uri: &Uri, expected: &str) -> bool {
+        let mut state = self.source_state.lock().await;
+        let in_flight = state
+            .pending_workspace_edits
+            .get(uri)
+            .is_some_and(|pending| pending == expected);
+        if in_flight {
+            state.pending_workspace_edits.shift_remove(uri);
+        }
+        in_flight
+    }
+
+    /// The text each file that `changes` alters will have once the editor
+    /// applies them, to its buffer or, when it has none, to the file on disk.
+    async fn edited_texts(&self, changes: &HashMap<Uri, Vec<TextEdit>>) -> Vec<(Uri, String)> {
+        let mut texts = Vec::new();
+        for (uri, edits) in changes {
+            let open = self
+                .source_state
+                .lock()
+                .await
+                .editor_files
+                .get(uri)
+                .cloned();
+            let document = match open {
+                Some(document) => document,
+                None => {
+                    let Some(path) = uri.to_file_path() else {
+                        continue;
+                    };
+                    let Ok(text) = tokio::fs::read_to_string(&path).await else {
+                        continue;
+                    };
+                    self.document(text)
+                }
+            };
+            let edited = document.edited(edits);
+            if edited != document.contents() {
+                texts.push((uri.clone(), edited));
+            }
+        }
+        texts
+    }
+
+    /// Waits until the editor reports all of each edit in `pending`,
+    /// withdrawing the ones it has not reported in time.
+    async fn wait_for_pending_edits(&self, pending: &[(Uri, String)]) {
+        let in_flight = |source: &SourceState| {
+            pending
+                .iter()
+                .any(|(uri, expected)| source.pending_workspace_edits.get(uri) == Some(expected))
+        };
+        let arrived = self
+            .wait_for_source(PENDING_EDIT_TIMEOUT, |source| {
+                (!in_flight(source)).then_some(())
+            })
+            .await;
+        if arrived.is_none() {
+            for (uri, expected) in pending {
+                self.end_pending_edit(uri, expected).await;
+            }
+        }
+    }
+
+    /// Applies `changes` through the editor as one edit, returning once the
+    /// editor has reported all of it.
     pub(crate) async fn apply_source_changes(
         &self,
         changes: HashMap<Uri, Vec<TextEdit>>,
         focus: Option<Uri>,
     ) -> bool {
-        let pending_uris = changes.keys().cloned().collect::<Vec<_>>();
-        {
-            let mut state = self.source_state.lock().await;
-            for uri in &pending_uris {
-                *state
-                    .pending_workspace_edits
-                    .entry(uri.clone())
-                    .or_default() += 1;
-            }
+        let pending = self.edited_texts(&changes).await;
+        for (uri, expected) in &pending {
+            self.begin_pending_edit(uri, expected.clone()).await;
         }
         let result: Result<(), String> = async {
             if let Some(uri) = focus {
@@ -763,19 +1164,13 @@ impl State {
         .await;
 
         if let Err(error) = result {
-            let mut state = self.source_state.lock().await;
-            for uri in pending_uris {
-                if let Some(count) = state.pending_workspace_edits.get_mut(&uri) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        state.pending_workspace_edits.shift_remove(&uri);
-                    }
-                }
+            for (uri, expected) in &pending {
+                self.end_pending_edit(uri, expected).await;
             }
-            drop(state);
             self.report_message(MessageType::ERROR, error).await;
             false
         } else {
+            self.wait_for_pending_edits(&pending).await;
             true
         }
     }
@@ -784,24 +1179,279 @@ impl State {
         self.apply_source_changes(HashMap::from([(uri.clone(), vec![edit])]), Some(uri))
             .await
     }
-}
 
-impl LangServer for State {
-    async fn register(self, _: tarpc::context::Context, addr: SocketAddr) -> () {
-        let mut transport = tarpc::serde_transport::tcp::connect(addr, Bincode::default);
-        transport.config_mut().max_frame_length(usize::MAX);
-        let gui_client = match transport.await {
-            Ok(transport) => GuiClient::new(tarpc::client::Config::default(), transport).spawn(),
-            Err(error) => {
-                self.editor_client
-                    .show_message(
-                        MessageType::ERROR,
-                        format!("Could not connect to the GUI: {error}"),
-                    )
-                    .await;
-                return;
+    /// The published workspace and the snapshot the GUI holds, when a
+    /// schematic edit drawn on `base_revision` that touches `spans` is safe:
+    /// that revision is the published one, the editor buffers match it, and
+    /// none of the touched files has an edit still being applied.
+    pub(crate) async fn schematic_edit_context<'s>(
+        &self,
+        base_revision: u64,
+        spans: impl Iterator<Item = &'s Span>,
+    ) -> std::result::Result<(Arc<WorkspaceParseAst>, CompilationSnapshot), &'static str> {
+        let spans = spans.collect::<Vec<_>>();
+        let workspace_ast = {
+            let source = self.source_state.lock().await;
+            let compiled = self.published_state.lock().await;
+            if compiled.compiled_revision != base_revision {
+                return Err(STALE_SNAPSHOT_MESSAGE);
+            }
+            if !editor_buffers_are_current(&source, &compiled) {
+                return Err(OUT_OF_SYNC_MESSAGE);
+            }
+            for span in &spans {
+                if let Some(error) = source_edit_error(&compiled.ast, span) {
+                    return Err(error);
+                }
+                let pending = Uri::from_file_path(&span.path)
+                    .is_some_and(|uri| source.pending_workspace_edits.contains_key(&uri));
+                if pending {
+                    return Err(PENDING_EDIT_MESSAGE);
+                }
+            }
+            compiled.ast.clone()
+        };
+        let connection = self
+            .gui_connection()
+            .await
+            .ok_or("The GUI is not connected.")?;
+        let snapshot = connection.snapshot.lock().await.clone();
+        match snapshot {
+            Some(snapshot) if snapshot.revision == base_revision => Ok((workspace_ast, snapshot)),
+            _ => Err(STALE_SNAPSHOT_MESSAGE),
+        }
+    }
+
+    /// [`Self::schematic_edit_context`], reporting a refusal to the editor
+    /// and the GUI.
+    async fn schematic_context<'s>(
+        &self,
+        base_revision: u64,
+        spans: impl Iterator<Item = &'s Span>,
+    ) -> Option<(Arc<WorkspaceParseAst>, CompilationSnapshot)> {
+        match self.schematic_edit_context(base_revision, spans).await {
+            Ok(context) => Some(context),
+            Err(message) => {
+                self.report_message(MessageType::ERROR, message).await;
+                None
+            }
+        }
+    }
+
+    /// Applies `replacements` through the editor as one edit, returning the
+    /// source revision afterward. Nothing to apply is a success.
+    async fn apply_replacements(
+        &self,
+        workspace_ast: &WorkspaceParseAst,
+        mut replacements: schematic_edit::FileReplacements,
+    ) -> Option<u64> {
+        let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+        for (path, replacements) in &mut replacements {
+            replacements.sort_by_key(|replacement| std::cmp::Reverse(replacement.0.start));
+            let (Some(ast), Some(uri)) = (
+                schematic_edit::module_at(workspace_ast, path),
+                Uri::from_file_path(path),
+            ) else {
+                continue;
+            };
+            let document = self.document(&ast.source_text);
+            let edits = replacements
+                .iter()
+                .map(|(range, text)| TextEdit {
+                    range: Range::new(
+                        document.offset_to_pos(range.start),
+                        document.offset_to_pos(range.end),
+                    ),
+                    new_text: text.clone(),
+                })
+                .collect::<Vec<_>>();
+            if !edits.is_empty() {
+                changes.insert(uri, edits);
+            }
+        }
+        if !changes.is_empty() && !self.apply_source_changes(changes, None).await {
+            return None;
+        }
+        Some(self.source_state.lock().await.revision)
+    }
+
+    /// Adds `statements` to the end of the body of the cell at `target`, with
+    /// `placements` applied in the same edit. The receipt holds the span of
+    /// the call in each statement.
+    async fn insert_statements(
+        &self,
+        workspace_ast: &WorkspaceParseAst,
+        data: &CompiledData,
+        target: &SchematicTarget,
+        statements: Result<Vec<String>, String>,
+        placements: &[PlacementEdit],
+    ) -> Option<EditReceipt> {
+        let result = statements.and_then(|statements| {
+            let (ast, cell) = cell_body(workspace_ast, data, &target.cell)?;
+            let (mut replacements, _) = placement_replacements(workspace_ast, data, placements)?;
+            let insertion =
+                schematic_edit::insert_statements(&ast.source_text, &cell.scope, &statements);
+            let file = replacements
+                .entry(target.cell.path.to_path_buf())
+                .or_default();
+            let spans = statements
+                .iter()
+                .zip(&insertion.statements)
+                .map(|(statement, range)| {
+                    let call = schematic_edit::call_range(statement);
+                    Span {
+                        path: target.cell.path.clone(),
+                        span: schematic_edit::inserted_span(
+                            &insertion.replacement,
+                            &(range.start + call.start..range.start + call.end),
+                            file,
+                        ),
+                    }
+                })
+                .collect::<Vec<_>>();
+            file.push(insertion.replacement);
+            Ok((replacements, spans))
+        });
+        let (replacements, spans) = match result {
+            Ok(result) => result,
+            Err(message) => {
+                self.report_message(MessageType::ERROR, message).await;
+                return None;
             }
         };
+        let revision = self.apply_replacements(workspace_ast, replacements).await?;
+        Some(EditReceipt { revision, spans })
+    }
+}
+
+/// The module and declaration of the cell whose body is `cell`, when the
+/// snapshot compiled it.
+fn cell_body<'a>(
+    workspace_ast: &'a WorkspaceParseAst,
+    data: &CompiledData,
+    cell: &Span,
+) -> std::result::Result<(&'a AnnotatedParseAst, &'a CellDecl<Substr, ParseMetadata>), String> {
+    let ast = schematic_edit::module_at(workspace_ast, &cell.path)
+        .ok_or_else(|| OUT_OF_SYNC_MESSAGE.to_owned())?;
+    let decl = schematic_edit::cell_with_body(ast, cell.span)
+        .ok_or_else(|| STALE_SNAPSHOT_MESSAGE.to_owned())?;
+    let compiled = data.cells.values().any(|compiled| {
+        compiled.scopes.contains_key(&compiled.root) && *compiled.scope_span(compiled.root) == *cell
+    });
+    if !compiled {
+        return Err(STALE_SNAPSHOT_MESSAGE.to_owned());
+    }
+    Ok((ast, decl))
+}
+
+/// A compiled cell whose body is `cell`; any set of arguments will do for
+/// the ports and symbol.
+fn compiled_cell<'a>(
+    data: &'a CompiledData,
+    cell: &Span,
+) -> std::result::Result<&'a argonc::compile::CompiledCell, String> {
+    data.cells
+        .values()
+        .map(|compiled| &**compiled)
+        .find(|compiled| {
+            compiled.scopes.contains_key(&compiled.root)
+                && *compiled.scope_span(compiled.root) == *cell
+        })
+        .ok_or_else(|| STALE_SNAPSHOT_MESSAGE.to_owned())
+}
+
+/// Checks a device the GUI wants to place, returning its kind.
+fn check_device(
+    kind: &str,
+    terminals: usize,
+    args: &str,
+) -> std::result::Result<DeviceKind, String> {
+    let kind = DeviceKind::from_variant(kind)
+        .ok_or_else(|| format!("`{kind}` is not a `std::schematic::DeviceKind`."))?;
+    kind.check_terminals(terminals)
+        .map_err(|error| format!("A `{}` device {error}.", kind.name()))?;
+    let call = schematic_edit::device_statement(
+        "d",
+        kind.name(),
+        terminals,
+        args,
+        &ElementPlacement::default(),
+    );
+    let call = &call[schematic_edit::call_range(&call)];
+    argonc::parse::parse_cell(call)
+        .map_err(|error| format!("The device arguments do not parse: {error}"))?;
+    Ok(kind)
+}
+
+/// The keyword rewrites of `edits`, per file, with the call each edit names.
+fn placement_replacements(
+    workspace_ast: &WorkspaceParseAst,
+    data: &CompiledData,
+    edits: &[PlacementEdit],
+) -> std::result::Result<(schematic_edit::FileReplacements, Vec<Span>), String> {
+    let mut per_file: schematic_edit::FileReplacements = HashMap::new();
+    let mut calls = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let ast = schematic_edit::module_at(workspace_ast, &edit.call.path)
+            .ok_or_else(|| OUT_OF_SYNC_MESSAGE.to_owned())?;
+        let (Some(call), Some((kind, editable))) = (
+            ast.span2call.get(&edit.call),
+            schematic_edit::site_of(data, &edit.call),
+        ) else {
+            return Err(STALE_SNAPSHOT_MESSAGE.to_owned());
+        };
+        if !editable {
+            return Err(format!(
+                "This {} cannot be edited from the GUI.",
+                kind.describe()
+            ));
+        }
+        if let Some(keyword) = edit
+            .keywords
+            .iter()
+            .find(|keyword| !kind.keywords().contains(&keyword.name.as_str()))
+        {
+            return Err(format!(
+                "`{}` is not a keyword of a {}.",
+                keyword.name,
+                kind.describe()
+            ));
+        }
+        // The points of a line or polygon are its first argument.
+        let (points, keywords): (Vec<_>, Vec<_>) = edit
+            .keywords
+            .iter()
+            .cloned()
+            .partition(|keyword| keyword.name == schematic_edit::POINTS);
+        let mut replacements =
+            schematic_edit::keyword_replacements(&ast.source_text, call, &keywords);
+        for points in points {
+            let value = points
+                .value
+                .ok_or_else(|| "A line or polygon keeps its points.".to_owned())?;
+            replacements.extend(schematic_edit::argument_replacements(
+                &ast.source_text,
+                call,
+                &CallArgument::Positional(0),
+                &value,
+            )?);
+        }
+        per_file
+            .entry(edit.call.path.to_path_buf())
+            .or_default()
+            .extend(replacements);
+        calls.push(Span {
+            path: edit.call.path.clone(),
+            span: call.span,
+        });
+    }
+    Ok((per_file, calls))
+}
+
+impl State {
+    /// Adopts a GUI that connected back for callbacks, replacing any earlier
+    /// one, and sends it the session's configuration and current cell.
+    pub(crate) async fn connect_gui(self, gui_client: GuiClient) {
         let connection = self.install_gui_connection(gui_client.clone()).await;
         let modified = self.source_state.lock().await.workspace_modified;
         if let Err(error) = gui_client
@@ -822,17 +1472,16 @@ impl LangServer for State {
         if !self.publish_workspace_path(Some(connection.clone())).await {
             return;
         }
-        self.publish_workspace_modified(modified, Some(connection))
+        self.publish_workspace_modified(modified, Some(connection.clone()))
             .await;
-        // Acknowledge the connection before compiling/preparing its first
-        // snapshot. That work may need GUI callbacks or exceed the handshake
-        // deadline; neither should prevent the window from opening.
-        tokio::spawn(async move {
-            Backend { state: self }.open_current().await;
-        });
+        self.publish_cells(Some(connection.clone())).await;
+        self.publish_recent_cells(Some(connection)).await;
+        Backend { state: self }.open_current().await;
     }
+}
 
-    async fn select_rect(self, _: tarpc::context::Context, span: Span) {
+impl LangServer for State {
+    async fn select_span(self, _: tarpc::context::Context, span: Span) {
         // TODO: check that vim file is in sync with GUI file.
         let compiled = self.published_state.lock().await;
         if let Some(ast) = compiled.ast.values().find(|ast| ast.path == span.path) {
@@ -1370,6 +2019,422 @@ impl LangServer for State {
         Some(edits)
     }
 
+    /// Rewrites the placement and route keywords of schematic calls in one
+    /// workspace edit, after checking that the GUI drew the gesture on the
+    /// published snapshot and that every call is the one it came from.
+    async fn place(self, _: tarpc::context::Context, request: PlaceRequest) -> Option<EditReceipt> {
+        let (workspace_ast, snapshot) = self
+            .schematic_context(
+                request.base_revision,
+                request.edits.iter().map(|edit| &edit.call),
+            )
+            .await?;
+        let data = snapshot.data()?;
+        let (replacements, calls) =
+            match placement_replacements(&workspace_ast, data, &request.edits) {
+                Ok(replacements) => replacements,
+                Err(message) => {
+                    self.report_message(MessageType::ERROR, message).await;
+                    return None;
+                }
+            };
+        let spans = calls
+            .iter()
+            .map(|call| Span {
+                path: call.path.clone(),
+                span: schematic_edit::span_after(call.span, &replacements[&*call.path]),
+            })
+            .collect();
+        let revision = self
+            .apply_replacements(&workspace_ast, replacements)
+            .await?;
+        Some(EditReceipt { revision, spans })
+    }
+
+    async fn add_signal(
+        self,
+        _: tarpc::context::Context,
+        request: AddSignalRequest,
+    ) -> Option<EditReceipt> {
+        let touched = std::iter::once(&request.target.cell)
+            .chain(request.placements.iter().map(|edit| &edit.call));
+        let (workspace_ast, snapshot) = self
+            .schematic_context(request.target.base_revision, touched)
+            .await?;
+        let data = snapshot.data()?;
+        let statements = (|| {
+            let (_, cell) = cell_body(&workspace_ast, data, &request.target.cell)?;
+            let what = if request.port {
+                "a port"
+            } else {
+                "a net label"
+            };
+            schematic_edit::check_new_name(&request.name, what, &schematic_edit::cell_names(cell))?;
+            let mut statements = vec![schematic_edit::signal_statement(
+                &request.name,
+                request.port,
+                request.at,
+            )];
+            if let Some(path) = &request.connect_to {
+                schematic_edit::check_path(path)?;
+                statements.push(schematic_edit::connect_statement(
+                    &request.name,
+                    path,
+                    request.route.as_deref(),
+                ));
+            }
+            Ok(statements)
+        })();
+        self.insert_statements(
+            &workspace_ast,
+            data,
+            &request.target,
+            statements,
+            &request.placements,
+        )
+        .await
+    }
+
+    async fn place_schematic_instance(
+        self,
+        _: tarpc::context::Context,
+        request: PlaceSchematicInstanceRequest,
+    ) -> Option<EditReceipt> {
+        let (workspace_ast, snapshot) = self
+            .schematic_context(
+                request.target.base_revision,
+                std::iter::once(&request.target.cell),
+            )
+            .await?;
+        let data = snapshot.data()?;
+        let statements = (|| {
+            let (_, cell) = cell_body(&workspace_ast, data, &request.target.cell)?;
+            let base = schematic_edit::invoked_cell_name(&request.invocation)?;
+            let name = schematic_edit::fresh_name(&base, &schematic_edit::cell_names(cell));
+            Ok(vec![schematic_edit::instance_statement(
+                &name,
+                &request.invocation,
+                &request.placement,
+            )])
+        })();
+        self.insert_statements(&workspace_ast, data, &request.target, statements, &[])
+            .await
+    }
+
+    async fn place_device(
+        self,
+        _: tarpc::context::Context,
+        request: PlaceDeviceRequest,
+    ) -> Option<EditReceipt> {
+        let (workspace_ast, snapshot) = self
+            .schematic_context(
+                request.target.base_revision,
+                std::iter::once(&request.target.cell),
+            )
+            .await?;
+        let data = snapshot.data()?;
+        let statements = (|| {
+            let (_, cell) = cell_body(&workspace_ast, data, &request.target.cell)?;
+            let kind = check_device(&request.kind, request.terminals, &request.args)?;
+            let name = schematic_edit::fresh_name(
+                &kind.name().to_lowercase(),
+                &schematic_edit::cell_names(cell),
+            );
+            Ok(vec![schematic_edit::device_statement(
+                &name,
+                kind.name(),
+                request.terminals,
+                &request.args,
+                &request.placement,
+            )])
+        })();
+        self.insert_statements(&workspace_ast, data, &request.target, statements, &[])
+            .await
+    }
+
+    async fn connect(
+        self,
+        _: tarpc::context::Context,
+        request: ConnectRequest,
+    ) -> Option<EditReceipt> {
+        let touched = std::iter::once(&request.target.cell)
+            .chain(request.placements.iter().map(|edit| &edit.call));
+        let (workspace_ast, snapshot) = self
+            .schematic_context(request.target.base_revision, touched)
+            .await?;
+        let data = snapshot.data()?;
+        let statements = (|| {
+            cell_body(&workspace_ast, data, &request.target.cell)?;
+            schematic_edit::check_path(&request.a)?;
+            schematic_edit::check_path(&request.b)?;
+            Ok(vec![schematic_edit::connect_statement(
+                &request.a,
+                &request.b,
+                request.route.as_deref(),
+            )])
+        })();
+        self.insert_statements(
+            &workspace_ast,
+            data,
+            &request.target,
+            statements,
+            &request.placements,
+        )
+        .await
+    }
+
+    async fn delete(
+        self,
+        _: tarpc::context::Context,
+        request: DeleteRequest,
+    ) -> Option<DeleteOutcome> {
+        let (workspace_ast, snapshot) = self
+            .schematic_context(request.base_revision, request.targets.iter())
+            .await?;
+        let data = snapshot.data()?;
+        let index = self.nav_index().await;
+        let plan = match schematic_edit::plan_deletion(
+            &workspace_ast,
+            data,
+            index.as_deref(),
+            &request.targets,
+        ) {
+            Ok(plan) => plan,
+            Err(message) => {
+                self.report_message(MessageType::ERROR, message).await;
+                return None;
+            }
+        };
+        if !plan.blocking.is_empty() {
+            return Some(DeleteOutcome::Blocked(plan.blocking));
+        }
+        let revision = self
+            .apply_replacements(&workspace_ast, plan.replacements)
+            .await?;
+        Some(DeleteOutcome::Applied(EditReceipt {
+            revision,
+            spans: Vec::new(),
+        }))
+    }
+
+    async fn set_argument(
+        self,
+        _: tarpc::context::Context,
+        request: SetArgumentRequest,
+    ) -> Option<EditReceipt> {
+        let (workspace_ast, snapshot) = self
+            .schematic_context(request.base_revision, std::iter::once(&request.call))
+            .await?;
+        let data = snapshot.data()?;
+        let result = (|| {
+            let ast = schematic_edit::module_at(&workspace_ast, &request.call.path)
+                .ok_or_else(|| OUT_OF_SYNC_MESSAGE.to_owned())?;
+            let (Some(call), Some((kind, editable))) = (
+                ast.span2call.get(&request.call),
+                schematic_edit::site_of(data, &request.call),
+            ) else {
+                return Err(STALE_SNAPSHOT_MESSAGE.to_owned());
+            };
+            if !editable {
+                return Err(format!(
+                    "This {} cannot be edited from the GUI.",
+                    kind.describe()
+                ));
+            }
+            schematic_edit::check_expression(&request.value)?;
+            let replacements = schematic_edit::argument_replacements(
+                &ast.source_text,
+                call,
+                &request.argument,
+                &request.value,
+            )?;
+            let span = schematic_edit::span_after(call.span, &replacements);
+            Ok((
+                HashMap::from([(request.call.path.to_path_buf(), replacements)]),
+                Span {
+                    path: request.call.path.clone(),
+                    span,
+                },
+            ))
+        })();
+        let (replacements, span) = match result {
+            Ok(result) => result,
+            Err(message) => {
+                self.report_message(MessageType::ERROR, message).await;
+                return None;
+            }
+        };
+        let revision = self
+            .apply_replacements(&workspace_ast, replacements)
+            .await?;
+        Some(EditReceipt {
+            revision,
+            spans: vec![span],
+        })
+    }
+
+    async fn call_arguments(
+        self,
+        _: tarpc::context::Context,
+        base_revision: u64,
+        call: Span,
+    ) -> Option<CallArguments> {
+        let compiled = self.published_state.lock().await;
+        if compiled.compiled_revision != base_revision {
+            return None;
+        }
+        let ast = schematic_edit::module_at(&compiled.ast, &call.path)?;
+        let call = ast.span2call.get(&call)?;
+        Some(schematic_edit::call_arguments(&ast.source_text, call))
+    }
+
+    async fn add_symbol_items(
+        self,
+        _: tarpc::context::Context,
+        request: AddSymbolItemsRequest,
+    ) -> Option<EditReceipt> {
+        let (workspace_ast, snapshot) = self
+            .schematic_context(
+                request.target.base_revision,
+                std::iter::once(&request.target.cell),
+            )
+            .await?;
+        let data = snapshot.data()?;
+        let statements = (|| {
+            let (_, cell) = cell_body(&workspace_ast, data, &request.target.cell)?;
+            let compiled = compiled_cell(data, &request.target.cell)?;
+            request
+                .items
+                .iter()
+                .map(|item| schematic_edit::symbol_statement(item, cell, &compiled.schematic))
+                .collect::<Result<Vec<_>, _>>()
+        })();
+        self.insert_statements(&workspace_ast, data, &request.target, statements, &[])
+            .await
+    }
+
+    async fn create_symbol(
+        self,
+        _: tarpc::context::Context,
+        request: CreateSymbolRequest,
+    ) -> Option<EditReceipt> {
+        let (workspace_ast, snapshot) = self
+            .schematic_context(
+                request.target.base_revision,
+                std::iter::once(&request.target.cell),
+            )
+            .await?;
+        let data = snapshot.data()?;
+        let statements = (|| {
+            cell_body(&workspace_ast, data, &request.target.cell)?;
+            let compiled = compiled_cell(data, &request.target.cell)?;
+            schematic_edit::create_symbol_statements(compiled)
+        })();
+        self.insert_statements(&workspace_ast, data, &request.target, statements, &[])
+            .await
+    }
+
+    async fn rename(
+        self,
+        _: tarpc::context::Context,
+        request: RenameRequest,
+    ) -> Option<EditReceipt> {
+        let (workspace_ast, snapshot) = self
+            .schematic_context(request.base_revision, std::iter::once(&request.site))
+            .await?;
+        let data = snapshot.data()?;
+        let index = self.nav_index().await;
+        let replacements = match schematic_edit::rename_replacements(
+            &workspace_ast,
+            data,
+            index.as_deref(),
+            &request.site,
+            &request.name,
+        ) {
+            Ok(replacements) => replacements,
+            Err(message) => {
+                self.report_message(MessageType::ERROR, message).await;
+                return None;
+            }
+        };
+        let span = Span {
+            path: request.site.path.clone(),
+            span: schematic_edit::span_after(
+                request.site.span,
+                replacements
+                    .get(&*request.site.path)
+                    .map_or(&[][..], Vec::as_slice),
+            ),
+        };
+        let revision = self
+            .apply_replacements(&workspace_ast, replacements)
+            .await?;
+        Some(EditReceipt {
+            revision,
+            spans: vec![span],
+        })
+    }
+
+    async fn copy_statements(
+        self,
+        _: tarpc::context::Context,
+        base_revision: u64,
+        targets: Vec<Span>,
+    ) -> Option<Vec<ClipboardItem>> {
+        let (workspace_ast, snapshot) = self
+            .schematic_context(base_revision, targets.iter())
+            .await?;
+        let data = snapshot.data()?;
+        match schematic_edit::copy_statements(&workspace_ast, data, &targets) {
+            Ok(items) => Some(items),
+            Err(message) => {
+                self.report_message(MessageType::ERROR, message).await;
+                None
+            }
+        }
+    }
+
+    async fn paste(self, _: tarpc::context::Context, request: PasteRequest) -> Option<EditReceipt> {
+        let (workspace_ast, snapshot) = self
+            .schematic_context(
+                request.target.base_revision,
+                std::iter::once(&request.target.cell),
+            )
+            .await?;
+        let data = snapshot.data()?;
+        let statements = (|| {
+            let (_, cell) = cell_body(&workspace_ast, data, &request.target.cell)?;
+            schematic_edit::paste_statements(
+                &request.items,
+                request.offset,
+                request.symbol_offset,
+                &schematic_edit::cell_names(cell),
+            )
+        })();
+        self.insert_statements(&workspace_ast, data, &request.target, statements, &[])
+            .await
+    }
+
+    async fn cell_parameters(
+        self,
+        _: tarpc::context::Context,
+        base_revision: u64,
+        cell: Span,
+    ) -> Option<Vec<String>> {
+        let compiled = self.published_state.lock().await;
+        if compiled.compiled_revision != base_revision {
+            return None;
+        }
+        let ast = schematic_edit::module_at(&compiled.ast, &cell.path)?;
+        let decl = schematic_edit::cell_with_body(ast, cell.span)?;
+        Some(
+            decl.args
+                .iter()
+                .map(|arg| arg.name.name.to_string())
+                .collect(),
+        )
+    }
+
     async fn add_eq_constraint(
         self,
         _: tarpc::context::Context,
@@ -1411,7 +2476,7 @@ impl LangServer for State {
 
     async fn open_cell(self, _: tarpc::context::Context, cell: String) {
         self.editor_client
-            .show_message(MessageType::INFO, &format!("cell {}", cell))
+            .show_message(MessageType::LOG, &format!("cell {}", cell))
             .await;
         tokio::spawn(async move {
             Backend { state: self }.select_and_open_cell(cell).await;
@@ -1753,7 +2818,9 @@ cell top() { let m = inst(mid(), x=0., y=0.); }
         );
         assert!(!editor_buffers_are_current(&source_state, &compiled));
 
-        source_state.pending_workspace_edits.insert(uri, 1);
+        source_state
+            .pending_workspace_edits
+            .insert(uri, "cell top() { rect(); }\n".to_owned());
         assert!(editor_buffers_are_current(&source_state, &compiled));
     }
 
@@ -1782,6 +2849,87 @@ cell top() { let m = inst(mid(), x=0., y=0.); }
         let root = parse::parse_source_text(edited.clone(), path).unwrap();
         let (_, errors) = argonc::compile::static_compile(&parse::with_std(root)).unwrap();
         assert!(errors.errors.is_empty(), "{edited}\n{:?}", errors.errors);
+    }
+
+    #[test]
+    fn place_rewrites_symbol_coordinates_and_the_points_of_a_line() {
+        use super::{KeywordEdit, PlacementEdit, placement_replacements};
+        use crate::schematic_edit::testing::compile;
+        let compiled = compile(
+            "use std::schematic::Signal;
+             use std::symbol::{line, pin, rect, text};
+             cell inv() {
+                 pub let a = Signal(x=-6, y=0);
+                 line([(-4., 0.), (-2., 0.)]);
+                 rect(x0=-2., y0=-2., x1=2., y1=2.);
+                 text(\"inv\", x=0., y=3.);
+                 pin(a, x=-4, y=0);
+             }
+             cell top() {
+                 let u = std::schematic::inst(inv(), x=0, y=0);
+             }",
+        );
+        let keyword = |name: &str, value: &str| KeywordEdit {
+            name: name.to_owned(),
+            value: Some(value.to_owned()),
+        };
+        let edits = vec![
+            PlacementEdit {
+                call: compiled.site("line("),
+                keywords: vec![keyword("points", "[(-4., 0.5), (-2., 0.5)]")],
+            },
+            PlacementEdit {
+                call: compiled.site("rect("),
+                keywords: vec![keyword("x0", "-3."), keyword("fill", "true")],
+            },
+            PlacementEdit {
+                call: compiled.site("text("),
+                keywords: vec![
+                    keyword("x", "1."),
+                    keyword("align", "std::symbol::Align::Right"),
+                ],
+            },
+            PlacementEdit {
+                call: compiled.site("pin("),
+                keywords: vec![keyword("x", "-5"), keyword("label", "true")],
+            },
+        ];
+        let (replacements, calls) =
+            placement_replacements(&compiled.workspace, &compiled.data, &edits).unwrap();
+        assert_eq!(calls.len(), 4);
+        let mut file = replacements[&compiled.path].clone();
+        file.sort_by_key(|replacement| std::cmp::Reverse(replacement.0.start));
+        let edited = crate::schematic_edit::apply_replacements(compiled.source(), &file);
+        assert!(
+            edited.contains("line([(-4., 0.5), (-2., 0.5)]);"),
+            "{edited}"
+        );
+        assert!(
+            edited.contains("rect(x0=-3., y0=-2., x1=2., y1=2., fill=true);"),
+            "{edited}"
+        );
+        assert!(
+            edited.contains("text(\"inv\", x=1., y=3., align=std::symbol::Align::Right);"),
+            "{edited}"
+        );
+        assert!(
+            edited.contains("pin(a, x=-5, y=0, label=true);"),
+            "{edited}"
+        );
+        // A keyword of another kind is refused, and so is dropping the points.
+        let wrong = vec![PlacementEdit {
+            call: compiled.site("line("),
+            keywords: vec![keyword("x0", "1.")],
+        }];
+        assert!(placement_replacements(&compiled.workspace, &compiled.data, &wrong).is_err());
+        let dropped = vec![PlacementEdit {
+            call: compiled.site("line("),
+            keywords: vec![KeywordEdit {
+                name: "points".into(),
+                value: None,
+            }],
+        }];
+        assert!(placement_replacements(&compiled.workspace, &compiled.data, &dropped).is_err());
     }
 
     #[test]

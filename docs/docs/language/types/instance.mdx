@@ -38,7 +38,7 @@ Imported GDS cells expose fields found in the file, including pin names when pin
 
 ## Schematic instances
 
-`SchematicInst` is a cell placed in a schematic with [`std::schematic::inst`](/language/std-schematic#inst). It has no position, so its only fields are the cell's public fields.
+`SchematicInst` is a cell placed in a schematic with [`std::schematic::inst`](/language/std-schematic#inst). Its [placement](/language/schematic#placement-and-routes) only says where the GUI draws it and can't be read back, so its only fields are the cell's public fields.
 
 <FieldTable rows={[
   {name: '<cell field>', type: 'Declared type', description: 'A public field of the cell. A signal on one of the cell\'s ports reads as the instance\'s terminal.'},

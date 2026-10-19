@@ -1,7 +1,7 @@
 use std::{
     fmt::Display,
     future::Future,
-    net::{Ipv4Addr, SocketAddr, TcpListener},
+    net::SocketAddr,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
@@ -11,10 +11,15 @@ use std::{
 
 use analyzer::ArgonConfig;
 use analyzer::rpc::{
-    CompilationSnapshot, CompressedCompilationUpdate, DimensionParams, FocusEditorParams,
+    AddSignalRequest, AddSymbolItemsRequest, CallArguments, CellEntry, ClipboardItem,
+    CompilationSnapshot, CompressedCompilationUpdate, ConnectRequest, CreateSymbolRequest,
+    DeleteOutcome, DeleteRequest, DevicePreview, DimensionParams, EditReceipt, FocusEditorParams,
     FocusedCellPreview, Gui, GuiUpdateResult, InitialConditionEdit, InstancePreview,
-    LangServerAction, LangServerClient, PathParams, PolygonParams, RectangleEditResult, ValueEdit,
+    LangServerAction, LangServerClient, PasteRequest, PathParams, PlaceDeviceRequest, PlaceRequest,
+    PlaceSchematicInstanceRequest, PolygonParams, RecentCell, RectangleEditResult, RenameRequest,
+    SchematicInstancePreview, SetArgumentRequest, ValueEdit,
 };
+use analyzer::transport::{self, Role, SessionToken};
 use anyhow::{Result, anyhow};
 use argonc::{
     ast::Span,
@@ -28,19 +33,12 @@ use futures::{
     },
     prelude::*,
 };
-use gpui::AsyncApp;
-use tarpc::{
-    context,
-    server::{Channel, incoming::Incoming},
-    tokio_serde::formats::Bincode,
-};
+use gpui::{AsyncApp, Task};
+use tarpc::{context, server::Channel, tokio_serde::formats::Bincode};
 use tower_lsp_server::ls_types::MessageType;
 use tracing::error;
 
-use crate::{
-    editor::{Editor, prepare_compilation_snapshot},
-    editor_window_options, focus,
-};
+use crate::editor::{Editor, prepare_compilation_snapshot};
 
 pub const LANG_SERVER_CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_SNAPSHOT_PREPARATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -58,6 +56,7 @@ fn lock_unpoisoned<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct SyncLangServerClient {
     app: AsyncApp,
     lang_server_addr: SocketAddr,
+    token: SessionToken,
     client: Arc<Mutex<LangServerClient>>,
     to_exec: UnboundedSender<EditorFn>,
 }
@@ -76,20 +75,22 @@ fn is_disconnected(error: &tarpc::client::RpcError) -> bool {
     )
 }
 
-fn connect_client(app: &AsyncApp, lang_server_addr: SocketAddr) -> Result<LangServerClient> {
+async fn connect_lang_server(
+    lang_server_addr: SocketAddr,
+    token: SessionToken,
+) -> std::io::Result<LangServerClient> {
+    let stream = transport::connect(lang_server_addr, &token, Role::Gui).await?;
+    let transport = tarpc::serde_transport::new(stream, Bincode::default());
+    Ok(LangServerClient::new(tarpc::client::Config::default(), transport).spawn())
+}
+
+fn connect_client(
+    app: &AsyncApp,
+    lang_server_addr: SocketAddr,
+    token: &SessionToken,
+) -> Result<LangServerClient> {
     app.background_executor()
-        .block(
-            async move {
-                let mut transport =
-                    tarpc::serde_transport::tcp::connect(lang_server_addr, Bincode::default);
-                transport.config_mut().max_frame_length(usize::MAX);
-                let transport = transport.await?;
-                Ok::<_, std::io::Error>(
-                    LangServerClient::new(tarpc::client::Config::default(), transport).spawn(),
-                )
-            }
-            .compat(),
-        )
+        .block(connect_lang_server(lang_server_addr, token.clone()).compat())
         .map_err(Into::into)
 }
 
@@ -109,6 +110,7 @@ impl SyncLangServerClient {
         Self {
             app,
             lang_server_addr: "127.0.0.1:1".parse().unwrap(),
+            token: SessionToken::generate().unwrap(),
             client: Arc::new(Mutex::new(client)),
             to_exec,
         }
@@ -128,6 +130,7 @@ impl SyncLangServerClient {
             Self {
                 app,
                 lang_server_addr: "127.0.0.1:1".parse().unwrap(),
+                token: SessionToken::generate().unwrap(),
                 client: Arc::new(Mutex::new(client.client)),
                 to_exec,
             },
@@ -135,18 +138,23 @@ impl SyncLangServerClient {
         )
     }
 
-    pub fn new(app: AsyncApp, lang_server_addr: SocketAddr) -> (Self, UnboundedReceiver<EditorFn>) {
-        let client = connect_client(&app, lang_server_addr).unwrap();
+    pub fn new(
+        app: AsyncApp,
+        lang_server_addr: SocketAddr,
+        token: SessionToken,
+    ) -> Result<(Self, UnboundedReceiver<EditorFn>)> {
+        let client = connect_client(&app, lang_server_addr, &token)?;
         let (to_exec, rx) = mpsc::unbounded();
-        (
+        Ok((
             Self {
                 app,
                 lang_server_addr,
+                token,
                 client: Arc::new(Mutex::new(client)),
                 to_exec,
             },
             rx,
-        )
+        ))
     }
 
     fn call<T, F, Fut>(&self, request: F) -> Result<T>
@@ -181,7 +189,7 @@ impl SyncLangServerClient {
 
     /// Source placement must yield while Neovim accepts the edit, so painting
     /// and navigation continue throughout the request and reconnect timeout.
-    async fn call_async<T, F, Fut>(&self, request: F) -> Result<T>
+    pub(crate) async fn call_async<T, F, Fut>(&self, request: F) -> Result<T>
     where
         T: Send + 'static,
         F: Fn(LangServerClient) -> Fut,
@@ -192,23 +200,17 @@ impl SyncLangServerClient {
         let result = match result {
             Err(RpcCallError::Rpc(error)) if is_disconnected(&error) => {
                 let addr = self.lang_server_addr;
+                let token = self.token.clone();
                 let reconnect = self
                     .app
                     .background_executor()
                     .spawn(
                         async move {
-                            let mut transport =
-                                tarpc::serde_transport::tcp::connect(addr, Bincode::default);
-                            transport.config_mut().max_frame_length(usize::MAX);
-                            tokio::time::timeout(LANG_SERVER_CLIENT_TIMEOUT, transport)
-                                .await?
-                                .map(|transport| {
-                                    LangServerClient::new(
-                                        tarpc::client::Config::default(),
-                                        transport,
-                                    )
-                                    .spawn()
-                                })
+                            tokio::time::timeout(
+                                LANG_SERVER_CLIENT_TIMEOUT,
+                                connect_lang_server(addr, token),
+                            )
+                            .await?
                         }
                         .compat(),
                     )
@@ -274,7 +276,7 @@ impl SyncLangServerClient {
     }
 
     fn reconnect(&self) -> Result<LangServerClient> {
-        let client = connect_client(&self.app, self.lang_server_addr)?;
+        let client = connect_client(&self.app, self.lang_server_addr, &self.token)?;
         *lock_unpoisoned(&self.client) = client.clone();
         Ok(client)
     }
@@ -305,110 +307,55 @@ impl SyncLangServerClient {
         }));
     }
 
-    pub fn register_server(
-        &self,
-        configured_port: Option<u16>,
-        prebound_listener: Option<TcpListener>,
-        register_addr: Option<SocketAddr>,
-    ) {
+    /// Opens the connection the analyzer calls the GUI back over and serves
+    /// it until the returned task is dropped.
+    pub fn serve_callbacks(&self) -> Task<()> {
         let client = self.clone();
         self.app
-            .spawn(async move |_| {
-                let result = client
-                    .start_server(configured_port, prebound_listener, register_addr)
-                    .await;
-                if let Err(error) = &result {
-                    error!("Failed to register GUI: {error}");
+            .spawn(async move |_| match client.connect_callbacks().await {
+                Ok(server) => {
+                    client.report_connection_result(&Ok(()));
+                    server.await;
                 }
-                client.report_connection_result(&result);
+                Err(error) => {
+                    error!("Failed to connect the GUI to the analyzer: {error}");
+                    client.report_connection_result::<()>(&Err(error));
+                }
             })
-            .detach();
     }
 
-    async fn start_server(
-        &self,
-        configured_port: Option<u16>,
-        prebound_listener: Option<TcpListener>,
-        register_addr: Option<SocketAddr>,
-    ) -> Result<()> {
-        let background_executor = self.app.background_executor().clone();
-        let mut listener = self
+    async fn connect_callbacks(&self) -> Result<Task<()>> {
+        let addr = self.lang_server_addr;
+        let token = self.token.clone();
+        let stream = self
             .app
             .background_executor()
             .spawn(
-                async move {
-                    if let Some(listener) = prebound_listener {
-                        match listener
-                            .set_nonblocking(true)
-                            .and_then(|_| tokio::net::TcpListener::from_std(listener))
-                        {
-                            Ok(listener) => {
-                                tarpc::serde_transport::tcp::listen_on(listener, Bincode::default)
-                                    .await
-                            }
-                            Err(error) => Err(error),
-                        }
-                    } else {
-                        let port = configured_port.unwrap_or(0);
-                        tarpc::serde_transport::tcp::listen(
-                            (Ipv4Addr::LOCALHOST, port),
-                            Bincode::default,
-                        )
-                        .await
-                    }
-                }
-                .compat(),
+                async move { transport::connect(addr, &token, Role::GuiCallback).await }.compat(),
             )
             .await?;
-        let server_addr = listener.local_addr();
-        let register_addr = register_addr.unwrap_or(server_addr);
-        let to_exec = self.to_exec.clone();
-        self.app
-            .background_executor()
-            .spawn(
-                async move {
-                    listener.config_mut().max_frame_length(usize::MAX);
-                    listener
-                        // Ignore accept errors.
-                        .filter_map(|r| futures::future::ready(r.ok()))
-                        .map(tarpc::server::BaseChannel::with_defaults)
-                        // Limit channels to 1 per IP.
-                        .max_channels_per_key(1, |t| t.transport().peer_addr().unwrap().ip())
-                        // serve is generated by the service attribute. It takes as input any type implementing
-                        // the generated World trait.
-                        .map(|channel| {
-                            let server = GuiServer {
-                                to_exec: to_exec.clone(),
-                                snapshot: Arc::default(),
-                            };
-                            channel
-                                .execute(server.serve())
-                                .for_each(|t| background_executor.spawn(t))
-                        })
-                        // Max 10 channels.
-                        .buffer_unordered(10)
-                        .for_each(|_| async {})
-                        .await;
-                }
-                .compat(),
-            )
-            .detach();
-        self.register_with_analyzer(register_addr).await
+        let background_executor = self.app.background_executor().clone();
+        let server = GuiServer {
+            to_exec: self.to_exec.clone(),
+            snapshot: Arc::default(),
+        };
+        Ok(self.app.background_executor().spawn(
+            async move {
+                let transport = tarpc::serde_transport::new(stream, Bincode::default());
+                tarpc::server::BaseChannel::with_defaults(transport)
+                    .execute(server.serve())
+                    .for_each(|response| background_executor.spawn(response))
+                    .await;
+            }
+            .compat(),
+        ))
     }
 
-    async fn register_with_analyzer(&self, register_addr: SocketAddr) -> Result<()> {
-        // Registration can call back into the GUI for its first snapshot.
-        // The main thread must keep servicing those callbacks while we wait.
-        self.call_async(move |client| async move {
-            client.register(context::current(), register_addr).await
-        })
-        .await
-    }
-
-    pub fn select_rect(&self, span: Span) -> Result<()> {
+    /// Reveals `span` in the editor.
+    pub fn select_span(&self, span: Span) -> Result<()> {
         self.call(move |client| {
             let span = span.clone();
-            async move { client.select_rect(context::current(), span).await }
+            async move { client.select_span(context::current(), span).await }
         })
     }
 
@@ -539,6 +486,153 @@ impl SyncLangServerClient {
         }));
     }
 
+    /// Applies a schematic placement or route gesture, off the UI thread.
+    pub async fn place(&self, request: PlaceRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.place(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn add_signal(&self, request: AddSignalRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.add_signal(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn place_schematic_instance(
+        &self,
+        request: PlaceSchematicInstanceRequest,
+    ) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move {
+                client
+                    .place_schematic_instance(context::current(), request)
+                    .await
+            }
+        })
+        .await
+    }
+
+    pub async fn place_device(&self, request: PlaceDeviceRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.place_device(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn connect(&self, request: ConnectRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.connect(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn delete(&self, request: DeleteRequest) -> Result<Option<DeleteOutcome>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.delete(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn set_argument(&self, request: SetArgumentRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.set_argument(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn add_symbol_items(
+        &self,
+        request: AddSymbolItemsRequest,
+    ) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.add_symbol_items(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn create_symbol(&self, request: CreateSymbolRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.create_symbol(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn rename(&self, request: RenameRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.rename(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn copy_statements(
+        &self,
+        base_revision: u64,
+        targets: Vec<Span>,
+    ) -> Result<Option<Vec<ClipboardItem>>> {
+        self.call_async(move |client| {
+            let targets = targets.clone();
+            async move {
+                client
+                    .copy_statements(context::current(), base_revision, targets)
+                    .await
+            }
+        })
+        .await
+    }
+
+    pub async fn paste(&self, request: PasteRequest) -> Result<Option<EditReceipt>> {
+        self.call_async(move |client| {
+            let request = request.clone();
+            async move { client.paste(context::current(), request).await }
+        })
+        .await
+    }
+
+    pub async fn cell_parameters(
+        &self,
+        base_revision: u64,
+        cell: Span,
+    ) -> Result<Option<Vec<String>>> {
+        self.call_async(move |client| {
+            let cell = cell.clone();
+            async move {
+                client
+                    .cell_parameters(context::current(), base_revision, cell)
+                    .await
+            }
+        })
+        .await
+    }
+
+    pub async fn call_arguments(
+        &self,
+        base_revision: u64,
+        call: Span,
+    ) -> Result<Option<CallArguments>> {
+        self.call_async(move |client| {
+            let call = call.clone();
+            async move {
+                client
+                    .call_arguments(context::current(), base_revision, call)
+                    .await
+            }
+        })
+        .await
+    }
+
     pub fn add_eq_constraint(&self, scope_span: Span, lhs: String, rhs: String) -> Result<()> {
         self.call(move |client| {
             let scope_span = scope_span.clone();
@@ -568,6 +662,14 @@ impl SyncLangServerClient {
         })
     }
 
+    /// Opens the cell invocation `cell`, such as `inverter()`.
+    pub fn open_cell(&self, cell: String) -> Result<()> {
+        self.call(move |client| {
+            let cell = cell.clone();
+            async move { client.open_cell(context::current(), cell).await }
+        })
+    }
+
     pub fn open_command_bar(&self, command: Option<String>, return_to_gui: bool) -> Result<()> {
         self.call(move |client| {
             let params = FocusEditorParams {
@@ -594,7 +696,7 @@ impl Gui for GuiServer {
                 let _ = cx.update(|cx| editor.set_compilation_active(cx, activity_id, true));
             }))
             .await
-            .unwrap();
+            .ok();
     }
 
     async fn compilation_finished(mut self, _: context::Context, activity_id: u64) {
@@ -603,7 +705,7 @@ impl Gui for GuiServer {
                 let _ = cx.update(|cx| editor.set_compilation_active(cx, activity_id, false));
             }))
             .await
-            .unwrap();
+            .ok();
     }
 
     async fn update_cell(
@@ -643,7 +745,7 @@ impl Gui for GuiServer {
                 let _ = sender.send(context);
             }))
             .await
-            .unwrap();
+            .ok();
         let Ok(Some(preparation_context)) = receiver.await else {
             return GuiUpdateResult {
                 accepted: true,
@@ -666,7 +768,7 @@ impl Gui for GuiServer {
                     .update(|cx| editor.finish_snapshot_preparation(cx, preparation_id, snapshot));
             }))
             .await
-            .unwrap();
+            .ok();
         GuiUpdateResult {
             accepted: true,
             decode_seconds,
@@ -736,7 +838,7 @@ impl Gui for GuiServer {
                 let _ = cx.update(|cx| editor.fit_to_screen(cx));
             }))
             .await
-            .unwrap();
+            .ok();
     }
 
     async fn set_workspace_path(mut self, _: context::Context, path: Option<std::path::PathBuf>) {
@@ -745,7 +847,7 @@ impl Gui for GuiServer {
                 let _ = cx.update(|cx| editor.set_workspace_path(cx, path));
             }))
             .await
-            .unwrap();
+            .ok();
     }
 
     async fn workspace_modified(mut self, _: context::Context, modified: bool) {
@@ -754,7 +856,7 @@ impl Gui for GuiServer {
                 let _ = cx.update(|cx| editor.set_workspace_modified(cx, modified));
             }))
             .await
-            .unwrap();
+            .ok();
     }
 
     async fn show_message(mut self, _: context::Context, typ: MessageType, message: String) {
@@ -811,46 +913,126 @@ impl Gui for GuiServer {
             .send(Box::new(move |editor, cx| {
                 let _ = cx.update(|cx| {
                     editor.place_instance(cx, preview);
-                    focus::activate_gui(cx);
+                    editor.activate(cx);
                 });
             }))
             .await
-            .unwrap();
+            .ok();
+    }
+
+    async fn schematic_target(mut self, _: context::Context) -> Option<Span> {
+        let (sender, receiver) = oneshot::channel();
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let target = cx.update(|cx| editor.schematic_target(cx)).ok().flatten();
+                let _ = sender.send(target);
+            }))
+            .await
+            .ok()?;
+        receiver.await.ok().flatten()
+    }
+
+    async fn place_schematic_instance(
+        mut self,
+        _: context::Context,
+        preview: SchematicInstancePreview,
+    ) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| {
+                    editor.place_schematic_instance(cx, preview);
+                    editor.activate(cx);
+                });
+            }))
+            .await
+            .ok();
+    }
+
+    async fn place_device(mut self, _: context::Context, preview: DevicePreview) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| {
+                    editor.place_device(cx, preview);
+                    editor.activate(cx);
+                });
+            }))
+            .await
+            .ok();
     }
     async fn configure(mut self, _: tarpc::context::Context, config: ArgonConfig) -> () {
         let _ = analyzer::reload_log_filter(&config.log.level);
         self.to_exec
             .send(Box::new(move |editor, cx| {
-                editor
-                    .state
-                    .update(cx, |state, cx| {
-                        state.hierarchy_depth = config.gui.hierarchy_depth.unwrap_or(usize::MAX);
-                        state.dark_mode = config.gui.dark_mode;
-                        state.icon_size = config.gui.icon_size;
-                        state.font_size = config.gui.font_size;
-                        cx.notify();
-                    })
-                    .unwrap();
+                let _ = editor.state.update(cx, |state, cx| {
+                    state.hierarchy_depth = config.gui.hierarchy_depth.unwrap_or(usize::MAX);
+                    state.dark_mode = config.gui.dark_mode;
+                    state.icon_size = config.gui.icon_size;
+                    state.font_size = config.gui.font_size;
+                    state.option_as_meta = config.gui.option_as_meta;
+                    cx.notify();
+                });
             }))
             .await
-            .unwrap();
+            .ok();
+    }
+
+    async fn highlight_spans(
+        mut self,
+        _: context::Context,
+        revision: u64,
+        spans: Vec<argonc::ast::Span>,
+    ) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| editor.highlight_agent_edit(cx, revision, spans));
+            }))
+            .await
+            .ok();
+    }
+
+    async fn agent_activity(mut self, _: context::Context, label: Option<String>) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = cx.update(|cx| editor.set_agent_activity(cx, label));
+            }))
+            .await
+            .ok();
     }
 
     async fn activate(mut self, _context: ::tarpc::context::Context) -> () {
         self.to_exec
             .send(Box::new(|editor, cx| {
-                let editor = editor.clone();
                 let _ = cx.update(|cx| {
-                    if cx.windows().is_empty() {
-                        let _ = cx.open_window(editor_window_options(), |window, cx| {
-                            window.replace_root(cx, |_, _| editor)
-                        });
-                    }
-                    focus::activate_gui(cx);
+                    crate::main_window::reopen_standalone(editor, cx);
+                    editor.activate(cx);
                 });
             }))
             .await
-            .unwrap();
+            .ok();
+    }
+
+    async fn set_cells(mut self, _: context::Context, cells: Vec<CellEntry>) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = editor.state.update(cx, |state, cx| {
+                    state.cells = Some(cells);
+                    cx.notify();
+                });
+            }))
+            .await
+            .ok();
+    }
+
+    async fn set_recent_cells(mut self, _: context::Context, cells: Vec<RecentCell>) {
+        self.to_exec
+            .send(Box::new(move |editor, cx| {
+                let _ = editor.state.update(cx, |state, cx| {
+                    state.recent_cells = cells;
+                    cx.notify();
+                });
+            }))
+            .await
+            .ok();
     }
 }
 
@@ -859,60 +1041,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{is_disconnected, lock_unpoisoned};
-
-    #[gpui::test]
-    fn registration_yields_until_the_analyzer_replies(cx: &mut gpui::TestAppContext) {
-        use analyzer::rpc::{LangServerRequest, LangServerResponse};
-        use futures::{FutureExt, SinkExt, StreamExt};
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let (client, mut server) = super::SyncLangServerClient::for_rpc_test(cx.to_async());
-        let completed = Arc::new(AtomicBool::new(false));
-        let done = completed.clone();
-        cx.to_async()
-            .spawn(async move |_| {
-                client
-                    .register_with_analyzer("127.0.0.1:12345".parse().unwrap())
-                    .await
-                    .unwrap();
-                done.store(true, Ordering::Release);
-            })
-            .detach();
-        let request = loop {
-            if let Some(message) = server.next().now_or_never()
-                && let tarpc::ClientMessage::Request(request) = message.unwrap().unwrap()
-            {
-                break request;
-            }
-            assert!(cx.dispatcher.tick(false));
-        };
-        assert!(matches!(
-            request.message,
-            LangServerRequest::Register { .. }
-        ));
-        assert!(!completed.load(Ordering::Acquire));
-        // Foreground work can finish while the handshake is unanswered.
-        let foreground_ran = Arc::new(AtomicBool::new(false));
-        let ran = foreground_ran.clone();
-        cx.to_async()
-            .spawn(async move |_| ran.store(true, Ordering::Release))
-            .detach();
-        while !foreground_ran.load(Ordering::Acquire) {
-            assert!(cx.dispatcher.tick(false));
-        }
-        assert!(!completed.load(Ordering::Acquire));
-        server
-            .send(tarpc::Response {
-                request_id: request.id,
-                message: Ok(LangServerResponse::Register(())),
-            })
-            .now_or_never()
-            .unwrap()
-            .unwrap();
-        while !completed.load(Ordering::Acquire) {
-            assert!(cx.dispatcher.tick(false));
-        }
-    }
 
     #[gpui::test]
     fn sse_source_edit_yields_until_neovim_accepts_it(cx: &mut gpui::TestAppContext) {

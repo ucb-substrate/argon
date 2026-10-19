@@ -50,7 +50,7 @@ const sidebars: SidebarsConfig = {
       label: 'Standard library',
       collapsed: false,
       link: {type: 'doc', id: 'language/std'},
-      items: ['language/std-layout', 'language/std-schematic'],
+      items: ['language/std-layout', 'language/std-schematic', 'language/std-symbol'],
     },
     {
       type: 'category',
@@ -72,6 +72,8 @@ const sidebars: SidebarsConfig = {
     'gui/workspace',
     'gui/drawing',
     'gui/hierarchy-layers',
+    'gui/schematic',
+    'gui/symbol',
     'gui/cell-management',
     'gui/shortcuts-config',
   ],
@@ -82,6 +84,7 @@ const sidebars: SidebarsConfig = {
     'tools/argone',
     'tools/argonc',
     'tools/neovim',
+    'tools/agents',
   ],
 };
 
