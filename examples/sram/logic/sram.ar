@@ -1,0 +1,207 @@
+// The assembled SRAM: blocks placed by the floorplan, signal routes, power,
+// guard rings, and pins.
+
+use std::layout::{inst, text};
+use lib::params::SramLayoutParams;
+use lib::logic::floorplan::Grid;
+use lib::logic::floorplan::SramFloorplan;
+use lib::logic::routing::Shapes;
+
+// All signal routes, returning the shapes they use outside the blocks.
+fn draw_signal_routes(
+    p: SramLayoutParams,
+    g: Grid,
+    f: SramFloorplan,
+    bitcells: Any,
+    cols: Any,
+    dec: Any,
+    gate: Any,
+    wlen: Any,
+    pc_b: Any,
+    sense: Any,
+    write: Any,
+    col_dec: Any,
+    dffs: Any,
+    control: Any,
+    rbl: Any,
+    rpc: Any,
+    nmos: Any,
+    routing: Any,
+) -> Shapes {
+    let words = p.sram.data_width;
+    lib::logic::routing::draw_bitlines(cols, bitcells, p.col.cols);
+    lib::logic::routing::draw_wordlines(dec, bitcells, p.sram.num_words / p.sram.mux_ratio);
+    lib::logic::routing::join_all([
+            lib::logic::routing::draw_replica_bitlines(rbl, rpc),
+            lib::logic::routing::draw_replica_load_route(rpc, nmos, routing),
+            lib::logic::routing::draw_dff_pins(g, dffs, 0, p.address_dff_count),
+            lib::logic::routing::draw_predecode_routes(g, f, gate, dec, 0, 2 * lib::logic::floorplan::row_bits(p)),
+            lib::logic::routing::draw_buffer_column_routes(p, g, f, cols, pc_b, sense, write),
+            lib::logic::routing::draw_col_select_routes(p, g, f, col_dec, cols, 0),
+            lib::logic::routing::draw_clock_reset_routes(p, g, f, control, dffs, cols),
+            lib::logic::routing::draw_ce_we_routes(p, g, f, control, dffs),
+            lib::logic::routing::draw_replica_control_routes(p, g, control, rbl, rpc),
+            lib::logic::routing::draw_enable_routes(g, control, wlen, gate, pc_b),
+            lib::logic::routing::draw_buffer_enable_routes(g, f, control, sense, write),
+            lib::logic::routing::draw_col_address_routes(p, g, f, col_dec, dffs, 0),
+            lib::logic::routing::draw_row_address_routes(p, g, f, gate, dffs, 0),
+            lib::logic::routing::draw_data_pins(g, cols, words, words / p.sram.wmask_granularity),
+    ])
+}
+
+// The signal routes alone, drawn against construction copies of the blocks.
+cell sram_routes(p: SramLayoutParams) {
+    let f = lib::logic::floorplan::sram_floorplan(p);
+    let g = lib::logic::floorplan::sram_grid(p, f);
+    let bitcells = inst(lib::bitcells::array::sp_cell_array(p.sram.num_words / p.sram.mux_ratio, p.sram.data_width * p.sram.mux_ratio, p.sram.mux_ratio), x=0., y=0., construction=true);
+    let cols = inst(lib::columns::top::column_peripherals_exact(p.col), x=f.cols.0, y=f.cols.1, construction=true);
+    let dec = inst(lib::columns::decoder::row_decoder(p.periphery.row_decoder), x=f.row_decoder.0, y=f.row_decoder.1, angle=270, construction=true);
+    let gate = inst(lib::columns::decoder::address_gate_stage(2 * lib::logic::floorplan::row_bits(p)), x=f.addr_gate.0, y=f.addr_gate.1, reflect=true, angle=90, construction=true);
+    let wlen = inst(lib::columns::decoder::fanout_buffer(lib::logic::floorplan::wlen_buffer_layout(p)), x=f.wlen_buffer.0, y=f.wlen_buffer.1, construction=true);
+    let pc_b = inst(lib::columns::decoder::fanout_buffer(lib::logic::floorplan::pc_b_buffer_layout(p)), x=f.pc_b_buffer.0, y=f.pc_b_buffer.1, angle=270, construction=true);
+    let sense = inst(lib::columns::decoder::fanout_buffer(lib::logic::floorplan::sense_en_buffer_layout(p)), x=f.sense_en_buffer.0, y=f.sense_en_buffer.1, angle=270, construction=true);
+    let write = inst(lib::columns::decoder::fanout_buffer(lib::logic::floorplan::write_driver_en_buffer_layout(p)), x=f.write_driver_en_buffer.0, y=f.write_driver_en_buffer.1, angle=270, construction=true);
+    let col_dec = inst(lib::columns::decoder::column_decoder(lib::logic::floorplan::col_decoder_layout(p)), x=f.col_decoder.0, y=f.col_decoder.1, reflect=true, angle=90, construction=true);
+    let dffs = inst(lib::logic::dff::dff_array(p.address_dff_count), x=f.dffs.0, y=f.dffs.1, construction=true);
+    let control = inst(lib::logic::control::control_logic_replica_v2(p.control), x=f.control.0, y=f.control.1, angle=90, construction=true);
+    let rbl = inst(lib::bitcells::array::replica_cell_array(p.replica_rows, 2), x=f.rbl.0, y=f.rbl.1, construction=true);
+    let rpc = inst(lib::columns::precharge::replica_precharge(p.replica_precharge), x=f.replica_pc.0, y=f.replica_pc.1, reflect=true, construction=true);
+    let nmos = inst(lib::logic::replica::replica_column_mos(p.replica_column), x=f.replica_nmos.0, y=f.replica_nmos.1, construction=true);
+    let routing = inst(lib::logic::replica::replica_metal_routing(p.replica_routing), x=f.replica_routing.0, y=f.replica_routing.1, reflect=true, construction=true);
+    draw_signal_routes(p, g, f, bitcells, cols, dec, gate, wlen, pc_b, sense, write, col_dec, dffs, control, rbl, rpc, nmos, routing);
+}
+
+// The SRAM inside its guard ring: blocks, signal routes, and power, with the
+// bitcell array at the origin. Without control logic, the routes stop at its
+// pins.
+cell sram_inner(p: SramLayoutParams, with_control: Bool) {
+    let f = lib::logic::floorplan::sram_floorplan(p);
+    let g = lib::logic::floorplan::sram_grid(p, f);
+    let bitcells = inst(lib::bitcells::array::sp_cell_array(p.sram.num_words / p.sram.mux_ratio, p.sram.data_width * p.sram.mux_ratio, p.sram.mux_ratio), x=0., y=0.);
+    let cols = inst(lib::columns::top::column_peripherals_exact(p.col), x=f.cols.0, y=f.cols.1);
+    let dec = inst(lib::columns::decoder::row_decoder(p.periphery.row_decoder), x=f.row_decoder.0, y=f.row_decoder.1, angle=270);
+    let gate = inst(lib::columns::decoder::address_gate_stage(2 * lib::logic::floorplan::row_bits(p)), x=f.addr_gate.0, y=f.addr_gate.1, reflect=true, angle=90);
+    let wlen = inst(lib::columns::decoder::fanout_buffer(lib::logic::floorplan::wlen_buffer_layout(p)), x=f.wlen_buffer.0, y=f.wlen_buffer.1);
+    let pc_b = inst(lib::columns::decoder::fanout_buffer(lib::logic::floorplan::pc_b_buffer_layout(p)), x=f.pc_b_buffer.0, y=f.pc_b_buffer.1, angle=270);
+    let sense = inst(lib::columns::decoder::fanout_buffer(lib::logic::floorplan::sense_en_buffer_layout(p)), x=f.sense_en_buffer.0, y=f.sense_en_buffer.1, angle=270);
+    let write = inst(lib::columns::decoder::fanout_buffer(lib::logic::floorplan::write_driver_en_buffer_layout(p)), x=f.write_driver_en_buffer.0, y=f.write_driver_en_buffer.1, angle=270);
+    let col_dec = inst(lib::columns::decoder::column_decoder(lib::logic::floorplan::col_decoder_layout(p)), x=f.col_decoder.0, y=f.col_decoder.1, reflect=true, angle=90);
+    let dffs = inst(lib::logic::dff::dff_array(p.address_dff_count), x=f.dffs.0, y=f.dffs.1);
+    let control = inst(lib::logic::control::control_logic_replica_v2(p.control), x=f.control.0, y=f.control.1, angle=90, construction=if with_control { false } else { true });
+    let rbl = inst(lib::bitcells::array::replica_cell_array(p.replica_rows, 2), x=f.rbl.0, y=f.rbl.1);
+    let rpc = inst(lib::columns::precharge::replica_precharge(p.replica_precharge), x=f.replica_pc.0, y=f.replica_pc.1, reflect=true);
+    let nmos = inst(lib::logic::replica::replica_column_mos(p.replica_column), x=f.replica_nmos.0, y=f.replica_nmos.1);
+    let routing = inst(lib::logic::replica::replica_metal_routing(p.replica_routing), x=f.replica_routing.0, y=f.replica_routing.1, reflect=true);
+    let routes = draw_signal_routes(p, g, f, bitcells, cols, dec, gate, wlen, pc_b, sense, write, col_dec, dffs, control, rbl, rpc, nmos, routing);
+    let feeders = lib::logic::power::draw_block_feeders(p, g, f, bitcells, cols, dec, gate, wlen, pc_b, sense, write, col_dec, dffs, control, rbl, rpc, nmos, with_control, routes);
+    lib::logic::power::draw_straps(g, f, routes, feeders);
+}
+
+// The routing grid's metal extent, which the guard ring encloses with 1 um
+// to spare.
+fn grid_extent(g: Grid) -> Rect {
+    lib::columns::util::cbox(g.x0 - 160., g.y0 - 160., g.x0 + 680. * (g.nx - 1) as Float + 160., g.y0 + 680. * (g.ny - 1) as Float + 160.)
+}
+
+fn ring_hole(g: Grid) -> Rect {
+    let e = grid_extent(g);
+    lib::columns::util::cbox(e.x0 - 1000., e.y0 - 1000., e.x1 + 1000., e.y1 + 1000.)
+}
+
+// The full layout's bounds: the VDD ring's hole is 2.72 um outside the VSS
+// ring's, and its nwell frame 1.52 um beyond that.
+fn macro_bounds(g: Grid) -> Rect {
+    let h = ring_hole(g);
+    lib::columns::util::cbox(h.x0 - 4240., h.y0 - 4240., h.x1 + 4240., h.y1 + 4240.)
+}
+
+fn power_via(bot: Rect, top: Rect) -> Rect {
+    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", bot, top, 0, 0, false).2
+}
+
+// Ties the edge banks to the guard rings: one vertical bank rail per supply
+// runs to both horizontal rings, and one horizontal rail per supply at the
+// bottom and top runs to both vertical rings.
+fn draw_ring_ties(g: Grid) -> Rect {
+    let h = ring_hole(g);
+    for supply in std::range(2) {
+        let inner = if supply == 0 { lib::columns::util::cbox(h.x0 - 2720., h.y0 - 2720., h.x1 + 2720., h.y1 + 2720.) } else { h };
+        let left = (inner.x0 - 1360., inner.x0,);
+        let right = (inner.x1, inner.x1 + 1360.,);
+        let bottom = (inner.y0 - 1360., inner.y0,);
+        let top = (inner.y1, inner.y1 + 1360.,);
+        let vertical = lib::logic::routing::m1(lib::columns::util::rect_from_spans(lib::logic::routing::m1_track(g, lib::logic::power::left_bank(supply)), lib::columns::util::span_union(bottom, top)));
+        power_via(vertical, lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(vertical), bottom));
+        power_via(vertical, lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(vertical), top));
+        for t in [lib::logic::power::bottom_bank(supply), lib::logic::power::top_bank(g, supply)] {
+            let feed = lib::logic::routing::m2(lib::columns::util::rect_from_spans(lib::columns::util::span_union(left, right), lib::logic::routing::m2_track(g, t)));
+            power_via(lib::columns::util::rect_from_spans(left, lib::columns::util::rect_vspan(feed)), feed);
+            power_via(lib::columns::util::rect_from_spans(right, lib::columns::util::rect_vspan(feed)), feed);
+        }
+    }
+    h
+}
+
+// A pin from a signal's track down through the guard rings.
+fn pin_down(g: Grid, hspan: (Float, Float)) -> Rect {
+    let bottom = macro_bounds(g).y0;
+    lib::columns::util::met1_port(hspan.0, bottom, hspan.1, g.y0 + 320.)
+}
+
+fn pins_down(g: Grid, l: [Rect], i: Int) -> [Rect] { [for r in l { pin_down(g, lib::columns::util::rect_hspan(r)) }] }
+
+fn dff_pins(g: Grid, dffs: Any, i: Int, n: Int) -> [Rect] {
+    [for k in range_full(i, n, 1) { pin_down(g, lib::columns::util::rect_hspan(lib::logic::routing::dff_pin(g, dffs, k))) }]
+}
+
+fn reverse<T>(l: [T]) -> [T] { reverse_onto(l, []) }
+fn reverse_onto<T>(l: [T], acc: [T]) -> [T] { if l == [] { acc } else { reverse_onto(tail(l), cons(head(l), acc)) } }
+
+// The SRAM with its guard rings and pins. `addr[k]` comes from address DFF
+// `addr_width - 1 - k`; the last two DFFs take the chip and write enables.
+cell sram(p: SramLayoutParams, with_control: Bool) {
+    let f = lib::logic::floorplan::sram_floorplan(p);
+    let g = lib::logic::floorplan::sram_grid(p, f);
+    let inner = inst(sram_inner(p, with_control), x=0., y=0.);
+    let hole = ring_hole(g);
+    let ring = inst(lib::logic::guard_ring::guard_ring(hole.x0, hole.y0, hole.x1, hole.y1), x=0., y=0.);
+    draw_ring_ties(g);
+    let dffs = inst(lib::logic::dff::dff_array(p.address_dff_count), x=f.dffs.0, y=f.dffs.1, construction=true);
+    let cols = inst(lib::columns::top::column_peripherals_exact(p.col), x=f.cols.0, y=f.cols.1, construction=true);
+    let n = p.address_dff_count;
+    let dff = dff_pins(g, dffs, 0, n);
+    pub let addr = reverse(dff_pins(g, dffs, 0, n - 2));
+    pub let ce = dff[n - 2];
+    pub let we = dff[n - 1];
+    pub let clk = pin_down(g, lib::columns::util::rect_hspan(lib::logic::routing::clock_pin(g, f, 0)));
+    pub let rstb = pin_down(g, lib::columns::util::rect_hspan(lib::logic::routing::clock_pin(g, f, 1)));
+    pub let din = pins_down(g, cols.din, 0);
+    pub let dout = pins_down(g, cols.dout, 0);
+    pub let wmask = pins_down(g, cols.wmask, 0);
+    // Compact supply pins on the left bank, and the rings' left sides.
+    for supply in std::range(2) {
+        let track = lib::logic::routing::m1_track(g, lib::logic::power::left_bank(supply));
+        lib::columns::util::met1_port(track.0, g.y0 + 1200., track.1, g.y0 + 2200.);
+        text(if supply == 0 { "vdd" } else { "vss" }, "met1.label", (track.0 + track.1) / 2., g.y0 + 1700.);
+    }
+    pub let vdd = lib::columns::util::met1_port(hole.x0 - 4080., hole.y0 - 4080., hole.x0 - 2720., hole.y1 + 4080.);
+    pub let vss = lib::columns::util::met1_port(hole.x0 - 1360., hole.y0 - 1360., hole.x0, hole.y1 + 1360.);
+}
+
+// The SRAM with its lower-left corner at the origin.
+cell sram_macro(p: SramLayoutParams, with_control: Bool) {
+    let f = lib::logic::floorplan::sram_floorplan(p);
+    let g = lib::logic::floorplan::sram_grid(p, f);
+    let b = macro_bounds(g);
+    let native = inst(sram(p, with_control), x=0. - b.x0, y=0. - b.y0);
+    pub let addr = native.addr;
+    pub let ce = native.ce;
+    pub let we = native.we;
+    pub let clk = native.clk;
+    pub let rstb = native.rstb;
+    pub let din = native.din;
+    pub let dout = native.dout;
+    pub let wmask = native.wmask;
+    pub let vdd = native.vdd;
+    pub let vss = native.vss;
+}

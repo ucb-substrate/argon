@@ -7,17 +7,19 @@
 //!
 //! Entries are keyed by the content [`CellId`] from
 //! `gdscache::source_cell_id`, which folds in the fingerprint, the arguments
-//! and the scope name. They survive edits, and are dropped only when the
-//! execution environment changes, which is what tracks the technology file and
-//! the imported GDS libraries.
+//! and the scope name. Unchanged reachable cells survive edits; obsolete source
+//! versions are pruned after the next successful execution. The whole cache is
+//! dropped when the execution environment changes, which is what tracks the
+//! technology file and imported GDS libraries.
 
 use std::{
     collections::{HashMap, HashSet},
+    path::PathBuf,
     sync::Arc,
 };
 
 use crate::{
-    compile::{CellId, CompiledCell, ExecError},
+    compile::{CellArg, CellId, CompiledCell, ExecError},
     fingerprint::{ItemIndex, SpanRebase},
 };
 
@@ -25,6 +27,9 @@ use crate::{
 #[derive(Clone, Debug)]
 pub(crate) struct CachedCell {
     pub cell: Arc<CompiledCell>,
+    /// Exact arguments used by the parent. A focused preview must retain the
+    /// same parameterization even when the source invocation is generated.
+    pub invocation_args: Vec<CellArg>,
     /// Cells this one instantiates or holds in a field. Reinstating a cell
     /// means reinstating all of them, since a compiled cell names its children
     /// by [`CellId`].
@@ -38,6 +43,8 @@ pub(crate) struct CachedCell {
     pub ids_consumed: u64,
     /// Declaration placements the cell's spans were recorded against.
     pub items: Arc<ItemIndex>,
+    /// Source files with spans in this cell, recorded when it is first built.
+    pub span_paths: HashSet<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -71,6 +78,18 @@ impl CellCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.stats.entries = 0;
+    }
+
+    /// Retain only cells reachable from the current revision's compiled outputs.
+    ///
+    /// Content IDs make old entries correct forever, but an editor can create
+    /// a new version of a very large top cell on every keystroke. Keeping all
+    /// of those unreachable versions would make session memory grow without
+    /// bound. Every unchanged dependency used by a retained output is present
+    /// in `live`, so pruning here does not reduce reuse for its next edit.
+    pub(crate) fn retain(&mut self, live: &HashSet<CellId>) {
+        self.entries.retain(|id, _| live.contains(id));
+        self.stats.entries = self.entries.len() as u64;
     }
 
     /// The entry for `id` and its whole instantiation closure, with every span
@@ -114,22 +133,42 @@ impl CellCache {
                 translated.push(index);
                 continue;
             };
-            let cell = Arc::make_mut(&mut entry.cell);
-            if cell.rebase_spans(rebase).is_err() {
+            if !rebase.affects_any_path(entry.span_paths.iter()) {
+                entry.items = items.clone();
+                translated.push(index);
+                continue;
+            }
+            // Sharing a file with a moved declaration does not mean this
+            // cell's own spans moved. Keeping the same `Arc` when they did not
+            // lets consumers recognize the cell as unchanged.
+            let cell_moved = match entry.cell.spans_moved_by(rebase) {
+                Ok(moved) => moved,
+                Err(_) => {
+                    self.stats.rebase_failures += 1;
+                    self.stats.misses += 1;
+                    return None;
+                }
+            };
+            if cell_moved && Arc::make_mut(&mut entry.cell).rebase_spans(rebase).is_err() {
                 self.stats.rebase_failures += 1;
                 self.stats.misses += 1;
                 return None;
             }
+            let mut errors_moved = false;
             for error in &mut entry.errors {
+                let before = error.span.clone();
                 if rebase.rebase_opt(&mut error.span).is_err() {
                     self.stats.rebase_failures += 1;
                     self.stats.misses += 1;
                     return None;
                 }
+                errors_moved |= error.span != before;
             }
             entry.items = items.clone();
             translated.push(index);
-            self.stats.rebased += 1;
+            if cell_moved || errors_moved {
+                self.stats.rebased += 1;
+            }
         }
 
         // Write the translated entries back, so the shift is paid once per
@@ -183,5 +222,10 @@ impl CellCache {
 
     pub(crate) fn contains(&self, id: CellId) -> bool {
         self.entries.contains_key(&id)
+    }
+
+    pub(crate) fn invocation(&self, id: CellId) -> Option<(String, Vec<CellArg>)> {
+        let entry = self.entries.get(&id)?;
+        Some((entry.cell.name.clone(), entry.invocation_args.clone()))
     }
 }

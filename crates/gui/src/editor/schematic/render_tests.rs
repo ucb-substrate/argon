@@ -14,6 +14,7 @@ use crate::editor::{self, EditorState, View};
 fn test_state(cx: &mut TestAppContext, view: View) -> Entity<EditorState> {
     cx.new(|cx| {
         let solved_cell = cx.new(|_| None);
+        let preview_cell = cx.new(|_| None);
         let layers = cx.new(|_| editor::Layers {
             layers: IndexMap::new(),
             selected_layer: None,
@@ -42,6 +43,9 @@ fn test_state(cx: &mut TestAppContext, view: View) -> Entity<EditorState> {
                 cx.observe(&layers, |_, _, cx| cx.notify()),
             ],
             solved_cell,
+            preview_cell,
+            preview_revision: None,
+            preview_source_scope: None,
             hide_external_geometry: false,
             layers,
             lang_server_client: crate::rpc::SyncLangServerClient::for_render_test(cx.to_async()),

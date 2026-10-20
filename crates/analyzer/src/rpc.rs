@@ -1,11 +1,18 @@
 //! RPC types shared by the analyzer and Argone.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use arcstr::Substr;
 use argonc::{
     ast::{CellDecl, Decl, Span},
-    compile::{Align, BasicRect, CellId, CompileOutput, CompiledData, DeviceKind, Symbol},
+    compile::{
+        Align, BasicRect, CellId, CompileOutput, CompiledData, DeviceKind, PreviewGeometry, Symbol,
+    },
     parse::{self, AnnotatedParseAst, ParseMetadata, WorkspaceParseAst},
 };
 
@@ -29,6 +36,101 @@ pub struct ValueEdit {
     pub span: Span,
     pub value: String,
 }
+
+/// Maps a span through value replacements applied to the text it was recorded
+/// against. A span containing a replacement grows or shrinks with it.
+pub fn remap_span_after_value_edits(span: &Span, edits: &[ValueEdit]) -> Span {
+    let start = span.span.start();
+    let end = span.span.end();
+    let mut shift_before = 0isize;
+    let mut shift_within = 0isize;
+    for edit in edits.iter().filter(|edit| edit.span.path == span.path) {
+        let old_start = edit.span.span.start();
+        let old_end = edit.span.span.end();
+        let delta = edit.value.len() as isize - (old_end - old_start) as isize;
+        if old_end <= start {
+            shift_before += delta;
+        } else if old_start < end {
+            shift_within += delta;
+        }
+    }
+    Span {
+        path: span.path.clone(),
+        span: cfgrammar::Span::new(
+            (start as isize + shift_before) as usize,
+            (end as isize + shift_before + shift_within) as usize,
+        ),
+    }
+}
+
+/// Applies non-overlapping replacements to one file's text.
+fn apply_value_edits(text: &str, path: &Path, edits: &[ValueEdit]) -> String {
+    let mut edits = edits
+        .iter()
+        .filter(|edit| *edit.span.path == *path)
+        .collect::<Vec<_>>();
+    edits.sort_by_key(|edit| std::cmp::Reverse(edit.span.span.start()));
+    let mut text = text.to_owned();
+    for edit in edits {
+        text.replace_range(edit.span.span.start()..edit.span.span.end(), &edit.value);
+    }
+    text
+}
+
+/// Drag edits the analyzer applied on top of one compile revision, so a later
+/// drag whose spans were recorded against that revision can still be placed.
+#[derive(Debug, Default)]
+pub(crate) struct DragEditHistory {
+    base_revision: Option<u64>,
+    /// Applied batches in order, each in the coordinates of the text before it.
+    batches: Vec<Vec<ValueEdit>>,
+    /// Each edited file's text after the batches.
+    texts: HashMap<PathBuf, String>,
+}
+
+impl DragEditHistory {
+    /// The batches that carry spans recorded against `base_revision` onto the
+    /// current text, or `None` unless that text is exactly what they produced.
+    fn batches_since(
+        &self,
+        base_revision: u64,
+        current: impl Fn(&Path) -> Option<String>,
+    ) -> Option<&[Vec<ValueEdit>]> {
+        (self.base_revision == Some(base_revision)
+            && self
+                .texts
+                .iter()
+                .all(|(path, text)| current(path).as_deref() == Some(text.as_str())))
+        .then_some(&self.batches)
+    }
+
+    /// Records a batch applied to `texts`, starting afresh from `base_revision`
+    /// when the batch was placed without earlier ones.
+    fn record(
+        &mut self,
+        base_revision: u64,
+        fresh: bool,
+        texts: &HashMap<PathBuf, String>,
+        batch: Vec<ValueEdit>,
+    ) {
+        if fresh {
+            *self = Self {
+                base_revision: Some(base_revision),
+                ..Self::default()
+            };
+        }
+        for (path, text) in texts {
+            if batch.iter().any(|edit| *edit.span.path == **path) {
+                self.texts
+                    .insert(path.clone(), apply_value_edits(text, path, &batch));
+            }
+        }
+        self.batches.push(batch);
+    }
+}
+
+/// How long a drag waits for the analyzer's own earlier edits to reach Neovim.
+const DRAG_EDIT_SETTLE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Ensures that a geometry constructor has a named initial-condition kwarg.
 /// If the kwarg already exists, its value is replaced; otherwise the analyzer
@@ -74,13 +176,12 @@ pub enum DrawSegmentConstraint {
     DiagonalNegative(usize),
 }
 
-/// A solved cell and the source location where placing it will insert an
+/// Flattened geometry and the source location where placing it will insert an
 /// instance. The GUI keeps this separate from the currently open layout and
 /// uses it only for the cursor-following placement outline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstancePreview {
-    pub output: CompiledData,
-    pub cell: CellId,
+    pub geometry: PreviewGeometry,
     pub invocation: String,
     pub scope_span: Span,
 }
@@ -91,6 +192,9 @@ pub struct InstancePreview {
 pub struct RectangleEditResult {
     pub span: Span,
     pub revision: u64,
+    /// The source-authoritative binding name, which may differ when several
+    /// drawings outpace the last compiled geometry snapshot.
+    pub name: String,
 }
 
 /// A keyword to set on a call, or to remove when it has no value.
@@ -409,6 +513,53 @@ pub struct CompilationUpdate {
     pub cell_order: Vec<CellId>,
 }
 
+/// A losslessly compressed compilation update for the analyzer-to-GUI RPC.
+///
+/// Scope-heavy layouts contain millions of repeated names and source paths.
+/// Compressing the bincode stream directly avoids first allocating a second,
+/// equally large uncompressed byte buffer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressedCompilationUpdate {
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FocusedCellPreview {
+    pub previous_cell: CellId,
+    pub update: CompressedCompilationUpdate,
+}
+
+/// GUI-side costs for accepting a compilation snapshot. Returning these to the
+/// language server makes a long transfer distinguishable from decompression,
+/// delta materialization, and hierarchy preparation in editor progress.
+#[derive(Debug, Copy, Clone, Default, Serialize, Deserialize)]
+pub struct GuiUpdateResult {
+    pub accepted: bool,
+    pub decode_seconds: f64,
+    pub materialize_seconds: f64,
+    pub prepare_seconds: f64,
+}
+
+impl CompressedCompilationUpdate {
+    pub fn encode(update: &CompilationUpdate) -> Result<Self, String> {
+        let mut encoder =
+            zstd::stream::write::Encoder::new(Vec::new(), 1).map_err(|error| error.to_string())?;
+        bincode::serialize_into(&mut encoder, update).map_err(|error| error.to_string())?;
+        let bytes = encoder.finish().map_err(|error| error.to_string())?;
+        Ok(Self { bytes })
+    }
+
+    pub fn decode(self) -> Result<CompilationUpdate, String> {
+        let decoder = zstd::stream::read::Decoder::new(self.bytes.as_slice())
+            .map_err(|error| error.to_string())?;
+        bincode::deserialize_from(decoder).map_err(|error| error.to_string())
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
 impl CompilationUpdate {
     pub fn new(snapshot: CompilationSnapshot, previous: Option<&CompilationSnapshot>) -> Self {
         let mut update = Self {
@@ -526,9 +677,11 @@ pub trait LangServer {
     async fn place_instance(scope_span: Span, invocation: String, x: f64, y: f64) -> Option<Span>;
     async fn draw_dimension(scope_span: Span, params: DimensionParams) -> Option<Span>;
     async fn edit_dimension(span: Span, value: String) -> Option<Span>;
+    /// `base_revision` is the compile revision whose spans the edits refer to.
     async fn update_values(
         edits: Vec<ValueEdit>,
         initial_conditions: Vec<InitialConditionEdit>,
+        base_revision: Option<u64>,
     ) -> Option<Vec<ValueEdit>>;
     async fn add_eq_constraint(scope_span: Span, lhs: String, rhs: String);
     async fn place(request: PlaceRequest) -> Option<EditReceipt>;
@@ -559,12 +712,16 @@ pub trait LangServer {
 pub trait Gui {
     async fn compilation_started(activity_id: u64);
     async fn compilation_finished(activity_id: u64);
-    async fn update_cell(update: CompilationUpdate) -> bool;
+    async fn update_cell(update: CompressedCompilationUpdate) -> GuiUpdateResult;
+    /// An independent, focused-cell geometry snapshot. It never advances the
+    /// full-snapshot delta base or replaces the opened top-level hierarchy.
+    async fn preview_cell(preview: FocusedCellPreview) -> GuiUpdateResult;
     async fn show_message(typ: MessageType, message: String);
     async fn fit();
     async fn set_workspace_path(path: Option<PathBuf>);
     async fn workspace_modified(modified: bool);
     async fn selected_scope() -> Option<Span>;
+    async fn selected_cell() -> Option<CellId>;
     async fn place_instance(preview: InstancePreview);
     /// The body of the cell the schematic view shows.
     async fn schematic_target() -> Option<Span>;
@@ -584,6 +741,8 @@ pub trait Gui {
 }
 
 pub(crate) const OUT_OF_SYNC_MESSAGE: &str = "Editor buffer state is inconsistent with GUI state.";
+pub(crate) const STALE_DRAG_MESSAGE: &str =
+    "The source changed while dragging, so the drag was not applied. Drag again.";
 pub(crate) const STALE_SNAPSHOT_MESSAGE: &str =
     "The schematic changed since this gesture began; it was not applied.";
 pub(crate) const PENDING_EDIT_MESSAGE: &str =
@@ -591,11 +750,55 @@ pub(crate) const PENDING_EDIT_MESSAGE: &str =
 pub(crate) const READ_ONLY_GENERATED_SOURCE_MESSAGE: &str =
     "Imported GDS cells are read-only in the GUI. Open an Argon source cell to edit geometry.";
 
+const NOT_IN_WORKSPACE_MESSAGE: &str =
+    "The selected GUI object is no longer part of the current Argon workspace.";
+
 pub(crate) fn source_edit_error(ast: &WorkspaceParseAst, span: &Span) -> Option<&'static str> {
     let Some(ast) = ast.values().find(|ast| ast.path == span.path) else {
-        return Some("The selected GUI object is no longer part of the current Argon workspace.");
+        return Some(NOT_IN_WORKSPACE_MESSAGE);
     };
     (span.span.end() > ast.source_text.len()).then_some(READ_ONLY_GENERATED_SOURCE_MESSAGE)
+}
+
+/// Re-find a scope after queued edits. A scope is safe to match by the same
+/// opening offset when the prefix is unchanged, or by a shifted offset when
+/// the complete suffix beginning at that scope is unchanged. If neither side
+/// anchors it, an old byte offset could select a different scope.
+fn scope_after_insertion(
+    ast: &AnnotatedParseAst,
+    old_scope: &Span,
+    old_source: &str,
+) -> Option<Span> {
+    let old_start = old_scope.span.start();
+    let current = ast.source_text.as_str();
+    let prefix_unchanged = old_start < old_source.len()
+        && old_start < current.len()
+        && old_source.as_bytes()[..=old_start] == current.as_bytes()[..=old_start];
+    let start = if prefix_unchanged {
+        old_start
+    } else {
+        let suffix = old_source.get(old_start..)?;
+        current.strip_suffix(suffix).map(str::len)?
+    };
+    if prefix_unchanged && ast.span2scope.contains_key(old_scope) {
+        return Some(old_scope.clone());
+    }
+    let mut matching = ast
+        .span2scope
+        .keys()
+        .filter(|span| span.path == old_scope.path && span.span.start() == start);
+    let scope = matching.next()?.clone();
+    matching.next().is_none().then_some(scope)
+}
+
+fn available_rect_name(requested: String, used: &std::collections::HashSet<&str>) -> String {
+    if !used.contains(requested.as_str()) {
+        return requested;
+    }
+    (0..)
+        .map(|index| format!("rect{index}"))
+        .find(|name| !used.contains(name.as_str()))
+        .expect("a finite scope has a free rectangle name")
 }
 
 pub(crate) fn editor_buffers_are_current(source: &SourceState, compiled: &PublishedState) -> bool {
@@ -770,6 +973,73 @@ impl State {
                 .client
                 .show_message(context::current(), typ, message)
                 .await;
+        }
+    }
+
+    /// Waits for the analyzer's own earlier edits to reach `paths`, then
+    /// returns the batches that carry spans recorded against `base_revision`
+    /// onto the current text, whether none were needed, and that text.
+    async fn drag_edit_base(
+        &self,
+        history: &DragEditHistory,
+        base_revision: u64,
+        paths: &HashSet<PathBuf>,
+    ) -> Option<(Vec<Vec<ValueEdit>>, bool, HashMap<PathBuf, String>)> {
+        let paths = paths
+            .iter()
+            .chain(history.texts.keys())
+            .cloned()
+            .collect::<HashSet<_>>();
+        let uris = paths
+            .iter()
+            .filter_map(Uri::from_file_path)
+            .collect::<Vec<_>>();
+        let deadline = tokio::time::Instant::now() + DRAG_EDIT_SETTLE_TIMEOUT;
+        loop {
+            {
+                let source = self.source_state.lock().await;
+                if !uris
+                    .iter()
+                    .any(|uri| source.pending_workspace_edits.contains_key(uri))
+                {
+                    let compiled = self.published_state.lock().await;
+                    let text = |path: &Path| {
+                        Uri::from_file_path(path)
+                            .and_then(|uri| source.editor_files.get(&uri))
+                            .map(|document| document.contents().to_string())
+                            .or_else(|| {
+                                compiled
+                                    .ast
+                                    .values()
+                                    .find(|ast| *ast.path == *path)
+                                    .map(|ast| ast.source_text.to_string())
+                            })
+                    };
+                    let placed = if source.revision == base_revision {
+                        Some((Vec::new(), true))
+                    } else {
+                        history
+                            .batches_since(base_revision, text)
+                            .map(|batches| (batches.to_vec(), false))
+                    };
+                    if let Some((batches, fresh)) = placed {
+                        let texts = paths
+                            .iter()
+                            .filter_map(|path| Some((path.clone(), text(path)?)))
+                            .collect();
+                        return Some((batches, fresh, texts));
+                    }
+                    // Only the analyzer's own edits, still arriving, could
+                    // make the text match.
+                    if history.base_revision != Some(base_revision) {
+                        return None;
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -1021,7 +1291,9 @@ impl State {
             let (mut replacements, _) = placement_replacements(workspace_ast, data, placements)?;
             let insertion =
                 schematic_edit::insert_statements(&ast.source_text, &cell.scope, &statements);
-            let file = replacements.entry(target.cell.path.clone()).or_default();
+            let file = replacements
+                .entry(target.cell.path.to_path_buf())
+                .or_default();
             let spans = statements
                 .iter()
                 .zip(&insertion.statements)
@@ -1064,10 +1336,7 @@ fn cell_body<'a>(
     let decl = schematic_edit::cell_with_body(ast, cell.span)
         .ok_or_else(|| STALE_SNAPSHOT_MESSAGE.to_owned())?;
     let compiled = data.cells.values().any(|compiled| {
-        compiled
-            .scopes
-            .get(&compiled.root)
-            .is_some_and(|root| root.span == *cell)
+        compiled.scopes.contains_key(&compiled.root) && *compiled.scope_span(compiled.root) == *cell
     });
     if !compiled {
         return Err(STALE_SNAPSHOT_MESSAGE.to_owned());
@@ -1085,10 +1354,8 @@ fn compiled_cell<'a>(
         .values()
         .map(|compiled| &**compiled)
         .find(|compiled| {
-            compiled
-                .scopes
-                .get(&compiled.root)
-                .is_some_and(|root| root.span == *cell)
+            compiled.scopes.contains_key(&compiled.root)
+                && *compiled.scope_span(compiled.root) == *cell
         })
         .ok_or_else(|| STALE_SNAPSHOT_MESSAGE.to_owned())
 }
@@ -1170,7 +1437,7 @@ fn placement_replacements(
             )?);
         }
         per_file
-            .entry(edit.call.path.clone())
+            .entry(edit.call.path.to_path_buf())
             .or_default()
             .extend(replacements);
         calls.push(Span {
@@ -1245,20 +1512,72 @@ impl LangServer for State {
         var_name: String,
         rect: BasicRect<f64>,
     ) -> Option<RectangleEditResult> {
-        let Some(workspace_ast) = self.current_editor_ast().await else {
-            self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
-                .await;
-            return None;
+        let published_source = {
+            let published = self.published_state.lock().await;
+            if let Some(error) = source_edit_error(&published.ast, &scope_span) {
+                drop(published);
+                self.report_message(MessageType::ERROR, error).await;
+                return None;
+            }
+            published
+                .ast
+                .values()
+                .find(|ast| ast.path == scope_span.path)?
+                .source_text
+                .clone()
         };
-        if let Some(error) = source_edit_error(&workspace_ast, &scope_span) {
-            self.report_message(MessageType::ERROR, error).await;
-            return None;
-        }
         let url = Uri::from_file_path(&scope_span.path)?;
-        let ast = workspace_ast
-            .values()
-            .find(|ast| ast.path == scope_span.path)?;
-        let scope = ast.span2scope.get(&scope_span)?;
+        // The editor can acknowledge an insertion before its didChange event
+        // reaches the analyzer. Wait for that local source update, not for the
+        // entire layout to compile, before inserting the next queued shape.
+        let wait_started = std::time::Instant::now();
+        let source_text = loop {
+            let source = self.source_state.lock().await;
+            if !source.pending_workspace_edits.contains_key(&url) {
+                break source
+                    .editor_files
+                    .get(&url)
+                    .map(|document| document.contents().to_owned())
+                    .unwrap_or_else(|| published_source.to_string());
+            }
+            drop(source);
+            if wait_started.elapsed() >= std::time::Duration::from_secs(3) {
+                self.report_message(
+                    MessageType::ERROR,
+                    "Timed out waiting for the editor to apply the previous drawing.",
+                )
+                .await;
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        let ast = match argonc::parse::parse_source_text(source_text, scope_span.path.to_path_buf())
+        {
+            Ok(ast) => ast,
+            Err(error) => {
+                self.report_message(MessageType::ERROR, error.to_string())
+                    .await;
+                return None;
+            }
+        };
+        let current_scope = match scope_after_insertion(&ast, &scope_span, &published_source) {
+            Some(scope) => scope,
+            None => {
+                self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+                    .await;
+                return None;
+            }
+        };
+        let scope = &ast.span2scope[&current_scope];
+        let used_names = scope
+            .stmts
+            .iter()
+            .filter_map(|statement| match statement {
+                argonc::ast::Statement::LetBinding(binding) => Some(binding.name.name.as_str()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let var_name = available_rect_name(var_name, &used_names);
         let document = self.document(&ast.source_text);
         let grid = self.technology_grid().await;
         let expression = format!(
@@ -1272,7 +1591,7 @@ impl LangServer for State {
             argonc::compile::format_initial_condition(rect.x1, grid),
             argonc::compile::format_initial_condition(rect.y1, grid),
         );
-        let prefix = let_prefix(ast, scope.span, &var_name);
+        let prefix = let_prefix(&ast, scope.span, &var_name);
         let insertion = insert_statement(
             &document,
             scope.span,
@@ -1290,6 +1609,7 @@ impl LangServer for State {
         Some(RectangleEditResult {
             span,
             revision: self.source_state.lock().await.revision,
+            name: var_name,
         })
     }
 
@@ -1529,16 +1849,44 @@ impl LangServer for State {
         self,
         _: tarpc::context::Context,
         mut edits: Vec<ValueEdit>,
-        initial_conditions: Vec<InitialConditionEdit>,
+        mut initial_conditions: Vec<InitialConditionEdit>,
+        base_revision: Option<u64>,
     ) -> Option<Vec<ValueEdit>> {
         if edits.is_empty() && initial_conditions.is_empty() {
             return Some(Vec::new());
         }
-        let Some(workspace_ast) = self.current_editor_ast().await else {
-            self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+        // Drags are placed one at a time, each onto the text the one before
+        // it left. Spans recorded against any other text would overwrite the
+        // wrong bytes.
+        let mut history = self.drag_edits.lock().await;
+        let paths = edits
+            .iter()
+            .map(|edit| edit.span.path.to_path_buf())
+            .chain(
+                initial_conditions
+                    .iter()
+                    .map(|initial_condition| initial_condition.call_span.path.to_path_buf()),
+            )
+            .collect::<HashSet<_>>();
+        let placed = match base_revision {
+            Some(base_revision) => self.drag_edit_base(&history, base_revision, &paths).await,
+            None => None,
+        };
+        let (Some(base_revision), Some((batches, fresh, texts))) = (base_revision, placed) else {
+            self.report_message(MessageType::ERROR, STALE_DRAG_MESSAGE)
                 .await;
             return None;
         };
+        for batch in &batches {
+            for edit in &mut edits {
+                edit.span = remap_span_after_value_edits(&edit.span, batch);
+            }
+            for initial_condition in &mut initial_conditions {
+                initial_condition.call_span =
+                    remap_span_after_value_edits(&initial_condition.call_span, batch);
+            }
+        }
+        let workspace_ast = self.published_state.lock().await.ast.clone();
         let source_error = edits
             .iter()
             .map(|edit| &edit.span)
@@ -1547,15 +1895,22 @@ impl LangServer for State {
                     .iter()
                     .map(|initial_condition| &initial_condition.call_span),
             )
-            .find_map(|span| source_edit_error(&workspace_ast, span));
+            .find_map(|span| {
+                if !workspace_ast.values().any(|ast| ast.path == span.path) {
+                    return Some(NOT_IN_WORKSPACE_MESSAGE);
+                }
+                (span.span.end() > texts.get(&*span.path).map_or(0, String::len))
+                    .then_some(READ_ONLY_GENERATED_SOURCE_MESSAGE)
+            });
         if let Some(error) = source_error {
             self.report_message(MessageType::ERROR, error).await;
             return None;
         }
 
-        // Resolve "ensure kwarg" requests against the current AST. Existing
+        // Resolve "ensure kwarg" requests against the current text. Existing
         // kwargs become ordinary value replacements. Missing kwargs sharing a
         // call are collected into one insertion so edit ordering is defined.
+        let mut asts = HashMap::<PathBuf, AnnotatedParseAst>::new();
         let mut missing: HashMap<Span, Vec<(String, String)>> = HashMap::new();
         for InitialConditionEdit {
             call_span,
@@ -1563,13 +1918,19 @@ impl LangServer for State {
             value,
         } in initial_conditions
         {
-            let Some(ast) = workspace_ast
-                .values()
-                .find(|ast| ast.path == call_span.path)
-            else {
-                continue;
-            };
-            let Some(call) = ast.span2call.get(&call_span) else {
+            if !asts.contains_key(&*call_span.path) {
+                let parsed = texts.get(&*call_span.path).and_then(|text| {
+                    argonc::parse::parse_source_text(text.clone(), call_span.path.to_path_buf())
+                        .ok()
+                });
+                let Some(ast) = parsed else {
+                    self.report_message(MessageType::ERROR, OUT_OF_SYNC_MESSAGE)
+                        .await;
+                    return None;
+                };
+                asts.insert(call_span.path.to_path_buf(), ast);
+            }
+            let Some(call) = asts[&*call_span.path].span2call.get(&call_span) else {
                 continue;
             };
             if let Some(kwarg) = call
@@ -1599,13 +1960,8 @@ impl LangServer for State {
         }
 
         for (call_span, values) in missing {
-            let Some(ast) = workspace_ast
-                .values()
-                .find(|ast| ast.path == call_span.path)
-            else {
-                continue;
-            };
-            if let Some(edit) = missing_initial_condition_edit(&ast.source_text, &call_span, values)
+            if let Some(text) = texts.get(&*call_span.path)
+                && let Some(edit) = missing_initial_condition_edit(text, &call_span, values)
             {
                 edits.push(edit);
             }
@@ -1631,10 +1987,10 @@ impl LangServer for State {
         // back-to-front without invalidating each other's offsets.
         let mut pending: HashMap<Uri, Vec<(usize, TextEdit)>> = HashMap::new();
         for ValueEdit { span, value } in &edits {
-            if let Some(ast) = workspace_ast.values().find(|ast| ast.path == span.path)
+            if let Some(text) = texts.get(&*span.path)
                 && let Some(uri) = Uri::from_file_path(&span.path)
             {
-                let doc = self.document(&ast.source_text);
+                let doc = self.document(text.as_str());
                 let start = doc.offset_to_pos(span.span.start());
                 let stop = doc.offset_to_pos(span.span.end());
                 pending.entry(uri).or_default().push((
@@ -1656,9 +2012,11 @@ impl LangServer for State {
                 (uri, edits.into_iter().map(|(_, edit)| edit).collect())
             })
             .collect();
-        self.apply_source_changes(changes, None)
-            .await
-            .then_some(edits)
+        if !self.apply_source_changes(changes, None).await {
+            return None;
+        }
+        history.record(base_revision, fresh, &texts, edits.clone());
+        Some(edits)
     }
 
     /// Rewrites the placement and route keywords of schematic calls in one
@@ -1684,7 +2042,7 @@ impl LangServer for State {
             .iter()
             .map(|call| Span {
                 path: call.path.clone(),
-                span: schematic_edit::span_after(call.span, &replacements[&call.path]),
+                span: schematic_edit::span_after(call.span, &replacements[&*call.path]),
             })
             .collect();
         let revision = self
@@ -1892,7 +2250,7 @@ impl LangServer for State {
             )?;
             let span = schematic_edit::span_after(call.span, &replacements);
             Ok((
-                HashMap::from([(request.call.path.clone(), replacements)]),
+                HashMap::from([(request.call.path.to_path_buf(), replacements)]),
                 Span {
                     path: request.call.path.clone(),
                     span,
@@ -2004,7 +2362,7 @@ impl LangServer for State {
             span: schematic_edit::span_after(
                 request.site.span,
                 replacements
-                    .get(&request.site.path)
+                    .get(&*request.site.path)
                     .map_or(&[][..], Vec::as_slice),
             ),
         };
@@ -2155,8 +2513,50 @@ impl LangServer for State {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn rapid_rectangles_get_unique_source_names_even_with_a_stale_layout() {
+        let mut names = std::collections::HashSet::<String>::new();
+        for _ in 0..100 {
+            // The GUI may keep requesting the same name while a large top
+            // cell is still evaluating. The source is authoritative.
+            let used = names.iter().map(String::as_str).collect();
+            let name = super::available_rect_name("rect61".to_owned(), &used);
+            assert!(names.insert(name));
+        }
+        assert!(names.contains("rect61"));
+        assert_eq!(names.len(), 100);
+    }
+
+    #[test]
+    fn queued_rectangle_relocates_scope_without_top_level_compilation() {
+        let path = std::path::PathBuf::from("lib.ar");
+        let original = "cell top() { let first = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.); }";
+        let parsed = argonc::parse::parse_source_text(original, path.clone()).unwrap();
+        let scope = parsed.span2scope.keys().next().unwrap().clone();
+        let edited = original.replace(
+            " }",
+            " let second = rect(\"met1\", x0=2., y0=2., x1=3., y1=3.); }",
+        );
+        let current = argonc::parse::parse_source_text(edited, path.clone()).unwrap();
+        let relocated = super::scope_after_insertion(&current, &scope, original).unwrap();
+        assert_eq!(relocated.span.start(), scope.span.start());
+        assert!(relocated.span.end() > scope.span.end());
+
+        let shifted = format!("// shifted\n{original}");
+        let shifted = argonc::parse::parse_source_text(shifted, path.clone()).unwrap();
+        let relocated = super::scope_after_insertion(&shifted, &scope, original).unwrap();
+        assert_eq!(
+            relocated.span.start(),
+            scope.span.start() + "// shifted\n".len()
+        );
+
+        let ambiguous = format!("// shifted\n{original}\n// changed tail");
+        let ambiguous = argonc::parse::parse_source_text(ambiguous, path).unwrap();
+        assert!(super::scope_after_insertion(&ambiguous, &scope, original).is_none());
+    }
+
+    #[test]
     fn compilation_delta_preserves_identity_order_and_removes_old_cells() {
-        use super::{CompilationSnapshot, CompilationUpdate};
+        use super::{CompilationSnapshot, CompilationUpdate, CompressedCompilationUpdate};
         use std::sync::Arc;
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("lib.ar");
@@ -2179,7 +2579,11 @@ cell top() { let a = inst(leaf(), x=0., y=0.); }
             output: compiler.compile_cell(&config, &["top".into()], vec![]),
         };
         let roundtrip = |update: CompilationUpdate| -> CompilationUpdate {
-            bincode::deserialize(&bincode::serialize(&update).unwrap()).unwrap()
+            let raw_len = bincode::serialized_size(&update).unwrap();
+            let compressed = CompressedCompilationUpdate::encode(&update).unwrap();
+            assert!(compressed.encoded_len() > 0);
+            assert!((compressed.encoded_len() as u64) < raw_len);
+            compressed.decode().unwrap()
         };
         let received_base = roundtrip(CompilationUpdate::new(base.clone(), None))
             .materialize(None)
@@ -2225,6 +2629,119 @@ cell top() { let a = inst(leaf(), x=0., y=0.); }
         );
     }
 
+    #[test]
+    fn drag_history_places_spans_only_on_the_text_its_edits_produced() {
+        use super::{
+            DragEditHistory, Span, ValueEdit, apply_value_edits, remap_span_after_value_edits,
+        };
+        let path = std::path::PathBuf::from("lib.ar");
+        let text = "rect(x0i = 0., y0i = 0.)".to_owned();
+        let span = |text: &str, kwarg: &str| {
+            let start = text.find(kwarg).unwrap() + kwarg.len();
+            let len = text[start..].find([',', ')']).unwrap();
+            Span {
+                path: path.clone().into(),
+                span: cfgrammar::Span::new(start, start + len),
+            }
+        };
+        let edit = |text: &str, kwarg: &str, value: &str| ValueEdit {
+            span: span(text, kwarg),
+            value: value.to_owned(),
+        };
+        let mut history = DragEditHistory::default();
+        let texts = std::collections::HashMap::from([(path.clone(), text.clone())]);
+        history.record(1, true, &texts, vec![edit(&text, "x0i = ", "12345.")]);
+        let edited = "rect(x0i = 12345., y0i = 0.)";
+        assert_eq!(apply_value_edits(&text, &path, &history.batches[0]), edited);
+
+        let batches = history
+            .batches_since(1, |_| Some(edited.to_owned()))
+            .unwrap();
+        let y0 = batches.iter().fold(span(&text, "y0i = "), |span, batch| {
+            remap_span_after_value_edits(&span, batch)
+        });
+        assert_eq!(y0, span(edited, "y0i = "));
+        // Text anyone else changed, or a different base, cannot be mapped.
+        assert!(
+            history
+                .batches_since(1, |_| Some(format!("// typed\n{edited}")))
+                .is_none()
+        );
+        assert!(
+            history
+                .batches_since(2, |_| Some(edited.to_owned()))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_focused_preview_is_a_delta_against_the_full_snapshot() {
+        use super::{CompilationSnapshot, CompilationUpdate, CompressedCompilationUpdate};
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.ar");
+        let original = r#"
+use std::layout::{inst, rect};
+cell leaf() { let r = rect("met1", x0=0., y0=0., x1=10., y1=5.); }
+cell mid() { let a = inst(leaf(), x=0., y=0.); }
+cell top() { let m = inst(mid(), x=0., y=0.); }
+"#;
+        std::fs::write(&source, original).unwrap();
+        let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/tech/basic.tech.toml"),
+        ));
+        let mut compiler = argonc::incremental::IncrementalCompiler::new();
+        let base = CompilationSnapshot {
+            revision: 1,
+            output: compiler.compile_cell(&config, &["top".into()], vec![]),
+        };
+        let named = |snapshot: &CompilationSnapshot, name: &str| {
+            snapshot
+                .data()
+                .unwrap()
+                .cells
+                .iter()
+                .find(|(_, cell)| cell.name.ends_with(name))
+                .map(|(id, cell)| (*id, cell.clone()))
+                .unwrap()
+        };
+        compiler.set_source_text(
+            source,
+            original.replace("inst(leaf(), x=0.", "inst(leaf(), x=5."),
+        );
+        let preview = CompilationSnapshot {
+            revision: 2,
+            output: compiler
+                .compile_cached_cell_preview(&config, named(&base, "mid").0)
+                .unwrap(),
+        };
+        let update = CompilationUpdate::new(preview.clone(), Some(&base));
+        // The unchanged leaf is named by ID rather than sent again.
+        assert_eq!(update.snapshot.data().unwrap().cells.len(), 1);
+        let encoded = || CompressedCompilationUpdate::encode(&update).unwrap();
+        let received = encoded()
+            .decode()
+            .unwrap()
+            .materialize(Some(&base))
+            .unwrap();
+        assert_eq!(
+            received.data().unwrap().geometry_digest(),
+            preview.data().unwrap().geometry_digest()
+        );
+        assert!(Arc::ptr_eq(
+            &named(&received, "leaf").1,
+            &named(&base, "leaf").1
+        ));
+        assert!(
+            encoded()
+                .decode()
+                .unwrap()
+                .materialize(Some(&preview))
+                .is_none()
+        );
+    }
+
     use argonc::{WorkspaceConfig, parse};
     use tower_lsp_server::ls_types::{Position, Uri};
 
@@ -2260,7 +2777,7 @@ cell top() { let a = inst(leaf(), x=0., y=0.); }
         let source_scope = compiled
             .ast
             .values()
-            .find(|ast| ast.path == source_path)
+            .find(|ast| *ast.path == *source_path)
             .and_then(|ast| ast.span2scope.keys().next())
             .cloned()
             .expect("source cell should have a scope");
@@ -2269,7 +2786,7 @@ cell top() { let a = inst(leaf(), x=0., y=0.); }
         let imported_scope = compiled
             .ast
             .values()
-            .find(|ast| ast.path == source_path)
+            .find(|ast| *ast.path == *source_path)
             .and_then(|ast| {
                 ast.span2scope
                     .keys()
@@ -2479,7 +2996,7 @@ cell top() { let a = inst(leaf(), x=0., y=0.); }
         fn insert(source: &str, call: &str, values: &[(&str, &str)]) -> String {
             let start = source.find(call).unwrap();
             let call_span = argonc::ast::Span {
-                path: std::path::PathBuf::from("/virtual/lib.ar"),
+                path: std::path::Path::new("/virtual/lib.ar").into(),
                 span: cfgrammar::Span::new(start, start + call.len()),
             };
             let edit = missing_initial_condition_edit(
@@ -2493,7 +3010,7 @@ cell top() { let a = inst(leaf(), x=0., y=0.); }
             .unwrap();
             let mut updated = source.to_owned();
             updated.replace_range(edit.span.span.start()..edit.span.span.end(), &edit.value);
-            parse::parse_source_text(updated.clone(), call_span.path).unwrap();
+            parse::parse_source_text(updated.clone(), call_span.path.to_path_buf()).unwrap();
             updated
         }
 

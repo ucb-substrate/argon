@@ -1,0 +1,156 @@
+// Public parameter records shared by the native layout modules.
+
+struct PrimitiveGateParams {
+    nwidth: Int,
+    pwidth: Int,
+    length: Int,
+}
+
+struct DiffLatchParams {
+    inv_in: PrimitiveGateParams,
+    lch: Int,
+    inv_out: PrimitiveGateParams,
+    invq: PrimitiveGateParams,
+    nwidth: Int,
+}
+
+struct PrechargeParams {
+    length: Int,
+    pull_up_width: Int,
+    equalizer_width: Int,
+    en_b_width: Int,
+}
+
+struct TGateMuxParams {
+    length: Int,
+    pwidth: Int,
+    nwidth: Int,
+    mux_ratio: Int,
+    idx: Int,
+    sel_width: Int,
+}
+
+struct WriteDriverParams {
+    length: Int,
+    pwidth_driver: Int,
+    nwidth_driver: Int,
+}
+
+struct DecoderStageParams {
+    nwidth: Int,
+    pwidth: Int,
+    folds: Int,
+}
+
+struct DecoderParams {
+    stages: [DecoderStageParams],
+    num_stages: Int,
+    max_folds: Int,
+}
+
+struct ColParams {
+    pc: PrechargeParams,
+    mux: TGateMuxParams,
+    wrdriver: WriteDriverParams,
+    latch: DiffLatchParams,
+    cols: Int,
+    include_wmask: Bool,
+    wmask_granularity: Int,
+    wmask_decoder: DecoderParams,
+}
+
+struct SramParams {
+    wmask_granularity: Int,
+    mux_ratio: Int,
+    num_words: Int,
+    data_width: Int,
+}
+
+struct ReplicaColumnParams {
+    gate_target: Int,
+    drain_n_target: Int,
+    drain_p_target: Int,
+    max_height: Int,
+    gate_width: Int,
+    drain_n_width: Int,
+    drain_p_width: Int,
+    units: Int,
+}
+
+struct ReplicaRoutingParams {
+    m0_width: Int,
+    m0_height: Int,
+    m1_width: Int,
+    m1_height: Int,
+    tracks: Int,
+}
+
+struct ControlLogicParams {
+    decoder_delay_invs: Int,
+    wlen_pulse_invs: Int,
+    pc_set_delay_invs: Int,
+    wrdrven_set_delay_invs: Int,
+}
+
+// Gate sizes of one decoder stage, from input to output: a NAND2 or NAND3
+// and its inverter, then the buffer inverters after them.
+struct AndStageSizing {
+    inputs: Int,
+    nand: PrimitiveGateParams,
+    inv: PrimitiveGateParams,
+    invs: [PrimitiveGateParams],
+}
+
+// Gate sizes of a buffer chain, from input to output.
+struct BufferSizing {
+    stages: [PrimitiveGateParams],
+}
+
+// One row decoder node: an AND2 or AND3 of a NAND and its inverter, then any
+// buffer inverters, with `num` one-hot outputs. Its inputs come from the
+// nodes listed in `children`, or from address bits when it has none.
+struct DecoderNodeSizing {
+    inputs: Int,
+    nand: PrimitiveGateParams,
+    inv: PrimitiveGateParams,
+    invs: [PrimitiveGateParams],
+    num: Int,
+    children: [Int],
+}
+
+// The row decoder tree as a node list, with the root first.
+struct RowDecoderSizing {
+    nodes: [DecoderNodeSizing],
+}
+
+// Sizes of the decoders and enable buffers around the array.
+struct PeripherySizing {
+    row_decoder: RowDecoderSizing,
+    col_decoder: AndStageSizing,
+    pc_b_buffer: BufferSizing,
+    sense_en_buffer: BufferSizing,
+    write_driver_en_buffer: BufferSizing,
+    wlen_buffer: BufferSizing,
+}
+
+// Routing tracks SRAM22 gives each column control bus.
+struct RoutingTracks {
+    pc_b: Int,
+    sense_en: Int,
+    write_driver_en: Int,
+    col_dec: Int,
+}
+
+struct SramLayoutParams {
+    sram: SramParams,
+    col: ColParams,
+    standalone_col: ColParams,
+    replica_rows: Int,
+    address_dff_count: Int,
+    replica_precharge: PrechargeParams,
+    replica_column: ReplicaColumnParams,
+    replica_routing: ReplicaRoutingParams,
+    control: ControlLogicParams,
+    periphery: PeripherySizing,
+    routing_tracks: RoutingTracks,
+}

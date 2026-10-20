@@ -22,17 +22,18 @@
 //! has to make the fingerprint differ.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::Hasher,
     ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use indexmap::{IndexMap, IndexSet};
 
 use crate::{
     ast::{
-        ArgDecl, Decl, Expr, IdentPath, ModPath, Pattern, Scope, Statement, WorkspaceAst,
+        ArgDecl, Decl, Expr, ForLoop, IdentPath, ModPath, Pattern, Scope, Statement, WorkspaceAst,
         annotated::AnnotatedAst,
     },
     compile::{Native, Ty, TypeDefs, TypedWorkspace, VarId, VarIdTyMetadata},
@@ -72,7 +73,7 @@ impl ItemKind {
 pub struct ItemSite {
     pub fingerprint: Fingerprint,
     pub kind: ItemKind,
-    pub path: PathBuf,
+    pub path: Arc<Path>,
     /// Byte range of the declaration within its module's backing text, which
     /// is what every `cfgrammar::Span` in that module indexes.
     pub span: Range<usize>,
@@ -123,7 +124,7 @@ impl ItemIndex {
 /// One declaration, before its dependencies are known.
 struct Item {
     kind: ItemKind,
-    path: PathBuf,
+    path: Arc<Path>,
     span: Range<usize>,
     self_hash: u64,
     deps: IndexSet<VarId>,
@@ -461,10 +462,7 @@ impl Builder<'_> {
                     self.expr(&binding.value, out);
                     self.pattern(&binding.pattern, out);
                 }
-                Statement::ForLoop(loop_) => {
-                    self.expr(&loop_.seq, out);
-                    self.scope(&loop_.body, out);
-                }
+                Statement::ForLoop(loop_) => self.for_loop(loop_, out),
             }
         }
         if let Some(tail) = &scope.tail {
@@ -472,8 +470,24 @@ impl Builder<'_> {
         }
     }
 
+    fn for_loop(
+        &self,
+        loop_: &ForLoop<arcstr::Substr, VarIdTyMetadata>,
+        out: &mut IndexSet<VarId>,
+    ) {
+        self.expr(&loop_.seq, out);
+        if let Some(filter) = &loop_.filter {
+            self.expr(filter, out);
+        }
+        self.scope(&loop_.body, out);
+    }
+
     fn expr(&self, expr: &Expr<arcstr::Substr, VarIdTyMetadata>, out: &mut IndexSet<VarId>) {
         match expr {
+            Expr::ListComp(e) => {
+                self.ty(&e.metadata, out);
+                self.for_loop(&e.for_loop, out);
+            }
             Expr::If(e) => {
                 self.ty(&e.metadata, out);
                 self.expr(&e.cond, out);
@@ -771,7 +785,7 @@ impl ItemIndex {
         let mut sites = self
             .sites
             .values()
-            .filter(|site| site.path == path)
+            .filter(|site| *site.path == *path)
             .collect::<Vec<_>>();
         sites.sort_by_key(|site| site.span.start);
         sites
@@ -797,7 +811,7 @@ mod tests {
         let index = ItemIndex::build(&typed);
         let mut named = HashMap::new();
         for annotated in typed.values() {
-            if annotated.path != Path::new("/virtual/lib.ar") {
+            if *annotated.path != *Path::new("/virtual/lib.ar") {
                 continue;
             }
             for decl in declarations(annotated) {
@@ -1156,11 +1170,11 @@ fn untouched<T>(v: T) -> T { v }
 
             let visible: IndexMap<&Path, usize> = typed
                 .values()
-                .map(|module| (module.path.as_path(), module.source_text.len()))
+                .map(|module| (&*module.path, module.source_text.len()))
                 .collect();
             for module in typed.values() {
                 let sites = index.sites_in(&module.path);
-                let limit = visible[module.path.as_path()];
+                let limit = visible[&*module.path];
                 for pair in sites.windows(2) {
                     assert!(
                         pair[0].span.end <= pair[1].span.start,
@@ -1212,9 +1226,11 @@ fn untouched<T>(v: T) -> T { v }
 pub struct SpanRebase {
     /// Declaration extents in the revision the spans were recorded against,
     /// per file and ordered by position, with the fingerprint that names each.
-    from: HashMap<PathBuf, Vec<(Range<usize>, Fingerprint)>>,
+    from: HashMap<Arc<Path>, Vec<(Range<usize>, Fingerprint)>>,
     /// Where each of those declarations lives now.
-    to: HashMap<Fingerprint, (PathBuf, Range<usize>)>,
+    to: HashMap<Fingerprint, (Arc<Path>, Range<usize>)>,
+    /// Files containing a declaration whose source extent moved or changed.
+    moved_paths: HashSet<Arc<Path>>,
 }
 
 /// A span that could not be translated.
@@ -1234,15 +1250,19 @@ impl SpanRebase {
     /// and every span is already correct.
     pub fn new(from: &ItemIndex, to: &ItemIndex) -> Option<Self> {
         let mut moved = false;
+        let mut moved_paths = HashSet::new();
         let mut by_fingerprint = HashMap::with_capacity(to.len());
         for (_, site) in to.iter() {
             by_fingerprint.insert(site.fingerprint, (site.path.clone(), site.span.clone()));
         }
-        let mut by_path: HashMap<PathBuf, Vec<(Range<usize>, Fingerprint)>> = HashMap::new();
+        let mut by_path: HashMap<Arc<Path>, Vec<(Range<usize>, Fingerprint)>> = HashMap::new();
         for (_, site) in from.iter() {
             match by_fingerprint.get(&site.fingerprint) {
                 Some((path, span)) if path == &site.path && span == &site.span => {}
-                _ => moved = true,
+                _ => {
+                    moved = true;
+                    moved_paths.insert(site.path.clone());
+                }
             }
             by_path
                 .entry(site.path.clone())
@@ -1258,7 +1278,14 @@ impl SpanRebase {
         Some(Self {
             from: by_path,
             to: by_fingerprint,
+            moved_paths,
         })
+    }
+
+    pub fn affects_any_path<'a>(&self, paths: impl IntoIterator<Item = &'a PathBuf>) -> bool {
+        paths
+            .into_iter()
+            .any(|path| self.moved_paths.contains(path.as_path()))
     }
 
     /// Translates one span in place.
@@ -1266,20 +1293,42 @@ impl SpanRebase {
     /// A span in a file with no declarations at all is left alone: that is the
     /// GDS-import case, whose spans name a `.gds` file at offset `0..0`.
     pub fn rebase(&self, span: &mut crate::ast::Span) -> Result<(), RebaseError> {
-        let Some(extents) = self.from.get(&span.path) else {
+        let Some((path, shift)) = self.translation(span)? else {
             return Ok(());
+        };
+        let shifted = |offset: usize| (offset as isize + shift) as usize;
+        span.path = path.clone();
+        span.span = cfgrammar::Span::new(shifted(span.span.start()), shifted(span.span.end()));
+        Ok(())
+    }
+
+    /// Whether [`Self::rebase`] would change `span`, with the same errors.
+    pub fn moves(&self, span: &crate::ast::Span) -> Result<bool, RebaseError> {
+        Ok(self
+            .translation(span)?
+            .is_some_and(|(path, shift)| shift != 0 || path != &span.path))
+    }
+
+    /// The file and offset shift that translate `span`, or `None` when it lies
+    /// outside every declaration.
+    fn translation(
+        &self,
+        span: &crate::ast::Span,
+    ) -> Result<Option<(&Arc<Path>, isize)>, RebaseError> {
+        let Some(extents) = self.from.get(&span.path) else {
+            return Ok(None);
         };
         let start = span.span.start();
         // Extents within a file never overlap or nest, so the last one
         // beginning at or before `start` is the only candidate.
         let index = extents.partition_point(|(extent, _)| extent.start <= start);
         let Some((extent, fingerprint)) = index.checked_sub(1).map(|index| &extents[index]) else {
-            return Ok(());
+            return Ok(None);
         };
         if start >= extent.end {
             // Between declarations: whitespace, a comment, or a `use`. Nothing
             // the executor records a span for lives here.
-            return Ok(());
+            return Ok(None);
         }
         let Some((path, moved)) = self.to.get(fingerprint) else {
             return Err(RebaseError::UnknownDeclaration);
@@ -1287,11 +1336,7 @@ impl SpanRebase {
         if moved.end - moved.start != extent.end - extent.start {
             return Err(RebaseError::LengthChanged);
         }
-        let shift = moved.start as isize - extent.start as isize;
-        let shifted = |offset: usize| (offset as isize + shift) as usize;
-        span.path = path.clone();
-        span.span = cfgrammar::Span::new(shifted(span.span.start()), shifted(span.span.end()));
-        Ok(())
+        Ok(Some((path, moved.start as isize - extent.start as isize)))
     }
 
     /// Translates an optional span, leaving `None` alone.

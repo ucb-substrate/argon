@@ -20,9 +20,9 @@ use crate::ast::{
     CellDecl, ComparisonOp, ConstantDecl, Decl, EmitExpr, EnumDecl, EnumVariant, Expr,
     FieldAccessExpr, FieldPattern, FloatLiteral, FnDecl, ForLoop, GenericArgs, Ident, IdentPath,
     IfExpr, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, LetBinding, LetPattern,
-    MatchArm, MatchExpr, ModDecl, NilLiteral, Pattern, Scope, SeqLiteral, Statement, StringLiteral,
-    StructDecl, StructField, StructLitExpr, StructLitField, TupleExpr, TyParam, TySpec, TySpecKind,
-    UnaryOp, UnaryOpExpr, UseDecl, VariantPayload,
+    ListCompExpr, MatchArm, MatchExpr, ModDecl, NilLiteral, Pattern, Scope, SeqLiteral, Statement,
+    StringLiteral, StructDecl, StructField, StructLitExpr, StructLitField, TupleExpr, TyParam,
+    TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, VariantPayload,
 };
 use crate::compile::BUILTINS;
 use crate::parse::ParseMetadata;
@@ -823,7 +823,8 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        let scope = self.parse_scope();
+        let mut scope = self.parse_scope();
+        mark_tail_calls(&mut scope);
         FnDecl {
             name,
             params,
@@ -1118,7 +1119,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `forLoop : FOR ident IN expr scope`
+    /// `forLoop : FOR ident IN expr (IF expr)? scope`
     fn parse_for_loop(&mut self) -> ForLoop<&'a str, Md> {
         let lo = self.cur.start;
         let scope_order = self.next_scope_order();
@@ -1126,10 +1127,14 @@ impl<'a> Parser<'a> {
         let var = self.ident(CompletionSite::NewIdentifier);
         self.expect(TokenKind::KwIn);
         let seq = self.with_struct_literals(false, |p| p.parse_expr(0));
+        let filter = self
+            .eat(TokenKind::KwIf)
+            .then(|| Box::new(self.with_struct_literals(false, |p| p.parse_expr(0))));
         let body = self.parse_scope();
         ForLoop {
             var,
             seq,
+            filter,
             body,
             scope_order,
             metadata: (),
@@ -1767,12 +1772,22 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `seqLiteral : LBRACK (expr (COMMA expr)* COMMA?)? RBRACK`
+    /// `seqLiteral : LBRACK (expr (COMMA expr)* COMMA?)? RBRACK` or
+    /// `listComp : LBRACK forLoop RBRACK`.
     ///
     /// A struct literal is unambiguous inside the brackets, so it is allowed
     /// there even where the enclosing head forbids one.
     fn parse_seq_literal(&mut self) -> Expr<&'a str, Md> {
         let lb = self.bump();
+        if self.at(TokenKind::KwFor) {
+            let for_loop = self.parse_for_loop();
+            let rb = self.expect(TokenKind::RBrack);
+            return Expr::ListComp(Box::new(ListCompExpr {
+                for_loop,
+                span: Span::new(lb.start as usize, rb.end as usize),
+                metadata: (),
+            }));
+        }
         let items = self.with_struct_literals(true, |p| {
             p.separated_list(TokenKind::RBrack, CompletionSite::Expression, |p| {
                 p.parse_expr(0)
@@ -1839,6 +1854,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::RParen);
         CallExpr {
             scope_order,
+            tail: false,
             func,
             args,
             span: self.finish_span(lo),
@@ -2009,5 +2025,32 @@ impl<'a> Parser<'a> {
                 metadata: (),
             }
         }
+    }
+}
+
+/// Marks the calls whose value is the value of `scope`, through `if`/`match`
+/// branches and blocks.
+fn mark_tail_calls<S, T: crate::ast::AstMetadata>(scope: &mut Scope<S, T>) {
+    if let Some(tail) = &mut scope.tail {
+        mark_tail_expr(tail);
+    }
+}
+
+fn mark_tail_expr<S, T: crate::ast::AstMetadata>(expr: &mut Expr<S, T>) {
+    match expr {
+        Expr::Call(call) => call.tail = true,
+        Expr::If(if_) => {
+            mark_tail_calls(&mut if_.then);
+            if let Some(else_) = &mut if_.else_ {
+                mark_tail_calls(else_);
+            }
+        }
+        Expr::Match(match_) => {
+            for arm in &mut match_.arms {
+                mark_tail_expr(&mut arm.expr);
+            }
+        }
+        Expr::Scope(scope) => mark_tail_calls(scope),
+        _ => {}
     }
 }

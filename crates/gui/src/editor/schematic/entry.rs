@@ -491,7 +491,7 @@ mod tests {
         SchematicTarget {
             base_revision: 1,
             cell: argonc::ast::Span {
-                path: "/virtual/lib.ar".into(),
+                path: std::path::Path::new("/virtual/lib.ar").into(),
                 span: cfgrammar::Span::new(0, 0),
             },
         }

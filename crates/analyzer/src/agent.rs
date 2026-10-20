@@ -716,7 +716,7 @@ impl Backend {
             .ast
             .values()
             .find(|module| identity(&module.path) == target)
-            .map_or_else(|| path.to_path_buf(), |module| module.path.clone());
+            .map_or_else(|| std::sync::Arc::from(path), |module| module.path.clone());
         let spans = spans
             .iter()
             .map(|&span| Span {
@@ -899,6 +899,7 @@ impl Agent for Backend {
                     cell: Some(cell.clone()),
                 },
                 root_dir: root_dir.clone(),
+                preview_cell: None,
             })
             .await
             .ok_or_else(|| "The compiler is unavailable.".to_owned())?;

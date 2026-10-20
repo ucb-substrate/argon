@@ -90,8 +90,9 @@ impl View {
 pub enum RootStep {
     /// A schematic instance, by its element name.
     Schematic(String),
-    /// A layout instance, by its scope path in the cell above it.
-    Layout(ScopePath),
+    /// A layout instance, by the scope names that reach it in the cell above
+    /// it.
+    Layout(Vec<String>),
 }
 
 impl RootStep {
@@ -103,6 +104,48 @@ impl RootStep {
             }
         }
     }
+}
+
+/// The scope names from the root of `state` down to `address`.
+fn scope_name_path(
+    state: &imbl::HashMap<ScopePath, ScopeState>,
+    mut address: ScopeAddress,
+) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    loop {
+        let scope = state.get(&address)?;
+        names.push(scope.name.to_string());
+        match scope.parent {
+            Some(parent) => address = parent,
+            None => break,
+        }
+    }
+    names.reverse();
+    Some(names)
+}
+
+/// The scope that `names`, starting with the name of `root`, reach in
+/// `state`.
+fn scope_at_name_path(
+    state: &imbl::HashMap<ScopePath, ScopeState>,
+    root: ScopeAddress,
+    names: &[String],
+) -> Option<ScopeAddress> {
+    let (first, rest) = names.split_first()?;
+    if *state.get(&root)?.name != **first {
+        return None;
+    }
+    let mut address = root;
+    for name in rest {
+        address = state
+            .get(&address)?
+            .children
+            .iter()
+            .rev()
+            .copied()
+            .find(|child| state.get(child).is_some_and(|scope| *scope.name == **name))?;
+    }
+    Some(address)
 }
 
 /// Where focus goes when the GUI hands off to Neovim.
@@ -150,14 +193,18 @@ pub struct LayerState {
 
 #[derive(Clone, Debug)]
 pub struct ScopeState {
-    pub name: String,
-    pub address: ScopeAddress,
     pub visible: bool,
-    pub bbox: Option<Rect<f64>>,
     pub parent: Option<ScopeAddress>,
+    prepared: Arc<hierarchy::PreparedScope>,
 }
 
-pub type ScopePath = Vec<String>;
+impl std::ops::Deref for ScopeState {
+    type Target = hierarchy::PreparedScope;
+
+    fn deref(&self) -> &Self::Target {
+        &self.prepared
+    }
+}
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
 pub struct ScopeAddress {
@@ -165,13 +212,37 @@ pub struct ScopeAddress {
     pub cell: CellId,
 }
 
+/// Compact UI scope identity within one compilation snapshot. Name paths are
+/// reconstructed only when a selection must be carried across changed IDs.
+pub type ScopePath = ScopeAddress;
+
 #[derive(Clone, Debug)]
 pub struct CompileOutputState {
     pub output: Arc<CompiledData>,
     pub selected_scope: ScopePath,
     pub state: Arc<imbl::HashMap<ScopePath, ScopeState>>,
-    pub scope_paths: Arc<imbl::HashMap<ScopeAddress, ScopePath>>,
-    hierarchy: Arc<hierarchy::PreparedHierarchy>,
+    /// Whether every scope in `state` is visible. It may be false when they
+    /// all are, but is never true when one is hidden.
+    pub all_scopes_visible: bool,
+}
+
+impl CompileOutputState {
+    /// Whether a cell's prepared geometry, including every referenced child,
+    /// is shared with a previous presentation.
+    #[cfg(test)]
+    pub(crate) fn same_cell(&self, previous: &Self, cell: CellId) -> bool {
+        let Some(cell_info) = self.output.cells.get(&cell) else {
+            return false;
+        };
+        let address = ScopeAddress {
+            cell,
+            scope: cell_info.root,
+        };
+        self.state
+            .get(&address)
+            .zip(previous.state.get(&address))
+            .is_some_and(|(new, old)| Arc::ptr_eq(&new.prepared, &old.prepared))
+    }
 }
 
 pub struct Layers {
@@ -200,6 +271,11 @@ pub struct EditorState {
     pub agent_highlight: Option<AgentHighlight>,
     agent_highlight_generation: u64,
     pub solved_cell: Entity<Option<CompileOutputState>>,
+    /// Focused-cell geometry shown while the opened top is still compiling.
+    /// The full snapshot remains canonical for source edits and hierarchy UI.
+    pub preview_cell: Entity<Option<CompileOutputState>>,
+    preview_revision: Option<u64>,
+    preview_source_scope: Option<ScopePath>,
     pub hide_external_geometry: bool,
     pub layers: Entity<Layers>,
     pub lang_server_client: SyncLangServerClient,
@@ -302,7 +378,6 @@ fn shape_fill(
 struct ProcessScopeState {
     layers: IndexMap<SharedString, LayerState>,
     state: imbl::HashMap<ScopePath, ScopeState>,
-    scope_paths: imbl::HashMap<ScopeAddress, ScopePath>,
 }
 
 #[derive(Default)]
@@ -317,8 +392,7 @@ struct PreparedCompileOutput {
     layers: IndexMap<SharedString, LayerState>,
     selected_scope: ScopePath,
     state: imbl::HashMap<ScopePath, ScopeState>,
-    scope_paths: imbl::HashMap<ScopeAddress, ScopePath>,
-    hierarchy: Arc<hierarchy::PreparedHierarchy>,
+    all_scopes_visible: bool,
 }
 
 pub(crate) struct PreparedCompilationSnapshot {
@@ -353,6 +427,24 @@ fn mark_layer_used(state: &mut ProcessScopeState, layer: &str) {
 }
 
 impl EditorState {
+    pub(crate) fn displayed_cell(&self, cx: &App) -> Option<CompileOutputState> {
+        self.displayed_cell_and_revision(cx).0
+    }
+
+    /// The displayed cell and the compile revision it came from.
+    pub(crate) fn displayed_cell_and_revision(
+        &self,
+        cx: &App,
+    ) -> (Option<CompileOutputState>, Option<u64>) {
+        let full = self.solved_cell.read(cx).clone();
+        if full.as_ref().map(|cell| cell.selected_scope) == self.preview_source_scope
+            && let Some(preview) = self.preview_cell.read(cx).clone()
+        {
+            return (Some(preview), self.preview_revision);
+        }
+        (full, self.compilation_revision)
+    }
+
     pub(crate) fn theme(&self) -> &'static Theme {
         if self.dark_mode {
             &DARK_THEME
@@ -426,11 +518,11 @@ impl EditorState {
                 if solved.output.top != from {
                     return None;
                 }
-                solved
-                    .scope_paths
-                    .iter()
-                    .find(|(_, scope_path)| *scope_path == path)
-                    .map(|(address, _)| address.cell)
+                let root = ScopeAddress {
+                    cell: from,
+                    scope: solved.output.cells.get(&from)?.root,
+                };
+                scope_at_name_path(&solved.state, root, path).map(|address| address.cell)
             }
         }
     }
@@ -497,7 +589,7 @@ impl EditorState {
                 cell,
                 scope: compiled.root,
             };
-            solved.scope_paths.get(&address).cloned()
+            scope_name_path(&solved.state, address)
         };
         let Some(path) = path else {
             return false;
@@ -522,7 +614,7 @@ impl EditorState {
         let old_cell = self.solved_cell.read(cx);
         CompilationPreparationContext {
             layers: self.layers.read(cx).layers.clone(),
-            selected_scope: old_cell.as_ref().map(|cell| cell.selected_scope.clone()),
+            selected_scope: old_cell.as_ref().map(|cell| cell.selected_scope),
             scope_state: old_cell.as_ref().map(|cell| cell.state.clone()),
             previous: old_cell.clone(),
         }
@@ -568,8 +660,7 @@ impl EditorState {
             layers,
             selected_scope,
             state,
-            scope_paths,
-            hierarchy,
+            all_scopes_visible,
         }) = prepared_output
         else {
             return;
@@ -591,8 +682,7 @@ impl EditorState {
                 output: Arc::new(solved_cell),
                 selected_scope,
                 state: Arc::new(state),
-                scope_paths: Arc::new(scope_paths),
-                hierarchy,
+                all_scopes_visible,
             });
             cx.notify();
         });
@@ -618,9 +708,6 @@ pub(crate) fn prepare_compilation_snapshot(
             scope: solved_cell.cells[&solved_cell.top].root,
             cell: solved_cell.top,
         };
-        let root_scope_name = solved_cell.cells[&root_scope.cell].scopes[&root_scope.scope]
-            .name
-            .clone();
         let mut state = ProcessScopeState::default();
         for layer in &solved_cell.tech.layers {
             let name = SharedString::from(layer.name.clone());
@@ -651,22 +738,29 @@ pub(crate) fn prepare_compilation_snapshot(
             &mut state,
             context.scope_state.as_deref(),
             context.previous.as_ref(),
+            context.previous.as_ref().map(|_| &context.layers),
         );
-        let ProcessScopeState {
-            layers,
-            state,
-            scope_paths,
-        } = state;
+        let ProcessScopeState { layers, state } = state;
         let selected_scope = context
             .selected_scope
-            .filter(|selected_scope| state.contains_key(selected_scope))
-            .unwrap_or_else(|| vec![root_scope_name]);
+            .and_then(|selected_scope| {
+                state
+                    .contains_key(&selected_scope)
+                    .then_some(selected_scope)
+                    .or_else(|| {
+                        hierarchy.remap_path(
+                            root_scope,
+                            context.scope_state.as_deref()?,
+                            selected_scope,
+                        )
+                    })
+            })
+            .unwrap_or(root_scope);
         PreparedCompileOutput {
             layers,
             selected_scope,
             state,
-            scope_paths,
-            hierarchy: Arc::new(hierarchy),
+            all_scopes_visible: hierarchy.all_scopes_visible,
         }
     });
     PreparedCompilationSnapshot {
@@ -689,6 +783,7 @@ impl Editor {
         let (lang_server_client, mut rx) =
             SyncLangServerClient::new(cx.to_async(), lang_server_addr, token)?;
         let solved_cell = cx.new(|_cx| None);
+        let preview_cell = cx.new(|_cx| None);
         let tool = cx.new(|_cx| ToolState::default());
         let layers = cx.new(|_cx| Layers {
             layers: IndexMap::new(),
@@ -719,6 +814,9 @@ impl Editor {
                 agent_highlight: None,
                 agent_highlight_generation: 0,
                 solved_cell,
+                preview_cell,
+                preview_revision: None,
+                preview_source_scope: None,
                 hide_external_geometry: false,
                 tool,
                 layers,
@@ -811,6 +909,17 @@ impl Editor {
             _ => None,
         };
         self.state.update(cx, |state, cx| {
+            if state
+                .preview_revision
+                .is_some_and(|revision| snapshot.revision >= revision)
+            {
+                state.preview_revision = None;
+                state.preview_source_scope = None;
+                state.preview_cell.update(cx, |preview, cx| {
+                    *preview = None;
+                    cx.notify();
+                });
+            }
             state.connection_error = None;
             state.compilation_revision = Some(snapshot.revision);
             // A later revision may have moved the source the highlight names.
@@ -833,8 +942,104 @@ impl Editor {
             }
             cx.notify();
         });
-        self.canvas
-            .update(cx, |canvas, cx| canvas.finish_sse_persist(cx));
+        self.canvas.update(cx, |canvas, cx| {
+            canvas.follow_sse_source_edits(cx);
+            canvas.finish_sse_persist(cx);
+        });
+        true
+    }
+
+    pub(crate) fn selected_cell_id(&self, cx: &App) -> Option<CellId> {
+        let state = self.state.read(cx);
+        let solved = state.solved_cell.read(cx);
+        Some(solved.as_ref()?.selected_scope.cell)
+    }
+
+    pub(crate) fn preview_preparation_context(
+        &self,
+        cx: &App,
+        previous_cell: CellId,
+        revision: u64,
+    ) -> Option<(CompilationPreparationContext, ScopePath)> {
+        let state = self.state.read(cx);
+        if state
+            .compilation_revision
+            .is_some_and(|current| current >= revision)
+            || state
+                .preview_revision
+                .is_some_and(|current| current > revision)
+            || self.selected_cell_id(cx) != Some(previous_cell)
+        {
+            return None;
+        }
+        let selected = state.solved_cell.read(cx).as_ref()?.selected_scope;
+        Some((state.compilation_preparation_context(cx), selected))
+    }
+
+    pub(crate) fn finish_cell_preview(
+        &self,
+        cx: &mut App,
+        previous_cell: CellId,
+        source_scope: ScopePath,
+        preview: PreparedCompilationSnapshot,
+    ) -> bool {
+        if self
+            .preview_preparation_context(cx, previous_cell, preview.revision)
+            .is_none_or(|(_, selected)| selected != source_scope)
+        {
+            return false;
+        }
+        // A preview compiled before Neovim acknowledges the SSE edit cannot
+        // replace its live drag yet, but retaining it avoids waiting for a
+        // full parent compilation when that acknowledgement arrives.
+        if self.canvas.read(cx).is_sse_dragging()
+            || self.canvas.read(cx).is_sse_source_edit_inflight()
+        {
+            self.canvas.update(cx, |canvas, _| {
+                canvas.defer_cell_preview(previous_cell, source_scope, preview)
+            });
+            return false;
+        }
+        // The first matching focused preview can end the optimistic drag;
+        // otherwise applying the drag delta to its new geometry doubles it.
+        if !self.canvas.read(cx).accepts_snapshot(&preview) {
+            return false;
+        }
+        let Some(PreparedCompileOutput {
+            selected_scope,
+            state: scopes,
+            all_scopes_visible,
+            ..
+        }) = preview.prepared_output
+        else {
+            return false;
+        };
+        let output = match preview.output {
+            CompileOutput::Valid(output) => output,
+            CompileOutput::ExecErrors(ExecErrorCompileOutput {
+                output: Some(output),
+                errors,
+            }) if !errors.iter().any(|error| error.kind.is_invalid_cell()) => output,
+            _ => return false,
+        };
+        self.state.update(cx, |state, cx| {
+            state.preview_revision = Some(preview.revision);
+            state.preview_source_scope = Some(source_scope);
+            state.preview_cell.update(cx, |cell, cx| {
+                *cell = Some(CompileOutputState {
+                    output: Arc::new(output),
+                    selected_scope,
+                    state: Arc::new(scopes),
+                    all_scopes_visible,
+                });
+                cx.notify();
+            });
+            cx.notify();
+        });
+        self.canvas.update(cx, |canvas, cx| {
+            canvas.follow_sse_source_edits(cx);
+            canvas.finish_sse_persist(cx);
+        });
         true
     }
 
@@ -964,7 +1169,12 @@ impl Editor {
                 .update(cx, |canvas, _| canvas.defer_snapshot(snapshot));
             return;
         }
-        if !self.canvas.read(cx).accepts_snapshot(&snapshot) || !self.apply_snapshot(cx, snapshot) {
+        if !self.canvas.read(cx).accepts_snapshot(&snapshot) {
+            self.canvas
+                .update(cx, |canvas, _| canvas.defer_snapshot(snapshot));
+            return;
+        }
+        if !self.apply_snapshot(cx, snapshot) {
             return;
         }
         let state = self.state.clone();
@@ -985,6 +1195,30 @@ impl Editor {
             });
             cx.notify();
         });
+    }
+
+    pub(crate) fn finish_sse_source_edit(
+        &self,
+        cx: &mut App,
+        generation: u64,
+        result: anyhow::Result<Option<Vec<analyzer::rpc::ValueEdit>>>,
+        initial_conditions: Vec<analyzer::rpc::InitialConditionEdit>,
+    ) {
+        self.canvas.update(cx, |canvas, cx| {
+            canvas.complete_sse_source_edit(generation, result, &initial_conditions, cx)
+        });
+        let deferred_preview = self
+            .canvas
+            .update(cx, |canvas, _| canvas.take_deferred_cell_preview());
+        if let Some((previous_cell, source_scope, preview)) = deferred_preview {
+            self.finish_cell_preview(cx, previous_cell, source_scope, preview);
+        }
+        let deferred = self
+            .canvas
+            .update(cx, |canvas, _| canvas.take_deferred_snapshot());
+        if let Some(snapshot) = deferred {
+            self.update_cell(cx, snapshot);
+        }
     }
 
     pub fn highlight_agent_edit(&self, cx: &mut App, revision: u64, spans: Vec<argonc::ast::Span>) {
@@ -1078,24 +1312,19 @@ impl Editor {
         let solved = state.solved_cell.read(cx);
         let solved = solved.as_ref()?;
         let cell = solved.output.cells.get(&solved.output.top)?;
-        Some(cell.scopes.get(&cell.root)?.span.clone())
+        cell.scopes
+            .contains_key(&cell.root)
+            .then(|| cell.scope_span(cell.root).clone())
     }
 
     pub fn selected_scope_span(&self, cx: &App) -> Option<argonc::ast::Span> {
         let state = self.state.read(cx);
         let solved = state.solved_cell.read(cx);
         let solved = solved.as_ref()?;
-        let scope = solved.state.get(&solved.selected_scope)?.address;
-        Some(
-            solved
-                .output
-                .cells
-                .get(&scope.cell)?
-                .scopes
-                .get(&scope.scope)?
-                .span
-                .clone(),
-        )
+        let scope = solved.selected_scope;
+        let cell = solved.output.cells.get(&scope.cell)?;
+        cell.scopes.get(&scope.scope)?;
+        Some(cell.scope_span(scope.scope).clone())
     }
 
     fn on_mouse_move(
@@ -1124,6 +1353,12 @@ impl Editor {
     fn on_left_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if self.state.read(cx).view != View::Layout {
             return;
+        }
+        let deferred_preview = self
+            .canvas
+            .update(cx, |canvas, _| canvas.take_deferred_cell_preview());
+        if let Some((previous_cell, source_scope, preview)) = deferred_preview {
+            self.finish_cell_preview(cx, previous_cell, source_scope, preview);
         }
         let deferred = self
             .canvas
@@ -1674,7 +1909,7 @@ mod tests {
     #[test]
     fn compilation_error_message_does_not_embed_individual_diagnostics() {
         let span = Span {
-            path: PathBuf::from("lib.ar"),
+            path: PathBuf::from("lib.ar").into(),
             span: cfgrammar::Span::new(0, 1),
         };
         let output = CompileOutput::StaticErrors(StaticErrorCompileOutput {
@@ -1776,5 +2011,73 @@ mod tests {
                 layer.name
             );
         }
+    }
+
+    #[test]
+    fn prepares_deeply_nested_scopes_from_a_small_stack() {
+        // GPUI's background executor, which runs the GUI's RPC handlers, gives
+        // its threads 512 KiB of stack. Each level of this recursion nests a
+        // call scope and a branch scope.
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("lib.ar");
+        std::fs::write(
+            &source,
+            r#"
+use std::layout::rect;
+fn nest(n: Int) -> Rect {
+    if n == 0 {
+        rect("met1", x0=0., y0=0., x1=1., y1=1.)
+    } else {
+        let r = nest(n - 1);
+        r
+    }
+}
+cell top() { let r = nest(3000); }
+"#,
+        )
+        .unwrap();
+        let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+        ));
+        let ast = argonc::parse::parse_workspace_with_config(&config).ast();
+        let output = argonc::compile::compile(
+            &ast,
+            argonc::compile::CompileInput {
+                cell: &["top"],
+                args: vec![],
+            },
+            &config,
+        )
+        .unwrap_valid();
+        let top = &output.cells[&output.top];
+        let mut deepest = 0;
+        let mut stack = vec![(top.root, 1)];
+        while let Some((scope, depth)) = stack.pop() {
+            deepest = deepest.max(depth);
+            stack.extend(
+                top.scopes[&scope]
+                    .children
+                    .iter()
+                    .map(|child| (*child, depth + 1)),
+            );
+        }
+        assert!(deepest > 5000, "scopes nest only {deepest} deep");
+        let snapshot = super::CompilationSnapshot {
+            revision: 0,
+            output: CompileOutput::Valid(output),
+        };
+        let context = super::CompilationPreparationContext {
+            layers: Default::default(),
+            selected_scope: None,
+            scope_state: None,
+            previous: None,
+        };
+        let prepared = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || super::prepare_compilation_snapshot(snapshot, context))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(prepared.prepared_output.is_some());
     }
 }

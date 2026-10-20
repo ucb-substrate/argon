@@ -470,7 +470,10 @@ impl SchematicCanvas {
         let compiled = output.cells.get(&cell)?;
         Some(SchematicTarget {
             base_revision,
-            cell: compiled.scopes.get(&compiled.root)?.span.clone(),
+            cell: compiled
+                .scopes
+                .contains_key(&compiled.root)
+                .then(|| compiled.scope_span(compiled.root).clone())?,
         })
     }
 

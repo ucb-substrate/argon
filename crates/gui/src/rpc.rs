@@ -6,22 +6,25 @@ use std::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use analyzer::ArgonConfig;
 use analyzer::rpc::{
     AddSignalRequest, AddSymbolItemsRequest, CallArguments, CellEntry, ClipboardItem,
-    CompilationSnapshot, CompilationUpdate, ConnectRequest, CreateSymbolRequest, DeleteOutcome,
-    DeleteRequest, DevicePreview, DimensionParams, EditReceipt, FocusEditorParams, Gui,
-    InitialConditionEdit, InstancePreview, LangServerAction, LangServerClient, PasteRequest,
-    PathParams, PlaceDeviceRequest, PlaceRequest, PlaceSchematicInstanceRequest, PolygonParams,
-    RecentCell, RectangleEditResult, RenameRequest, SchematicInstancePreview, SetArgumentRequest,
-    ValueEdit,
+    CompilationSnapshot, CompressedCompilationUpdate, ConnectRequest, CreateSymbolRequest,
+    DeleteOutcome, DeleteRequest, DevicePreview, DimensionParams, EditReceipt, FocusEditorParams,
+    FocusedCellPreview, Gui, GuiUpdateResult, InitialConditionEdit, InstancePreview,
+    LangServerAction, LangServerClient, PasteRequest, PathParams, PlaceDeviceRequest, PlaceRequest,
+    PlaceSchematicInstanceRequest, PolygonParams, RecentCell, RectangleEditResult, RenameRequest,
+    SchematicInstancePreview, SetArgumentRequest, ValueEdit,
 };
 use analyzer::transport::{self, Role, SessionToken};
 use anyhow::{Result, anyhow};
-use argonc::{ast::Span, compile::BasicRect};
+use argonc::{
+    ast::Span,
+    compile::{BasicRect, CellId},
+};
 use async_compat::CompatExt;
 use futures::{
     channel::{
@@ -453,20 +456,34 @@ impl SyncLangServerClient {
         })
     }
 
-    pub fn update_values(
+    pub async fn update_values_async(
         &self,
         edits: Vec<ValueEdit>,
         initial_conditions: Vec<InitialConditionEdit>,
+        base_revision: Option<u64>,
     ) -> Result<Option<Vec<ValueEdit>>> {
-        self.call(move |client| {
+        self.call_async(move |rpc| {
             let edits = edits.clone();
             let initial_conditions = initial_conditions.clone();
             async move {
-                client
-                    .update_values(context::current(), edits, initial_conditions)
+                rpc.update_values(context::current(), edits, initial_conditions, base_revision)
                     .await
             }
         })
+        .await
+    }
+
+    pub fn dispatch_sse_source_edit_result(
+        &self,
+        generation: u64,
+        result: Result<Option<Vec<ValueEdit>>>,
+        initial_conditions: Vec<InitialConditionEdit>,
+    ) {
+        let _ = self.to_exec.unbounded_send(Box::new(move |editor, cx| {
+            let _ = cx.update(|cx| {
+                editor.finish_sse_source_edit(cx, generation, result, initial_conditions)
+            });
+        }));
     }
 
     /// Applies a schematic placement or route gesture, off the UI thread.
@@ -691,15 +708,33 @@ impl Gui for GuiServer {
             .ok();
     }
 
-    async fn update_cell(mut self, _: context::Context, update: CompilationUpdate) -> bool {
+    async fn update_cell(
+        mut self,
+        _: context::Context,
+        update: CompressedCompilationUpdate,
+    ) -> GuiUpdateResult {
+        let decode_started = Instant::now();
+        let update = match update.decode() {
+            Ok(update) => update,
+            Err(error) => {
+                error!("could not decode compilation update: {error}");
+                return GuiUpdateResult::default();
+            }
+        };
+        let decode_seconds = decode_started.elapsed().as_secs_f64();
+        let materialize_started = Instant::now();
         let snapshot = {
             let mut previous = lock_unpoisoned(&self.snapshot);
             let Some(snapshot) = update.materialize(previous.as_ref()) else {
-                return false;
+                return GuiUpdateResult {
+                    decode_seconds,
+                    ..GuiUpdateResult::default()
+                };
             };
             *previous = Some(snapshot.clone());
             snapshot
         };
+        let materialize_seconds = materialize_started.elapsed().as_secs_f64();
         let preparation_id = NEXT_SNAPSHOT_PREPARATION_ID.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = oneshot::channel();
         self.to_exec
@@ -712,14 +747,21 @@ impl Gui for GuiServer {
             .await
             .ok();
         let Ok(Some(preparation_context)) = receiver.await else {
-            return true;
+            return GuiUpdateResult {
+                accepted: true,
+                decode_seconds,
+                materialize_seconds,
+                prepare_seconds: 0.,
+            };
         };
 
-        // Scope paths, bounding boxes, and layer usage can be expensive for a
-        // large cell. This RPC future runs on GPUI's background executor, so
+        // Hierarchy metadata, bounding boxes, and layer usage can be expensive
+        // for a large cell. This RPC future runs on GPUI's background executor, so
         // prepare the immutable presentation data here instead of blocking the
         // UI thread and freezing its activity animation.
+        let prepare_started = Instant::now();
         let snapshot = prepare_compilation_snapshot(snapshot, preparation_context);
+        let prepare_seconds = prepare_started.elapsed().as_secs_f64();
         self.to_exec
             .send(Box::new(move |editor, app| {
                 let _ = app
@@ -727,7 +769,67 @@ impl Gui for GuiServer {
             }))
             .await
             .ok();
-        true
+        GuiUpdateResult {
+            accepted: true,
+            decode_seconds,
+            materialize_seconds,
+            prepare_seconds,
+        }
+    }
+
+    async fn preview_cell(
+        mut self,
+        _: context::Context,
+        preview: FocusedCellPreview,
+    ) -> GuiUpdateResult {
+        let decode_started = Instant::now();
+        let Ok(update) = preview.update.decode() else {
+            return GuiUpdateResult::default();
+        };
+        // A preview may be a delta against the current full snapshot, but it
+        // never becomes the base for later updates. A preview built against
+        // any other base is rejected before it is prepared.
+        let Some(snapshot) = update.materialize(lock_unpoisoned(&self.snapshot).as_ref()) else {
+            return GuiUpdateResult::default();
+        };
+        let decode_seconds = decode_started.elapsed().as_secs_f64();
+        let (sender, receiver) = oneshot::channel();
+        let previous_cell = preview.previous_cell;
+        let revision = snapshot.revision;
+        self.to_exec
+            .send(Box::new(move |editor, app| {
+                let context = app
+                    .update(|cx| editor.preview_preparation_context(cx, previous_cell, revision))
+                    .ok()
+                    .flatten();
+                let _ = sender.send(context);
+            }))
+            .await
+            .ok();
+        let Ok(Some((context, source_scope))) = receiver.await else {
+            return GuiUpdateResult::default();
+        };
+        let prepare_started = Instant::now();
+        let snapshot = prepare_compilation_snapshot(snapshot, context);
+        let prepare_seconds = prepare_started.elapsed().as_secs_f64();
+        let (sender, receiver) = oneshot::channel();
+        self.to_exec
+            .send(Box::new(move |editor, app| {
+                let accepted = app
+                    .update(|cx| {
+                        editor.finish_cell_preview(cx, previous_cell, source_scope, snapshot)
+                    })
+                    .unwrap_or(false);
+                let _ = sender.send(accepted);
+            }))
+            .await
+            .ok();
+        GuiUpdateResult {
+            accepted: receiver.await.unwrap_or(false),
+            decode_seconds,
+            prepare_seconds,
+            ..GuiUpdateResult::default()
+        }
     }
 
     async fn fit(mut self, _: context::Context) {
@@ -779,6 +881,26 @@ impl Gui for GuiServer {
                     .update(|cx| editor.selected_scope_span(cx))
                     .ok()
                     .flatten();
+                let _ = sender.send(selected);
+            }))
+            .await
+            .ok()?;
+        receiver.await.ok().flatten()
+    }
+
+    async fn selected_cell(mut self, _: context::Context) -> Option<CellId> {
+        let opened_top = lock_unpoisoned(&self.snapshot)
+            .as_ref()
+            .and_then(CompilationSnapshot::data)
+            .map(|data| data.top)?;
+        let (sender, receiver) = oneshot::channel();
+        self.to_exec
+            .send(Box::new(move |editor, app| {
+                let selected = app
+                    .update(|cx| editor.selected_cell_id(cx))
+                    .ok()
+                    .flatten()
+                    .filter(|selected| *selected != opened_top);
                 let _ = sender.send(selected);
             }))
             .await
@@ -919,6 +1041,59 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{is_disconnected, lock_unpoisoned};
+
+    #[gpui::test]
+    fn sse_source_edit_yields_until_neovim_accepts_it(cx: &mut gpui::TestAppContext) {
+        use analyzer::rpc::{LangServerRequest, LangServerResponse};
+        use futures::{FutureExt, SinkExt, StreamExt};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (client, mut server) = super::SyncLangServerClient::for_rpc_test(cx.to_async());
+        let completed = Arc::new(AtomicBool::new(false));
+        let done = completed.clone();
+        cx.to_async()
+            .spawn(async move |_| {
+                client
+                    .update_values_async(vec![], vec![], None)
+                    .await
+                    .unwrap();
+                done.store(true, Ordering::Release);
+            })
+            .detach();
+        let request = loop {
+            if let Some(message) = server.next().now_or_never()
+                && let tarpc::ClientMessage::Request(request) = message.unwrap().unwrap()
+            {
+                break request;
+            }
+            assert!(cx.dispatcher.tick(false));
+        };
+        assert!(matches!(
+            request.message,
+            LangServerRequest::UpdateValues { .. }
+        ));
+        assert!(!completed.load(Ordering::Acquire));
+        let foreground_ran = Arc::new(AtomicBool::new(false));
+        let ran = foreground_ran.clone();
+        cx.to_async()
+            .spawn(async move |_| ran.store(true, Ordering::Release))
+            .detach();
+        while !foreground_ran.load(Ordering::Acquire) {
+            assert!(cx.dispatcher.tick(false));
+        }
+        assert!(!completed.load(Ordering::Acquire));
+        server
+            .send(tarpc::Response {
+                request_id: request.id,
+                message: Ok(LangServerResponse::UpdateValues(Some(vec![]))),
+            })
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        while !completed.load(Ordering::Acquire) {
+            assert!(cx.dispatcher.tick(false));
+        }
+    }
 
     #[test]
     fn client_lock_recovers_from_poisoning() {

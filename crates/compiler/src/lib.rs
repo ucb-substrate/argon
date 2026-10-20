@@ -13,6 +13,7 @@ pub mod parse;
 mod parser;
 pub mod solver;
 pub mod tech;
+mod via_array;
 pub mod workspace;
 
 pub use workspace::WorkspaceConfig;
@@ -459,7 +460,7 @@ mod tests {
             // general sparse-QR fixture rather than a specially dominant one.
             let rhs = -expected[previous] + 2. * expected[i] - 1.1 * expected[next];
             solver.constrain_eq0(LinearExpr {
-                coeffs: vec![(-1., vars[previous]), (2., vars[i]), (-1.1, vars[next])],
+                coeffs: vec![(-1., vars[previous]), (2., vars[i]), (-1.1, vars[next])].into(),
                 constant: -rhs,
             });
         }
@@ -519,7 +520,7 @@ mod tests {
         let vars: Vec<_> = (0..n).map(|_| solver.new_var()).collect();
         for i in 0..n - 2 {
             solver.constrain_eq0(LinearExpr {
-                coeffs: vec![(1., vars[i]), (-0.5, vars[i + 1]), (-0.5, vars[i + 2])],
+                coeffs: vec![(1., vars[i]), (-0.5, vars[i + 1]), (-0.5, vars[i + 2])].into(),
                 constant: 0.,
             });
         }
@@ -1212,11 +1213,11 @@ mod tests {
         );
         let data = cell.unwrap_valid();
         let compiled = &data.cells[&data.top];
-        assert_eq!(compiled.scopes[&compiled.root].name, "cell scopes");
+        assert_eq!(compiled.scope_name(compiled.root), "cell scopes");
         let child_names = compiled.scopes[&compiled.root]
             .children
             .iter()
-            .map(|id| compiled.scopes[id].name.as_str())
+            .map(|id| compiled.scope_name(*id))
             .collect::<Vec<_>>();
         assert_eq!(child_names, ["0 block"]);
     }
@@ -1417,7 +1418,7 @@ mod tests {
         let scope_names = data
             .cells
             .values()
-            .flat_map(|cell| cell.scopes.values().map(|scope| scope.name.as_str()))
+            .flat_map(|cell| cell.scopes.keys().map(|scope| cell.scope_name(*scope)))
             .collect::<Vec<_>>();
         assert!(scope_names.contains(&"cell top"));
         assert!(scope_names.contains(&"0 cell middle"));
@@ -1775,7 +1776,7 @@ mod tests {
             "an invalid module graph must not be typed"
         );
         assert_eq!(output.errors.len(), 1);
-        assert_eq!(output.errors[0].span.path, devices_path);
+        assert_eq!(*output.errors[0].span.path, *devices_path);
         assert_eq!(
             output.errors[0].kind.to_string(),
             "cyclic module dependency: lib -> devices -> lib"
@@ -2180,6 +2181,329 @@ mod tests {
         assert_eq!(outline.layer.as_deref(), Some("met2"));
         assert_relative_eq!(outline.x1.0, 460., epsilon = EPSILON);
         assert_relative_eq!(outline.y1.0, 100., epsilon = EPSILON);
+    }
+
+    /// Without debug information, construction geometry is dropped from the
+    /// output unless a field names it or a check reports it, so the drawn
+    /// geometry and the diagnostics are the same as with it.
+    /// The via array search written in Argon, which `max_via_array` must match.
+    const VIA_ARRAY_REFERENCE: &str = "
+        fn cbox(x0: Float, y0: Float, x1: Float, y1: Float) -> Rect { crect(x0=x0, y0=y0, x1=x1, y1=y1) }
+        fn rect_w(r: Rect) -> Float { r.x1 - r.x0 }
+        fn rect_h(r: Rect) -> Float { r.y1 - r.y0 }
+        fn rect_cx_i(r: Rect) -> Float { ((r.x0 + r.x1) / 2.) as Int as Float }
+        fn rect_cy_i(r: Rect) -> Float { ((r.y0 + r.y1) / 2.) as Int as Float }
+        fn rect_intersection(a: Rect, b: Rect) -> Rect {
+            let x0 = max_float(a.x0, b.x0);
+            let y0 = max_float(a.y0, b.y0);
+            let x1 = min_float(a.x1, b.x1);
+            let y1 = min_float(a.y1, b.y1);
+            if (x1 >= x0 && y1 >= y0) { cbox(x0, y0, x1, y1) } else { cbox(a.x0, a.y0, a.x0, a.y0) }
+        }
+        fn rect_area(r: Rect) -> Float { max_float(0., rect_w(r)) * max_float(0., rect_h(r)) }
+        fn rect_intersection_area(a: Rect, b: Rect) -> Float { rect_area(rect_intersection(a, b)) }
+        fn rect_expand_xy(r: Rect, dx: Float, dy: Float) -> Rect { cbox(r.x0 - dx, r.y0 - dy, r.x1 + dx, r.y1 + dy) }
+        fn snap5(v: Float) -> Float {
+            if v < 0. { (((v / 5.) - 0.5) as Int) as Float * 5. } else { (((v / 5.) + 0.5) as Int) as Float * 5. }
+        }
+        fn contact_size(via: Int) -> Float { if via == 0 { 170. } else { if via == 1 { 150. } else { 170. } } }
+        fn contact_space(via: Int) -> Float { if via == 0 { 190. } else { if via == 1 { 170. } else { 170. } } }
+        fn contact_bot_enc(via: Int) -> (Float, Float) {
+            if via == 0 { (0., 0.,) } else { if via == 1 { (55., 85.,) } else { if via == 2 { (0., 120.,) } else { (50., 80.,) } } }
+        }
+        fn contact_top_enc(via: Int) -> (Float, Float) {
+            if via == 0 { (30., 60.,) } else { if via == 1 { (55., 85.,) } else { (0., 80.,) } }
+        }
+        fn contact_dims(enc: (Float, Float), ext_dir: Int, transpose: Bool) -> (Float, Float) {
+            if ext_dir == 1 { (enc.1, enc.0,) } else {
+                if ext_dir == 2 { (enc.0, enc.1,) } else { if transpose { (enc.1, enc.0,) } else { (enc.0, enc.1,) } }
+            }
+        }
+        fn contact_max_n(len: Float, ext2: Float, size: Float, space: Float) -> Int {
+            max_int((((len + space - ext2) / (size + space)) + 0.000001) as Int, 0)
+        }
+        fn contact_n_dir(bot_len: Float, top_len: Float, overlap_len: Float, bot_ext: Float, top_ext: Float, size: Float, space: Float) -> Int {
+            max_int(0, min_int(min_int(contact_max_n(bot_len, 2. * bot_ext, size, space), contact_max_n(top_len, 2. * top_ext, size, space)), contact_max_n(overlap_len, 0., size, space)))
+        }
+        fn contact_center(bot: Rect, top: Rect) -> Rect {
+            let x0 = max_float(bot.x0, top.x0);
+            let y0 = max_float(bot.y0, top.y0);
+            let x1 = min_float(bot.x1, top.x1);
+            let y1 = min_float(bot.y1, top.y1);
+            if (x1 >= x0 && y1 >= y0) { cbox(x0, y0, x1, y1) } else { bot }
+        }
+        fn contact_candidate(via: Int, bot: Rect, top: Rect, bot_ext_dir: Int, top_ext_dir: Int, bot_transpose: Bool, top_transpose: Bool, longer: Bool) -> (Int, Int, Float, Float, Float, Float, Int, Float) {
+            if ((bot_ext_dir != 0 && bot_transpose) || (top_ext_dir != 0 && top_transpose)) {
+                (0, 0, 0., 0., 0., 0., -1, 1000000000000.,)
+            } else {
+                let size = contact_size(via);
+                let space = contact_space(via);
+                let bd = contact_dims(contact_bot_enc(via), bot_ext_dir, bot_transpose);
+                let td = contact_dims(contact_top_enc(via), top_ext_dir, top_transpose);
+                let overlap = rect_intersection(bot, top);
+                let ow = max_float(0., rect_w(overlap));
+                let oh = max_float(0., rect_h(overlap));
+                let mut_nx = contact_n_dir(rect_w(bot), rect_w(top), ow, bd.0, td.0, size, space);
+                let mut_ny = contact_n_dir(rect_h(bot), rect_h(top), oh, bd.1, td.1, size, space);
+                let needs_min = (mut_nx == 0 || mut_ny == 0);
+                let nx = if needs_min { if longer { max_int(mut_nx, 1) } else { 1 } } else { mut_nx };
+                let ny = if needs_min { if longer { max_int(mut_ny, 1) } else { 1 } } else { mut_ny };
+                let center = contact_center(bot, top);
+                let aw = size * nx as Float + space * (nx - 1) as Float;
+                let ah = size * ny as Float + space * (ny - 1) as Float;
+                let arr = cbox(snap5(rect_cx_i(center) - aw / 2.), snap5(rect_cy_i(center) - ah / 2.), snap5(rect_cx_i(center) - aw / 2.) + aw, snap5(rect_cy_i(center) - ah / 2.) + ah);
+                let br = rect_expand_xy(arr, bd.0, bd.1);
+                let tr = rect_expand_xy(arr, td.0, td.1);
+                let diff = rect_area(br) - rect_intersection_area(br, bot) + rect_area(tr) - rect_intersection_area(tr, top);
+                (nx, ny, bd.0, bd.1, td.0, td.1, nx * ny, diff,)
+            }
+        }
+        fn better_contact(old: (Int, Int, Float, Float, Float, Float, Int, Float), new: (Int, Int, Float, Float, Float, Float, Int, Float), later: Bool) -> (Int, Int, Float, Float, Float, Float, Int, Float) {
+            if new.6 > old.6 { new } else {
+                if later {
+                    if (new.6 == old.6 && new.7 <= old.7 + 0.5) { new } else { old }
+                } else {
+                    if (new.6 == old.6 && new.7 + 0.5 < old.7) { new } else { old }
+                }
+            }
+        }
+        fn contact_choice(via: Int, bot: Rect, top: Rect, bot_ext_dir: Int, top_ext_dir: Int, longer: Bool, later: Bool) -> (Int, Int, Float, Float, Float, Float, Int, Float) {
+            let c00 = contact_candidate(via, bot, top, bot_ext_dir, top_ext_dir, false, false, longer);
+            let c01 = contact_candidate(via, bot, top, bot_ext_dir, top_ext_dir, true, false, longer);
+            let c10 = contact_candidate(via, bot, top, bot_ext_dir, top_ext_dir, false, true, longer);
+            let c11 = contact_candidate(via, bot, top, bot_ext_dir, top_ext_dir, true, true, longer);
+            better_contact(better_contact(better_contact(c00, c01, later), c10, later), c11, later)
+        }
+        fn same(via: Int, bot: Rect, top: Rect, bot_ext_dir: Int, top_ext_dir: Int, longer: Bool, later: Bool) -> Bool {
+            let a = contact_choice(via, bot, top, bot_ext_dir, top_ext_dir, longer, later);
+            let b = max_via_array(contact_size(via), contact_space(via), contact_bot_enc(via), contact_top_enc(via), bot, top, bot_ext_dir, top_ext_dir, longer, later);
+            a.0 == b.0 && a.1 == b.1 && a.6 == b.6 && feq(a.2, b.2) && feq(a.3, b.3) && feq(a.4, b.4) && feq(a.5, b.5) && feq(a.7, b.7)
+        }
+        fn feq(a: Float, b: Float) -> Bool { a <= b && a >= b }
+    ";
+
+    /// `max_via_array` chooses what the Argon search above chooses, including
+    /// ties, shapes that do not overlap, and fixed extension directions.
+    #[test]
+    fn max_via_array_matches_argon_reference() {
+        use std::fmt::Write;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % n
+        };
+        let mut source = format!("use std::layout::{{crect, rect}};\n{VIA_ARRAY_REFERENCE}");
+        source.push_str("cell top() {\n");
+        for case in 0..1500 {
+            let mut coord = |range: u64, offset: i64| (next(range) as i64 * 5 + offset) as f64;
+            let (bx, by) = (coord(200, -500), coord(200, -500));
+            let (bw, bh) = (coord(300, 0), coord(300, 0));
+            let (tx, ty) = (bx + coord(400, -800), by + coord(400, -800));
+            let (tw, th) = (coord(300, 0), coord(300, 0));
+            let (via, bot_dir, top_dir) = (next(4), next(3), next(3));
+            let (longer, later) = (next(2) == 1, next(2) == 1);
+            writeln!(
+                source,
+                "if !same({via}, crect(x0={bx:?}, y0={by:?}, x1={:?}, y1={:?}), \
+                 crect(x0={tx:?}, y0={ty:?}, x1={:?}, y1={:?}), {bot_dir}, {top_dir}, {longer}, {later}) \
+                 {{ rect(\"mismatch{case}\", x0=0., y0=0., x1=5., y1=5.); }}",
+                bx + bw,
+                by + bh,
+                tx + tw,
+                ty + th,
+            )
+            .unwrap();
+        }
+        source.push_str("}\n");
+        let (_dir, output) = scratch_workspace("via_array", &source);
+        assert!(
+            output.static_errors().is_empty(),
+            "{:#?}",
+            output.static_errors()
+        );
+        let compiled = compile_sky130(
+            &output.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        );
+        match compiled {
+            CompileOutput::Valid(_) => {}
+            CompileOutput::ExecErrors(errors) => {
+                let errors = errors
+                    .errors
+                    .iter()
+                    .map(|error| error.kind.to_string())
+                    .collect::<Vec<_>>();
+                panic!("{} mismatches: {errors:#?}", errors.len());
+            }
+            CompileOutput::StaticErrors(errors) => panic!("{errors:#?}"),
+            _ => panic!("the reference must compile"),
+        }
+    }
+
+    /// Pure functions called directly without debug information give the
+    /// same values, and the same diagnostics, as ordinary evaluation.
+    #[test]
+    fn direct_calls_match_ordinary_evaluation() {
+        let source = "use std::layout::{crect, rect};
+             enum Shape { Dot, Bar(Int, Float), }
+             struct Run { a: Int, b: Int, t: Int, }
+             fn fib(n: Int) -> Int { if n < 2 { n } else { fib(n - 1) + fib(n - 2) } }
+             fn count_up(n: Int, acc: Int) -> Int { if n == 0 { acc } else { count_up(n - 1, acc + 2) } }
+             fn depth(n: Int) -> Int { if n == 0 { 0 } else { 1 + depth(n - 1) } }
+             fn covers(runs: [Run], c: Int) -> Bool { std::any([for r in runs { r.a <= c && c <= r.b }]) }
+             fn area(s: Shape) -> Float { match s { Shape::Dot => 0., Shape::Bar(n, w) => n as Float * w, } }
+             fn scaled(x: Float, k: Float = 2., offset: Float = x) -> Float { x * k + offset }
+             fn pick(p: (Int, Float)) -> Float { p.1 + p.0 as Float }
+             fn widen(r: Run) -> Run { Run { b: r.b + 1, ..r } }
+             fn evens(xs: [Int]) -> Int { std::sum([for x in xs if x % 2 == 0 { x }]) }
+             fn snap5(v: Float) -> Float {
+                 if v < 0. { (((v / 5.) - 0.5) as Int) as Float * 5. } else { (((v / 5.) + 0.5) as Int) as Float * 5. }
+             }
+             fn span_of(r: Rect) -> Float { r.x1 - r.x0 }
+             fn third(r: Rect) -> Int { ((r.x1 - r.x0) / 3.) as Int }
+             fn lists(n: Int) -> Int {
+                 let xs = cons(n, range_full(0, n, 2));
+                 head(xs) + std::len(tail(xs)) + max_int(n, 3) - min_int(n, 3)
+             }
+             fn quotient(a: Int, b: Int) -> Int { a / b }
+             cell top() {
+                 let base = crect(x0=0., y0=0., x1=10., y1=10.);
+                 let later = crect(x0=0., y0=0., y1=10.);
+                 let runs = [Run { a: 0, b: 4, t: 1, }, Run { a: 6, b: 9, t: 2, }];
+                 let w = fib(10) as Float + count_up(500, 0) as Float + area(Shape::Bar(3, 2.5))
+                     + area(Shape::Dot) + scaled(1.5) + scaled(1.5, k=3.) + pick((2, 0.5,))
+                     + evens([1, 2, 3, 4]) as Float + snap5(12.3) + snap5(-12.3) + span_of(base)
+                     + widen(runs[1]).b as Float + lists(7) as Float + third(later) as Float
+                     + depth(100) as Float;
+                 let h = if covers(runs, 5) { 1. } else { 2. } + max_float(0., span_of(later));
+                 let r = rect(\"met1\", x0=0., y0=0., x1=w, y1=h + 5.);
+                 eq(later.x1, 20.);
+                 let bad = quotient(1, 0);
+             }";
+        let (_dir, output) = scratch_workspace("direct", source);
+        assert!(
+            output.static_errors().is_empty(),
+            "{:#?}",
+            output.static_errors()
+        );
+        let mut ast = output.ast();
+        let invocation = crate::parse::splice_cell_invocation(&mut ast, "top()")
+            .expect("invocation should splice");
+        let (typed, errors) = static_compile(&ast).unwrap();
+        assert!(errors.errors.is_empty(), "{:?}", errors.errors);
+        let config = WorkspaceConfig::default().with_tech(Some(PathBuf::from(BASIC_TECH)));
+        let summarize = |output: CompileOutput| {
+            let CompileOutput::ExecErrors(output) = output else {
+                panic!("the division by zero should be reported");
+            };
+            let errors = output
+                .errors
+                .iter()
+                .map(|error| format!("{:?} {}", error.span, error.kind))
+                .collect::<Vec<_>>();
+            let data = output.output.expect("errors still come with an output");
+            let mut drawn = data
+                .cells
+                .values()
+                .flat_map(|cell| cell.objects.values().filter(|o| o.is_layout()))
+                .map(|object| format!("{object:?}"))
+                .collect::<Vec<_>>();
+            drawn.sort();
+            (errors, drawn)
+        };
+        let full = summarize(crate::compile::execute_cell_invocation(
+            &typed,
+            &invocation,
+            &config,
+        ));
+        let lean = summarize(crate::compile::execute_cell_invocation_without_debug_info(
+            &typed,
+            &invocation,
+            &config,
+        ));
+        assert_eq!(full.0.len(), 1, "{:#?}", full.0);
+        assert_eq!(lean, full);
+    }
+
+    #[test]
+    fn output_without_debug_info_keeps_geometry_and_diagnostics() {
+        let source = "use std::layout::{crect, inst, rect};
+             fn flipped_height() -> Float {
+                 let r = crect(x0=64., y0=0., x1=60., y1=4.);
+                 r.y1 - r.y0
+             }
+             fn far_height() -> Float {
+                 let r = crect(x0=0., y0=0., x1=1000000000000000., y1=4.);
+                 r.y1 - r.y0
+             }
+             fn unnamed_height() -> Float {
+                 let r = crect(x0=70., y0=0., x1=74., y1=4.);
+                 r.y1 - r.y0
+             }
+             cell child() {
+                 pub let named = crect(x0=0., y0=0., w=4., h=4.);
+                 let hidden = crect(x0=10., y0=0., w=4., h=4.);
+                 let bad_layer = crect(layer=\"nope\", x0=20., y0=0., w=4., h=4.);
+                 let drawn = rect(\"met1\", x0=named.x0, y0=named.y0, w=4., h=4.);
+                 pub let pinned = crect(x0=30., y0=0., x1=34., y1=4.);
+                 pub let pair = cons(crect(x0=40., y0=0., x1=44., y1=4.), cons(crect(x0=50., y0=0., x1=54., y1=4.), []));
+                 let heights = flipped_height() + far_height() + unnamed_height();
+             }
+             cell top() {
+                 let c = inst(child(), x=0., y=0.);
+                 let r = rect(\"met2\", x0=c.named.x0, y0=c.named.y1, w=8., h=2.);
+                 let s = rect(\"met2\", x0=c.pinned.x0, y0=c.pinned.y1, x1=c.pair[1].x1, y1=c.pair[0].y1 + 10.);
+             }";
+        let (_dir, output) = scratch_workspace("lean", source);
+        let mut ast = output.ast();
+        let invocation = crate::parse::splice_cell_invocation(&mut ast, "top()")
+            .expect("invocation should splice");
+        let (typed, errors) = static_compile(&ast).unwrap();
+        assert!(errors.errors.is_empty(), "{:?}", errors.errors);
+        let config = WorkspaceConfig::default().with_tech(Some(PathBuf::from(BASIC_TECH)));
+        let summarize = |output: CompileOutput| {
+            let CompileOutput::ExecErrors(output) = output else {
+                panic!("the bad construction rects should be reported");
+            };
+            let errors = output
+                .errors
+                .iter()
+                .map(|error| format!("{:?} {}", error.span, error.kind))
+                .collect::<Vec<_>>();
+            let data = output.output.expect("errors still come with an output");
+            let mut drawn = data
+                .cells
+                .values()
+                .flat_map(|cell| cell.objects.values().filter(|o| o.is_layout()))
+                .map(|object| format!("{object:?}"))
+                .collect::<Vec<_>>();
+            drawn.sort();
+            let objects = data
+                .cells
+                .values()
+                .map(|cell| cell.objects.len())
+                .sum::<usize>();
+            (errors, drawn, objects)
+        };
+        let full = summarize(crate::compile::execute_cell_invocation(
+            &typed,
+            &invocation,
+            &config,
+        ));
+        let lean = summarize(crate::compile::execute_cell_invocation_without_debug_info(
+            &typed,
+            &invocation,
+            &config,
+        ));
+        assert_eq!(full.0.len(), 3, "{:#?}", full.0);
+        assert_eq!(lean.0, full.0);
+        assert_eq!(lean.1, full.1);
+        assert!(lean.2 < full.2, "{} of {} objects kept", lean.2, full.2);
     }
 
     /// A struct literal in a cell invocation, as `arc run --cell` and the GUI
@@ -3655,7 +3979,7 @@ cell top() {
             .iter()
             .map(|error| error.span.as_ref().expect("error should point to a value"))
             .collect::<Vec<_>>();
-        assert!(spans.iter().all(|span| span.path == path));
+        assert!(spans.iter().all(|span| *span.path == *path));
         assert_eq!(
             spans
                 .iter()
@@ -7198,6 +7522,197 @@ cell top() {
     }
 
     #[test]
+    fn native_sequence_functions() {
+        let data = compile_top(
+            "use std::layout::rect;
+             cell top() {
+                 let xs = [1, 2, 3];
+                 let empty = tail([1]);
+                 let n = std::len(xs) + 10 * std::len(std::concat(xs, xs)) + 100 * std::sum(std::flatten([xs, [4], empty]));
+                 let m = std::len(empty) + std::len(std::concat(empty, empty)) + std::sum(empty) + std::len(std::flatten([empty]));
+                 let flags = if std::any([false, true]) && std::all([true, true]) && !std::all([true, false]) && !std::any([]) && std::all([]) {
+                     1
+                 } else {
+                     0
+                 };
+                 let r = rect(\"met2\", x0=0., y0=0., x1=(n + 10000 * m + 100000 * flags) as Float, y1=1.);
+             }",
+        );
+        let widths = layout_objects(&data, data.top)
+            .into_iter()
+            .filter_map(SolvedValue::get_rect)
+            .filter(|rect| rect.layer.as_deref() == Some("met2"))
+            .map(|rect| rect.x1.0 - rect.x0.0)
+            .collect::<Vec<_>>();
+        assert_eq!(widths, [101063.]);
+    }
+
+    #[test]
+    fn list_comprehensions_map_and_filter() {
+        let data = compile_top(
+            "use std::layout::rect;
+             fn squares(n: Int) -> [Int] {
+                 [for i in std::range(n) { i * i }]
+             }
+             fn evens(l: [Int]) -> [Int] {
+                 [for x in l if x % 2 == 0 { x }]
+             }
+             cell top() {
+                 let a = squares(4);
+                 let b = evens([1, 2, 3, 4, 6]);
+                 let c = [for x in b if x > 100 { x }];
+                 let nested = std::flatten([for i in std::range(3) { [for j in std::range(i) { 10 * i + j }] }]);
+                 let rects = [for i in std::range(3) {
+                     let w = 5. * (i + 1) as Float;
+                     rect(\"met1\", x0=0., y0=10. * i as Float, x1=w, y1=10. * i as Float + 5.)
+                 }];
+                 for r in rects if r.x1 > 5. {
+                     rect(\"met2\", x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1);
+                 }
+                 let code = std::sum(a) + 100 * std::sum(b) + 10000 * std::len(c) + 100000 * std::sum(nested) + 10000000 * std::len(rects);
+                 let out = rect(\"met3\", x0=0., y0=0., x1=5. * code as Float, y1=5.);
+             }",
+        );
+        let widths = |layer: &str| {
+            let mut widths = layout_objects(&data, data.top)
+                .into_iter()
+                .filter_map(SolvedValue::get_rect)
+                .filter(|rect| rect.layer.as_deref() == Some(layer))
+                .map(|rect| rect.x1.0 - rect.x0.0)
+                .collect::<Vec<_>>();
+            widths.sort_by(f64::total_cmp);
+            widths
+        };
+        assert_eq!(widths("met1"), [5., 10., 15.]);
+        assert_eq!(widths("met2"), [10., 15.]);
+        // 14 + 100 * 12 + 10^5 * (10 + 20 + 21) + 10^7 * 3, scaled onto the grid.
+        assert_eq!(widths("met3"), [5. * 35_101_214.]);
+    }
+
+    /// The deepest chain of execution scopes in `cell`.
+    fn max_scope_depth(cell: &crate::compile::CompiledCell) -> usize {
+        let mut deepest = 0;
+        let mut stack = vec![(cell.root, 1)];
+        while let Some((scope, depth)) = stack.pop() {
+            deepest = deepest.max(depth);
+            stack.extend(
+                cell.scopes[&scope]
+                    .children
+                    .iter()
+                    .map(|child| (*child, depth + 1)),
+            );
+        }
+        deepest
+    }
+
+    #[test]
+    fn tail_calls_keep_scopes_flat() {
+        let data = compile_top(
+            "use std::layout::{inst, rect};
+             fn count_up(n: Int, acc: Int) -> Int {
+                 if n == 0 { acc } else { count_up(n - 1, acc + 2) }
+             }
+             fn count_down(n: Int) -> Int {
+                 if n == 0 { 0 } else { 2 + count_down(n - 1) }
+             }
+             cell up() {
+                 let r = rect(\"met1\", x0=0., y0=0., x1=5. * count_up(3000, 0) as Float, y1=5.);
+             }
+             cell down() {
+                 let r = rect(\"met1\", x0=0., y0=0., x1=5. * count_down(300) as Float, y1=5.);
+             }
+             cell top() {
+                 let a = inst(up(), x=0., y=0.);
+                 let b = inst(down(), x=0., y=10.);
+             }",
+        );
+        assert_eq!(rect_widths_of(&data, "up"), [30000.]);
+        assert_eq!(rect_widths_of(&data, "down"), [3000.]);
+        let depth = |name: &str| {
+            let cell = data
+                .cells
+                .values()
+                .find(|cell| cell.name.ends_with(name))
+                .unwrap();
+            max_scope_depth(cell)
+        };
+        // Each step of the tail-recursive loop opens its scope beside the
+        // first call's; the other recursion nests a call and a branch per step.
+        assert!(depth("up") < 10, "tail calls nested {} deep", depth("up"));
+        assert!(
+            depth("down") > 600,
+            "non-tail recursion nested only {} deep",
+            depth("down")
+        );
+    }
+
+    #[test]
+    fn annotated_bindings_take_their_declared_type_in_cells() {
+        let data = compile_top(
+            "use std::layout::rect;
+             fn pair<T>(a: [T], b: [T]) -> [T] { std::concat(a, b) }
+             cell top() {
+                 let e: [Int] = [];
+                 let n = std::len(pair(e, cons(1, e))) + std::len(head([e]));
+                 let r = rect(\"met1\", x0=0., y0=0., x1=5. * n as Float, y1=5.);
+             }",
+        );
+        assert_eq!(rect_widths_of(&data, "top"), [5.]);
+    }
+
+    #[test]
+    fn native_min_and_max() {
+        let data = compile_top(
+            "use std::layout::rect;
+             cell top() {
+                 let a = rect(\"met1\", x0=0., y0=0., y1=5.);
+                 let w = max_float(a.x1, 10.);
+                 eq(a.x1, 15.);
+                 let r = rect(\"met2\", x0=0., y0=20., x1=w, y1=25.);
+                 let n = max_int(3, 7) + 10 * min_int(3, 7) + 100 * max_int(4, 4);
+                 let s = rect(\"met3\", x0=0., y0=30., x1=5. * n as Float, y1=35.);
+                 let m = rect(\"met4\", x0=0., y0=40., x1=std::min(std::max(5., 20.), 15.), y1=45.);
+             }",
+        );
+        let widths = |layer: &str| {
+            layout_objects(&data, data.top)
+                .into_iter()
+                .filter_map(SolvedValue::get_rect)
+                .filter(|rect| rect.layer.as_deref() == Some(layer))
+                .map(|rect| rect.x1.0 - rect.x0.0)
+                .collect::<Vec<_>>()
+        };
+        // The float maximum waits for the solver to fix `a.x1`.
+        assert_eq!(widths("met2"), [15.]);
+        assert_eq!(widths("met3"), [5. * 437.]);
+        assert_eq!(widths("met4"), [15.]);
+    }
+
+    #[test]
+    fn empty_list_fields_are_exported() {
+        let data = compile_top(
+            "use std::layout::{inst, rect};
+             cell sub() {
+                 let r = rect(\"met1\", x0=0., y0=0., x1=5., y1=5.);
+                 pub let none: [Rect] = [];
+                 pub let nested = [[r], []];
+             }
+             cell top() {
+                 let s = inst(sub(), x=0., y=0.);
+                 let n = std::len(s.none) + 10 * std::len(s.nested) + 100 * std::len(s.nested[0]) + 1000 * std::len(s.nested[1]);
+                 let q = rect(\"met2\", x0=0., y0=0., x1=5. * n as Float, y1=5.);
+             }",
+        );
+        let widths = layout_objects(&data, data.top)
+            .into_iter()
+            .filter_map(SolvedValue::get_rect)
+            .filter(|rect| rect.layer.as_deref() == Some("met2"))
+            .map(|rect| rect.x1.0 - rect.x0.0)
+            .collect::<Vec<_>>();
+        assert_eq!(widths, [5. * 120.]);
+    }
+
+    #[test]
     fn option_cell_arguments_distinguish_cells() {
         let data = compile_top(
             "use std::layout::{inst, rect};
@@ -9622,6 +10137,37 @@ cell device_inv(pw: Float, nw: Float) {
         let pin_site = symbol.pins[0].as_ref().unwrap().site.as_ref().unwrap();
         assert_eq!(pin_site.origin, rect_site.origin, "one group");
         assert!(!pin_site.editable);
+    }
+
+    #[test]
+    fn a_symbol_drawn_through_a_tail_call_belongs_to_the_first_call() {
+        let body = "fn pinned(a: Signal, y: Int) {\n\
+                        pin(a, x=0, y=y);\n\
+                    }\n\
+                    fn boxed(a: Signal, y: Int) {\n\
+                        rect(x0=0., y0=0., x1=2., y1=2.);\n\
+                        pinned(a, y)\n\
+                    }\n\
+                    cell top() {\n\
+                        pub let a = Signal();\n\
+                        pub let b = Signal();\n\
+                        boxed(a, 0);\n\
+                        if true {\n\
+                            boxed(b, 1);\n\
+                        }\n\
+                    }";
+        let source = format!("{SCHEMATIC_PRELUDE}{SYMBOL_PRELUDE}{body}");
+        let data = compile_top(&source);
+        let origins = top_symbol(&data)
+            .pins
+            .iter()
+            .map(|pin| {
+                let site = pin.as_ref().unwrap().site.as_ref().unwrap();
+                assert!(!site.editable, "drawn in a function");
+                site.origin.as_ref().map(|span| span_text(&source, span))
+            })
+            .collect_vec();
+        assert_eq!(origins, [Some("boxed(a, 0)"), Some("boxed(b, 1)")]);
     }
 
     #[test]

@@ -26,7 +26,7 @@ use std::{
         Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use arc::Library;
@@ -44,8 +44,8 @@ use argonc::{
 use futures::prelude::*;
 use indexmap::IndexMap;
 use rpc::{
-    CompilationSnapshot, DevicePreview, GuiClient, InstancePreview, LangServer,
-    SchematicInstancePreview, insert_statement,
+    CompilationSnapshot, CompressedCompilationUpdate, DevicePreview, FocusedCellPreview, GuiClient,
+    InstancePreview, LangServer, SchematicInstancePreview, insert_statement,
 };
 use serde::{Deserialize, Serialize};
 use tarpc::{context, server::Channel, tokio_serde::formats::Bincode};
@@ -65,11 +65,26 @@ use tracing_subscriber::{
 };
 
 use crate::command_completion::{CommandCompletion, CommandCompletionParams};
-use crate::compiler_worker::{CompileIdentity, CompileRequest, CompileResult, CompilerWorker};
+use crate::compiler_worker::{
+    CompileIdentity, CompilePreview, CompileRequest, CompileResult, CompilerWorker,
+};
 use crate::document::{Document, DocumentChange, PositionEncoding};
 
 const DEFAULT_LOG_LEVEL: &str = "error";
 const LOG_FILE: &str = "argon.log";
+
+// tarpc gives every new context a ten-second deadline. A compilation update can
+// contain a complete native layout, and both transferring it and preparing its
+// GUI hierarchy are legitimately unbounded with respect to that default. tarpc
+// has no deadline-free context, so give snapshot delivery an effectively
+// unlimited horizon. Connection loss still fails the request immediately.
+const GUI_SNAPSHOT_DEADLINE: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+fn gui_snapshot_context() -> context::Context {
+    let mut context = context::current();
+    context.deadline = Instant::now() + GUI_SNAPSHOT_DEADLINE;
+    context
+}
 
 fn completion_trigger_characters() -> Vec<String> {
     // Neovim's native LSP completion uses the server's trigger characters for
@@ -261,6 +276,14 @@ pub fn argon_cache_dir() -> Option<PathBuf> {
 
 pub fn argon_log_path() -> Option<PathBuf> {
     argon_state_dir().map(|directory| directory.join(LOG_FILE))
+}
+
+/// The progress message shown for the whole compilation of `identity`.
+fn compilation_message(identity: &CompileIdentity) -> String {
+    identity.cell.as_deref().map_or_else(
+        || "Compiling workspace".to_owned(),
+        |cell| format!("Compiling {cell}"),
+    )
 }
 
 fn read_config() -> std::result::Result<ArgonConfig, String> {
@@ -476,6 +499,7 @@ pub(crate) struct PublishedState {
     pub(crate) nav: Option<Arc<NavIndex>>,
     pub(crate) prev_diagnostics: IndexMap<Uri, Vec<Diagnostic>>,
     pub(crate) compiled_revision: u64,
+    pub(crate) compiled_cell: Option<String>,
     /// Compiler messages that accompanied the latest committed result.
     pub(crate) messages: Vec<String>,
     /// The latest committed result, summarized on demand for agents.
@@ -618,7 +642,7 @@ impl<'a> SpanRanger<'a> {
         let encoding = self.encoding;
         let document = self
             .documents
-            .entry(span.path.clone())
+            .entry(span.path.to_path_buf())
             .or_insert_with(|| {
                 let module = ast.values().find(|module| module.path == span.path)?;
                 Some(Document::new(&module.source_text, 0, encoding))
@@ -646,7 +670,7 @@ fn diagnostics(
             CompileOutput::FatalParseErrors => {
                 vec![(
                     Span {
-                        path: root_dir.join("lib.ar"),
+                        path: root_dir.join("lib.ar").into(),
                         span: cfgrammar::Span::new(0, 0),
                     },
                     "fatal parse errors encountered, unable to compile".to_string(),
@@ -661,7 +685,7 @@ fn diagnostics(
                 .map(|e| {
                     (
                         e.span.clone().unwrap_or_else(|| Span {
-                            path: root_dir.join("lib.ar"),
+                            path: root_dir.join("lib.ar").into(),
                             span: cfgrammar::Span::new(0, 0),
                         }),
                         format!("{}", e.kind),
@@ -677,7 +701,7 @@ fn diagnostics(
         if dropped > 0 {
             errs.push((
                 Span {
-                    path: root_dir.join("lib.ar"),
+                    path: root_dir.join("lib.ar").into(),
                     span: cfgrammar::Span::new(0, 0),
                 },
                 format!(
@@ -720,6 +744,8 @@ pub struct State {
     pub(crate) source_state: Arc<Mutex<SourceState>>,
     pub(crate) published_state: Arc<Mutex<PublishedState>>,
     compiler: CompilerWorker,
+    /// Serializes GUI drags and remembers the edits they applied.
+    pub(crate) drag_edits: Arc<Mutex<rpc::DragEditHistory>>,
     gui: Arc<Mutex<GuiState>>,
     next_compilation_activity_id: Arc<AtomicU64>,
     app_config: Arc<RwLock<ArgonConfig>>,
@@ -762,6 +788,7 @@ impl State {
             source_state: Default::default(),
             published_state: Default::default(),
             compiler: CompilerWorker::new(),
+            drag_edits: Default::default(),
             gui: Default::default(),
             next_compilation_activity_id: Default::default(),
             app_config: Arc::new(RwLock::new(config)),
@@ -825,6 +852,12 @@ impl State {
         source.compile_identity() == *identity
     }
 
+    /// Whether the cell `identity` compiles is still the open one, at any
+    /// source revision.
+    async fn is_open_cell(&self, identity: &CompileIdentity) -> bool {
+        self.source_state.lock().await.cell == identity.cell
+    }
+
     async fn gui_connection(&self) -> Option<GuiConnection> {
         self.gui.lock().await.connection.clone()
     }
@@ -853,14 +886,10 @@ impl State {
             .editor_client
             .create_work_done_progress(token.clone())
             .await;
-        let message = identity.cell.as_deref().map_or_else(
-            || "Compiling workspace".to_owned(),
-            |cell| format!("Compiling {cell}"),
-        );
         let editor_progress = self
             .editor_client
             .progress(token, "Argon compilation")
-            .with_message(message)
+            .with_message(compilation_message(identity))
             .begin()
             .await;
         CompilationActivity {
@@ -1125,11 +1154,13 @@ impl Backend {
     /// Compiles `identity` after an editor document changed: at once when the
     /// change completes an analyzer edit, and after the debounce otherwise. A
     /// partly reported edit waits for the rest, up to `PENDING_EDIT_TIMEOUT`.
-    async fn compile_after_change(&self, progress: EditProgress, identity: CompileIdentity) {
+    ///
+    /// The compilation runs on its own task, so a didChange notification
+    /// releases its LSP service slot as soon as the source is recorded; the
+    /// GUI update can be much slower than the edit.
+    fn compile_after_change(&self, progress: EditProgress, identity: CompileIdentity) {
         match progress {
-            EditProgress::Complete => {
-                self.update_cell(identity).await;
-            }
+            EditProgress::Complete => self.compile_after(identity, Duration::ZERO),
             EditProgress::Partial => self.compile_after(identity, PENDING_EDIT_TIMEOUT),
             EditProgress::Unrelated => self.compile_after_debounce(identity),
         }
@@ -1137,19 +1168,32 @@ impl Backend {
 
     /// Compile and publish diagnostics for an exact source/cell identity.
     /// GUI presentation is deliberately handled by the caller.
-    async fn compile_snapshot(&self, identity: CompileIdentity) -> Option<CompilationSnapshot> {
-        let request = {
+    async fn compile_snapshot(
+        &self,
+        identity: CompileIdentity,
+        preview_cell: Option<compile::CellId>,
+    ) -> Option<CompilationSnapshot> {
+        let (preview, result) = {
             let source = self.state.source_state.lock().await;
             if source.compile_identity() != identity {
                 return None;
             }
             let root_dir = self.state.root_dir.get().cloned()?;
-            CompileRequest {
+            self.state.compiler.compile_streamed(CompileRequest {
                 identity: identity.clone(),
                 root_dir,
-            }
+                preview_cell,
+            })
         };
-        let result = self.state.compiler.compile(request).await?;
+        if let Some(preview) = preview {
+            let backend = self.clone();
+            tokio::spawn(async move {
+                if let Ok(preview) = preview.await {
+                    backend.send_cell_preview(preview).await;
+                }
+            });
+        }
+        let result = result.await.ok()?;
         if !self.state.is_latest_compile_request(&result.identity).await {
             return None;
         }
@@ -1202,6 +1246,7 @@ impl Backend {
                 compiled.nav = Some(nav);
             }
             compiled.compiled_revision = identity.revision;
+            compiled.compiled_cell = identity.cell.clone();
             compiled.messages = result.messages.clone();
             compiled.latest = latest;
             let drawable = snapshot
@@ -1251,6 +1296,8 @@ impl Backend {
         &self,
         identity: &CompileIdentity,
         snapshot: CompilationSnapshot,
+        progress: &OngoingProgress<Unbounded, NotCancellable>,
+        pipeline_started: Instant,
     ) -> Option<GuiConnection> {
         if !self.state.is_latest_compile_request(identity).await {
             return None;
@@ -1259,6 +1306,23 @@ impl Backend {
         if !self.state.is_latest_compile_request(identity).await {
             return None;
         }
+        let geometry = match &snapshot.output {
+            CompileOutput::Valid(data) => Some(data),
+            CompileOutput::ExecErrors(output) => output.output.as_ref(),
+            CompileOutput::FatalParseErrors | CompileOutput::StaticErrors(_) => None,
+        };
+        let detail = geometry.map(|data| {
+            let scopes: usize = data.cells.values().map(|cell| cell.scopes.len()).sum();
+            let objects: usize = data.cells.values().map(|cell| cell.objects.len()).sum();
+            format!(" ({} scopes, {} objects)", scopes, objects)
+        });
+        progress
+            .report(format!(
+                "Compressing layout snapshot{}; compilation took {:.1}s",
+                detail.as_deref().unwrap_or_default(),
+                pipeline_started.elapsed().as_secs_f64(),
+            ))
+            .await;
         // Serialize updates per connection so each delta names an acknowledged
         // base. Reconnection creates a fresh cache; IDs alone never prove reuse.
         let mut previous = connection.snapshot.lock().await;
@@ -1266,23 +1330,130 @@ impl Backend {
             return None;
         }
         let update = rpc::CompilationUpdate::new(snapshot.clone(), previous.as_ref());
-        let result = connection
-            .client
-            .update_cell(context::current(), update)
+        let compression_started = Instant::now();
+        let update = self.compress_gui_update(update).await?;
+        // A rapid source burst may supersede this snapshot while its large
+        // delta is being compressed. Do not occupy the serialized GUI RPC
+        // lane with a revision that can no longer be displayed.
+        if !self.state.is_latest_compile_request(identity).await {
+            return None;
+        }
+        let compressed_mib = update.encoded_len() as f64 / (1024. * 1024.);
+        progress
+            .report(format!(
+                "Transferring {:.1} MiB and preparing layout in GUI; compression took {:.1}s",
+                compressed_mib,
+                compression_started.elapsed().as_secs_f64(),
+            ))
             .await;
-        if !self.handle_gui_result(&connection, result).await? {
-            let full = rpc::CompilationUpdate::new(snapshot.clone(), None);
-            let result = connection
-                .client
-                .update_cell(context::current(), full)
+        let gui_started = Instant::now();
+        let result = self
+            .await_gui_update(&connection, update, progress, gui_started)
+            .await?;
+        if result.accepted {
+            let gui_seconds = gui_started.elapsed().as_secs_f64();
+            let other_seconds = (gui_seconds
+                - result.decode_seconds
+                - result.materialize_seconds
+                - result.prepare_seconds)
+                .max(0.);
+            progress
+                .report(format!(
+                    "Layout accepted in {gui_seconds:.1}s: transfer/dispatch {other_seconds:.1}s, decode {:.1}s, materialize {:.1}s, hierarchy {:.1}s ({:.1}s total)",
+                    result.decode_seconds,
+                    result.materialize_seconds,
+                    result.prepare_seconds,
+                    pipeline_started.elapsed().as_secs_f64(),
+                ))
                 .await;
-            if !self.handle_gui_result(&connection, result).await? {
+        } else {
+            progress
+                .report("GUI requested a full snapshot; recompressing layout")
+                .await;
+            let retry_started = Instant::now();
+            let full = rpc::CompilationUpdate::new(snapshot.clone(), None);
+            let full = self.compress_gui_update(full).await?;
+            progress
+                .report(format!(
+                    "Transferring {:.1} MiB full layout and preparing it in GUI",
+                    full.encoded_len() as f64 / (1024. * 1024.),
+                ))
+                .await;
+            let result = self
+                .await_gui_update(&connection, full, progress, retry_started)
+                .await?;
+            if !result.accepted {
                 return None;
             }
+            progress
+                .report(format!(
+                    "Layout accepted; full retry {:.1}s (decode {:.1}s, materialize {:.1}s, hierarchy {:.1}s; {:.1}s total)",
+                    retry_started.elapsed().as_secs_f64(),
+                    result.decode_seconds,
+                    result.materialize_seconds,
+                    result.prepare_seconds,
+                    pipeline_started.elapsed().as_secs_f64(),
+                ))
+                .await;
         }
         *previous = Some(snapshot);
         drop(previous);
         Some(connection)
+    }
+
+    async fn await_gui_update(
+        &self,
+        connection: &GuiConnection,
+        update: CompressedCompilationUpdate,
+        progress: &OngoingProgress<Unbounded, NotCancellable>,
+        started: Instant,
+    ) -> Option<rpc::GuiUpdateResult> {
+        let mut request = Box::pin(
+            connection
+                .client
+                .update_cell(gui_snapshot_context(), update),
+        );
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        heartbeat.tick().await;
+        let result = loop {
+            tokio::select! {
+                result = &mut request => break result,
+                _ = heartbeat.tick() => {
+                    progress.report(format!(
+                        "GUI is receiving/decompressing/preparing layout ({:.0}s elapsed)",
+                        started.elapsed().as_secs_f64(),
+                    )).await;
+                }
+            }
+        };
+        self.handle_gui_result(connection, result).await
+    }
+
+    async fn compress_gui_update(
+        &self,
+        update: rpc::CompilationUpdate,
+    ) -> Option<CompressedCompilationUpdate> {
+        match tokio::task::spawn_blocking(move || CompressedCompilationUpdate::encode(&update))
+            .await
+        {
+            Ok(Ok(update)) => Some(update),
+            result => {
+                let error = match result {
+                    Ok(Err(error)) => error,
+                    Err(error) => error.to_string(),
+                    Ok(Ok(_)) => unreachable!(),
+                };
+                self.state
+                    .editor_client
+                    .show_message(
+                        MessageType::ERROR,
+                        format!("Could not encode the GUI snapshot: {error}"),
+                    )
+                    .await;
+                None
+            }
+        }
     }
 
     async fn handle_gui_result<T>(
@@ -1309,28 +1480,131 @@ impl Backend {
     }
 
     async fn update_cell(&self, identity: CompileIdentity) -> Option<GuiConnection> {
+        let pipeline_started = Instant::now();
         let activity = self.state.begin_compilation(&identity).await;
+        let preview_cell = if identity.cell.is_some()
+            && self.state.published_state.lock().await.compiled_cell == identity.cell
+        {
+            if let Some(connection) = self.state.gui_connection().await {
+                // The query is only an optimization. A busy GUI must never
+                // delay the mandatory top-level compilation for an RPC's
+                // ordinary ten-second deadline.
+                tokio::time::timeout(
+                    Duration::from_millis(200),
+                    connection.client.selected_cell(context::current()),
+                )
+                .await
+                .ok()
+                .and_then(|result| result.ok())
+                .flatten()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let result = async {
-            let snapshot = self.compile_snapshot(identity.clone()).await?;
-            self.send_cell_update(&identity, snapshot).await
+            // The compiler runs on its dedicated worker thread, so the async
+            // language-server task remains free to publish a heartbeat. Large
+            // cells used to leave Neovim showing an undifferentiated spinner
+            // for tens of seconds, making healthy evaluation indistinguishable
+            // from a wedged worker.
+            let mut compilation = Box::pin(self.compile_snapshot(identity.clone(), preview_cell));
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // `interval`'s first tick is immediate; the begin notification
+            // already describes that instant.
+            heartbeat.tick().await;
+            let snapshot = loop {
+                tokio::select! {
+                    snapshot = &mut compilation => break snapshot?,
+                    _ = heartbeat.tick() => {
+                        activity.editor_progress.report(format!(
+                            "{} ({:.0}s elapsed)",
+                            compilation_message(&identity),
+                            pipeline_started.elapsed().as_secs_f64(),
+                        )).await;
+                    }
+                }
+            };
+            self.send_cell_update(
+                &identity,
+                snapshot,
+                &activity.editor_progress,
+                pipeline_started,
+            )
+            .await
         }
         .await;
         self.state.finish_compilation(activity).await;
         result
     }
 
+    async fn send_cell_preview(&self, preview: CompilePreview) {
+        if !self
+            .state
+            .is_latest_compile_request(&preview.identity)
+            .await
+        {
+            return;
+        }
+        if !matches!(
+            preview.output,
+            CompileOutput::Valid(_) | CompileOutput::ExecErrors(_)
+        ) {
+            return;
+        }
+        let Some(connection) = self.state.gui_connection().await else {
+            return;
+        };
+        // Cells the GUI already holds are sent by reference. The lock keeps an
+        // in-flight update from replacing that base while the delta is built;
+        // if one lands before the preview arrives, the GUI rejects the preview.
+        let update = rpc::CompilationUpdate::new(
+            CompilationSnapshot {
+                revision: preview.identity.revision,
+                output: preview.output,
+            },
+            connection.snapshot.lock().await.as_ref(),
+        );
+        let Some(update) = self.compress_gui_update(update).await else {
+            return;
+        };
+        if !self
+            .state
+            .is_latest_compile_request(&preview.identity)
+            .await
+        {
+            return;
+        }
+        let request = FocusedCellPreview {
+            previous_cell: preview.previous_cell,
+            update,
+        };
+        if let Err(error) = connection
+            .client
+            .preview_cell(gui_snapshot_context(), request)
+            .await
+            && is_gui_disconnected(&error)
+        {
+            self.state.clear_gui_connection(connection.id).await;
+        }
+    }
+
     async fn open_cell_view(&self, identity: CompileIdentity) {
         let Some(connection) = self.update_cell(identity.clone()).await else {
             return;
         };
-        if !self.state.is_latest_compile_request(&identity).await {
+        // An edit made once the layout arrived, such as a GUI drawing, leaves
+        // the cell open; only opening another cell cancels the fit.
+        if !self.state.is_open_cell(&identity).await {
             return;
         }
         let result = connection.client.fit(context::current()).await;
         if self.handle_gui_result(&connection, result).await.is_none() {
             return;
         }
-        if self.state.is_latest_compile_request(&identity).await {
+        if self.state.is_open_cell(&identity).await {
             let result = connection.client.activate(context::current()).await;
             self.handle_gui_result(&connection, result).await;
         }
@@ -1482,7 +1756,7 @@ impl LanguageServer for Backend {
         let identity = source.compile_identity();
         drop(source);
         self.state.notify_source_changed();
-        self.compile_after_change(progress, identity).await;
+        self.compile_after_change(progress, identity);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -1523,7 +1797,7 @@ impl LanguageServer for Backend {
         let identity = source.compile_identity();
         drop(source);
         self.state.notify_source_changed();
-        self.compile_after_change(progress, identity).await;
+        self.compile_after_change(progress, identity);
     }
 
     async fn goto_definition(
@@ -1745,7 +2019,7 @@ fn preview_instance_cell(
 ) -> Option<compile::CellId> {
     output.cells.values().find_map(|cell| {
         cell.scopes.values().find_map(|scope| {
-            scope.bindings.values().find_map(|(name, objects)| {
+            scope.bindings.iter().find_map(|(_, (name, objects))| {
                 if name != preview_binding {
                     return None;
                 }
@@ -2057,7 +2331,7 @@ impl Backend {
         let mut preview_source = ast.text.to_string();
         preview_source.insert_str(insertion.offset, &insertion.edit.new_text);
         let mut preview_module =
-            match parse::parse_source_text(preview_source, scope_span.path.clone()) {
+            match parse::parse_source_text(preview_source, scope_span.path.to_path_buf()) {
                 Ok(ast) => ast,
                 Err(error) => {
                     self.state
@@ -2443,8 +2717,7 @@ impl Backend {
             return Ok(());
         };
         let preview = InstancePreview {
-            output,
-            cell,
+            geometry: output.preview_geometry(cell),
             invocation: params.cell,
             scope_span,
         };
@@ -3271,6 +3544,14 @@ mod tests {
 
             // Revision 1 opened the file and revision 2 had half the edit.
             assert_eq!(edit.await.unwrap(), (true, 3));
+            let mut compiled = editor.backend.state.compiled_revisions.subscribe();
+            tokio::time::timeout(
+                PENDING_EDIT_TIMEOUT * 10,
+                compiled.wait_for(|&revision| revision >= 3),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(editor.compiled_revision().await, 3);
             let published = editor.backend.state.published_state.lock().await;
             assert!(

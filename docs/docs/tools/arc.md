@@ -58,7 +58,7 @@ Parses, resolves, and type-checks the library without running a cell. No technol
 ## `arc run`
 
 ```text
-arc run --cell <EXPR> [--output <PATH>] [--gds] [--spice] [--spectre] [--netlist-width <COLS>]
+arc run --cell <EXPR> [--output <PATH>] [--gds | --gds-only] [--spice] [--spectre] [--netlist-width <COLS>]
 ```
 
 | Option | Required/default | Description |
@@ -66,6 +66,7 @@ arc run --cell <EXPR> [--output <PATH>] [--gds] [--spice] [--spectre] [--netlist
 | `--cell <EXPR>` | Required | Cell to run, such as `top(10., 20.)`. Arguments are Argon expressions evaluated in the library's scope. |
 | `-o, --output <PATH>` | `target/argon.bin` | Where to write the compiled layout. |
 | `--gds` | Off | Also write `target/argon.gds`. |
+| `--gds-only` | Off | Write only `target/argon.gds`, without the compiled layout the editor opens. Uses much less memory, so it suits generating large layouts. |
 | `--spice` | Off | Also write a SPICE netlist to `target/argon.spice`. |
 | `--spectre` | Off | Also write a Spectre netlist to `target/argon.scs`. |
 | `--netlist-width <COLS>` | `80` | Break netlist lines longer than this many characters; `0` turns wrapping off. Requires `--spice` or `--spectre`. |
@@ -75,6 +76,7 @@ arc run --cell <EXPR> [--output <PATH>] [--gds] [--spice] [--spectre] [--netlist
 ```bash
 arc run --cell 'top(10., 20.)'
 arc run --cell 'top(10., 20.)' --gds
+arc run --cell 'top(10., 20.)' --gds-only
 arc run --cell 'inv(2., 1., 2)' --spice --spectre
 ```
 

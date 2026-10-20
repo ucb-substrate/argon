@@ -74,6 +74,10 @@ struct RunArgs {
     /// Also write target/argon.gds.
     #[arg(long)]
     gds: bool,
+    /// Write only target/argon.gds: no binary compiler output, and none of the
+    /// debug information the editor reads, which uses much less memory.
+    #[arg(long, conflicts_with_all = ["output", "gds"])]
+    gds_only: bool,
     /// Also write a SPICE netlist to target/argon.spice.
     #[arg(long)]
     spice: bool,
@@ -183,10 +187,13 @@ fn check(args: LibraryArgs) -> Result<()> {
 
 fn run_cell(args: RunArgs) -> Result<()> {
     let library = Library::load(&args.library.manifest_path)?;
-    let output = args
-        .output
-        .clone()
-        .unwrap_or_else(|| library.target_path("argon.bin"));
+    let output = if args.gds_only {
+        library.target_path("argon.gds")
+    } else {
+        args.output
+            .clone()
+            .unwrap_or_else(|| library.target_path("argon.bin"))
+    };
     let command = run_command(&library, &args, &output)?;
     status("Running", &format!("{} in {}", args.cell, library.name));
     run_compiler(command)?;
@@ -195,7 +202,7 @@ fn run_cell(args: RunArgs) -> Result<()> {
 }
 
 /// The compiler command that runs `args.cell`, writing `output` and any
-/// requested GDS and netlists.
+/// requested GDS and netlists. With `--gds-only`, `output` is the GDS.
 fn run_command(library: &Library, args: &RunArgs, output: &Path) -> Result<Command> {
     let tech = library.tech.as_ref().ok_or_else(|| {
         anyhow!(
@@ -208,12 +215,15 @@ fn run_command(library: &Library, args: &RunArgs, output: &Path) -> Result<Comma
         .arg("--cell")
         .arg(&args.cell)
         .arg("--tech")
-        .arg(tech)
-        .arg("--output")
-        .arg(output);
-    if args.gds {
-        let gds = library.target_path("argon.gds");
-        command.arg("--gds").arg(gds);
+        .arg(tech);
+    if args.gds_only {
+        command.arg("--gds").arg(output).arg("--gds-only");
+    } else {
+        command.arg("--output").arg(output);
+        if args.gds {
+            let gds = library.target_path("argon.gds");
+            command.arg("--gds").arg(gds);
+        }
     }
     if args.spice {
         command

@@ -855,7 +855,7 @@ pub(crate) fn module_at<'a>(
     workspace: &'a WorkspaceParseAst,
     path: &std::path::Path,
 ) -> Option<&'a AnnotatedParseAst> {
-    workspace.values().find(|ast| ast.path == path)
+    workspace.values().find(|ast| *ast.path == *path)
 }
 
 /// The cell declaration whose body is `span`.
@@ -1001,10 +1001,8 @@ fn compiled_cells<'a>(
         .values()
         .map(|compiled| &**compiled)
         .filter(move |compiled| {
-            compiled
-                .scopes
-                .get(&compiled.root)
-                .is_some_and(|root| root.span == *cell)
+            compiled.scopes.contains_key(&compiled.root)
+                && *compiled.scope_span(compiled.root) == *cell
         })
 }
 
@@ -1089,7 +1087,7 @@ pub(crate) fn plan_deletion(
                         });
                         if names_it {
                             removals
-                                .entry(reference.path.clone())
+                                .entry(reference.path.to_path_buf())
                                 .or_default()
                                 .push(statement_span(enclosing));
                             continue;
@@ -1097,7 +1095,7 @@ pub(crate) fn plan_deletion(
                     }
                     Some(_) if is_terminal(data, &body, reference.span) => {
                         replacements
-                            .entry(reference.path.clone())
+                            .entry(reference.path.to_path_buf())
                             .or_default()
                             .push((
                                 reference.span.start()..reference.span.end(),
@@ -1111,7 +1109,7 @@ pub(crate) fn plan_deletion(
             }
         }
         removals
-            .entry(target.path.clone())
+            .entry(target.path.to_path_buf())
             .or_default()
             .push(statement_span(statement));
     }
@@ -1207,7 +1205,7 @@ pub(crate) fn rename_replacements(
             );
         }
         replacements
-            .entry(reference.path.clone())
+            .entry(reference.path.to_path_buf())
             .or_default()
             .push((
                 reference.span.start()..reference.span.end(),
@@ -1599,7 +1597,7 @@ pub(crate) mod testing {
         /// The body of the cell named `name`.
         pub(crate) fn body(&self, name: &str) -> Span {
             let cell = self.cell(name);
-            cell.scopes[&cell.root].span.clone()
+            cell.scope_span(cell.root).clone()
         }
 
         pub(crate) fn delete(&self, targets: &[Span]) -> Result<DeletePlan, String> {

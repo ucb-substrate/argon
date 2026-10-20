@@ -54,6 +54,10 @@ wait_for('Argon language server', function()
   return #vim.lsp.get_clients({ name = 'argon', bufnr = bufnr }) == 1
     and vim.fn.exists(':Argon') == 2
 end)
+assert(
+  argon_client().flags.debounce_text_changes == 0,
+  'Argon GUI edits must bypass Neovim change debounce'
+)
 
 local compilation_tokens = {}
 local compilation_begins = 0
@@ -107,6 +111,19 @@ if vim.env.ARGON_TEST_MODE == 'roundtrip' then
   vim.api.nvim_buf_set_lines(bufnr, closing_line - 1, closing_line - 1, false, {
     '    let editor_rect = std::layout::rect("met1", x0i = 20., y0i = 20., x1i = 30., y1i = 30.)!;',
   })
+  vim.cmd('write')
+elseif vim.env.ARGON_TEST_MODE == 'rapid_drawing'
+  or vim.env.ARGON_TEST_MODE == 'bulk_delete_after_burst'
+then
+  wait_for('20 GUI drawings to reach the buffer', function()
+    local text = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
+    local _, count = text:gsub('= std::layout::rect%(', '')
+    return count == 20
+  end)
+  if vim.env.ARGON_TEST_MODE == 'bulk_delete_after_burst' then
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { 'cell top() {', '}' })
+    vim.fn.writefile({ 'deleted' }, vim.env.ARGON_TEST_READY)
+  end
   vim.cmd('write')
 elseif vim.env.ARGON_TEST_MODE == 'startup_errors' then
   wait_for('initial analyzer diagnostics without a selected cell', function()
@@ -377,6 +394,12 @@ elseif vim.env.ARGON_TEST_MODE == 'navigation' then
       .. ' got '
       .. tostring(shifted.range.start.line)
   )
+elseif vim.env.ARGON_TEST_MODE == 'sse_edits' then
+  -- The Rust test drives SSE edits over RPC, then asks for the result on disk.
+  wait_for('SSE edits', function()
+    return vim.uv.fs_stat(vim.env.ARGON_TEST_GUI_EDIT_ACK) ~= nil
+  end)
+  vim.cmd('write')
 elseif vim.env.ARGON_TEST_MODE == 'schematic_move' then
   -- The Rust test moves a device through the analyzer, then acknowledges the
   -- recompiled result; one undo must take the placement and the rewritten

@@ -1,9 +1,14 @@
 //! Self-contained rendering regressions using generated layouts and repository technology files.
 use super::*;
+use crate::editor::{PreparedCompileOutput, prepare_compilation_snapshot};
+use analyzer::rpc::CompilationSnapshot;
+use argonc::compile::CompileOutput;
+use std::path::PathBuf;
 
 fn test_canvas(cx: &mut gpui::TestAppContext) -> Entity<LayoutCanvas> {
     let state = cx.new(|cx| {
         let solved_cell = cx.new(|_| None);
+        let preview_cell = cx.new(|_| None);
         let layers = cx.new(|_| editor::Layers {
             layers: IndexMap::new(),
             selected_layer: None,
@@ -32,6 +37,9 @@ fn test_canvas(cx: &mut gpui::TestAppContext) -> Entity<LayoutCanvas> {
                 cx.observe(&layers, |_, _, cx| cx.notify()),
             ],
             solved_cell,
+            preview_cell,
+            preview_revision: None,
+            preview_source_scope: None,
             hide_external_geometry: false,
             layers,
             lang_server_client: crate::rpc::SyncLangServerClient::for_render_test(cx.to_async()),
@@ -56,6 +64,327 @@ fn test_canvas(cx: &mut gpui::TestAppContext) -> Entity<LayoutCanvas> {
         });
         LayoutCanvas::new(cx, &state, focus, input_focus, input)
     })
+}
+
+#[gpui::test]
+fn minimap_keeps_its_previous_image_until_replacement_is_ready(cx: &mut gpui::TestAppContext) {
+    let canvas = test_canvas(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    std::fs::write(
+        &source,
+        "use std::layout::rect; cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }",
+    )
+    .unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+    ));
+    let CompileOutput::Valid(data) = argonc::incremental::IncrementalCompiler::new().compile_cell(
+        &config,
+        &["top".into()],
+        vec![],
+    ) else {
+        panic!("test cell did not compile");
+    };
+    let object_id = *data.cells[&data.top].objects.keys().next().unwrap();
+    canvas.update(cx, |canvas, _| {
+        let size = Size::new(px(100.), px(100.));
+        let image = image::RgbaImage::new(1, 1);
+        canvas.screen_bounds = Bounds::new(Point::default(), size);
+        canvas.raster_layout_bbox = Some(Arc::new(compile::Rect {
+            layer: None,
+            x0: 0.,
+            y0: 0.,
+            x1: 10.,
+            y1: 10.,
+            id: object_id,
+            construction: true,
+            span: None,
+        }));
+        canvas.raster_overview = Some(LayoutRasterCache {
+            image: Arc::new(RenderImage::new(vec![image::Frame::new(image)])),
+            scale_safe_lod: true,
+            texts: Arc::from([]),
+            scope_labels: Arc::from([]),
+            viewport: size,
+            screen_viewport: size,
+            scale: 1.,
+            offset: Point::default(),
+            content_revision: 1,
+        });
+        canvas.raster_content_revision = 2;
+        canvas.raster_stale_tiles_displayable = false;
+        assert!(
+            canvas
+                .navigation_overview_snapshot(Bounds::new(Point::default(), size))
+                .is_some()
+        );
+    });
+}
+
+#[gpui::test]
+fn sse_keeps_the_moved_preview_until_its_source_edit_is_acknowledged(
+    cx: &mut gpui::TestAppContext,
+) {
+    let canvas = test_canvas(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    std::fs::write(
+        &source,
+        "use std::layout::rect; cell top() { let r = rect(\"met1\", x0i=1., y0i=0., x1i=10., y1i=10.)!; }",
+    )
+    .unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+    ));
+    let output = argonc::incremental::IncrementalCompiler::new().compile_cell(
+        &config,
+        &["top".into()],
+        vec![],
+    );
+    let data = match &output {
+        CompileOutput::Valid(data) => data,
+        CompileOutput::ExecErrors(errors) => errors.output.as_ref().unwrap(),
+        _ => panic!("SSE fixture did not compile"),
+    };
+    let fallback = data.cells[&data.top]
+        .fallback_constraints_used
+        .first()
+        .unwrap();
+    let pending = PendingSseValue {
+        span: Some(fallback.span.clone()),
+        value: -fallback.constraint.constant,
+    };
+    let snapshot = prepare_compilation_snapshot(
+        CompilationSnapshot {
+            revision: 2,
+            output,
+        },
+        canvas.read_with(cx, |canvas, cx| {
+            canvas.state.read(cx).compilation_preparation_context(cx)
+        }),
+    );
+    canvas.update(cx, |canvas, _| {
+        canvas.is_sse_persisting = true;
+        canvas.sse_source_edit_inflight = true;
+        canvas.sse_persist_after_revision = Some(1);
+        canvas.pending_sse_values = vec![pending];
+        assert!(!canvas.accepts_snapshot(&snapshot));
+        canvas.sse_source_edit_inflight = false;
+        assert!(canvas.accepts_snapshot(&snapshot));
+    });
+}
+
+#[gpui::test]
+fn sse_drags_continue_from_a_drag_that_is_still_persisting(cx: &mut gpui::TestAppContext) {
+    let canvas = test_canvas(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    std::fs::write(
+        &source,
+        "use std::layout::rect; cell top() { let r = rect(\"met1\", x0i=1., y0i=0., x1i=10., y1i=10.)!; }",
+    )
+    .unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+    ));
+    let mut compiler = argonc::incremental::IncrementalCompiler::new();
+    let output = compiler.compile_cell(&config, &["top".into()], vec![]);
+    let x1 = match &output {
+        CompileOutput::Valid(data) => data,
+        CompileOutput::ExecErrors(errors) => errors.output.as_ref().unwrap(),
+        _ => panic!("SSE fixture did not compile"),
+    }
+    .cells
+    .values()
+    .find_map(|cell| cell.objects.values().find_map(SolvedValue::get_rect))
+    .unwrap()
+    .x1
+    .1
+    .clone();
+    let newer = prepare_compilation_snapshot(
+        CompilationSnapshot {
+            revision: 2,
+            output: compiler.compile_cell(&config, &["top".into()], vec![]),
+        },
+        canvas.read_with(cx, |canvas, cx| {
+            canvas.state.read(cx).compilation_preparation_context(cx)
+        }),
+    );
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.update(cx, |state, cx| {
+            state.compilation_revision = Some(1);
+            state.update(cx, output);
+        });
+        let drag_x1 = |canvas: &mut LayoutCanvas, pixels: f32| {
+            canvas.sse_targets = vec![SseDragTarget {
+                expr: x1.clone(),
+                normal: Point::new(1., 0.),
+                source: None,
+            }];
+            canvas.sse_delta = Point::new(px(pixels), px(0.));
+        };
+        let x1_edits = |canvas: &mut LayoutCanvas, cx: &mut Context<LayoutCanvas>| {
+            let (edits, base_revision) = canvas.sse_source_edits(cx);
+            assert_eq!(base_revision, Some(1));
+            edits
+                .values
+                .into_iter()
+                .map(|edit| edit.value)
+                .collect::<Vec<_>>()
+        };
+        // A drag moved `x1` by 5 and its source edit is still in flight.
+        drag_x1(canvas, 5.);
+        canvas.is_sse_persisting = true;
+        canvas.sse_source_edit_inflight = true;
+        canvas.sse_persist_after_revision = Some(1);
+        assert!(canvas.can_begin_sse_drag(cx));
+        // The next drag starts where that one left `x1`.
+        drag_x1(canvas, 3.);
+        assert_eq!(x1_edits(canvas, cx), ["18."]);
+        // Ending where the first drag did needs no further edit, and returning
+        // to the compiled position has to undo it.
+        drag_x1(canvas, 0.);
+        assert!(x1_edits(canvas, cx).is_empty());
+        drag_x1(canvas, -5.);
+        assert_eq!(x1_edits(canvas, cx), ["10."]);
+
+        // A newer compile that never showed the persisted values ends the
+        // wait instead of continuing from outdated geometry.
+        canvas.sse_source_edit_inflight = false;
+        canvas.deferred_snapshot = Some(newer);
+        assert!(!canvas.can_begin_sse_drag(cx));
+        assert!(!canvas.is_sse_persisting);
+        assert!(canvas.sse_offset.is_none());
+        assert!(canvas.deferred_snapshot.is_some());
+        assert!(canvas.can_begin_sse_drag(cx));
+    });
+}
+
+#[gpui::test]
+fn focused_preview_changes_canvas_geometry_without_retargeting_source_edits(
+    cx: &mut gpui::TestAppContext,
+) {
+    let canvas = test_canvas(cx);
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    let original = "use std::layout::{inst, rect}; cell leaf(w: Int) { let r = rect(\"met1\", x0=0., y0=0., x1=w as Float, y1=10.); } cell top() { let child = inst(leaf(10), x=0., y=0.); }";
+    std::fs::write(&source, original).unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+    ));
+    let mut compiler = argonc::incremental::IncrementalCompiler::new();
+    let full = compiler.compile_cell(&config, &["top".to_owned()], vec![]);
+    let CompileOutput::Valid(ref full_data) = full else {
+        panic!("initial hierarchy did not compile");
+    };
+    let child = full_data
+        .cells
+        .iter()
+        .find_map(|(id, cell)| (cell.name == "leaf").then_some(*id))
+        .unwrap();
+    let scope = ScopeAddress {
+        cell: child,
+        scope: full_data.cells[&child].root,
+    };
+    let full_top = full_data.top;
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.update(cx, |state, cx| {
+            state.compilation_revision = Some(1);
+            state.update(cx, full);
+            state.solved_cell.update(cx, |cell, cx| {
+                cell.as_mut().unwrap().selected_scope = scope;
+                cx.notify();
+            });
+            cx.notify();
+        });
+        canvas.pending_rectangles.push(PendingRectangle {
+            id: 1,
+            scope_path: scope,
+            source_path: source.clone(),
+            name: "rect0".to_owned(),
+            rect: compile::BasicRect {
+                layer: Some("met1".to_owned()),
+                x0: 0.,
+                y0: 0.,
+                x1: 1.,
+                y1: 1.,
+                construction: false,
+            },
+            submitted: false,
+            submitted_revision: None,
+            receipt: None,
+            resolved_content_revision: None,
+        });
+        canvas.update_raster_presentation(cx);
+    });
+    compiler.set_source_text(
+        source,
+        original.replace("x1=w as Float", "x1=w as Float + 1."),
+    );
+    let preview = compiler.compile_cell_preview(
+        &config,
+        &["leaf".to_owned()],
+        vec![argonc::compile::CellArg::Int(10)],
+    );
+    let context = canvas.read_with(cx, |canvas, cx| {
+        canvas.state.read(cx).compilation_preparation_context(cx)
+    });
+    let prepared = prepare_compilation_snapshot(
+        CompilationSnapshot {
+            revision: 2,
+            output: preview,
+        },
+        context,
+    );
+    let PreparedCompileOutput {
+        selected_scope,
+        state: scopes,
+        all_scopes_visible,
+        ..
+    } = prepared.prepared_output.unwrap();
+    let CompileOutput::Valid(data) = prepared.output else {
+        panic!("focused preview did not compile");
+    };
+    let preview_top = data.top;
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.update(cx, |state, cx| {
+            state.preview_revision = Some(2);
+            state.preview_source_scope = Some(scope);
+            state.preview_cell.update(cx, |cell, cx| {
+                *cell = Some(CompileOutputState {
+                    output: Arc::new(data),
+                    selected_scope,
+                    state: Arc::new(scopes),
+                    all_scopes_visible,
+                });
+                cx.notify();
+            });
+            cx.notify();
+        });
+        canvas.update_raster_presentation(cx);
+        assert!(canvas.raster_exclude_editable_geometry);
+        assert_eq!(canvas.raster_output.as_ref().unwrap().top, preview_top);
+        assert_eq!(canvas.pending_rectangles[0].scope_path, scope);
+        let canonical = canvas.state.read(cx).solved_cell.read(cx);
+        assert_eq!(canonical.as_ref().unwrap().output.top, full_top);
+    });
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.update(cx, |state, cx| {
+            state.solved_cell.update(cx, |cell, cx| {
+                let root = cell.as_ref().unwrap().output.cells[&full_top].root;
+                cell.as_mut().unwrap().selected_scope = ScopeAddress {
+                    cell: full_top,
+                    scope: root,
+                };
+                cx.notify();
+            });
+            cx.notify();
+        });
+        canvas.update_raster_presentation(cx);
+        assert_eq!(canvas.raster_output.as_ref().unwrap().top, full_top);
+        assert_eq!(canvas.pending_rectangles[0].scope_path, scope);
+    });
 }
 
 #[gpui::test]
@@ -215,8 +544,7 @@ fn prepare(
             output: Arc::new(output),
             selected_scope: prepared.selected_scope,
             state: Arc::new(prepared.state),
-            scope_paths: Arc::new(prepared.scope_paths),
-            hierarchy: prepared.hierarchy,
+            all_scopes_visible: prepared.all_scopes_visible,
         },
         Arc::new(prepared.layers),
     )
@@ -236,6 +564,7 @@ fn input(
         viewport,
         text_color: rgb(0xffffff),
         include_text: true,
+        exclude_editable_geometry: false,
         content_revision: 1,
         content_revision_signal: Arc::new(AtomicU64::new(1)),
         scale_signal: Arc::new(AtomicU64::new(viewport.scale.to_bits() as u64)),
@@ -379,8 +708,8 @@ cell top() { let child = inst(branch(), x=0., y=0.); }
             let scopes = Arc::make_mut(&mut solved.state);
             let (_, scope) = scopes
                 .iter_mut()
-                .find(|(_, scope)| {
-                    solved.output.cells[&scope.address.cell]
+                .find(|(address, _)| {
+                    solved.output.cells[&address.cell]
                         .objects
                         .values()
                         .any(|value| matches!(value, SolvedValue::Rect(_)))
@@ -391,7 +720,8 @@ cell top() { let child = inst(branch(), x=0., y=0.); }
         let hierarchy_depth = if hidden { usize::MAX } else { 2 };
         let spatial_index = Arc::new(RasterSpatialIndex::for_presentation(
             hierarchy_depth,
-            Some(&solved.state),
+            solved.state.values().all(|scope| scope.visible),
+            false,
         ));
         assert!(!spatial_index.collapse_instances);
         let mut indexed = input(solved.clone(), layers.clone(), viewport, spatial_index);
@@ -587,7 +917,7 @@ fn interleaved_layers_coalesce_before_visiting_sram_leaf_shapes() {
     ));
     let (solved, _) = prepare(&source, &config);
     let index = RasterSpatialIndex::default();
-    let root = solved.state[&solved.selected_scope].address;
+    let root = solved.selected_scope;
     let extents = index.layer_extents(&solved, root.cell);
     assert_eq!(extents.len(), 2);
     assert!(
@@ -601,23 +931,123 @@ fn interleaved_layers_coalesce_before_visiting_sram_leaf_shapes() {
         max_x: 33.,
         max_y: 33.,
     };
-    let (emits, occupancies) = index
+    let query = index
         .query_lod_ready_bounded(root, bounds, 8., &mut GeometryWorkBudget(256))
         .expect("zoomed-out work must follow screen detail")
         .unwrap();
-    assert!(emits.is_empty());
+    assert!(query.emits.is_empty());
     assert!(
-        occupancies.len() <= 64,
+        query.occupancies.len() <= 64,
         "interleaved layers must not force one occupancy per shape"
     );
-    assert!(occupancies.iter().all(|lod| lod.layers.len() == 1));
-    let (emits, occupancies) = index.query_lod(&solved, root, bounds, 2048, 0.);
+    assert!(query.occupancies.iter().all(|lod| lod.layers.len() == 1));
+    let query = index.query_lod(&solved, root, bounds, 2048, 0.);
     assert_eq!(
-        emits.len(),
+        query.emits.len(),
         2048,
         "zooming in must recover every original shape"
     );
-    assert!(occupancies.is_empty());
+    assert!(query.occupancies.is_empty());
+}
+
+#[gpui::test]
+fn fully_visible_render_index_skips_execution_scope_tree(cx: &mut gpui::TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    std::fs::write(
+        &source,
+        r#"
+use std::layout::rect;
+cell top() {
+    for row in std::range(8) {
+        for col in std::range(8) {
+            let shape = rect(
+                "met1",
+                x0=(col as Float) * 2.,
+                y0=(row as Float) * 2.,
+                x1=(col as Float) * 2. + 1.,
+                y1=(row as Float) * 2. + 1.,
+            );
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml"),
+    ));
+    let (solved, layers) = prepare(&source, &config);
+    let root = solved.selected_scope;
+    assert!(solved.output.cells[&root.cell].scopes.len() > 64);
+
+    let spatial_index = Arc::new(RasterSpatialIndex::default());
+    let cell_index = spatial_index.cell_index(&solved, root.cell);
+    let cell_index = cell_index.get().unwrap();
+    assert!(cell_index.scopes.is_empty());
+    assert!(cell_index.flattened.is_some());
+    let bounds = RasterBvhBounds {
+        min_x: -1.,
+        min_y: -1.,
+        max_x: 16.,
+        max_y: 16.,
+    };
+    let query = spatial_index.query_lod(&solved, root, bounds, 0, 0.);
+    assert!(query.flattened_scope_tree);
+    assert_eq!(query.emits.len(), 64);
+    assert!(query.emits.iter().all(|emit| emit.scope_depth > 0));
+
+    let viewport = ViewportTransform {
+        size: Size::new(px(64.), px(64.)),
+        screen_size: Size::new(px(64.), px(64.)),
+        scale: 3.,
+        offset: Point::new(px(4.), px(52.)),
+    };
+    let indexed = build_navigation_raster(input(
+        solved.clone(),
+        layers.clone(),
+        viewport,
+        spatial_index.clone(),
+    ))
+    .unwrap();
+    let mut linear_input = input(
+        solved.clone(),
+        layers.clone(),
+        viewport,
+        Arc::new(RasterSpatialIndex::default()),
+    );
+    linear_input.use_spatial_index = false;
+    let linear = build_navigation_raster(linear_input).unwrap();
+    assert_eq!(indexed.image.as_bytes(0), linear.image.as_bytes(0));
+
+    // The sparse/direct renderer uses the same flattened index, but preserves
+    // the original scope depth so nested geometry does not become root-editable.
+    let canvas = test_canvas(cx);
+    load_canvas(&canvas, solved, layers, cx);
+    let size = Size::new(px(400.), px(400.));
+    canvas.update(cx, |canvas, cx| {
+        canvas.update_raster_presentation(cx);
+        canvas.pending_init = false;
+        canvas.scale = 20.;
+        canvas.offset = Point::new(px(20.), px(320.));
+        canvas.raster_spatial_index = spatial_index;
+        canvas.raster_cache_enabled = false;
+        canvas.raster_prefetch_enabled = false;
+        canvas.raster_decision_refinement = None;
+    });
+    let cx = cx.add_empty_window();
+    cx.draw(
+        Point::default(),
+        size.map(gpui::AvailableSpace::Definite),
+        |_, _| CanvasElement {
+            inner: canvas.clone(),
+        },
+    );
+    canvas.update(cx, |canvas, _| {
+        assert_eq!(canvas.rects.len(), 64);
+        assert!(canvas.rects.iter().all(|(rect, _)| rect.cvars.is_none()));
+    });
 }
 
 #[test]
@@ -870,6 +1300,94 @@ fn recent_invocations_leave_room_for_the_library(cx: &mut gpui::TestAppContext) 
         cx.debug_bounds("start_recent_9").unwrap().bottom() > recents.bottom(),
         "the recent invocations scroll instead"
     );
+}
+
+#[gpui::test]
+fn early_sse_cell_preview_is_applied_as_soon_as_neovim_acknowledges_the_edit(
+    cx: &mut gpui::TestAppContext,
+) {
+    let canvas = test_canvas(cx);
+    let editor = test_editor(&canvas, cx);
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    let original = "use std::layout::rect; cell top() { let r = rect(\"met1\", x0i=0., y0i=0., x1i=10., y1i=10.)!; }";
+    std::fs::write(&source, original).unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+    ));
+    let mut compiler = argonc::incremental::IncrementalCompiler::new();
+    let full = compiler.compile_cell(&config, &["top".into()], vec![]);
+    let data = match &full {
+        CompileOutput::Valid(data) => data,
+        CompileOutput::ExecErrors(errors) => errors.output.as_ref().unwrap(),
+        _ => panic!("initial SSE cell did not compile"),
+    };
+    let previous_cell = data.top;
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.update(cx, |state, cx| {
+            state.compilation_revision = Some(1);
+            state.update(cx, full);
+            cx.notify();
+        });
+    });
+    let source_scope = canvas.read_with(cx, |canvas, cx| {
+        canvas
+            .state
+            .read(cx)
+            .solved_cell
+            .read(cx)
+            .as_ref()
+            .unwrap()
+            .selected_scope
+    });
+    compiler.set_source_text(source.clone(), original.replace("x1i=10.", "x1i=12."));
+    let preview = compiler.compile_cell(&config, &["top".into()], vec![]);
+    let prepared = prepare_compilation_snapshot(
+        CompilationSnapshot {
+            revision: 2,
+            output: preview,
+        },
+        canvas.read_with(cx, |canvas, cx| {
+            canvas.state.read(cx).compilation_preparation_context(cx)
+        }),
+    );
+    canvas.update(cx, |canvas, _| {
+        canvas.is_sse_persisting = true;
+        canvas.sse_source_edit_inflight = true;
+        canvas.sse_persist_after_revision = Some(1);
+    });
+    editor.update(cx, |editor, cx| {
+        assert!(!editor.finish_cell_preview(cx, previous_cell, source_scope, prepared));
+    });
+    assert!(canvas.read_with(cx, |canvas, _| canvas.deferred_cell_preview.is_some()));
+
+    editor.update(cx, |editor, cx| {
+        editor.finish_sse_source_edit(
+            cx,
+            0,
+            Ok(Some(vec![])),
+            vec![analyzer::rpc::InitialConditionEdit {
+                call_span: Span {
+                    path: source.into(),
+                    span: cfgrammar::Span::new(0, original.len()),
+                },
+                name: "x1i".to_owned(),
+                value: "12.".to_owned(),
+            }],
+        );
+    });
+    assert!(canvas.read_with(cx, |canvas, _| !canvas.is_sse_persisting));
+    let displayed_x1 = canvas.read_with(cx, |canvas, cx| {
+        let displayed = canvas.state.read(cx).displayed_cell(cx).unwrap();
+        displayed.output.cells[&displayed.selected_scope.cell]
+            .objects
+            .values()
+            .find_map(SolvedValue::get_rect)
+            .unwrap()
+            .x1
+            .0
+    });
+    assert_eq!(displayed_x1, 12.);
 }
 
 #[gpui::test]
@@ -1572,7 +2090,7 @@ cell top() { let a = inst(leaf(), x=0., y=0.); let b = inst(unchanged(), x=70., 
         },
         editor::CompilationPreparationContext {
             layers: layers.as_ref().clone(),
-            selected_scope: Some(before.selected_scope.clone()),
+            selected_scope: Some(before.selected_scope),
             scope_state: Some(before.state.clone()),
             previous: Some(before.clone()),
         },
@@ -1582,15 +2100,10 @@ cell top() { let a = inst(leaf(), x=0., y=0.); let b = inst(unchanged(), x=70., 
         output: Arc::new(prepared.output.unwrap_valid()),
         selected_scope: metadata.selected_scope,
         state: Arc::new(metadata.state),
-        scope_paths: Arc::new(metadata.scope_paths),
-        hierarchy: metadata.hierarchy,
+        all_scopes_visible: metadata.all_scopes_visible,
     };
     let mut reused = RasterSpatialIndex::default();
-    reused.reuse_ready_cells(&old_index, |cell| {
-        after
-            .hierarchy
-            .same_cell(&before.hierarchy, &after.output, cell)
-    });
+    reused.reuse_ready_cells(&old_index, |cell| after.same_cell(&before, cell));
     let cells = reused.cells.lock().unwrap();
     assert!(!cells.contains_key(&leaf));
     assert!(
@@ -1823,6 +2336,7 @@ cell top() { for row in std::range(96) { for col in std::range(96) {
         message: Ok(LangServerResponse::DrawRect(Some(RectangleEditResult {
             span: scope_span.clone(),
             revision: 1,
+            name: var_name.to_owned(),
         }))),
     });
     if !dense {
@@ -1978,6 +2492,9 @@ cell top() { for row in std::range(96) { for col in std::range(96) {
         canvas.read_with(cx, |canvas, _| canvas.painted_rectangle_previews.len()),
         1
     );
+    // A rejected edit must not permanently freeze the queued drawing. The
+    // next source RPC is sent without waiting for a new compiled frame.
+    assert!(canvas.read_with(cx, |canvas, _| canvas.pending_rectangles[0].submitted));
     let request = loop {
         if let Some(message) = server.next().now_or_never()
             && let tarpc::ClientMessage::Request(request) = message.unwrap().unwrap()
@@ -1986,12 +2503,20 @@ cell top() { for row in std::range(96) { for col in std::range(96) {
         }
         assert!(cx.dispatcher.tick(false));
     };
+    let LangServerRequest::DrawRect {
+        var_name: resumed_name,
+        ..
+    } = &request.message
+    else {
+        panic!("expected queued rectangle RPC");
+    };
     server
         .send(tarpc::Response {
             request_id: request.id,
             message: Ok(LangServerResponse::DrawRect(Some(RectangleEditResult {
                 span: scope_span,
                 revision: 2,
+                name: resumed_name.clone(),
             }))),
         })
         .now_or_never()
@@ -2023,4 +2548,121 @@ cell top() { for row in std::range(96) { for col in std::range(96) {
         0
     );
     assert!(canvas.read_with(cx, |canvas, _| canvas.painted_complete_frame));
+}
+
+/// Times how long the full editor takes to settle after deleting one of many
+/// unconstrained rectangles from the SRAM top cell.
+#[gpui::test]
+#[ignore = "SRAM unconstrained-rectangle editor benchmark; run in release with --nocapture"]
+fn bench_sram_unconstrained_rect_delete_editor(cx: &mut gpui::TestAppContext) {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/sram");
+    let source = workspace.join("lib.ar");
+    let original = std::fs::read_to_string(&source).unwrap();
+    let config = argonc::WorkspaceConfig::new(&source)
+        .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")));
+    let rects = |count: usize| {
+        (0..count)
+            .map(|i| {
+                let x = 30000. * (i % 9) as f64;
+                let y = 12000. * (i / 9) as f64;
+                format!(
+                    "let bench_rect{i} = rect(\"prBoundary.boundary\", x0i = {x}., y0i = {y}., x1i = {}., y1i = {}.)!;\n",
+                    x + 20000.,
+                    y + 8000.
+                )
+            })
+            .collect::<String>()
+    };
+    let opening = "cell example_no_control_logic() {\n";
+    let with_rects =
+        |count: usize| original.replacen(opening, &format!("{opening}{}", rects(count)), 1);
+    let cell = vec!["example_no_control_logic".to_owned()];
+    let mut compiler = argonc::incremental::IncrementalCompiler::new();
+    compiler.set_source_text(source.clone(), with_rects(73));
+    let first = compiler.compile_cell(&config, &cell, vec![]);
+    let canvas = test_canvas(cx);
+    let editor = test_editor(&canvas, cx);
+    editor.update(cx, |editor, cx| {
+        let context = editor.begin_snapshot_preparation(cx, 1);
+        let prepared = editor::prepare_compilation_snapshot(
+            analyzer::rpc::CompilationSnapshot {
+                revision: 1,
+                output: first,
+            },
+            context,
+        );
+        editor.finish_snapshot_preparation(cx, 1, prepared);
+    });
+    let cx = cx.add_empty_window();
+    let draw_time = std::cell::Cell::new(std::time::Duration::ZERO);
+    let draws = std::cell::Cell::new(0);
+    let draw = |cx: &mut gpui::VisualTestContext| {
+        let started = std::time::Instant::now();
+        editor.update(cx, |_, cx| cx.notify());
+        cx.draw(
+            Point::default(),
+            Size::new(px(1200.), px(800.)).map(gpui::AvailableSpace::Definite),
+            |_, _| div().size_full().child(editor.clone()),
+        );
+        draw_time.set(draw_time.get() + started.elapsed());
+        draws.set(draws.get() + 1);
+    };
+    let settle = |cx: &mut gpui::VisualTestContext| {
+        for _ in 0..4096 {
+            draw(cx);
+            let pending = canvas.read_with(cx, |canvas, _| {
+                canvas.raster_worker_active
+                    || canvas.raster_decision_refinement.is_some()
+                    || canvas.raster_overview_requested_revision.is_some()
+            });
+            if !pending {
+                return;
+            }
+            assert!(cx.dispatcher.tick(false));
+        }
+        panic!("renderer did not settle");
+    };
+    draw(cx);
+    editor.update(cx, |editor, cx| editor.fit_to_screen(cx));
+    let started = std::time::Instant::now();
+    settle(cx);
+    eprintln!(
+        "sram_unconstrained_rect_editor_initial,settle_ms={},draws={},draw_ms={}",
+        started.elapsed().as_millis(),
+        draws.get(),
+        draw_time.get().as_millis(),
+    );
+    for count in [72, 71] {
+        draws.set(0);
+        draw_time.set(std::time::Duration::ZERO);
+        compiler.set_source_text(source.clone(), with_rects(count));
+        let started = std::time::Instant::now();
+        let output = compiler.compile_cell(&config, &cell, vec![]);
+        let compile = started.elapsed();
+        let started = std::time::Instant::now();
+        editor.update(cx, |editor, cx| {
+            let id = 75 - count as u64;
+            let context = editor.begin_snapshot_preparation(cx, id);
+            let prepared = editor::prepare_compilation_snapshot(
+                analyzer::rpc::CompilationSnapshot {
+                    revision: id,
+                    output,
+                },
+                context,
+            );
+            editor.finish_snapshot_preparation(cx, id, prepared);
+        });
+        let apply = started.elapsed();
+        let started = std::time::Instant::now();
+        settle(cx);
+        eprintln!(
+            "sram_unconstrained_rect_editor_delete,rects={count},compile_ms={},apply_ms={},settle_ms={},draws={},draw_ms={},sse_bodies={}",
+            compile.as_millis(),
+            apply.as_millis(),
+            started.elapsed().as_millis(),
+            draws.get(),
+            draw_time.get().as_millis(),
+            canvas.read_with(cx, |canvas, _| canvas.sse_bodies.len()),
+        );
+    }
 }

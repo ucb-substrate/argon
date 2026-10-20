@@ -51,6 +51,11 @@ struct Args {
     #[arg(long, requires = "cell")]
     gds: Option<PathBuf>,
 
+    /// Write only the GDS: no binary compiler output, and none of the debug
+    /// information the editor reads, which uses much less memory.
+    #[arg(long, requires = "gds", conflicts_with = "output")]
+    gds_only: bool,
+
     /// Also write a SPICE netlist to this path.
     #[arg(long, value_name = "PATH", requires = "cell", group = "netlist")]
     spice: Option<PathBuf>,
@@ -202,17 +207,31 @@ fn execute(args: Args) -> Result<(), Failed> {
         return Ok(());
     };
 
-    let output = compile::execute_cell_invocation(&typed_ast, &invocation, &workspace);
+    // Evaluation reads only the typed AST.
+    drop(analysis.ast);
+    let output = if args.gds_only {
+        let output = compile::execute_cell_invocation_without_debug_info(
+            &typed_ast,
+            &invocation,
+            &workspace,
+        );
+        drop(typed_ast);
+        output
+    } else {
+        compile::execute_cell_invocation(&typed_ast, &invocation, &workspace)
+    };
     if !matches!(output, CompileOutput::Valid(_)) {
         return Err(compile_failed(format, output, Some(&invocation)));
     }
-    let output_path = args.output.unwrap_or_else(|| root.with_extension("bin"));
-    artifact::write(&output, &output_path).map_err(|error| {
-        fail(
-            format,
-            format!("could not write `{}`: {error}", output_path.display()),
-        )
-    })?;
+    if !args.gds_only {
+        let output_path = args.output.unwrap_or_else(|| root.with_extension("bin"));
+        artifact::write(&output, &output_path).map_err(|error| {
+            fail(
+                format,
+                format!("could not write `{}`: {error}", output_path.display()),
+            )
+        })?;
+    }
 
     if let Some(gds_path) = args.gds {
         output.to_gds(&gds_path).map_err(|error| {
@@ -242,6 +261,8 @@ fn execute(args: Args) -> Result<(), Failed> {
                 )
             })?;
     }
+    // The process exits next, so freeing the output would only take time.
+    std::mem::forget(output);
     Ok(())
 }
 
@@ -418,6 +439,7 @@ mod tests {
             gds_imports: Vec::new(),
             output: None,
             gds: None,
+            gds_only: false,
             spice: None,
             spectre: None,
             netlist_width: 80,
@@ -435,6 +457,7 @@ mod tests {
             gds_imports: Vec::new(),
             output: None,
             gds: None,
+            gds_only: false,
             spice: None,
             spectre: None,
             netlist_width: 80,
@@ -628,6 +651,46 @@ mod tests {
     }
 
     #[test]
+    fn gds_only_writes_the_same_gds_and_no_binary_output() {
+        let program = r#"use std::layout::{inst, rect};
+
+fn shifted(r: Rect, dx: Float) -> Rect {
+    rect("met1", x0=r.x0 + dx, y0=r.y0, x1=r.x1 + dx, y1=r.y1)
+}
+
+cell child(n: Int) {
+    pub let base = rect("met1", x0=0., y0=0., x1=5., y1=5.);
+    pub let copies = [for i in std::range(n) if i > 0 { shifted(base, i as Float * 10.) }];
+}
+
+cell top() {
+    let a = inst(child(3), x=0., y=0.);
+    let b = inst(child(3), x=0., y=20.);
+    let bar = rect("met2", x0=a.base.x0, y0=0., x1=b.copies[1].x1, y1=30.);
+}
+"#;
+        let structures = |gds_only: bool| {
+            let source = temp_source("gds-only", program);
+            let gds_path = source.with_extension("gds");
+            let artifact_path = source.with_extension("bin");
+            let mut args = execution_args(source, "top()", basic_tech());
+            args.gds = Some(gds_path.clone());
+            args.gds_only = gds_only;
+            assert!(execute(args).is_ok());
+            assert_eq!(artifact_path.exists(), !gds_only);
+            GdsLibrary::load(gds_path)
+                .expect("GDS should load")
+                .structs
+                .into_iter()
+                .map(|structure| (structure.name, structure.elems))
+                .collect::<Vec<_>>()
+        };
+        let full = structures(false);
+        assert!(full.len() > 1);
+        assert_eq!(structures(true), full);
+    }
+
+    #[test]
     fn execution_accepts_a_boolean_cell_argument() {
         let source = temp_source("bool-root", "");
         let dependency = temp_source(
@@ -665,7 +728,7 @@ cell device(enabled: Bool, w: Float, count: Int) {
         // The generated entry cell is an implementation detail and must not
         // reach the output, and the target keeps its own root scope name.
         assert_eq!(output.cells.len(), 1, "entry cell should not be emitted");
-        assert_eq!(top.scopes[&top.root].name, "cell top");
+        assert_eq!(top.scope_name(top.root), "cell top");
         top.objects
             .values()
             .find_map(|object| object.get_rect())
@@ -687,6 +750,20 @@ cell device(enabled: Bool, w: Float, count: Int) {
         assert_eq!(rect.x0.0, -5.);
         assert_eq!(rect.y0.0, -2.);
         assert_eq!(rect.y1.0, 18.);
+    }
+
+    #[test]
+    fn float_to_int_cast_does_not_snap_to_the_layout_grid() {
+        let source = temp_source(
+            "float-to-int-exact",
+            "use std::layout::rect;\n\
+             cell top() {\n\
+             let n = 7.9 as Int;\n\
+             let r = rect(\"met1\", x0=0., y0=0., x1=n as Float, y1=10.);\n\
+             }\n",
+        );
+        let rect = compiled_rect("float-to-int-exact", source, "top()");
+        assert_eq!(rect.x1.0, 7.);
     }
 
     #[test]
@@ -868,7 +945,7 @@ cell device(enabled: Bool, w: Float, count: Int) {
             panic!("GDS import should compile successfully");
         };
         let top = &output.cells[&output.top];
-        assert_eq!(top.scopes[&top.root].name, "cell top");
+        assert_eq!(top.scope_name(top.root), "cell top");
         assert_eq!(top.objects.len(), 2);
         let imported = top
             .objects
