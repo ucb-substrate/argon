@@ -9163,7 +9163,7 @@ struct ExecPass<'a> {
     /// instantiation recurses through `execute_cell`. Both descend until the
     /// stack dies -- an abort `catch_unwind` cannot intercept -- so they need an
     /// explicit limit. `if` and `match` branches are visited at once only
-    /// below [`MAX_EAGER_DEPTH`], and wait on the worklist deeper than that.
+    /// below [`MAX_EAGER_NESTING`], and wait on the worklist deeper than that.
     eval_depth: u32,
     /// Control-flow evaluations nested on the native stack. See
     /// [`MAX_EAGER_NESTING`].

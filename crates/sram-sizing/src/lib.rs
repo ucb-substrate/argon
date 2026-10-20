@@ -13,8 +13,7 @@ mod control;
 
 pub use control::{
     AndStageSizing, BufferSizing, ControlLogicParams, DecoderNodeSizing, PeripherySizing,
-    RowDecoderSizing,
-    control_logic_params, periphery_sizing,
+    RowDecoderSizing, control_logic_params, periphery_sizing,
 };
 
 const GRID: i32 = 50;

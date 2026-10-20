@@ -852,6 +852,12 @@ impl State {
         source.compile_identity() == *identity
     }
 
+    /// Whether the cell `identity` compiles is still the open one, at any
+    /// source revision.
+    async fn is_open_cell(&self, identity: &CompileIdentity) -> bool {
+        self.source_state.lock().await.cell == identity.cell
+    }
+
     async fn gui_connection(&self) -> Option<GuiConnection> {
         self.gui.lock().await.connection.clone()
     }
@@ -1579,10 +1585,9 @@ impl Backend {
             .client
             .preview_cell(gui_snapshot_context(), request)
             .await
+            && is_gui_disconnected(&error)
         {
-            if is_gui_disconnected(&error) {
-                self.state.clear_gui_connection(connection.id).await;
-            }
+            self.state.clear_gui_connection(connection.id).await;
         }
     }
 
@@ -1590,14 +1595,16 @@ impl Backend {
         let Some(connection) = self.update_cell(identity.clone()).await else {
             return;
         };
-        if !self.state.is_latest_compile_request(&identity).await {
+        // An edit made once the layout arrived, such as a GUI drawing, leaves
+        // the cell open; only opening another cell cancels the fit.
+        if !self.state.is_open_cell(&identity).await {
             return;
         }
         let result = connection.client.fit(context::current()).await;
         if self.handle_gui_result(&connection, result).await.is_none() {
             return;
         }
-        if self.state.is_latest_compile_request(&identity).await {
+        if self.state.is_open_cell(&identity).await {
             let result = connection.client.activate(context::current()).await;
             self.handle_gui_result(&connection, result).await;
         }

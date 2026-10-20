@@ -14260,7 +14260,9 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                 .image
                 .as_bytes(0)
                 .unwrap()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|pixel| pixel[3] != 0)
                 .count()
         };
