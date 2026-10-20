@@ -34,7 +34,7 @@ use futures::{
     prelude::*,
 };
 use gpui::{AsyncApp, Task};
-use tarpc::{context, server::Channel, tokio_serde::formats::Bincode};
+use tarpc::{context, server::Channel};
 use tower_lsp_server::ls_types::MessageType;
 use tracing::error;
 
@@ -80,7 +80,7 @@ async fn connect_lang_server(
     token: SessionToken,
 ) -> std::io::Result<LangServerClient> {
     let stream = transport::connect(lang_server_addr, &token, Role::Gui).await?;
-    let transport = tarpc::serde_transport::new(stream, Bincode::default());
+    let transport = tarpc::serde_transport::new(stream, transport::Postcard::default());
     Ok(LangServerClient::new(tarpc::client::Config::default(), transport).spawn())
 }
 
@@ -341,7 +341,7 @@ impl SyncLangServerClient {
         };
         Ok(self.app.background_executor().spawn(
             async move {
-                let transport = tarpc::serde_transport::new(stream, Bincode::default());
+                let transport = tarpc::serde_transport::new(stream, transport::Postcard::default());
                 tarpc::server::BaseChannel::with_defaults(transport)
                     .execute(server.serve())
                     .for_each(|response| background_executor.spawn(response))

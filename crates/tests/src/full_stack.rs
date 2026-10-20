@@ -17,7 +17,7 @@ use argonc::{
     compile::{CompileOutput, CompiledData},
 };
 use futures::prelude::*;
-use tarpc::{context, server::Channel, tokio_serde::formats::Bincode};
+use tarpc::{context, server::Channel};
 use tempfile::TempDir;
 use tokio::{sync::mpsc, time};
 
@@ -507,7 +507,7 @@ impl Session {
         let stream = self.connect(Role::GuiCallback).await;
         let gui = self.gui.clone();
         tokio::spawn(async move {
-            let transport = tarpc::serde_transport::new(stream, Bincode::default());
+            let transport = tarpc::serde_transport::new(stream, transport::Postcard::default());
             tarpc::server::BaseChannel::with_defaults(transport)
                 .execute(gui.serve())
                 .for_each(|response| async move {
@@ -519,7 +519,7 @@ impl Session {
 
     pub async fn connect_agent(&self) -> AgentClient {
         let stream = self.connect(Role::Agent).await;
-        let transport = tarpc::serde_transport::new(stream, Bincode::default());
+        let transport = tarpc::serde_transport::new(stream, transport::Postcard::default());
         AgentClient::new(tarpc::client::Config::default(), transport).spawn()
     }
 
@@ -551,7 +551,7 @@ impl Session {
 
     pub async fn connect_analyzer(&self) -> LangServerClient {
         let stream = self.connect(Role::Gui).await;
-        let transport = tarpc::serde_transport::new(stream, Bincode::default());
+        let transport = tarpc::serde_transport::new(stream, transport::Postcard::default());
         LangServerClient::new(tarpc::client::Config::default(), transport).spawn()
     }
 

@@ -48,7 +48,7 @@ use rpc::{
     InstancePreview, LangServer, SchematicInstancePreview, insert_statement,
 };
 use serde::{Deserialize, Serialize};
-use tarpc::{context, server::Channel, tokio_serde::formats::Bincode};
+use tarpc::{context, server::Channel};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader},
     process::{Child, Command},
@@ -2878,20 +2878,23 @@ async fn serve_rpc(listener: tokio::net::TcpListener, state: State) {
             };
             match role {
                 transport::Role::Gui => {
-                    let transport = tarpc::serde_transport::new(stream, Bincode::default());
+                    let transport =
+                        tarpc::serde_transport::new(stream, transport::Postcard::default());
                     tarpc::server::BaseChannel::with_defaults(transport)
                         .execute(state.serve())
                         .for_each(spawn)
                         .await;
                 }
                 transport::Role::GuiCallback => {
-                    let transport = tarpc::serde_transport::new(stream, Bincode::default());
+                    let transport =
+                        tarpc::serde_transport::new(stream, transport::Postcard::default());
                     let client =
                         GuiClient::new(tarpc::client::Config::default(), transport).spawn();
                     state.connect_gui(client).await;
                 }
                 transport::Role::Agent => {
-                    let transport = tarpc::serde_transport::new(stream, Bincode::default());
+                    let transport =
+                        tarpc::serde_transport::new(stream, transport::Postcard::default());
                     tarpc::server::BaseChannel::with_defaults(transport)
                         .execute(agent::Agent::serve(Backend { state }))
                         .for_each(spawn)
@@ -3121,8 +3124,8 @@ mod tests {
                 ..ArgonConfig::default()
             },
         ] {
-            let encoded = bincode::serialize(&config).unwrap();
-            let decoded: ArgonConfig = bincode::deserialize(&encoded).unwrap();
+            let encoded = postcard::to_stdvec(&config).unwrap();
+            let decoded: ArgonConfig = postcard::from_bytes(&encoded).unwrap();
             assert_eq!(decoded.gui.icon_size, config.gui.icon_size);
             assert_eq!(decoded.gui.font_size, config.gui.font_size);
         }

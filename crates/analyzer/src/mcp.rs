@@ -14,7 +14,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tarpc::{context, tokio_serde::formats::Bincode};
+use tarpc::context;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::{Mutex, mpsc},
@@ -57,7 +57,7 @@ async fn connect_agent(info: &SessionInfo) -> io::Result<AgentClient> {
     })?;
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, info.port));
     let stream = transport::connect(addr, &token, transport::Role::Agent).await?;
-    let transport = tarpc::serde_transport::new(stream, Bincode::default());
+    let transport = tarpc::serde_transport::new(stream, transport::Postcard::default());
     Ok(AgentClient::new(tarpc::client::Config::default(), transport).spawn())
 }
 

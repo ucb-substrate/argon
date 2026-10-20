@@ -6,13 +6,14 @@
 //! traffic, so neither an unauthenticated client nor an impostor listening on
 //! the analyzer's port learns the token or gets trusted.
 
-use std::{fmt, io, net::SocketAddr, time::Duration};
+use std::{fmt, io, marker::PhantomData, net::SocketAddr, pin::Pin, time::Duration};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use tarpc::tokio_serde;
 use tokio::net::TcpStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -20,7 +21,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 pub const TOKEN_ENV: &str = "ARGON_SESSION_TOKEN";
 
 /// Version of the handshake and of the RPC services behind it.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// How long a peer may take to complete the handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -357,6 +358,39 @@ async fn accept_within(
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
     Ok((role, into_rpc_stream(framed)))
+}
+
+/// The postcard codec for tarpc transports over an [`AuthenticatedStream`].
+pub struct Postcard<Item, SinkItem>(PhantomData<fn(SinkItem) -> Item>);
+
+impl<Item, SinkItem> Default for Postcard<Item, SinkItem> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<Item, SinkItem> tokio_serde::Deserializer<Item> for Postcard<Item, SinkItem>
+where
+    Item: for<'de> Deserialize<'de>,
+{
+    type Error = io::Error;
+
+    fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> io::Result<Item> {
+        postcard::from_bytes(src).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+}
+
+impl<Item, SinkItem> tokio_serde::Serializer<SinkItem> for Postcard<Item, SinkItem>
+where
+    SinkItem: Serialize,
+{
+    type Error = io::Error;
+
+    fn serialize(self: Pin<&mut Self>, item: &SinkItem) -> io::Result<Bytes> {
+        postcard::to_stdvec(item)
+            .map(Bytes::from)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
 }
 
 #[cfg(test)]

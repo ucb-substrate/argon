@@ -51,7 +51,7 @@ itertools = "0.15"
 fnv = "1"
 rustc-hash = "2"
 smallvec = { version = "1", features = ["union", "serde"] }
-tarpc = { version = "0.38", features = ["full"] }
+tarpc = { version = "0.38", features = ["serde-transport"] }
 bytes = "1"
 futures = "0.3"
 tracing = "0.1"
@@ -59,7 +59,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 tower-lsp-server = "0.23"
 tempfile = "3"
-zstd = "0.13"
+zstd = "0.14"
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 
 geometry = { version = "0.7", registry = "substrate" }
 enumify = { version = "0.2", registry = "substrate" }

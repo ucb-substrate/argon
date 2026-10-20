@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::compile::CompileOutput;
 
-const MAGIC: &[u8; 8] = b"ARGON\0\0\x05";
+const MAGIC: &[u8; 8] = b"ARGON\0\0\x06";
 
 /// Writes a successful compiler result in Argon's versioned binary format.
 pub fn write(output: &CompileOutput, path: impl AsRef<Path>) -> Result<()> {
@@ -25,7 +25,7 @@ pub fn write(output: &CompileOutput, path: impl AsRef<Path>) -> Result<()> {
     writer
         .write_all(MAGIC)
         .with_context(|| format!("could not write `{}`", path.display()))?;
-    bincode::serialize_into(&mut writer, output).context("could not serialize compiler output")?;
+    postcard::to_io(output, &mut writer).context("could not serialize compiler output")?;
     writer
         .flush()
         .with_context(|| format!("could not write `{}`", path.display()))
@@ -38,5 +38,5 @@ pub fn read(path: impl AsRef<Path>) -> Result<CompileOutput> {
     let Some(payload) = bytes.strip_prefix(MAGIC) else {
         bail!("`{}` is not an Argon compiler artifact", path.display());
     };
-    bincode::deserialize(payload).context("could not deserialize compiler output")
+    postcard::from_bytes(payload).context("could not deserialize compiler output")
 }
