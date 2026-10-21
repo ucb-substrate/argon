@@ -1198,8 +1198,8 @@ mod tests {
         );
 
         assert_eq!(
-            bincode::serialize(&incremental).unwrap(),
-            bincode::serialize(&fresh).unwrap()
+            postcard::to_stdvec(&incremental).unwrap(),
+            postcard::to_stdvec(&fresh).unwrap()
         );
     }
 

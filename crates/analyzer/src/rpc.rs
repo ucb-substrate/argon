@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    io::{BufRead, BufReader, BufWriter},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -15,6 +16,7 @@ use argonc::{
     },
     parse::{self, AnnotatedParseAst, ParseMetadata, WorkspaceParseAst},
 };
+use bumpalo::Bump;
 
 use serde::{Deserialize, Serialize};
 use tarpc::context;
@@ -516,8 +518,8 @@ pub struct CompilationUpdate {
 /// A losslessly compressed compilation update for the analyzer-to-GUI RPC.
 ///
 /// Scope-heavy layouts contain millions of repeated names and source paths.
-/// Compressing the bincode stream directly avoids first allocating a second,
-/// equally large uncompressed byte buffer.
+/// Streaming postcard through zstd in both directions avoids allocating a
+/// second, equally large uncompressed byte buffer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompressedCompilationUpdate {
     bytes: Vec<u8>,
@@ -542,9 +544,12 @@ pub struct GuiUpdateResult {
 
 impl CompressedCompilationUpdate {
     pub fn encode(update: &CompilationUpdate) -> Result<Self, String> {
-        let mut encoder =
+        let encoder =
             zstd::stream::write::Encoder::new(Vec::new(), 1).map_err(|error| error.to_string())?;
-        bincode::serialize_into(&mut encoder, update).map_err(|error| error.to_string())?;
+        // postcard writes a few bytes at a time, which zstd handles slowly.
+        let writer =
+            postcard::to_io(update, BufWriter::new(encoder)).map_err(|error| error.to_string())?;
+        let encoder = writer.into_inner().map_err(|error| error.to_string())?;
         let bytes = encoder.finish().map_err(|error| error.to_string())?;
         Ok(Self { bytes })
     }
@@ -552,11 +557,62 @@ impl CompressedCompilationUpdate {
     pub fn decode(self) -> Result<CompilationUpdate, String> {
         let decoder = zstd::stream::read::Decoder::new(self.bytes.as_slice())
             .map_err(|error| error.to_string())?;
-        bincode::deserialize_from(decoder).map_err(|error| error.to_string())
+        let arena = Bump::new();
+        let mut deserializer = postcard::Deserializer::from_flavor(StreamFlavor {
+            reader: BufReader::new(decoder),
+            arena: &arena,
+            scratch: Vec::new(),
+        });
+        CompilationUpdate::deserialize(&mut deserializer).map_err(|error| error.to_string())
     }
 
     pub fn encoded_len(&self) -> usize {
         self.bytes.len()
+    }
+}
+
+/// Reads postcard data from a stream without holding all of it in memory.
+/// Borrowed strings and bytes are copied into `arena`.
+struct StreamFlavor<'de, R> {
+    reader: R,
+    arena: &'de Bump,
+    scratch: Vec<u8>,
+}
+
+impl<'de, R: BufRead + 'de> postcard::de_flavors::Flavor<'de> for StreamFlavor<'de, R> {
+    type Remainder = ();
+    type Source = ();
+
+    fn pop(&mut self) -> postcard::Result<u8> {
+        let byte = match self.reader.fill_buf() {
+            Ok([byte, ..]) => *byte,
+            _ => return Err(postcard::Error::DeserializeUnexpectedEnd),
+        };
+        self.reader.consume(1);
+        Ok(byte)
+    }
+
+    fn try_take_n(&mut self, ct: usize) -> postcard::Result<&'de [u8]> {
+        let bytes = self.arena.alloc_slice_fill_copy(ct, 0);
+        self.reader
+            .read_exact(bytes)
+            .map_err(|_| postcard::Error::DeserializeUnexpectedEnd)?;
+        Ok(bytes)
+    }
+
+    fn try_take_n_temp<'a>(&'a mut self, ct: usize) -> postcard::Result<&'a [u8]>
+    where
+        'de: 'a,
+    {
+        self.scratch.resize(ct, 0);
+        self.reader
+            .read_exact(&mut self.scratch)
+            .map_err(|_| postcard::Error::DeserializeUnexpectedEnd)?;
+        Ok(&self.scratch)
+    }
+
+    fn finalize(self) -> postcard::Result<()> {
+        Ok(())
     }
 }
 
@@ -2579,10 +2635,10 @@ cell top() { let a = inst(leaf(), x=0., y=0.); }
             output: compiler.compile_cell(&config, &["top".into()], vec![]),
         };
         let roundtrip = |update: CompilationUpdate| -> CompilationUpdate {
-            let raw_len = bincode::serialized_size(&update).unwrap();
+            let raw_len = postcard::to_stdvec(&update).unwrap().len();
             let compressed = CompressedCompilationUpdate::encode(&update).unwrap();
             assert!(compressed.encoded_len() > 0);
-            assert!((compressed.encoded_len() as u64) < raw_len);
+            assert!(compressed.encoded_len() < raw_len);
             compressed.decode().unwrap()
         };
         let received_base = roundtrip(CompilationUpdate::new(base.clone(), None))
