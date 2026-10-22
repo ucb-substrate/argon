@@ -4,9 +4,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use analyzer::rpc::{KeywordEdit, PlacementEdit};
 use argonc::compile::{NodeIdx, Placement};
 use geometry::transform::Rotation;
+use protocol::rpc::{KeywordEdit, PlacementEdit};
 
 use super::hit::Hit;
 use super::scene::{Overrides, Scene};

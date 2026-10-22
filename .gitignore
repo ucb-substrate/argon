@@ -101,3 +101,6 @@ build
 *.tsbuildinfo
 
 Argon_ICCAD_2026.pdf
+.vscode-test
+*.vsix
+plugins/vscode/media/gui

@@ -359,9 +359,15 @@ pub enum ExecErrorKind {
     /// A cell invocation evaluated to something other than a cell.
     #[error("cell invocation did not evaluate to a cell")]
     NotACell,
-    /// A cell does not have enough constraints for a unique solution.
-    #[error("cell is underconstrained")]
-    Underconstrained,
+    /// Nothing determines some of an object's values, or some of the cell's
+    /// when they belong to no known object.
+    #[error("{}", underconstrained_message(.object, .free))]
+    Underconstrained {
+        /// The object the free values belong to, if known.
+        object: Option<VarObject>,
+        /// The values nothing determines, in the order the object declares them.
+        free: Vec<VarRole>,
+    },
     /// A rectangle uses a layer absent from the technology file.
     #[error("rectangle uses layer `{layer}`, which is not defined in technology file `{tech}`")]
     IllegalLayer { layer: String, tech: String },
@@ -533,6 +539,87 @@ fn signal_cell_param(
         .map(|via| format!(", which holds a `{found}` at `{via}`"))
         .unwrap_or_default();
     format!("{subject}{location}; cells cannot take signals, schematic instances, or devices")
+}
+
+/// How many free values an underconstrained message names before summarizing.
+const NAMED_FREE_VALUES: usize = 4;
+
+/// The message of [`ExecErrorKind::Underconstrained`].
+fn underconstrained_message(object: &Option<VarObject>, free: &[VarRole]) -> String {
+    let Some(object) = object else {
+        return "cell is underconstrained".to_owned();
+    };
+    if free.is_empty() || *object == VarObject::Float {
+        return format!("{object} is underconstrained");
+    }
+    let mut names = free
+        .iter()
+        .take(NAMED_FREE_VALUES)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if free.len() > NAMED_FREE_VALUES {
+        names.push(format!("{} more", free.len() - NAMED_FREE_VALUES));
+    }
+    let list = match names.as_slice() {
+        [one] => one.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+        [] => unreachable!("`free` is not empty"),
+    };
+    let verb = if free.len() == 1 { "is" } else { "are" };
+    format!("{object} is underconstrained: {list} {verb} not determined")
+}
+
+/// A kind of object whose values the compiler solves for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VarObject {
+    Rect,
+    Polygon,
+    Path,
+    Instance,
+    /// A value made by `float()`.
+    Float,
+}
+
+impl std::fmt::Display for VarObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Rect => "rectangle",
+            Self::Polygon => "polygon",
+            Self::Path => "path",
+            Self::Instance => "instance",
+            Self::Float => "value",
+        })
+    }
+}
+
+/// One value of a [`VarObject`], displayed as the keyword argument that sets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VarRole {
+    /// `x`, or `x{i}` for a rectangle corner or a point.
+    X(Option<usize>),
+    /// `y`, or `y{i}` for a rectangle corner or a point.
+    Y(Option<usize>),
+    Width,
+    BeginExtension,
+    EndExtension,
+    /// The whole of a `float()` value.
+    Value,
+}
+
+impl std::fmt::Display for VarRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::X(None) => f.write_str("x"),
+            Self::X(Some(index)) => write!(f, "x{index}"),
+            Self::Y(None) => f.write_str("y"),
+            Self::Y(Some(index)) => write!(f, "y{index}"),
+            Self::Width => f.write_str("width"),
+            Self::BeginExtension => f.write_str("begin_extension"),
+            Self::EndExtension => f.write_str("end_extension"),
+            Self::Value => f.write_str("value"),
+        }
+    }
 }
 
 impl ExecErrorKind {

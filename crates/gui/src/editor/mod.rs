@@ -1,20 +1,20 @@
 use std::{
     hash::{DefaultHasher, Hash, Hasher},
-    net::SocketAddr,
     path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 
-use analyzer::rpc::{
-    CellEntry, CompilationSnapshot, DevicePreview, InstancePreview, LangServerAction, RecentCell,
-    SchematicInstancePreview,
-};
 use argonc::compile::{CellId, CompileOutput, CompiledData, ExecErrorCompileOutput, Rect, ScopeId};
 use canvas::{LayoutCanvas, ShapeFill, StipplePattern};
 use futures::StreamExt;
 use gpui::{prelude::FluentBuilder, *};
 use indexmap::{IndexMap, IndexSet};
+use ls_types::MessageType;
+use protocol::rpc::{
+    CellEntry, CompilationSnapshot, DevicePreview, EditorCommand, InstancePreview,
+    LangServerAction, RecentCell, SchematicInstancePreview,
+};
 use rgb::Rgb;
 use schematic::{
     SchematicCanvas,
@@ -22,7 +22,6 @@ use schematic::{
 };
 use start_screen::START_SCREEN_CONTEXT;
 use toolbars::{HierarchySideBar, LayerSideBar, TitleBar, ToolBar};
-use tower_lsp_server::ls_types::MessageType;
 
 use crate::{
     actions::{
@@ -31,7 +30,6 @@ use crate::{
         ShowDiagnostics, ShowMessages, Undo, ViewLayout, ViewSchematic, ViewSymbol,
     },
     editor::{canvas::ToolState, input::TextInput},
-    main_window::MainWindow,
     rpc::SyncLangServerClient,
     theme::{DARK_THEME, LIGHT_THEME, Theme},
 };
@@ -148,17 +146,21 @@ fn scope_at_name_path(
     Some(address)
 }
 
-/// Where focus goes when the GUI hands off to Neovim.
+/// Where focus goes when the GUI hands off to the editor.
 #[derive(Clone, Default)]
 pub(crate) enum Invoker {
     /// The application that launched the GUI.
     #[default]
     App,
     /// The Neovim pane in this window.
+    #[cfg(not(target_family = "wasm"))]
     Pane {
         window: AnyWindowHandle,
-        main: WeakEntity<MainWindow>,
+        main: WeakEntity<crate::main_window::MainWindow>,
     },
+    /// The page hosting this browser GUI, which holds the editor.
+    #[cfg(target_family = "wasm")]
+    Host { window: AnyWindowHandle },
 }
 
 /// The tasks that serve an [`Editor`]. Dropping them disconnects it from the
@@ -772,16 +774,14 @@ pub(crate) fn prepare_compilation_snapshot(
 }
 
 impl Editor {
-    /// Connects to the analyzer at `lang_server_addr` and builds the views.
+    /// Connects to the analyzer at `endpoint` and builds the views.
     pub(crate) fn new(
         cx: &mut App,
         window: &mut Window,
-        lang_server_addr: SocketAddr,
-        token: analyzer::transport::SessionToken,
+        endpoint: crate::rpc::Endpoint,
         invoker: Invoker,
     ) -> anyhow::Result<(Self, EditorTasks)> {
-        let (lang_server_client, mut rx) =
-            SyncLangServerClient::new(cx.to_async(), lang_server_addr, token)?;
+        let (lang_server_client, mut rx) = SyncLangServerClient::new(cx.to_async(), endpoint);
         let solved_cell = cx.new(|_cx| None);
         let preview_cell = cx.new(|_cx| None);
         let tool = cx.new(|_cx| ToolState::default());
@@ -839,7 +839,7 @@ impl Editor {
         let canvas_focus_handle = cx.focus_handle();
         let text_input_focus_handle = cx.focus_handle();
         if matches!(invoker, Invoker::App) {
-            window.focus(&canvas_focus_handle);
+            window.focus(&canvas_focus_handle, cx);
         }
         let text_input = cx.new(|cx| {
             TextInput::new_dimension_input(
@@ -1057,7 +1057,7 @@ impl Editor {
     }
 
     /// The focus handle of the active view's canvas.
-    fn active_focus_handle(&self, cx: &App) -> FocusHandle {
+    pub(crate) fn active_focus_handle(&self, cx: &App) -> FocusHandle {
         match self.state.read(cx).view {
             View::Layout => self.canvas.focus_handle(cx),
             View::Schematic | View::Symbol => self.schematic_canvas.focus_handle(cx),
@@ -1065,8 +1065,9 @@ impl Editor {
     }
 
     /// Focuses the active view's canvas.
-    pub(crate) fn focus_canvas(&self, window: &mut Window, cx: &App) {
-        window.focus(&self.active_focus_handle(cx));
+    pub(crate) fn focus_canvas(&self, window: &mut Window, cx: &mut App) {
+        let focus = self.active_focus_handle(cx);
+        window.focus(&focus, cx);
     }
 
     /// Brings the editor forward: its canvas when Neovim is in the same
@@ -1074,7 +1075,13 @@ impl Editor {
     pub(crate) fn activate(&self, cx: &mut App) {
         match self.state.read(cx).invoker.clone() {
             Invoker::App => crate::focus::activate_gui(cx),
+            #[cfg(not(target_family = "wasm"))]
             Invoker::Pane { window, .. } => {
+                let _ = window.update(cx, |_, window, cx| self.focus_canvas(window, cx));
+            }
+            #[cfg(target_family = "wasm")]
+            Invoker::Host { window } => {
+                crate::web::host::reveal();
                 let _ = window.update(cx, |_, window, cx| self.focus_canvas(window, cx));
             }
         }
@@ -1086,7 +1093,7 @@ impl Editor {
             cx.notify();
         });
         let focus = self.active_focus_handle(cx);
-        window.focus(&focus);
+        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -1201,8 +1208,8 @@ impl Editor {
         &self,
         cx: &mut App,
         generation: u64,
-        result: anyhow::Result<Option<Vec<analyzer::rpc::ValueEdit>>>,
-        initial_conditions: Vec<analyzer::rpc::InitialConditionEdit>,
+        result: anyhow::Result<Option<Vec<protocol::rpc::ValueEdit>>>,
+        initial_conditions: Vec<protocol::rpc::InitialConditionEdit>,
     ) {
         self.canvas.update(cx, |canvas, cx| {
             canvas.complete_sse_source_edit(generation, result, &initial_conditions, cx)
@@ -1240,7 +1247,7 @@ impl Editor {
             cx.background_executor()
                 .timer(AGENT_HIGHLIGHT_DURATION)
                 .await;
-            let _ = state.update(cx, |state, cx| {
+            state.update(cx, |state, cx| {
                 if state
                     .agent_highlight
                     .as_ref()
@@ -1250,7 +1257,7 @@ impl Editor {
                     cx.notify();
                 }
             });
-            let _ = canvas.update(cx, |_, cx| cx.notify());
+            canvas.update(cx, |_, cx| cx.notify());
         })
         .detach();
     }
@@ -1369,24 +1376,21 @@ impl Editor {
     }
 
     fn on_undo(&mut self, _: &Undo, _window: &mut Window, cx: &mut Context<Self>) {
-        let _ = self
-            .state
+        self.state
             .read(cx)
             .lang_server_client
             .dispatch_action(LangServerAction::Undo);
     }
 
     pub(crate) fn on_save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
-        let _ = self
-            .state
+        self.state
             .read(cx)
             .lang_server_client
             .dispatch_action(LangServerAction::Save);
     }
 
     fn on_redo(&mut self, _: &Redo, _window: &mut Window, cx: &mut Context<Self>) {
-        let _ = self
-            .state
+        self.state
             .read(cx)
             .lang_server_client
             .dispatch_action(LangServerAction::Redo);
@@ -1416,7 +1420,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(Some("messages<CR>"), false, cx);
+        self.open_invoking_command(Some(EditorCommand::Messages), false, cx);
     }
 
     pub(crate) fn show_diagnostics(
@@ -1425,7 +1429,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(Some("Argon diagnostics<CR>"), false, cx);
+        self.open_invoking_command(Some(EditorCommand::run("diagnostics")), false, cx);
     }
 
     fn instantiate_command(
@@ -1435,14 +1439,14 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let command = match self.state.read(cx).view {
-            View::Layout => "Argon inst ",
-            View::Schematic | View::Symbol => "Argon sinst ",
+            View::Layout => "inst",
+            View::Schematic | View::Symbol => "sinst",
         };
-        self.open_invoking_command(Some(command), true, cx);
+        self.open_invoking_command(Some(EditorCommand::prefill(command, "")), true, cx);
     }
 
     fn device_command(&mut self, _: &DeviceCommand, _window: &mut Window, cx: &mut Context<Self>) {
-        self.open_invoking_command(Some("Argon device Nmos "), true, cx);
+        self.open_invoking_command(Some(EditorCommand::prefill("device", "Nmos ")), true, cx);
     }
 
     /// Writes the netlist of the cell on screen where the user says; a
@@ -1503,7 +1507,7 @@ impl Editor {
                     format!("Could not write {}: {error}", path.display()),
                 ),
             };
-            let _ = state.update(cx, |state, cx| {
+            state.update(cx, |state, cx| {
                 state.show_message(message.0, message.1);
                 cx.notify();
             });
@@ -1517,7 +1521,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(Some("Argon openCell "), true, cx);
+        self.open_invoking_command(Some(EditorCommand::prefill("openCell", "")), true, cx);
     }
 
     pub(crate) fn new_cell_command(
@@ -1526,7 +1530,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(Some("Argon newCell "), true, cx);
+        self.open_invoking_command(Some(EditorCommand::prefill("newCell", "")), true, cx);
     }
 
     pub(crate) fn rename_cell_command(
@@ -1535,16 +1539,16 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_invoking_command(Some("Argon renameCell "), true, cx);
+        self.open_invoking_command(Some(EditorCommand::prefill("renameCell", "")), true, cx);
     }
 
     fn open_invoking_command(
         &mut self,
-        command: Option<&str>,
+        command: Option<EditorCommand>,
         return_to_gui: bool,
         cx: &mut Context<Self>,
     ) {
-        open_command(&self.state, command.map(str::to_owned), return_to_gui, cx);
+        open_command(&self.state, command, return_to_gui, cx);
     }
 }
 
@@ -1552,7 +1556,7 @@ impl Editor {
 /// to the GUI afterward when `return_to_gui`.
 pub(crate) fn open_command(
     state: &Entity<EditorState>,
-    command: Option<String>,
+    command: Option<EditorCommand>,
     return_to_gui: bool,
     cx: &mut App,
 ) {
@@ -1561,7 +1565,7 @@ pub(crate) fn open_command(
     if return_to_gui {
         focus_invoker(state, cx);
     }
-    let _ = state
+    state
         .read(cx)
         .lang_server_client
         .open_command_bar(command, return_to_gui);
@@ -1573,6 +1577,12 @@ pub(crate) fn open_command(
 }
 
 fn focus_invoker(state: &Entity<EditorState>, cx: &mut App) {
+    #[cfg(target_family = "wasm")]
+    if let Invoker::Host { .. } = state.read(cx).invoker {
+        crate::web::host::focus_editor();
+        return;
+    }
+    #[cfg(not(target_family = "wasm"))]
     if let Invoker::Pane { window, main } = state.read(cx).invoker.clone() {
         // Deferred so that this also works while `window` is being updated.
         cx.defer(move |cx| {
@@ -1707,12 +1717,16 @@ impl Render for Editor {
                         .on_click(cx.listener(move |editor, _, _, cx| {
                             if details == MessageDetails::Diagnostics {
                                 editor.open_invoking_command(
-                                    Some("Argon diagnostics<CR>"),
+                                    Some(EditorCommand::run("diagnostics")),
                                     false,
                                     cx,
                                 );
                             } else {
-                                editor.open_invoking_command(Some("messages<CR>"), false, cx);
+                                editor.open_invoking_command(
+                                    Some(EditorCommand::Messages),
+                                    false,
+                                    cx,
+                                );
                             }
                         })),
                 );
@@ -1733,7 +1747,7 @@ impl Render for Editor {
             status_bar = status_bar.child(
                 div()
                     .id("agent_activity")
-                    .flex_shrink()
+                    .flex_shrink(1.)
                     .min_w_0()
                     .overflow_x_hidden()
                     .text_ellipsis()
@@ -1847,7 +1861,7 @@ impl Render for Editor {
             .on_action(cx.listener(Self::open_cell_command))
             .on_action(cx.listener(Self::new_cell_command))
             .on_action(cx.listener(Self::rename_cell_command))
-            .font_family("Zed Plex Sans")
+            .font_family(crate::assets::SANS_FAMILY)
             .size_full()
             .flex()
             .flex_col()

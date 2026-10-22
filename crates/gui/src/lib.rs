@@ -1,6 +1,4 @@
-use std::{borrow::Cow, collections::BTreeSet, net::SocketAddr};
-
-use analyzer::transport::SessionToken;
+use std::{borrow::Cow, collections::BTreeSet};
 
 use editor::start_screen::START_SCREEN_CONTEXT;
 use gpui::*;
@@ -8,24 +6,26 @@ use rust_embed::RustEmbed;
 use tracing::info;
 
 use crate::actions::*;
-use crate::assets::{
-    ZED_PLEX_MONO, ZED_PLEX_MONO_BOLD, ZED_PLEX_MONO_BOLD_ITALIC, ZED_PLEX_MONO_ITALIC,
-    ZED_PLEX_SANS,
-};
+use crate::assets::FONTS;
+#[cfg(not(target_family = "wasm"))]
 use crate::main_window::MainWindow;
-use crate::nvim::NVIM_CONTEXT;
 
+#[cfg(not(target_family = "wasm"))]
 pub mod cli;
 
 pub mod actions;
 pub mod assets;
 pub mod editor;
 pub mod focus;
+#[cfg(not(target_family = "wasm"))]
 mod main_window;
+#[cfg(not(target_family = "wasm"))]
 mod nvim;
 pub mod rpc;
 pub mod sse;
 pub mod theme;
+#[cfg(target_family = "wasm")]
+pub mod web;
 
 #[derive(RustEmbed)]
 #[folder = "assets/"]
@@ -56,18 +56,7 @@ impl AssetSource for Assets {
 /// window holds a Neovim pane.
 fn init_app(cx: &mut App, embedded: bool) {
     cx.text_system()
-        .add_fonts(
-            [
-                ZED_PLEX_MONO,
-                ZED_PLEX_MONO_BOLD,
-                ZED_PLEX_MONO_ITALIC,
-                ZED_PLEX_MONO_BOLD_ITALIC,
-                ZED_PLEX_SANS,
-            ]
-            .into_iter()
-            .map(Cow::Borrowed)
-            .collect(),
-        )
+        .add_fonts(FONTS.into_iter().map(Cow::Borrowed).collect())
         .unwrap();
     // Bind keys must happen before menus to get the keybindings to show up next to menu items.
     cx.bind_keys(key_bindings(embedded));
@@ -101,10 +90,12 @@ fn init_app(cx: &mut App, embedded: bool) {
     cx.set_menus(vec![
         Menu {
             name: "Argon".into(),
+            disabled: false,
             items: vec![MenuItem::action("Quit", Quit)],
         },
         Menu {
             name: "File".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("New Cell…", NewCellCommand),
                 MenuItem::action("Open Cell…", OpenCellCommand),
@@ -116,6 +107,7 @@ fn init_app(cx: &mut App, embedded: bool) {
         },
         Menu {
             name: "Edit".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("Undo", Undo),
                 MenuItem::action("Redo", Redo),
@@ -127,6 +119,7 @@ fn init_app(cx: &mut App, embedded: bool) {
         },
         Menu {
             name: "Tools".into(),
+            disabled: false,
             items: vec![
                 MenuItem::action("Rect", DrawRect),
                 MenuItem::action("Polygon", DrawPolygon),
@@ -150,18 +143,20 @@ fn init_app(cx: &mut App, embedded: bool) {
         },
         Menu {
             name: "View".into(),
+            disabled: false,
             items: view_items,
         },
     ]);
 }
 
 /// Runs the GUI on its own, connected to the analyzer at `lang_server_addr`.
-pub fn run_gui(lang_server_addr: SocketAddr, token: SessionToken) {
+#[cfg(not(target_family = "wasm"))]
+pub fn run_gui(lang_server_addr: std::net::SocketAddr, token: analyzer::transport::SessionToken) {
     focus::initialize_target();
 
     analyzer::init_logging();
 
-    Application::new()
+    gpui_platform::application()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             init_app(cx, false);
@@ -176,6 +171,20 @@ pub fn run_gui(lang_server_addr: SocketAddr, token: SessionToken) {
         });
 }
 
+/// Runs the GUI in a browser page, in a window whose root `root` builds.
+#[cfg(target_family = "wasm")]
+pub(crate) fn run_web<V: Render + 'static>(
+    root: impl FnOnce(&mut Window, &mut App) -> Entity<V> + 'static,
+) {
+    gpui_platform::single_threaded_web()
+        .with_assets(Assets)
+        .run(move |cx: &mut App| {
+            init_app(cx, false);
+            cx.open_window(web::window_options(cx), root).unwrap();
+            cx.activate(true);
+        });
+}
+
 /// Runs the GUI with the Neovim that `client` talks to in a pane, connecting
 /// to each analyzer that `announcements` reports.
 #[cfg(unix)]
@@ -186,7 +195,7 @@ pub(crate) fn run_embedded(
 ) {
     analyzer::init_logging();
 
-    Application::new()
+    gpui_platform::application()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             init_app(cx, true);
@@ -312,10 +321,12 @@ fn key_bindings(embedded: bool) -> Vec<KeyBinding> {
         KeyBinding::new("end", End, Some("TextInput")),
         KeyBinding::new("enter", Enter, Some("TextInput")),
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some("TextInput")),
-        KeyBinding::new("cmd-v", Paste, Some(NVIM_CONTEXT)),
+        #[cfg(not(target_family = "wasm"))]
+        KeyBinding::new("cmd-v", Paste, Some(nvim::NVIM_CONTEXT)),
     ]
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn editor_window_options() -> WindowOptions {
     WindowOptions {
         titlebar: Some(TitlebarOptions {
@@ -338,7 +349,8 @@ fn quit(_: &Quit, cx: &mut App) {
 mod tests {
     use gpui::{Context, FocusHandle, Render, TestAppContext, Window, div, prelude::*};
 
-    use super::{NVIM_CONTEXT, START_SCREEN_CONTEXT, actions::*, key_bindings};
+    use super::{START_SCREEN_CONTEXT, actions::*, key_bindings};
+    use crate::nvim::NVIM_CONTEXT;
 
     struct ShortcutTestView {
         canvas_focus: FocusHandle,
@@ -525,7 +537,7 @@ mod tests {
         });
 
         window
-            .update(cx, |view, window, _| window.focus(&view.start_focus))
+            .update(cx, |view, window, cx| window.focus(&view.start_focus, cx))
             .unwrap();
         cx.simulate_keystrokes(*window, "o cmd-n r v f");
         window
@@ -550,7 +562,7 @@ mod tests {
 
         // The layout canvas: `e` and `shift-e` are not bound there.
         window
-            .update(cx, |view, window, _| window.focus(&view.canvas_focus))
+            .update(cx, |view, window, cx| window.focus(&view.canvas_focus, cx))
             .unwrap();
         cx.simulate_keystrokes(*window, keys);
         window
@@ -569,7 +581,9 @@ mod tests {
 
         // The schematic canvas: descend and return, but no layout tools.
         window
-            .update(cx, |view, window, _| window.focus(&view.schematic_focus))
+            .update(cx, |view, window, cx| {
+                window.focus(&view.schematic_focus, cx)
+            })
             .unwrap();
         cx.simulate_keystrokes(*window, keys);
         window
@@ -590,7 +604,7 @@ mod tests {
         // The symbol canvas: the common keys, plus its own drawing letters.
         // `p` and `r` are the polygon and rectangle there, and `x` turns.
         window
-            .update(cx, |view, window, _| window.focus(&view.symbol_focus))
+            .update(cx, |view, window, cx| window.focus(&view.symbol_focus, cx))
             .unwrap();
         cx.simulate_keystrokes(*window, keys);
         window
@@ -613,7 +627,7 @@ mod tests {
 
         // A text field keeps the letters, but the global shortcuts work.
         window
-            .update(cx, |view, window, _| window.focus(&view.input_focus))
+            .update(cx, |view, window, cx| window.focus(&view.input_focus, cx))
             .unwrap();
         cx.simulate_keystrokes(*window, keys);
         window
@@ -634,7 +648,7 @@ mod tests {
         });
 
         window
-            .update(cx, |view, window, _| window.focus(&view.input_focus))
+            .update(cx, |view, window, cx| window.focus(&view.input_focus, cx))
             .unwrap();
         cx.simulate_keystrokes(*window, "backspace");
         window
@@ -642,7 +656,7 @@ mod tests {
             .unwrap();
 
         window
-            .update(cx, |view, window, _| window.focus(&view.canvas_focus))
+            .update(cx, |view, window, cx| window.focus(&view.canvas_focus, cx))
             .unwrap();
         cx.simulate_keystrokes(*window, "backspace");
         window
@@ -659,7 +673,7 @@ mod tests {
         });
 
         window
-            .update(cx, |view, window, _| window.focus(&view.input_focus))
+            .update(cx, |view, window, cx| window.focus(&view.input_focus, cx))
             .unwrap();
         cx.simulate_keystrokes(
             *window,
@@ -689,7 +703,7 @@ mod tests {
             .unwrap();
 
         window
-            .update(cx, |view, window, _| window.focus(&view.canvas_focus))
+            .update(cx, |view, window, cx| window.focus(&view.canvas_focus, cx))
             .unwrap();
         cx.simulate_keystrokes(
             *window,
@@ -728,7 +742,7 @@ mod tests {
         });
 
         window
-            .update(cx, |view, window, _| window.focus(&view.nvim_focus))
+            .update(cx, |view, window, cx| window.focus(&view.nvim_focus, cx))
             .unwrap();
         cx.simulate_keystrokes(*window, "u r p i o 0 1 * v f left : cmd-s ctrl-shift-d");
         window
@@ -767,7 +781,7 @@ mod tests {
                 |view: &ShortcutTestView| view.nvim_focus.clone(),
             ] {
                 window
-                    .update(cx, |view, window, _| window.focus(&focus(view)))
+                    .update(cx, |view, window, cx| window.focus(&focus(view), cx))
                     .unwrap();
                 cx.simulate_keystrokes(*window, other_key);
                 cx.simulate_keystrokes(*window, focus_key);

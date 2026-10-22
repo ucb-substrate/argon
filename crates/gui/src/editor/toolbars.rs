@@ -1,12 +1,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use analyzer::rpc::LangServerAction;
 use argonc::compile::{CellId, CompiledData, SolvedValue};
 use gpui::prelude::*;
 use gpui::*;
 use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
+use protocol::rpc::LangServerAction;
 
 use crate::{
     actions::{
@@ -150,7 +150,7 @@ fn scrollbar_thumb_bounds(
     axis: SidebarScrollAxis,
 ) -> Option<Bounds<Pixels>> {
     let viewport_length = axis_size(scroll_handle.bounds().size, axis);
-    let max_offset = axis_size(scroll_handle.max_offset(), axis);
+    let max_offset = axis_position(scroll_handle.max_offset(), axis);
     let current_offset = axis_position(scroll_handle.offset(), axis);
     let track_length = axis_size(track_bounds.size, axis);
     let (thumb_offset, thumb_length) =
@@ -190,7 +190,7 @@ fn scroll_to_scrollbar_position(
         - axis_position(track_bounds.origin, axis)
         - grab_offset)
         .clamp(px(0.), thumb_travel);
-    let max_offset = axis_size(scroll_handle.max_offset(), axis);
+    let max_offset = axis_position(scroll_handle.max_offset(), axis);
     let new_axis_offset = -max_offset * (thumb_start / thumb_travel);
     let mut new_offset = scroll_handle.offset();
     match axis {
@@ -406,6 +406,7 @@ fn title_bar_frame(theme: &Theme) -> Div {
 }
 
 /// The title bar of a window that has no editor yet.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn placeholder_title_bar(theme: &Theme) -> Div {
     title_bar_frame(theme).child(workspace_title_contents(None, false))
 }
@@ -550,7 +551,7 @@ impl Render for ToolTip {
         // Tooltips are painted as their own root element, so the editor's text styles
         // do not cascade into them.
         let mut tooltip = div()
-            .font_family("Zed Plex Sans")
+            .font_family(crate::assets::SANS_FAMILY)
             .text_color(theme.text)
             .ml_2()
             .mt_2()
@@ -633,7 +634,7 @@ impl Render for ToolBar {
                         action: Box::new(Undo),
                         highlighted: Box::new(|_, _, _| false),
                         on_click: Arc::new(|state, cx| {
-                            let _ = state
+                            state
                                 .read(cx)
                                 .lang_server_client
                                 .dispatch_action(LangServerAction::Undo);
@@ -646,7 +647,7 @@ impl Render for ToolBar {
                         action: Box::new(Redo),
                         highlighted: Box::new(|_, _, _| false),
                         on_click: Arc::new(|state, cx| {
-                            let _ = state
+                            state
                                 .read(cx)
                                 .lang_server_client
                                 .dispatch_action(LangServerAction::Redo);
@@ -1243,7 +1244,7 @@ impl Render for LayerSideBar {
                                 .child(
                                     div()
                                         .id(SharedString::from(format!("layer_select_{}", layer.z)))
-                                        .flex_grow()
+                                        .flex_grow(1.)
                                         .flex_shrink_0()
                                         .child(layer.name.clone())
                                         .on_click({
@@ -1294,7 +1295,7 @@ impl Render for LayerSideBar {
         )
         .with_width_from_item(widest_row)
         .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-        .track_scroll(self.list_scroll_handle.clone())
+        .track_scroll(&self.list_scroll_handle)
         .size_full()
         .min_h_0()
         .min_w_0();
@@ -1610,7 +1611,7 @@ impl HierarchySideBar {
         let is_cell = solved_cell.output.cells[&scope.cell].root == scope.scope;
         let mut scope_name = div()
             .id(SharedString::from(format!("scope_select_{scope:?}")))
-            .flex_grow()
+            .flex_grow(1.)
             .flex_shrink_0()
             .child(format!(
                 "{}{}",
@@ -1817,7 +1818,7 @@ impl HierarchySideBar {
         )
         .with_width_from_item(widest_row)
         .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-        .track_scroll(self.list_scroll_handle.clone())
+        .track_scroll(&self.list_scroll_handle)
         .size_full()
         .min_h_0()
         .min_w_0();
@@ -1945,6 +1946,7 @@ impl HierarchySideBar {
                     window.paint_layer(bounds, |window| {
                         window
                             .paint_image(
+                                snapshot.image_bounds,
                                 snapshot.image_bounds,
                                 Corners::all(px(0.)),
                                 snapshot.image.clone(),

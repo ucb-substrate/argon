@@ -12,15 +12,22 @@ workspace = true
 name = "argone"
 
 [dependencies]
-analyzer = { package = "argon-analyzer", path = "../analyzer" }
+protocol = { package = "argon-protocol", path = "../protocol" }
+ls-types = "0.0.6"
+web-time = "1"
+postcard = { workspace = true }
 argonc = { path = "../compiler" }
 gpui = { git = "https://github.com/ucb-substrate/zed", branch = "argon-dev" }
+gpui_platform = { git = "https://github.com/ucb-substrate/zed", branch = "argon-dev", default-features = false, features = [
+    "font-kit",
+    "wayland",
+    "x11",
+] }
 anyhow = { workspace = true }
 smallvec = "1"
 rust-embed = "8"
 lazy_static = "1"
 itertools = { workspace = true }
-clap = { workspace = true }
 arcstr = { workspace = true }
 cfgrammar = { workspace = true }
 enumify = { workspace = true }
@@ -28,19 +35,27 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
 tarpc = { workspace = true }
-async-compat = "0.2"
 futures = { workspace = true }
-tokio = { version = "1", features = ["net"] }
 geometry = { version = "0.7.1", registry = "substrate" }
 indexmap = { workspace = true }
 imbl = "7.0.1"
 image = { version = "0.25", default-features = false }
 rgb = { version = "0.8", features = ["serde"] }
 unicode-segmentation = "1"
-rmpv = "1"
-tower-lsp-server = { workspace = true }
 tracing = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+analyzer = { package = "argon-analyzer", path = "../analyzer" }
+async-compat = "0.2"
+clap = { workspace = true }
+rmpv = "1"
 tempfile = { workspace = true }
+tokio = { version = "1", features = ["net"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.3", default-features = false, features = [

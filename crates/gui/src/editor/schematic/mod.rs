@@ -21,13 +21,6 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use analyzer::rpc::{
-    AddSignalRequest, AddSymbolItemsRequest, BlockingReference, CallArgument, CallArguments,
-    ClipboardItem, CreateSymbolRequest, DeleteOutcome, DeleteRequest, DevicePreview, EditReceipt,
-    ElementPlacement, NewSymbolItem, PasteRequest, PlaceDeviceRequest, PlaceRequest,
-    PlaceSchematicInstanceRequest, RenameRequest, SchematicInstancePreview, SchematicTarget,
-    SetArgumentRequest,
-};
 use argonc::ast::Span;
 use argonc::compile::{
     Align, CompiledData, Element, NetIdx, Placement, SymbolItemKind, SymbolText, device_symbol,
@@ -35,9 +28,16 @@ use argonc::compile::{
 use gpui::{
     App, Bounds, Context, DefiniteLength, Entity, EventEmitter, FocusHandle, Focusable,
     IntoElement, Length, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    Render, ScrollWheelEvent, Size, Style, Subscription, Task, Window, div, prelude::*, px,
+    Render, ScrollEvent, Size, Style, Subscription, Task, Window, div, prelude::*, px,
 };
-use tower_lsp_server::ls_types::MessageType;
+use ls_types::MessageType;
+use protocol::rpc::{
+    AddSignalRequest, AddSymbolItemsRequest, BlockingReference, CallArgument, CallArguments,
+    ClipboardItem, CreateSymbolRequest, DeleteOutcome, DeleteRequest, DevicePreview, EditReceipt,
+    ElementPlacement, NewSymbolItem, PasteRequest, PlaceDeviceRequest, PlaceRequest,
+    PlaceSchematicInstanceRequest, RenameRequest, SchematicInstancePreview, SchematicTarget,
+    SetArgumentRequest,
+};
 
 use self::entry::{EndError, WireDraft, WireRequest};
 use self::hit::{Hit, hits_at};
@@ -666,7 +666,7 @@ impl SchematicCanvas {
 
     /// Reveals `span` in the editor.
     pub(crate) fn reveal(&self, span: Span, cx: &App) {
-        let _ = self.state.read(cx).lang_server_client.select_span(span);
+        self.state.read(cx).lang_server_client.select_span(span);
     }
 
     fn show_message(
@@ -687,7 +687,7 @@ impl SchematicCanvas {
             input.show("", placeholder, cx);
             input.focus_handle.clone()
         });
-        window.focus(&focus);
+        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -699,7 +699,7 @@ impl SchematicCanvas {
         }
         self.name_input
             .update(cx, |input, cx| input.show("", "Name…", cx));
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         if let SymbolTool::Text { text: None } = self.symbol_tool
             && self.in_symbol_view
         {
@@ -733,7 +733,7 @@ impl SchematicCanvas {
     }
 
     fn name_dismissed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         if self.label_prompt.take().is_some() {
             cx.notify();
             return;
@@ -2291,8 +2291,7 @@ impl SchematicCanvas {
             })
             .unwrap_or_default();
         if let Some(span) = self.selection_spans.first() {
-            let _ = self
-                .state
+            self.state
                 .read(cx)
                 .lang_server_client
                 .select_span(span.clone());
@@ -2327,7 +2326,7 @@ impl SchematicCanvas {
             None => selection,
         };
         if let Some(span) = self.primary_span(cx) {
-            let _ = self.state.read(cx).lang_server_client.select_span(span);
+            self.state.read(cx).lang_server_client.select_span(span);
         }
         self.blocked_delete.clear();
         self.fetch_call_arguments(cx);
@@ -2890,7 +2889,7 @@ impl SchematicCanvas {
         }
         cx.emit(CanvasEvent::EditProperties);
         if let Some(focus) = &self.properties_focus {
-            window.focus(focus);
+            window.focus(focus, cx);
         }
     }
 
@@ -3405,7 +3404,7 @@ impl SchematicCanvas {
 
     fn on_scroll_wheel(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3441,7 +3440,7 @@ impl Render for SchematicCanvas {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_left_mouse_up))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_middle_mouse_up))
             .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_middle_mouse_up))
-            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .on_scroll(cx.listener(Self::on_scroll_wheel))
             .on_action(cx.listener(Self::fit_action))
             .on_action(cx.listener(Self::pan_left))
             .on_action(cx.listener(Self::pan_right))

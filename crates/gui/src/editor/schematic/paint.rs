@@ -3,7 +3,7 @@
 use argonc::compile::Align;
 use gpui::{
     App, Bounds, ContentMask, Corners, Element, Font, Hsla, IntoElement, PaintQuad, Pixels, Point,
-    Rgba, SharedString, TextRun, Window, fill, point, px, rgba,
+    Rgba, SharedString, TextAlign, TextRun, Window, fill, point, px, rgba,
 };
 use gpui::{Half, PathBuilder, Size};
 
@@ -342,7 +342,7 @@ pub fn paint_text(
             Align::Right => anchor.x - shaped.width,
         };
         let origin = point(x, anchor.y - line_height.half());
-        let _ = shaped.paint(origin, line_height, window, cx);
+        let _ = shaped.paint(origin, line_height, TextAlign::Left, None, window, cx);
         return;
     }
     // Stack the characters upward.
@@ -365,7 +365,7 @@ pub fn paint_text(
             anchor.x - shaped.width.half(),
             bottom - line_height * (index as f32 + 1.),
         );
-        let _ = shaped.paint(origin, line_height, window, cx);
+        let _ = shaped.paint(origin, line_height, TextAlign::Left, None, window, cx);
     }
 }
 

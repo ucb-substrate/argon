@@ -12,7 +12,7 @@ use futures::{StreamExt, channel::mpsc::UnboundedReceiver};
 use gpui::{
     App, Bounds, Context, EventEmitter, FocusHandle, Focusable, KeyDownEvent, Modifiers,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta,
-    ScrollWheelEvent, Size, Subscription, Task, UTF16Selection, Window, div, point, prelude::*,
+    ScrollEvent, Size, Subscription, Task, UTF16Selection, Window, div, point, prelude::*,
 };
 
 use crate::actions::Paste;
@@ -245,8 +245,8 @@ impl NvimPane {
         (self.ui.height() > 0).then(|| layout.cell_at(position, self.ui.height(), self.ui.width()))
     }
 
-    fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window) {
-        window.focus(&self.focus_handle);
+    fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut App) {
+        window.focus(&self.focus_handle, cx);
         if !self.ui.mouse_enabled {
             return;
         }
@@ -308,7 +308,7 @@ impl NvimPane {
         );
     }
 
-    fn scroll_wheel(&mut self, event: &ScrollWheelEvent) {
+    fn scroll_wheel(&mut self, event: &ScrollEvent) {
         let (Some(layout), Some(cell)) = (self.layout, self.cell_at(event.position)) else {
             return;
         };
@@ -489,9 +489,9 @@ mod tests {
         assert_eq!(attach[1].1[..2], [Value::from(100), Value::from(10)]);
 
         window
-            .update(cx, |pane, window, _| {
+            .update(cx, |pane, window, cx| {
                 window.activate_window();
-                window.focus(&pane.focus_handle);
+                window.focus(&pane.focus_handle, cx);
             })
             .unwrap();
         cx.run_until_parked();

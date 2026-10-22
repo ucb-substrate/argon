@@ -1,6 +1,6 @@
 //! The service agents use to read and edit the workspace.
 //!
-//! Agent edits are applied to Neovim's buffers rather than to disk, so the
+//! Agent edits are applied to the editor's buffers rather than to disk, so the
 //! user sees each one as it lands, can undo it, and decides when to save.
 
 use std::{
@@ -30,7 +30,7 @@ use crate::{
 /// How long the bridge lets one call run, which bounds an approval prompt.
 pub const CALL_DEADLINE: Duration = Duration::from_secs(600);
 
-/// How long Neovim may take to report a change the analyzer asked for.
+/// How long the editor may take to report a change the analyzer asked for.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long an edit waits for the compilation that includes it.
@@ -39,7 +39,7 @@ const COMPILE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Attempts at an edit whose buffer changed between planning and applying.
 const MAX_EDIT_ATTEMPTS: usize = 3;
 
-pub const FOLLOW_REQUIRED: &str = "The GUI's cell can only be switched while the user has follow mode on (`:Argon follow` in Neovim). Use compile_cell to check a cell without changing the GUI.";
+pub const FOLLOW_REQUIRED: &str = "The GUI's cell can only be switched while the user has follow mode on (`:Argon follow` in Neovim, `Argon: Follow Agent Edits` in VS Code). Use compile_cell to check a cell without changing the GUI.";
 
 /// One find-and-replace within a file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,7 +70,7 @@ pub struct CreateRequest {
 pub struct FileContents {
     pub path: PathBuf,
     pub contents: String,
-    /// Whether the text came from a Neovim buffer, which may be unsaved.
+    /// Whether the text came from an editor buffer, which may be unsaved.
     pub from_editor: bool,
 }
 
@@ -183,9 +183,9 @@ pub struct AgentStatus {
     pub gui_connected: bool,
     pub follow_mode: bool,
     pub approval: ApprovalMode,
-    /// Whether any Neovim buffer in the workspace has unsaved changes.
+    /// Whether any editor buffer in the workspace has unsaved changes.
     pub workspace_modified: bool,
-    /// Whether files changed on disk outside Neovim are picked up.
+    /// Whether files changed on disk outside the editor are picked up.
     pub watching_files: bool,
     pub open_files: Vec<PathBuf>,
     pub revision: u64,
@@ -198,7 +198,7 @@ pub trait Agent {
     /// The file as the user currently has it, unsaved edits included.
     async fn read_file(path: PathBuf) -> Result<FileContents, String>;
     async fn edit_file(request: EditRequest) -> Result<Report, String>;
-    /// Creates a new source file as an unsaved Neovim buffer.
+    /// Creates a new source file as an unsaved editor buffer.
     async fn create_file(request: CreateRequest) -> Result<Report, String>;
     async fn diagnostics() -> Report;
     /// Compiles a cell without changing what the GUI shows.
@@ -221,7 +221,7 @@ pub(crate) struct EnsureBufferResult {
     message: Option<String>,
 }
 
-/// Asks Neovim to load a file into a buffer attached to the analyzer.
+/// Asks the editor to load a file into a buffer attached to the analyzer.
 enum EnsureBuffer {}
 
 impl Request for EnsureBuffer {
@@ -254,7 +254,7 @@ pub(crate) enum ApplyAgentEditResult {
     Failed { message: String },
 }
 
-/// Asks Neovim to apply an agent edit if its buffer is still at the planned
+/// Asks the editor to apply an agent edit if its buffer is still at the planned
 /// version, confirming with the user first when `confirm` is set.
 enum ApplyAgentEdit {}
 
@@ -269,7 +269,7 @@ pub(crate) struct FollowModeParams {
     enabled: bool,
 }
 
-/// A resolved edit, ready to send to Neovim.
+/// A resolved edit, ready to send to the editor.
 #[derive(Debug, Clone)]
 pub(crate) struct EditPlan {
     version: i32,
@@ -477,7 +477,7 @@ fn agent_diagnostics(
         .collect()
 }
 
-/// The editor's URI for `path`, if Neovim has it open under any name.
+/// The editor's URI for `path`, if the editor has it open under any name.
 pub(crate) fn open_uri(source: &SourceState, path: &Path) -> Option<Uri> {
     let target = identity(path);
     source
@@ -529,7 +529,7 @@ impl Backend {
     async fn check_editable(&self, path: &Path) -> Result<(), String> {
         if path.extension().is_none_or(|extension| extension != "ar") {
             return Err(format!(
-                "{} is not an Argon source file. Only .ar files are edited through Neovim.",
+                "{} is not an Argon source file. Only .ar files are edited through the editor.",
                 path.display()
             ));
         }
@@ -562,7 +562,7 @@ impl Backend {
             .is_ok_and(|result| result.is_ok())
     }
 
-    /// Makes sure Neovim has `path` open in a buffer attached to this analyzer.
+    /// Makes sure the editor has `path` open in a buffer attached to this analyzer.
     async fn ensure_buffer(&self, path: &Path, create: bool) -> Result<Uri, String> {
         if let Some(uri) = open_uri(&*self.state.source_state.lock().await, path) {
             return Ok(uri);
@@ -590,16 +590,26 @@ impl Backend {
             .editor_client
             .send_request::<EnsureBuffer>(EnsureBufferParams { uri, create })
             .await
-            .map_err(|error| format!("Could not ask Neovim to open {}: {error}", path.display()))?;
+            .map_err(|error| {
+                format!(
+                    "Could not ask the editor to open {}: {error}",
+                    path.display()
+                )
+            })?;
         if !response.ok {
             return Err(response
                 .message
-                .unwrap_or_else(|| format!("Neovim could not open {}.", path.display())));
+                .unwrap_or_else(|| format!("The editor could not open {}.", path.display())));
         }
         self.state
             .wait_for_source(SETTLE_TIMEOUT, |source| open_uri(source, path))
             .await
-            .ok_or_else(|| format!("Neovim opened {} but did not attach it.", path.display()))
+            .ok_or_else(|| {
+                format!(
+                    "The editor opened {} but did not attach it.",
+                    path.display()
+                )
+            })
     }
 
     /// Applies the plan `plan_for` makes against the current buffer text,
@@ -617,7 +627,7 @@ impl Backend {
                 let document = source
                     .editor_files
                     .get(uri)
-                    .ok_or_else(|| "Neovim closed the file before the edit.".to_owned())?;
+                    .ok_or_else(|| "The editor closed the file before the edit.".to_owned())?;
                 plan_for(document)?
             };
             let confirm = self.state.config().agent.approval == ApprovalMode::Always;
@@ -642,10 +652,10 @@ impl Backend {
                     if !self.wait_for_version(uri, version).await {
                         self.state.end_pending_edit(uri, &plan.new_text).await;
                         return Err(
-                            "Neovim applied the edit but never reported the change.".to_owned()
+                            "The editor applied the edit but never reported the change.".to_owned()
                         );
                     }
-                    // Still in flight after Neovim reported every change: its
+                    // Still in flight after the editor reported every change: its
                     // text differs from the plan's, so compile what it has.
                     if self.state.end_pending_edit(uri, &plan.new_text).await {
                         let identity = self.state.source_state.lock().await.compile_identity();
@@ -660,15 +670,15 @@ impl Backend {
                 }
                 Ok(ApplyAgentEditResult::Rejected) => {
                     self.state.end_pending_edit(uri, &plan.new_text).await;
-                    return Err("The user rejected this edit in Neovim.".to_owned());
+                    return Err("The user rejected this edit in the editor.".to_owned());
                 }
                 Ok(ApplyAgentEditResult::Failed { message }) => {
                     self.state.end_pending_edit(uri, &plan.new_text).await;
-                    return Err(format!("Neovim could not apply the edit: {message}"));
+                    return Err(format!("The editor could not apply the edit: {message}"));
                 }
                 Err(error) => {
                     self.state.end_pending_edit(uri, &plan.new_text).await;
-                    return Err(format!("Could not reach Neovim: {error}"));
+                    return Err(format!("Could not reach the editor: {error}"));
                 }
             }
         }

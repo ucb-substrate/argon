@@ -118,6 +118,54 @@ jobs:
       - name: Run tests
         run: cargo test --release --workspace
 
+  vscode-extension:
+    name: VS Code Extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.128
+
+      - name: Cache Rust artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: plugins/vscode/package-lock.json
+
+      - name: Build the analyzer
+        run: cargo build -p argon --bin argon-analyzer
+
+      - name: Build and unit test the extension
+        working-directory: plugins/vscode
+        run: |
+          npm ci
+          npm run compile
+          npm run build:gui
+          npm run test:unit
+
+      - name: Run the extension in VS Code
+        working-directory: plugins/vscode
+        run: xvfb-run -a npm run test:integration
+
   markdown-links:
     name: Markdown Links
     runs-on: ubuntu-latest
