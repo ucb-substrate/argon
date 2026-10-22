@@ -1,16 +1,12 @@
----
-title: Install Argon
-description: Install the Argon command-line tools and the Neovim plugin.
----
-
-# Install Argon
+import {Neovim, VSCode} from '@site/src/components/Editor';
+import VSCodeExtensionInstall from '../../_partials/vscode-extension-install.mdx';
 
 Argon is installed from source with Cargo. The `argon` package provides four executables: `arc`, `argonc`, `argone`, and `argon-analyzer`.
 
 ## Prerequisites
 
 - A Rust toolchain with Cargo.
-- Neovim 0.12 or newer.
+- <Neovim>Neovim 0.12 or newer.</Neovim><VSCode>VS Code 1.100 or newer, and Node.js with npm to build the extension.</VSCode>
 - Git.
 
 ## Install
@@ -33,12 +29,14 @@ argone --version
 ```
 
 :::note
-The Rust and Neovim versions the project is tested against change over time. If an install fails, check the CI configuration in the repository for the versions currently in use.
+The Rust<Neovim> and Neovim</Neovim> versions the project is tested against change over time. If an install fails, check the CI configuration in the repository for the versions currently in use.
 :::
 
-## Add the Neovim plugin
+## Set up your editor
 
-With Neovim's built-in package manager:
+<Neovim>
+
+Add the Neovim plugin with Neovim's built-in package manager:
 
 ```lua
 vim.pack.add({
@@ -47,3 +45,11 @@ vim.pack.add({
 ```
 
 The plugin detects `.ar` files and starts `argon-analyzer` from your `PATH`.
+
+</Neovim>
+
+<VSCode>
+
+<VSCodeExtensionInstall />
+
+</VSCode>

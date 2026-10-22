@@ -1,17 +1,10 @@
----
-title: Add constraints
-description: Constrain the two rectangles and turn width and height into parameters.
----
-
-# Add constraints
-
 A constraint fixes a relationship between geometric values. It's different from the initial values the GUI wrote when you drew the rectangles: a constraint determines a value, while an initial value only positions something that is otherwise free.
 
 ## Inset the inner rectangle
 
 Press <kbd>D</kbd> for the Dimension tool. Click the matching edge on each rectangle, then click where the label should go. Type `50.` and press <kbd>Enter</kbd>.
 
-Do the same for the other three sides.
+Do the same for the other three sides. To change a dimension later, press <kbd>S</kbd>, select its label, and press <kbd>Q</kbd>.
 
 :::warning Floats need a decimal point
 `50` is an [`Int`](/language/types/scalars#int); `50.` is a [`Float`](/language/types/scalars#float). Coordinates and dimensions are floats.

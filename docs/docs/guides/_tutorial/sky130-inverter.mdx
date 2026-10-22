@@ -1,11 +1,6 @@
----
-title: SKY130 inverter
-description: Assemble SKY130 transistor and tap cells into a parameterized inverter.
----
+import OpenEditor from './open-editor.mdx';
 
-# SKY130 inverter
-
-This guide assembles an inverter layout from the transistor and tap cells in Argon's SKY130 library. It assumes you've worked through [Getting started](/guides/getting-started/installation).
+This guide assembles an inverter layout from the transistor and tap cells in Argon's SKY130 library. It assumes you've worked through [Getting started](./getting-started/installation).
 
 ## Set up the library
 
@@ -49,15 +44,13 @@ cell inv(nw: Float, pw: Float, nf: Int) {
 }
 ```
 
-The `use` lines import everything the guide needs. Open the editor:
+The `use` lines import everything the guide needs. From the library directory, open the editor:
 
-```bash
-argone .
-```
+<OpenEditor />
 
 Click the canvas, press <kbd>O</kbd>, and open `inv(1000., 1600., 4)`.
 
-Place the devices in the order below. For each, press <kbd>I</kbd> for the Instance tool, type the invocation, click to place it, and press <kbd>Esc</kbd>. The GUI binds the new instance to `inst0`. Rename it in Neovim before placing the next device, since later invocations refer to earlier names.
+Place the devices in the order below. For each, press <kbd>I</kbd> for the Instance tool, type the invocation, click to place it, and press <kbd>Esc</kbd>. The GUI binds the new instance to `inst0`. Rename it in `lib.ar` before placing the next device, since later invocations refer to earlier names.
 
 | Name | Invocation | Place it |
 | --- | --- | --- |

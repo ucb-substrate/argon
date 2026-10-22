@@ -4,24 +4,15 @@ description: The GUI panel, the Argon commands, focus handoff, and agent edits i
 sidebar_label: VS Code extension
 ---
 
+import VSCodeExtensionInstall from '../_partials/vscode-extension-install.mdx';
+
 # VS Code extension
 
 The VS Code extension starts `argon-analyzer` for each Argon project you open, shows the GUI in a panel beside your source, and adds the **Argon** commands to the Command Palette. A project is the nearest directory above a `.ar` file that contains `lib.ar`.
 
 ## Install
 
-Building the extension also builds the GUI as WebAssembly, which needs the `wasm32-unknown-unknown` Rust target and a `wasm-bindgen` CLI matching the `wasm-bindgen` version in `Cargo.lock`:
-
-```bash
-rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --locked --version "$(cargo pkgid wasm-bindgen | sed 's/.*@//')"
-cd plugins/vscode
-npm ci
-npx @vscode/vsce package
-code --install-extension argon-0.1.0.vsix
-```
-
-The extension runs `argon-analyzer` from your `PATH`. To use another executable, set `argon.analyzer.path`.
+<VSCodeExtensionInstall />
 
 ## The GUI panel
 
@@ -34,6 +25,7 @@ To show the GUI in a window of its own instead, as `argone --terminal` does, set
 | Command | Description |
 | --- | --- |
 | **Argon: Focus GUI** | Focus the GUI, opening its panel if it isn't open. <kbd>Ctrl</kbd>+<kbd>Backslash</kbd> in an Argon file. |
+| **Argon: Focus Source** | Focus the Argon source you last used, opening it beside the GUI if it isn't visible. <kbd>Ctrl</kbd>+<kbd>Backslash</kbd> in the GUI. |
 | **Argon: Open Cell** | Compile and show a cell, such as `top(100.)`. |
 | **Argon: New Cell** | Insert an empty cell in the current module and open it. |
 | **Argon: Rename Cell** | Rename the open cell and every reference to it. |
@@ -52,7 +44,7 @@ Commands that take an argument open a prompt. For **Open Cell**, **Place Instanc
 
 ## Focus handoff
 
-When the GUI opens a command, such as placing an instance, the prompt opens in VS Code. Focus returns to the GUI once you run or cancel it.
+<kbd>Ctrl</kbd>+<kbd>Backslash</kbd> switches focus between the source and the GUI. When the GUI opens a command, such as placing an instance, the prompt opens in VS Code. Focus returns to the GUI once you run or cancel it.
 
 ## How edits flow
 

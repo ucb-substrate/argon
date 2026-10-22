@@ -125,8 +125,13 @@ jobs:
           shared-key: ${{ runner.os }}-${{ matrix.rust }}
           cache-on-failure: true
 
+      # GPUI records the element bounds that layout tests check (`debug_bounds`)
+      # only when it is built with debug assertions.
       - name: Run tests
-        run: cargo test --release --workspace
+        run: >-
+          cargo test --release --workspace
+          --config 'profile.release.package.gpui.debug-assertions=true'
+          --config 'profile.release.package.gpui_macros.debug-assertions=true'
 
   vscode-extension:
     name: VS Code Extension

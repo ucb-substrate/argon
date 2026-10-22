@@ -181,7 +181,10 @@ export class Session implements vscode.Disposable {
     return this.gui?.panel.active === true;
   }
 
-  /** Focuses the project's source editor, the one last used if it is open. */
+  /**
+   * Focuses the project's source editor, the one last used if it is visible.
+   * With none visible, shows the last used source, or `lib.ar`, beside the GUI.
+   */
   focusEditor(): void {
     const editor =
       this.lastEditor && vscode.window.visibleTextEditors.includes(this.lastEditor)
@@ -189,9 +192,11 @@ export class Session implements vscode.Disposable {
         : vscode.window.visibleTextEditors.find((editor) => this.owns(editor.document));
     if (editor) {
       void vscode.window.showTextDocument(editor.document, editor.viewColumn);
-    } else {
-      void vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+      return;
     }
+    const last = this.lastEditor?.document;
+    const target = last && !last.isClosed ? last.uri : vscode.Uri.file(path.join(this.root, 'lib.ar'));
+    void vscode.window.showTextDocument(target, { viewColumn: this.sourceColumn(), preview: false });
   }
 
   /** An editor outside the GUI's group that shows `uri`. */

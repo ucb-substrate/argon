@@ -1,9 +1,4 @@
----
-title: Hierarchy and export
-description: Place cells inside other cells, check the library, and write GDS.
----
-
-# Hierarchy and export
+import {Neovim, VSCode} from '@site/src/components/Editor';
 
 A cell becomes reusable once you place it inside another cell.
 
@@ -21,7 +16,7 @@ cell triple_rect() {
 
 Save, then open `triple_rect()` from the canvas. The hierarchy sidebar lists the three instances under the root scope.
 
-You can also place instances from the GUI: press <kbd>I</kbd>, type a cell invocation, and click to place it in the selected scope. Placement stays active so you can drop several copies; press <kbd>Esc</kbd> when you're done.
+You can also place instances from the GUI: press <kbd>I</kbd>, type a cell invocation in <Neovim>the command line</Neovim><VSCode>the **Argon: Place Instance** prompt</VSCode>, and click to place it in the selected scope. Placement stays active so you can drop several copies; press <kbd>Esc</kbd> when you're done.
 
 ## Format and check
 
@@ -48,4 +43,4 @@ arc run --cell 'triple_rect()' --gds
 Quote the cell expression so the shell doesn't interpret the parentheses.
 :::
 
-That's the end of the getting-started guide. Other guides are listed on the [Guides](/guides) page. From here, the [language reference](/language/overview) covers the rest of the language, and the [GUI](/gui/workspace) and [tools](/tools/overview) books cover the editor and the command line in detail.
+That's the end of the getting-started guide. Other guides are listed on the [Guides](/guides) page. From here, the [language reference](/language/overview) covers the rest of the language, and the [GUI](/gui/workspace) and [tools](/tools/overview) books cover the editor and the command line in detail. <Neovim>The [Neovim plugin](/tools/neovim) page lists the `:Argon` commands.</Neovim><VSCode>The [VS Code extension](/tools/vscode) page lists the **Argon** commands.</VSCode>

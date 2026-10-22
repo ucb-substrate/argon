@@ -1,0 +1,14 @@
+The extension is built from a checkout of the Argon repository. Building it also builds the GUI as WebAssembly, which needs the `wasm32-unknown-unknown` Rust target and a `wasm-bindgen` CLI matching the `wasm-bindgen` version in `Cargo.lock`. From the root of the checkout:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --locked --version "$(cargo pkgid wasm-bindgen | sed 's/.*@//')"
+cd plugins/vscode
+npm ci
+npx @vscode/vsce package
+code --install-extension argon-*.vsix
+```
+
+If `code` isn't on your `PATH`, install the `.vsix` file from the Extensions view instead: open its **…** menu and choose **Install from VSIX…**.
+
+The extension runs `argon-analyzer` from your `PATH`. To use another executable, set `argon.analyzer.path`.

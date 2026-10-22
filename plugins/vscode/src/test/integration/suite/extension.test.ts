@@ -218,6 +218,16 @@ describe('Argon extension', () => {
     );
   });
 
+  it('moves focus between the source and the GUI', async () => {
+    const guiFocused = () => vscode.window.tabGroups.activeTabGroup.activeTab?.input instanceof vscode.TabInputWebview;
+    session.showGui(false);
+    await eventually('the GUI to have focus', () => (guiFocused() ? true : undefined));
+    await vscode.commands.executeCommand('argon.focusSource');
+    await eventually('the source to have focus', () =>
+      !guiFocused() && vscode.window.activeTextEditor?.document.languageId === 'argon' ? true : undefined,
+    );
+  });
+
   it('sends requests that take no params', async () => {
     assert.strictEqual(await session.request('custom/reloadConfig'), null);
   });

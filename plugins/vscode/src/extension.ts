@@ -253,6 +253,12 @@ export class Extension implements SessionHost, vscode.Disposable {
       context.subscriptions.push(vscode.commands.registerCommand(id, action));
 
     register('argon.gui', withSession((session) => this.run(session, 'gui', '')));
+    register('argon.focusSource', () => {
+      const sessions = [...this.sessions.values()];
+      const session =
+        sessions.find((session) => session.guiActive()) ?? (sessions.length === 1 ? sessions[0] : undefined);
+      session?.focusEditor();
+    });
     for (const name of PROMPTED) {
       register(`argon.${name}`, withSession((session) => this.prompt(session, name)));
     }

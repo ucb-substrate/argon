@@ -72,6 +72,11 @@
         "category": "Argon"
       },
       {
+        "command": "argon.focusSource",
+        "title": "Focus Source",
+        "category": "Argon"
+      },
+      {
         "command": "argon.openCell",
         "title": "Open Cell",
         "category": "Argon"
@@ -146,7 +151,12 @@
       {
         "command": "argon.gui",
         "key": "ctrl+\\",
-        "when": "argon.active"
+        "when": "argon.active && activeWebviewPanelId != 'argon.gui'"
+      },
+      {
+        "command": "argon.focusSource",
+        "key": "ctrl+\\",
+        "when": "activeWebviewPanelId == 'argon.gui'"
       }
     ],
     "menus": {
@@ -154,6 +164,10 @@
         {
           "command": "argon.gui",
           "when": "argon.active"
+        },
+        {
+          "command": "argon.focusSource",
+          "when": "activeWebviewPanelId == 'argon.gui'"
         },
         {
           "command": "argon.openCell",
