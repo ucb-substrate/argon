@@ -134,10 +134,17 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      # The CLI must match the wasm-bindgen crate in Cargo.lock exactly.
+      - name: Find the wasm-bindgen version
+        id: wasm-bindgen
+        run: |
+          id=$(cargo pkgid wasm-bindgen)
+          echo "version=${id##*@}" >> "$GITHUB_OUTPUT"
+
       - name: Install wasm-bindgen
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen@0.2.128
+          tool: wasm-bindgen@${{ steps.wasm-bindgen.outputs.version }}
 
       - name: Cache Rust artifacts
         uses: swatinem/rust-cache@v2

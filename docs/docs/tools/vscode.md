@@ -14,7 +14,7 @@ Building the extension also builds the GUI as WebAssembly, which needs the `wasm
 
 ```bash
 rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --version 0.2.128 --locked
+cargo install wasm-bindgen-cli --locked --version "$(cargo pkgid wasm-bindgen | sed 's/.*@//')"
 cd plugins/vscode
 npm ci
 npx @vscode/vsce package
