@@ -23,7 +23,14 @@ async function main(): Promise<void> {
     await runTests({
       extensionDevelopmentPath,
       extensionTestsPath: path.resolve(__dirname, 'suite'),
-      launchArgs: [project, '--disable-extensions', '--skip-welcome', '--skip-release-notes'],
+      launchArgs: [
+        project,
+        '--disable-extensions',
+        '--skip-welcome',
+        '--skip-release-notes',
+        // Lets the GUI render with software WebGL on machines without a GPU.
+        '--enable-unsafe-swiftshader',
+      ],
       extensionTestsEnv: {
         ARGON_ANALYZER: analyzer,
         ARGON_TEST_PROJECT: project,

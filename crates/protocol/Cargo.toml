@@ -26,4 +26,4 @@ zstd = { workspace = true }
 [target.'cfg(target_family = "wasm")'.dependencies]
 # tarpc draws request ids through rand, which needs the browser's random source.
 getrandom = { version = "0.4", features = ["wasm_js"] }
-ruzstd = "0.8"
+ruzstd = "0.9.1"
