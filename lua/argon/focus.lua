@@ -56,14 +56,15 @@ end
 ---@param opts? { return_to_gui?: boolean }
 function M.editor(command, opts)
   opts = opts or {}
-  local mode = vim.api.nvim_get_mode().mode
-  local keys = mode:sub(1, 1) == 't' and '<C-\\><C-N>:' or '<Esc>:'
+  -- <C-\><C-N> reaches Normal mode from any mode. A fed <Esc> would instead
+  -- execute a pending command line, and an error there drops the keys after it.
+  local keys = '<C-\\><C-N>:'
   if type(command) == 'string' then
     keys = keys .. command
   end
 
   -- Wait for this command line to be entered before watching it leave. The
-  -- leading <Esc> may itself leave a pre-existing command line or prompt.
+  -- leading <C-\><C-N> may itself leave a pre-existing command line.
   vim.api.nvim_clear_autocmds({ group = gui_command_group })
   if opts.return_to_gui ~= false then
     return_to_gui_after_command()
