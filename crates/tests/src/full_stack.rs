@@ -2120,7 +2120,7 @@ cell top() {
                 .unwrap();
             assert_eq!(
                 rejected.unwrap_err(),
-                "The user rejected this edit in Neovim."
+                "The user rejected this edit in the editor."
             );
             agent
                 .edit_file(agent_context(), rect("approved_rect"))
@@ -2334,7 +2334,7 @@ cell top() {
             .await;
             assert!(!failed && edited.contains("2 rects"), "{edited}");
             let (read, failed) = call("read_file", json!({ "path": "lib.ar" })).await;
-            assert!(!failed && read.contains("from the Neovim buffer"), "{read}");
+            assert!(!failed && read.contains("from the editor buffer"), "{read}");
             assert!(read.contains("let b = rect("), "{read}");
 
             let lib = session.project().join("lib.ar");

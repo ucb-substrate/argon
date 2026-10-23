@@ -70,7 +70,6 @@ use crate::compiler_worker::{
 };
 use crate::document::{Document, DocumentChange, PositionEncoding};
 
-const DEFAULT_LOG_LEVEL: &str = "error";
 const LOG_FILE: &str = "argon.log";
 
 // tarpc gives every new context a ten-second deadline. A compilation update can
@@ -115,116 +114,7 @@ fn write_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 }
 static LOG_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ArgonConfig {
-    pub analyzer: AnalyzerConfig,
-    pub agent: AgentConfig,
-    pub gui: GuiConfig,
-    pub log: LogConfig,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct AgentConfig {
-    pub approval: ApprovalMode,
-}
-
-/// Whether the user confirms each agent edit in Neovim before it is applied.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ApprovalMode {
-    /// Agent edits apply immediately and Neovim is never asked to confirm.
-    #[default]
-    Never,
-    /// Neovim shows each agent edit and applies it only if the user accepts.
-    Always,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct AnalyzerConfig {
-    pub compile_debounce_ms: u64,
-}
-
-impl Default for AnalyzerConfig {
-    fn default() -> Self {
-        Self {
-            compile_debounce_ms: 150,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct GuiConfig {
-    pub dark_mode: bool,
-    /// Maximum rendered hierarchy depth. Omitted means unlimited.
-    pub hierarchy_depth: Option<usize>,
-    /// Global GUI icon-size override in logical pixels.
-    #[serde(default, deserialize_with = "deserialize_gui_size")]
-    pub icon_size: Option<f32>,
-    /// Global GUI font-size override in logical pixels.
-    #[serde(default, deserialize_with = "deserialize_gui_size")]
-    pub font_size: Option<f32>,
-    /// Whether Option acts as Meta in the GUI's Neovim pane on macOS.
-    pub option_as_meta: bool,
-}
-
-impl Default for GuiConfig {
-    fn default() -> Self {
-        Self {
-            dark_mode: true,
-            hierarchy_depth: None,
-            icon_size: None,
-            font_size: None,
-            option_as_meta: false,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum HumanReadableGuiSize {
-    Integer(u16),
-    Float(f32),
-    None(()),
-}
-
-fn deserialize_gui_size<'de, D>(deserializer: D) -> std::result::Result<Option<f32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let size = if deserializer.is_human_readable() {
-        match HumanReadableGuiSize::deserialize(deserializer)? {
-            HumanReadableGuiSize::Integer(size) => Some(f32::from(size)),
-            HumanReadableGuiSize::Float(size) => Some(size),
-            HumanReadableGuiSize::None(()) => None,
-        }
-    } else {
-        Option::<f32>::deserialize(deserializer)?
-    };
-    if size.is_some_and(|size| !size.is_finite() || !(1.0..=256.0).contains(&size)) {
-        return Err(<D::Error as serde::de::Error>::custom(
-            "GUI sizes must be between 1 and 256 logical pixels",
-        ));
-    }
-    Ok(size)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct LogConfig {
-    pub level: String,
-}
-
-impl Default for LogConfig {
-    fn default() -> Self {
-        Self {
-            level: DEFAULT_LOG_LEVEL.to_owned(),
-        }
-    }
-}
+pub use protocol::config::*;
 
 /// Argon's own subdirectory of one XDG base directory.
 ///
@@ -756,16 +646,19 @@ pub struct State {
     source_changes: Arc<tokio::sync::watch::Sender<u64>>,
     /// The source revision of the latest committed compilation.
     compiled_revisions: Arc<tokio::sync::watch::Sender<u64>>,
-    /// Whether Neovim has a follow window for agent edits.
+    /// Whether the editor has a follow window for agent edits.
     follow_mode: Arc<std::sync::atomic::AtomicBool>,
     /// Serializes agent edits so each resolves against settled text.
     agent_edits: Arc<Mutex<()>>,
     watcher: Arc<std::sync::Mutex<Option<watcher::WorkspaceWatcher>>>,
-    /// Whether the GUI embeds this analyzer's Neovim.
+    /// Whether the GUI and this analyzer's editor share a window.
     embedded: bool,
     /// The library's recently opened invocations, most recent first. Held
     /// while the recents file is updated, so updates don't interleave.
     recents: Arc<Mutex<Vec<String>>>,
+    /// The document the analyzer last edited through the editor, which GUI
+    /// undo and redo apply to.
+    last_source_edit: Arc<std::sync::Mutex<Option<Uri>>>,
 }
 
 impl State {
@@ -801,6 +694,7 @@ impl State {
             watcher: Default::default(),
             embedded,
             recents: Default::default(),
+            last_source_edit: Default::default(),
         }
     }
 
@@ -1631,7 +1525,7 @@ impl Backend {
 struct Undo;
 
 impl Request for Undo {
-    type Params = ();
+    type Params = rpc::HistoryParams;
     type Result = ();
 
     const METHOD: &'static str = "custom/undo";
@@ -1641,7 +1535,7 @@ impl Request for Undo {
 struct Redo;
 
 impl Request for Redo {
-    type Params = ();
+    type Params = rpc::HistoryParams;
     type Result = ();
 
     const METHOD: &'static str = "custom/redo";
@@ -2035,6 +1929,15 @@ fn preview_instance_cell(
 }
 
 impl Backend {
+    /// The RPC address and session token, for an editor that hosts the GUI
+    /// itself and relays its connections.
+    async fn gui_endpoint(&self) -> Result<GuiEndpoint> {
+        Ok(GuiEndpoint {
+            port: self.state.server_addr.port(),
+            token: self.state.token.to_hex(),
+        })
+    }
+
     async fn start_gui(&self) -> Result<()> {
         if let Some(connection) = self.state.gui_connection().await {
             self.state
@@ -2729,7 +2632,7 @@ impl Backend {
         Ok(())
     }
 
-    async fn reload_config(&self, _: ()) -> Result<()> {
+    async fn reload_config(&self) -> Result<()> {
         let config = match read_config() {
             Ok(config) => config,
             Err(error) => {
@@ -2905,12 +2808,20 @@ async fn serve_rpc(listener: tokio::net::TcpListener, state: State) {
     }
 }
 
+/// Where the GUI connects, for an editor that relays its connections.
+#[derive(Debug, Serialize)]
+struct GuiEndpoint {
+    port: u16,
+    /// The session token, in hex.
+    token: String,
+}
+
 /// How the analyzer finds and launches its GUI.
 #[derive(Clone, Debug, Default)]
 pub struct GuiLink {
     /// Unix socket through which to report the RPC port and token.
     pub relay_socket: Option<PathBuf>,
-    /// Whether the GUI embeds this analyzer's Neovim.
+    /// Whether the GUI and this analyzer's editor share a window.
     pub embedded: bool,
 }
 
@@ -2984,6 +2895,7 @@ pub async fn main_with_io_on_listener<I, O>(
         Backend { state }
     })
     .custom_method("custom/startGui", Backend::start_gui)
+    .custom_method("custom/guiEndpoint", Backend::gui_endpoint)
     .custom_method("custom/openCell", Backend::open_cell)
     .custom_method("custom/newCell", Backend::new_cell)
     .custom_method("custom/renameCell", Backend::rename_cell)

@@ -1,5 +1,5 @@
 //! A Model Context Protocol server that lets agents work through running
-//! analyzers, so their edits land in the user's Neovim buffers.
+//! analyzers, so their edits land in the user's editor buffers.
 //!
 //! It speaks newline-delimited JSON-RPC on stdin and stdout. Each tool call
 //! goes to the session whose workspace contains the file it names, or to the
@@ -33,7 +33,7 @@ use crate::{
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 
 const INSTRUCTIONS: &str = "This server edits Argon layout sources through the user's running \
-Argon sessions. Edits go into the user's Neovim buffers, so the user watches them land in Neovim \
+Argon sessions. Edits go into the user's editor buffers, so the user watches them land in the editor \
 and the layout GUI and can undo them. Buffers may hold unsaved changes, so read .ar files with \
 read_file rather than from disk, edit them with edit_file or create_file rather than writing \
 files, and check cells with compile_cell rather than `arc run`. Never save files; the user does. \
@@ -43,7 +43,7 @@ which sessions are running.";
 
 pub(crate) fn no_session_message(directory: &Path) -> String {
     format!(
-        "No running Argon session was found for {}. Ask the user to open the project with `argone` (or open its lib.ar in Neovim with the Argon plugin), then try again.",
+        "No running Argon session was found for {}. Ask the user to open the project with `argone` (or open its lib.ar in Neovim or VS Code with the Argon plugin), then try again.",
         directory.display()
     )
 }
@@ -402,9 +402,9 @@ impl Bridge {
                     "{} ({})\n{}",
                     self.view(&session).show(&file.path),
                     if file.from_editor {
-                        "from the Neovim buffer, which may be unsaved"
+                        "from the editor buffer, which may be unsaved"
                     } else {
-                        "from disk; not open in Neovim"
+                        "from disk; not open in the editor"
                     },
                     numbered_lines(&file.contents, offset, limit)
                 ))
@@ -423,7 +423,7 @@ impl Bridge {
                     .await?;
                 let view = self.view(&session);
                 Ok(format!(
-                    "Applied the edit to the Neovim buffer for {}; it is unsaved.\n{}",
+                    "Applied the edit to the editor buffer for {}; it is unsaved.\n{}",
                     view.show(&request.path),
                     format_report(&report?, &view)
                 ))
@@ -442,7 +442,7 @@ impl Bridge {
                     .await?;
                 let view = self.view(&session);
                 Ok(format!(
-                    "Created {} as an unsaved Neovim buffer.\n{}",
+                    "Created {} as an unsaved editor buffer.\n{}",
                     view.show(&request.path),
                     format_report(&report?, &view)
                 ))
@@ -589,11 +589,11 @@ fn format_status(status: &AgentStatus, view: &PathView) -> String {
             "Approval: {}",
             match status.approval {
                 crate::ApprovalMode::Never => "edits apply immediately",
-                crate::ApprovalMode::Always => "the user confirms each edit in Neovim",
+                crate::ApprovalMode::Always => "the user confirms each edit in the editor",
             }
         ),
         format!(
-            "Unsaved changes in Neovim: {}",
+            "Unsaved changes in the editor: {}",
             if status.workspace_modified {
                 "yes"
             } else {
@@ -610,7 +610,7 @@ fn format_status(status: &AgentStatus, view: &PathView) -> String {
         ),
     ];
     if !status.open_files.is_empty() {
-        lines.push("Open in Neovim:".to_owned());
+        lines.push("Open in the editor:".to_owned());
         lines.extend(
             status
                 .open_files
@@ -704,12 +704,12 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "status",
-            "description": "List the running Argon sessions and describe one: its workspace, the cell open in the GUI, follow mode, the approval mode, and the files open in Neovim.",
+            "description": "List the running Argon sessions and describe one: its workspace, the cell open in the GUI, follow mode, the approval mode, and the files open in the editor.",
             "inputSchema": { "type": "object", "properties": { "workspace": workspace } }
         },
         {
             "name": "read_file",
-            "description": "Read a workspace file as the user currently has it, including unsaved Neovim edits. Use this instead of reading .ar files from disk, which can be out of date. Each line is prefixed with its number and a tab; never include that prefix in edit_file's old_string.",
+            "description": "Read a workspace file as the user currently has it, including unsaved editor changes. Use this instead of reading .ar files from disk, which can be out of date. Each line is prefixed with its number and a tab; never include that prefix in edit_file's old_string.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -722,7 +722,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "edit_file",
-            "description": "Edit an Argon source file through the user's Neovim buffer, so the change shows up live in Neovim and the GUI and can be undone. Each old_string must match the current text exactly and be unique unless replace_all is set. All edits in one call are matched against the file before any is applied, must not overlap, and land as one undo step. The buffer is left unsaved. The result reports the recompiled cell's shape and any diagnostics. The user may be asked to approve the edit, and may reject it.",
+            "description": "Edit an Argon source file through the user's editor buffer, so the change shows up live in the editor and the GUI and can be undone. Each old_string must match the current text exactly and be unique unless replace_all is set. All edits in one call are matched against the file before any is applied, must not overlap, and land as one undo step. The buffer is left unsaved. The result reports the recompiled cell's shape and any diagnostics. The user may be asked to approve the edit, and may reject it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -747,7 +747,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "create_file",
-            "description": "Create a new Argon source file as an unsaved Neovim buffer. A module must also be declared from its parent, for example `mod utils;` in lib.ar loads utils.ar. The directory must already exist.",
+            "description": "Create a new Argon source file as an unsaved editor buffer. A module must also be declared from its parent, for example `mod utils;` in lib.ar loads utils.ar. The directory must already exist.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -774,7 +774,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "open_cell",
-            "description": "Show a cell in the user's GUI. Works only while the user has follow mode on (`:Argon follow` in Neovim); otherwise use compile_cell.",
+            "description": "Show a cell in the user's GUI. Works only while the user has follow mode on (`:Argon follow` in Neovim, `Argon: Follow Agent Edits` in VS Code); otherwise use compile_cell.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "cell": cell, "workspace": workspace },

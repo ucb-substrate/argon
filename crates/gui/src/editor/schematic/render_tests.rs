@@ -289,12 +289,12 @@ fn empty_and_partial_cells_draw(cx: &mut TestAppContext) {
 /// Drives the analyzer side of one `place` request over the in-memory
 /// transport.
 mod editing {
-    use analyzer::rpc::{
-        BlockingReference, DeleteOutcome, EditReceipt, LangServerRequest, LangServerResponse,
-    };
     use argonc::compile::{CellArg, CompileOutput};
     use futures::{FutureExt, SinkExt, StreamExt};
     use gpui::{Modifiers, MouseButton, MouseDownEvent, TestAppContext};
+    use protocol::rpc::{
+        BlockingReference, DeleteOutcome, EditReceipt, LangServerRequest, LangServerResponse,
+    };
 
     use super::super::hit::Hit;
     use super::super::paint::Overlay;
@@ -303,7 +303,7 @@ mod editing {
     use super::super::{SymbolDrag, SymbolDragKind, SymbolSelection, SymbolTool, Tool, tools};
     use super::{draw, test_canvas};
     use crate::editor::View;
-    use analyzer::rpc::NewSymbolItem;
+    use protocol::rpc::NewSymbolItem;
 
     /// Clicks the canvas at the world point `at`, with the left button.
     fn click(

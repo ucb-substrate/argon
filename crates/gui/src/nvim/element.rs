@@ -6,9 +6,9 @@ use gpui::{
     App, BorderStyle, Bounds, ContentMask, DispatchPhase, Edges, Element, ElementId,
     ElementInputHandler, Entity, Font, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InputHandler,
     InspectorElementId, IntoElement, LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PaintQuad, Pixels, Point, ScrollWheelEvent, ShapedLine, SharedString, Size, StrikethroughStyle,
-    Style, TextRun, UTF16Selection, UnderlineStyle, Window, fill, font, outline, point, px,
-    relative, size,
+    PaintQuad, Pixels, Point, ScrollEvent, ShapedLine, SharedString, Size, StrikethroughStyle,
+    Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, fill, font, outline, point,
+    px, relative, size,
 };
 
 use super::{
@@ -16,7 +16,7 @@ use super::{
     redraw::CursorShape,
     ui::{Cell, CellText, Highlight, UiState},
 };
-use crate::assets::ZED_PLEX_MONO_FAMILY;
+use crate::assets::MONO_FAMILY;
 
 /// The font size used when `guifont` gives none.
 const DEFAULT_FONT_SIZE: f32 = 13.;
@@ -30,7 +30,7 @@ pub(crate) struct FontChoice {
 
 /// Monospace families tried, in order, when no `guifont` entry resolves.
 const DEFAULT_FAMILIES: &[&str] = &[
-    ZED_PLEX_MONO_FAMILY,
+    MONO_FAMILY,
     "Menlo",
     "DejaVu Sans Mono",
     "Liberation Mono",
@@ -100,7 +100,7 @@ fn choose_font(guifont: Option<&str>, resolves: impl Fn(&str) -> bool) -> FontCh
         .iter()
         .copied()
         .find(|family| resolves(family))
-        .unwrap_or(ZED_PLEX_MONO_FAMILY);
+        .unwrap_or(MONO_FAMILY);
     FontChoice {
         family: family.into(),
         size: px(DEFAULT_FONT_SIZE),
@@ -337,7 +337,7 @@ impl Layer {
             window.paint_quad(quad);
         }
         for (origin, line) in self.lines.drain(..) {
-            let _ = line.paint(origin, line_height, window, cx);
+            let _ = line.paint(origin, line_height, TextAlign::Left, None, window, cx);
         }
     }
 }
@@ -629,7 +629,7 @@ impl NvimElement {
         let target = hitbox.clone();
         window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && target.is_hovered(window) {
-                pane.update(cx, |pane, _| pane.mouse_down(event, window));
+                pane.update(cx, |pane, cx| pane.mouse_down(event, window, cx));
             }
         });
         let pane = self.pane.clone();
@@ -646,7 +646,7 @@ impl NvimElement {
         });
         let pane = self.pane.clone();
         let target = hitbox.clone();
-        window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+        window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && target.should_handle_scroll(window) {
                 pane.update(cx, |pane, _| pane.scroll_wheel(event));
             }
@@ -697,9 +697,9 @@ mod tests {
         assert_eq!(choose_font(Some("Missing:h20"), installed), fallback);
         assert_eq!(choose_font(None, installed), fallback);
         assert_eq!(
-            choose_font(None, |family| family == ZED_PLEX_MONO_FAMILY),
+            choose_font(None, |family| family == MONO_FAMILY),
             FontChoice {
-                family: ZED_PLEX_MONO_FAMILY.into(),
+                family: MONO_FAMILY.into(),
                 size: px(DEFAULT_FONT_SIZE),
             },
             "the bundled font comes first when it resolves"

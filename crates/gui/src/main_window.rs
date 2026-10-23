@@ -214,7 +214,7 @@ impl MainWindow {
                 async {}
             }),
         ];
-        window.focus(&pane.focus_handle(cx));
+        window.focus(&pane.focus_handle(cx), cx);
         Self {
             nvim: Some(pane),
             _announcements: Some(announcements),
@@ -260,7 +260,7 @@ impl MainWindow {
             .is_some_and(|focus| focus.contains_focused(window, cx));
         self.editor = None;
         self.editor_state = None;
-        match Editor::new(cx, window, addr, token, invoker) {
+        match Editor::new(cx, window, crate::rpc::Endpoint { addr, token }, invoker) {
             Ok((editor, tasks)) => {
                 if self.nvim.is_some() && !pane_focused {
                     editor.focus_canvas(window, cx);
@@ -301,16 +301,17 @@ impl MainWindow {
             return;
         };
         self.nvim_visible = true;
-        window.focus(&focus);
+        window.focus(&focus, cx);
         cx.notify();
     }
 
     /// Focuses the canvas, or the window itself when there is no editor.
-    fn focus_canvas(&self, window: &mut Window, cx: &App) {
-        match &self.editor {
-            Some((editor, _)) => editor.read(cx).focus_canvas(window, cx),
-            None => window.focus(&self.focus_handle),
-        }
+    fn focus_canvas(&self, window: &mut Window, cx: &mut App) {
+        let focus = match &self.editor {
+            Some((editor, _)) => editor.read(cx).active_focus_handle(cx),
+            None => self.focus_handle.clone(),
+        };
+        window.focus(&focus, cx);
     }
 
     /// Makes every Quit go through [`Self::request_quit`] of `window`, even
@@ -549,7 +550,7 @@ impl Render for MainWindow {
                 MouseButton::Left,
                 cx.listener(|main, _, _, _| main.dragging_divider = false),
             )
-            .font_family("Zed Plex Sans")
+            .font_family(crate::assets::SANS_FAMILY)
             .size_full()
             .flex()
             .flex_col()

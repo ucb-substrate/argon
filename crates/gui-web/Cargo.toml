@@ -1,0 +1,15 @@
+[package]
+name = "argone-web"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+argone = { path = "../gui" }

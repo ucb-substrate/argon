@@ -24,7 +24,7 @@ const reasons = [
   {
     title: 'Two-way editing',
     body:
-      'Neovim owns the source and the GUI renders the result. Draw on the canvas and Argon writes the code into your buffer. Edit the code and the canvas updates as you type.',
+      'Your editor, Neovim or VS Code, owns the source and the GUI renders the result. Draw on the canvas and Argon writes the code into your editor. Edit the code and the canvas updates as you type.',
   },
 ];
 
@@ -82,7 +82,7 @@ const books = [
   {
     icon: 'terminal',
     title: 'Tools',
-    body: 'arc, argone, argonc, and the Neovim plugin.',
+    body: 'arc, argone, argonc, the Neovim plugin, and the VS Code extension.',
     to: '/tools/overview',
     action: 'Tools reference',
   },
@@ -172,7 +172,7 @@ export default function Home(): ReactNode {
               A language and editor for constraint-based integrated-circuit layout.
             </p>
             <div className={styles.actions}>
-              <Link className={clsx(styles.btn, styles.btnPrimary)} to="/guides/getting-started/installation">
+              <Link className={clsx(styles.btn, styles.btnPrimary)} to="/guides">
                 Get started
               </Link>
               <Link className={clsx(styles.btn, styles.btnSecondary)} to="https://github.com/ucb-substrate/argon">

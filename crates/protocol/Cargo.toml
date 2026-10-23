@@ -1,0 +1,29 @@
+[package]
+name = "argon-protocol"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "protocol"
+
+[dependencies]
+argonc = { path = "../compiler" }
+bumpalo = "3"
+cfgrammar = { workspace = true }
+indexmap = { workspace = true }
+ls-types = "0.0.6"
+postcard = { workspace = true }
+serde = { workspace = true }
+tarpc = { workspace = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+zstd = { workspace = true }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+# tarpc draws request ids through rand, which needs the browser's random source.
+getrandom = { version = "0.4", features = ["wasm_js"] }
+ruzstd = "0.9.1"

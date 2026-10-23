@@ -4,12 +4,12 @@
 
 use std::rc::Rc;
 
-use analyzer::rpc::CallArgument;
 use argonc::compile::{Element, SymbolItemKind, SymbolText};
 use gpui::{
     Context, Entity, Focusable, IntoElement, MouseButton, Render, ScrollHandle, SharedString,
     Subscription, Window, div, prelude::*, px,
 };
+use protocol::rpc::{CallArgument, EditorCommand};
 
 use super::hit::Hit;
 use super::symbol_tools::TextSpec;
@@ -399,7 +399,7 @@ impl PropertiesSideBar {
             input.show(value, "Value…", cx);
             input.focus_handle.clone()
         });
-        window.focus(&focus);
+        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -425,13 +425,13 @@ impl PropertiesSideBar {
             EditTarget::Rename if !text.is_empty() => canvas.rename(text, cx),
             EditTarget::Argument(_) | EditTarget::Rename => {}
         });
-        window.focus(&self.canvas.read(cx).focus_handle(cx));
+        window.focus(&self.canvas.read(cx).focus_handle(cx), cx);
         cx.notify();
     }
 
     fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editing = None;
-        window.focus(&self.canvas.read(cx).focus_handle(cx));
+        window.focus(&self.canvas.read(cx).focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -966,7 +966,7 @@ impl Render for PropertiesSideBar {
                         Self::button(kind, kind, theme).on_click(move |_, _, cx| {
                             crate::editor::open_command(
                                 &state,
-                                Some(format!("Argon device {kind} ")),
+                                Some(EditorCommand::prefill("device", format!("{kind} "))),
                                 true,
                                 cx,
                             );

@@ -39,6 +39,23 @@ local function track_modified_buffer(bufnr, client_id)
     })
 end
 
+---Runs `command` (`undo` or `redo`) in the buffer the GUI last edited, or
+---in the current buffer when that one is not loaded.
+---@param params? { uri?: string }
+---@param command string
+local function history_command(params, command)
+    local bufnr = vim.api.nvim_get_current_buf()
+    if params and type(params.uri) == 'string' then
+        local edited = vim.fn.bufnr(vim.uri_to_fname(params.uri))
+        if edited ~= -1 and vim.api.nvim_buf_is_loaded(edited) then
+            bufnr = edited
+        end
+    end
+    vim.api.nvim_buf_call(bufnr, function()
+        vim.cmd(command)
+    end)
+end
+
 --- Buffers this plugin installed its own `gd` mapping in.
 local gd_mapped_buffers = {}
 
@@ -310,31 +327,20 @@ M.start = function(bufnr)
                 end)
                 return vim.NIL
             end,
-            ['custom/undo'] = function(err, result, ctx)
-                local bufnr = vim.api.nvim_get_current_buf()
-
-                if bufnr ~= -1 then
-                    vim.api.nvim_buf_call(bufnr, function()
-                        vim.cmd('undo')
-                    end)
-                end
-
+            ['custom/undo'] = function(_, params)
+                history_command(params, 'undo')
                 return vim.NIL
             end,
-            ['custom/redo'] = function(err, result, ctx)
-                local bufnr = vim.api.nvim_get_current_buf()
-
-                if bufnr ~= -1 then
-                    vim.api.nvim_buf_call(bufnr, function()
-                        vim.cmd('redo')
-                    end)
-                end
-
+            ['custom/redo'] = function(_, params)
+                history_command(params, 'redo')
                 return vim.NIL
             end,
             ['custom/focusEditor'] = function(_, params, _)
                 vim.schedule(function()
-                    focus.editor(params.command, { return_to_gui = params.return_to_gui })
+                    focus.editor(
+                        focus.command_line(params.command),
+                        { return_to_gui = params.return_to_gui }
+                    )
                 end)
             end,
             ['custom/ensureBuffer'] = function(_, params, ctx)

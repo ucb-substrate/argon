@@ -7,6 +7,8 @@ members = [
     "crates/argon",
     "crates/compiler",
     "crates/gui",
+    "crates/gui-web",
+    "crates/protocol",
     "crates/sram-sizing",
     "crates/sparse-linear-solver",
     "crates/tests",
@@ -69,3 +71,11 @@ uniquify = { version = "0.4", registry = "substrate" }
 [profile.dev.package.argon-sram-sizing]
 # Sizing runs tens of millions of gradient-descent steps.
 opt-level = 3
+
+# The GUI built as WebAssembly, where download and startup favor small code.
+[profile.web]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

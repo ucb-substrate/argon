@@ -14,7 +14,7 @@ struct Args {
     #[arg(long)]
     relay_socket: Option<PathBuf>,
 
-    /// The GUI embeds this analyzer's Neovim, so never start a separate GUI.
+    /// The GUI and the editor share a window, so never start a separate GUI.
     #[arg(long)]
     embedded_gui: bool,
 

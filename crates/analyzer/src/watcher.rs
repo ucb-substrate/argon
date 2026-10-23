@@ -1,4 +1,4 @@
-//! Picks up workspace files that change on disk outside Neovim.
+//! Picks up workspace files that change on disk outside the editor.
 
 use std::{
     path::{Path, PathBuf},
@@ -37,12 +37,12 @@ pub(crate) struct ReloadBufferParams {
 pub(crate) enum ReloadBufferResult {
     Reloaded,
     Unchanged,
-    /// The buffer has unsaved changes, so Neovim kept them.
+    /// The buffer has unsaved changes, so the editor kept them.
     Modified,
     Closed,
 }
 
-/// Asks Neovim to reread a file that changed on disk, unless its buffer has
+/// Asks the editor to reread a file that changed on disk, unless its buffer has
 /// unsaved changes.
 enum ReloadBuffer {}
 
@@ -152,8 +152,8 @@ impl Backend {
                 closed_file_changed = true;
                 continue;
             };
-            // A missing file is Neovim's to report, and matching text is
-            // Neovim's own write.
+            // A missing file is the editor's to report, and matching text is
+            // the editor's own write.
             match tokio::fs::read_to_string(&path).await {
                 Ok(disk) if disk != buffer => {}
                 _ => continue,
@@ -176,14 +176,17 @@ impl Backend {
                         .report_message(
                             MessageType::WARNING,
                             format!(
-                                "{} changed on disk, but Neovim has unsaved changes to it, so it was not reloaded.",
+                                "{} changed on disk, but the editor has unsaved changes to it, so it was not reloaded.",
                                 name.display()
                             ),
                         )
                         .await;
                 }
                 Ok(_) => {}
-                Err(error) => error!("could not ask Neovim to reload {}: {error}", path.display()),
+                Err(error) => error!(
+                    "could not ask the editor to reload {}: {error}",
+                    path.display()
+                ),
             }
         }
         if closed_file_changed {

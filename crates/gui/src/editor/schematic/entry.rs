@@ -1,10 +1,10 @@
 //! The entry tools: the wire being drawn, where ports and labels attach, and
 //! the requests each gesture sends.
 
-use analyzer::rpc::{
+use argonc::compile::NodeIdx;
+use protocol::rpc::{
     AddSignalRequest, ConnectRequest, KeywordEdit, PlaceRequest, PlacementEdit, SchematicTarget,
 };
-use argonc::compile::NodeIdx;
 
 use super::hit::Hit;
 use super::scene::{Overrides, Scene, UnroutedConnection};

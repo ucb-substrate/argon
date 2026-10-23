@@ -1,8 +1,8 @@
 //! Self-contained rendering regressions using generated layouts and repository technology files.
 use super::*;
 use crate::editor::{PreparedCompileOutput, prepare_compilation_snapshot};
-use analyzer::rpc::CompilationSnapshot;
 use argonc::compile::CompileOutput;
+use protocol::rpc::CompilationSnapshot;
 use std::path::PathBuf;
 
 fn test_canvas(cx: &mut gpui::TestAppContext) -> Entity<LayoutCanvas> {
@@ -525,7 +525,7 @@ fn prepare(
     )
     .unwrap_valid();
     let snapshot = editor::prepare_compilation_snapshot(
-        analyzer::rpc::CompilationSnapshot {
+        protocol::rpc::CompilationSnapshot {
             revision: 1,
             output: compile::CompileOutput::Valid(output),
         },
@@ -1141,7 +1141,7 @@ impl Render for Host {
 fn answer_open_cell(
     mut server: crate::rpc::TestLangServerTransport,
     cx: &gpui::VisualTestContext,
-) -> Task<analyzer::rpc::LangServerRequest> {
+) -> Task<protocol::rpc::LangServerRequest> {
     use futures::{SinkExt, StreamExt};
 
     cx.background_executor.spawn(async move {
@@ -1151,7 +1151,7 @@ fn answer_open_cell(
         server
             .send(tarpc::Response {
                 request_id: request.id,
-                message: Ok(analyzer::rpc::LangServerResponse::OpenCell(())),
+                message: Ok(protocol::rpc::LangServerResponse::OpenCell(())),
             })
             .await
             .unwrap();
@@ -1159,8 +1159,8 @@ fn answer_open_cell(
     })
 }
 
-fn library_cell(path: &str) -> analyzer::rpc::CellEntry {
-    analyzer::rpc::CellEntry {
+fn library_cell(path: &str) -> protocol::rpc::CellEntry {
+    protocol::rpc::CellEntry {
         path: path.to_owned(),
         parameters: Vec::new(),
         requires_arguments: false,
@@ -1169,8 +1169,8 @@ fn library_cell(path: &str) -> analyzer::rpc::CellEntry {
 
 #[gpui::test]
 fn the_start_screen_offers_the_library_until_a_cell_opens(cx: &mut gpui::TestAppContext) {
-    use analyzer::rpc::LangServerRequest;
     use futures::FutureExt;
+    use protocol::rpc::LangServerRequest;
 
     let canvas = test_canvas(cx);
     let (client, server) = crate::rpc::SyncLangServerClient::for_rpc_test(cx.to_async());
@@ -1230,8 +1230,8 @@ fn the_start_screen_offers_the_library_until_a_cell_opens(cx: &mut gpui::TestApp
 
 #[gpui::test]
 fn the_start_screen_reopens_recent_invocations(cx: &mut gpui::TestAppContext) {
-    use analyzer::rpc::{LangServerRequest, RecentCell};
     use futures::FutureExt;
+    use protocol::rpc::{LangServerRequest, RecentCell};
 
     let canvas = test_canvas(cx);
     let (client, server) = crate::rpc::SyncLangServerClient::for_rpc_test(cx.to_async());
@@ -1263,7 +1263,7 @@ fn the_start_screen_reopens_recent_invocations(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn recent_invocations_leave_room_for_the_library(cx: &mut gpui::TestAppContext) {
-    use analyzer::rpc::RecentCell;
+    use protocol::rpc::RecentCell;
 
     let canvas = test_canvas(cx);
     canvas.update(cx, |canvas, cx| {
@@ -1366,7 +1366,7 @@ fn early_sse_cell_preview_is_applied_as_soon_as_neovim_acknowledges_the_edit(
             cx,
             0,
             Ok(Some(vec![])),
-            vec![analyzer::rpc::InitialConditionEdit {
+            vec![protocol::rpc::InitialConditionEdit {
                 call_span: Span {
                     path: source.into(),
                     span: cfgrammar::Span::new(0, original.len()),
@@ -1779,7 +1779,7 @@ cell top() {
     editor.update(cx, |editor, cx| {
         let context = editor.begin_snapshot_preparation(cx, 1);
         let prepared = editor::prepare_compilation_snapshot(
-            analyzer::rpc::CompilationSnapshot {
+            protocol::rpc::CompilationSnapshot {
                 revision: 1,
                 output: first,
             },
@@ -1892,7 +1892,7 @@ cell top() {
             let id = index as u64 + 2;
             let context = editor.begin_snapshot_preparation(cx, id);
             let prepared = editor::prepare_compilation_snapshot(
-                analyzer::rpc::CompilationSnapshot {
+                protocol::rpc::CompilationSnapshot {
                     revision: id,
                     output,
                 },
@@ -2084,7 +2084,7 @@ cell top() { let a = inst(leaf(), x=0., y=0.); let b = inst(unchanged(), x=70., 
         }
     }
     let mut prepared = editor::prepare_compilation_snapshot(
-        analyzer::rpc::CompilationSnapshot {
+        protocol::rpc::CompilationSnapshot {
             revision: 2,
             output: compile::CompileOutput::Valid(output),
         },
@@ -2145,8 +2145,8 @@ fn placed_rectangle_stays_visible_until_raster_frame_arrives(cx: &mut gpui::Test
 }
 
 fn rectangle_placement_handoff(cx: &mut gpui::TestAppContext, dense: bool) {
-    use analyzer::rpc::{LangServerRequest, LangServerResponse, RectangleEditResult};
     use futures::{FutureExt, SinkExt, StreamExt};
+    use protocol::rpc::{LangServerRequest, LangServerResponse, RectangleEditResult};
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("lib.ar");
     let layer_name = "met1";
@@ -2181,7 +2181,7 @@ cell top() { for row in std::range(96) { for col in std::range(96) {
         editor.update(cx, |editor, cx| {
             let context = editor.begin_snapshot_preparation(cx, revision);
             let prepared = editor::prepare_compilation_snapshot(
-                analyzer::rpc::CompilationSnapshot { revision, output },
+                protocol::rpc::CompilationSnapshot { revision, output },
                 context,
             );
             editor.finish_snapshot_preparation(cx, revision, prepared);
@@ -2585,7 +2585,7 @@ fn bench_sram_unconstrained_rect_delete_editor(cx: &mut gpui::TestAppContext) {
     editor.update(cx, |editor, cx| {
         let context = editor.begin_snapshot_preparation(cx, 1);
         let prepared = editor::prepare_compilation_snapshot(
-            analyzer::rpc::CompilationSnapshot {
+            protocol::rpc::CompilationSnapshot {
                 revision: 1,
                 output: first,
             },
@@ -2644,7 +2644,7 @@ fn bench_sram_unconstrained_rect_delete_editor(cx: &mut gpui::TestAppContext) {
             let id = 75 - count as u64;
             let context = editor.begin_snapshot_preparation(cx, id);
             let prepared = editor::prepare_compilation_snapshot(
-                analyzer::rpc::CompilationSnapshot {
+                protocol::rpc::CompilationSnapshot {
                     revision: id,
                     output,
                 },
