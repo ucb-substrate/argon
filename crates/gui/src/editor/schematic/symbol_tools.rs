@@ -4,9 +4,9 @@
 
 use std::collections::HashMap;
 
-use analyzer::rpc::{KeywordEdit, PlacementEdit};
 use argonc::ast::Span;
 use argonc::compile::{Align, SymbolItemKind};
+use protocol::rpc::{KeywordEdit, PlacementEdit};
 
 use super::SymbolSelection;
 use super::symbol_scene::{SymbolOverrides, SymbolScene};

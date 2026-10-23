@@ -31,7 +31,7 @@ mod symbol;
 
 pub use result::{
     CompileOutput, ExecError, ExecErrorCompileOutput, ExecErrorKind, StaticError,
-    StaticErrorCompileOutput, StaticErrorKind,
+    StaticErrorCompileOutput, StaticErrorKind, VarObject, VarRole,
 };
 pub(crate) use schematic::Namer;
 use schematic::{ConnectRecord, DeviceRecord, NodeOrigin, SchInstRecord, SchematicState};
@@ -9037,7 +9037,8 @@ struct CellState {
     sse_basis: SseBasis,
     unsolved_vars: Option<IndexSet<Var>>,
     constraint_span_map: FxIndexMap<ConstraintId, Span>,
-    var_span_map: FxIndexMap<Var, Span>,
+    /// Where each variable that may be reported came from.
+    var_origins: FxIndexMap<Var, VarOrigin>,
     var_dependents: FxIndexMap<Var, FxIndexSet<ValueId>>,
     /// Objects built by reading a shape out of a placed instance.
     ///
@@ -9074,11 +9075,26 @@ impl CellState {
         &self.scope_metadata[self.scopes[&scope].metadata.0 as usize].span
     }
 
-    fn new_solver_var(&mut self, span: &Span) -> Var {
+    fn new_solver_var(&mut self, span: &Span, object: VarObject, value: VarRole) -> Var {
         let var = self.solver.new_var();
-        self.var_span_map.insert(var, span.clone());
+        self.var_origins.insert(
+            var,
+            VarOrigin {
+                span: span.clone(),
+                object,
+                value,
+            },
+        );
         var
     }
+}
+
+/// The source expression and object value a solver variable stands for.
+#[derive(Clone, Debug)]
+struct VarOrigin {
+    span: Span,
+    object: VarObject,
+    value: VarRole,
 }
 
 struct ExecPass<'a> {
@@ -10011,7 +10027,8 @@ impl<'a> ExecPass<'a> {
             if error.cell == entry_id
                 && matches!(
                     error.kind,
-                    ExecErrorKind::Underconstrained | ExecErrorKind::InconsistentConstraint(_)
+                    ExecErrorKind::Underconstrained { .. }
+                        | ExecErrorKind::InconsistentConstraint(_)
                 )
             {
                 error.kind = ExecErrorKind::UnevaluatedCellArgument;
@@ -10194,10 +10211,22 @@ impl<'a> ExecPass<'a> {
             .iter()
             .copied()
             .collect::<FxIndexSet<_>>();
-        let spans = unsolved_vars
+        // One report per source expression, naming each free value once, in
+        // the order the values were declared.
+        let mut origins = unsolved_vars
             .iter()
-            .filter_map(|var| state.var_span_map.get(var).cloned())
-            .collect::<IndexSet<_>>();
+            .filter_map(|var| Some((*var, state.var_origins.get(var)?)))
+            .collect::<Vec<_>>();
+        origins.sort_by_key(|(var, _)| *var);
+        let mut reports = FxIndexMap::<Span, (VarObject, Vec<VarRole>)>::default();
+        for (_, origin) in origins {
+            let (_, free) = reports
+                .entry(origin.span.clone())
+                .or_insert_with(|| (origin.object, Vec::new()));
+            if !free.contains(&origin.value) {
+                free.push(origin.value);
+            }
+        }
         if debug_info {
             state.sse_basis = match state.solver.sparse_nullspace_vecs() {
                 Some(vectors) => SseBasis::Nullspace(vectors),
@@ -10212,16 +10241,26 @@ impl<'a> ExecPass<'a> {
         if !underconstrained {
             return;
         }
-        let spans = if spans.is_empty() {
-            vec![None]
-        } else {
-            spans.into_iter().map(Some).collect()
-        };
-        self.errors.extend(spans.into_iter().map(|span| ExecError {
-            span,
-            cell: cell_id,
-            kind: ExecErrorKind::Underconstrained,
-        }));
+        if reports.is_empty() {
+            self.errors.push(ExecError {
+                span: None,
+                cell: cell_id,
+                kind: ExecErrorKind::Underconstrained {
+                    object: None,
+                    free: Vec::new(),
+                },
+            });
+            return;
+        }
+        self.errors
+            .extend(reports.into_iter().map(|(span, (object, free))| ExecError {
+                span: Some(span),
+                cell: cell_id,
+                kind: ExecErrorKind::Underconstrained {
+                    object: Some(object),
+                    free,
+                },
+            }));
     }
 
     pub(crate) fn execute_cell(
@@ -10400,7 +10439,7 @@ impl<'a> ExecPass<'a> {
                         unsolved_vars: Default::default(),
                         objects: Vec::new(),
                         constraint_span_map: FxIndexMap::default(),
-                        var_span_map: FxIndexMap::default(),
+                        var_origins: FxIndexMap::default(),
                         var_dependents: FxIndexMap::default(),
                         proxy_objects: FxIndexSet::default(),
                         schematic: SchematicState::default(),
@@ -10547,7 +10586,11 @@ impl<'a> ExecPass<'a> {
         }
         let grid = self.cell_state(cell_id).solver.grid();
         for (var, value) in self.cell_state(cell_id).solver.off_grid_vars().clone() {
-            let span = self.cell_state(cell_id).var_span_map.get(&var).cloned();
+            let span = self
+                .cell_state(cell_id)
+                .var_origins
+                .get(&var)
+                .map(|origin| origin.span.clone());
             self.errors.push(ExecError {
                 span,
                 cell: cell_id,
@@ -13722,9 +13765,24 @@ impl<'a> ExecPass<'a> {
                             }
                         }
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
-                        for (var, needs_span) in vars.into_iter().zip(needs_span) {
+                        const CORNERS: [VarRole; 4] = [
+                            VarRole::X(Some(0)),
+                            VarRole::Y(Some(0)),
+                            VarRole::X(Some(1)),
+                            VarRole::Y(Some(1)),
+                        ];
+                        for ((var, needs_span), value) in
+                            vars.into_iter().zip(needs_span).zip(CORNERS)
+                        {
                             if needs_span {
-                                state.var_span_map.insert(var, rect.span.clone().unwrap());
+                                state.var_origins.insert(
+                                    var,
+                                    VarOrigin {
+                                        span: rect.span.clone().unwrap(),
+                                        object: VarObject::Rect,
+                                        value,
+                                    },
+                                );
                             }
                         }
                         if droppable {
@@ -13799,10 +13857,22 @@ impl<'a> ExecPass<'a> {
                                 }
                                 let state = self.cell_state_mut(cell_id);
                                 (0..count)
-                                    .map(|_| {
+                                    .map(|i| {
                                         (
-                                            state.new_solver_var(&span).into(),
-                                            state.new_solver_var(&span).into(),
+                                            state
+                                                .new_solver_var(
+                                                    &span,
+                                                    VarObject::Polygon,
+                                                    VarRole::X(Some(i)),
+                                                )
+                                                .into(),
+                                            state
+                                                .new_solver_var(
+                                                    &span,
+                                                    VarObject::Polygon,
+                                                    VarRole::Y(Some(i)),
+                                                )
+                                                .into(),
                                         )
                                     })
                                     .collect()
@@ -13968,7 +14038,9 @@ impl<'a> ExecPass<'a> {
                             matches!(kwarg.name.name.as_str(), "end_extension" | "end_extensioni")
                         });
                         let state = self.cell_state_mut(cell_id);
-                        let width = state.new_solver_var(&span).into();
+                        let width = state
+                            .new_solver_var(&span, VarObject::Path, VarRole::Width)
+                            .into();
                         // Extensions are free variables even when no kwarg
                         // names them, exactly as `width` always is. Making
                         // them conditional meant `eq(p.begin_extension, 5.)`
@@ -13980,8 +14052,8 @@ impl<'a> ExecPass<'a> {
                         // only if nothing else determines the extension: a
                         // path that ignores extensions still solves to zero,
                         // and one that constrains them now works.
-                        let extension = |state: &mut CellState, named: bool| {
-                            let var = state.new_solver_var(&span);
+                        let extension = |state: &mut CellState, named: bool, value| {
+                            let var = state.new_solver_var(&span, VarObject::Path, value);
                             if !named {
                                 state
                                     .compiler_defaults
@@ -13989,13 +14061,19 @@ impl<'a> ExecPass<'a> {
                             }
                             LinearExpr::from(var)
                         };
-                        let begin_extension = extension(state, has_begin_extension);
-                        let end_extension = extension(state, has_end_extension);
+                        let begin_extension =
+                            extension(state, has_begin_extension, VarRole::BeginExtension);
+                        let end_extension =
+                            extension(state, has_end_extension, VarRole::EndExtension);
                         let points = (0..count)
-                            .map(|_| {
+                            .map(|i| {
                                 (
-                                    state.new_solver_var(&span).into(),
-                                    state.new_solver_var(&span).into(),
+                                    state
+                                        .new_solver_var(&span, VarObject::Path, VarRole::X(Some(i)))
+                                        .into(),
+                                    state
+                                        .new_solver_var(&span, VarObject::Path, VarRole::Y(Some(i)))
+                                        .into(),
                                 )
                             })
                             .collect();
@@ -14247,7 +14325,7 @@ impl<'a> ExecPass<'a> {
                         path: state.scope_span(vref.loc.scope).path.clone(),
                         span: c.expr.span,
                     };
-                    let var = state.new_solver_var(&span);
+                    let var = state.new_solver_var(&span, VarObject::Float, VarRole::Value);
                     self.values
                         .insert(vid, Defer::Ready(Value::Linear(LinearExpr::from(var))));
                     true
@@ -14553,8 +14631,12 @@ impl<'a> ExecPass<'a> {
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
                         let inst = Instance {
                             id,
-                            x: state.new_solver_var(&span).into(),
-                            y: state.new_solver_var(&span).into(),
+                            x: state
+                                .new_solver_var(&span, VarObject::Instance, VarRole::X(None))
+                                .into(),
+                            y: state
+                                .new_solver_var(&span, VarObject::Instance, VarRole::Y(None))
+                                .into(),
                             cell: *c.state.posargs.first().unwrap(),
                             reflect: refl.unwrap_or_default(),
                             angle: angle.unwrap_or_default(),

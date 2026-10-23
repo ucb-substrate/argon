@@ -1,0 +1,250 @@
+{
+  "name": "argon",
+  "displayName": "Argon",
+  "description": "Argon layout language support and the Argon layout editor",
+  "version": "0.1.0",
+  "publisher": "ucb-substrate",
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ucb-substrate/argon"
+  },
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "workspaceContains:**/lib.ar"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "argon",
+        "aliases": [
+          "Argon",
+          "argon"
+        ],
+        "extensions": [
+          ".ar"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "argon",
+        "scopeName": "source.argon",
+        "path": "./syntaxes/argon.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Argon",
+      "properties": {
+        "argon.analyzer.path": {
+          "scope": "machine-overridable",
+          "type": "string",
+          "default": "argon-analyzer",
+          "description": "The `argon-analyzer` executable, found on PATH by default."
+        },
+        "argon.gui.location": {
+          "scope": "window",
+          "type": "string",
+          "enum": [
+            "panel",
+            "window"
+          ],
+          "enumDescriptions": [
+            "Show the GUI in a VS Code panel beside the source.",
+            "Show the GUI in a window of its own."
+          ],
+          "default": "panel",
+          "description": "Where the Argon GUI appears. Takes effect when the analyzer restarts."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "argon.gui",
+        "title": "Focus GUI",
+        "category": "Argon"
+      },
+      {
+        "command": "argon.focusSource",
+        "title": "Focus Source",
+        "category": "Argon"
+      },
+      {
+        "command": "argon.openCell",
+        "title": "Open Cell",
+        "category": "Argon"
+      },
+      {
+        "command": "argon.newCell",
+        "title": "New Cell",
+        "category": "Argon"
+      },
+      {
+        "command": "argon.renameCell",
+        "title": "Rename Cell",
+        "category": "Argon"
+      },
+      {
+        "command": "argon.inst",
+        "title": "Place Instance",
+        "category": "Argon"
+      },
+      {
+        "command": "argon.sinst",
+        "title": "Place Schematic Instance",
+        "category": "Argon"
+      },
+      {
+        "command": "argon.device",
+        "title": "Place Device",
+        "category": "Argon"
+      },
+      {
+        "command": "argon.diagnostics",
+        "title": "Show Diagnostics",
+        "category": "Argon"
+      },
+      {
+        "command": "argon.follow",
+        "title": "Follow Agent Edits",
+        "category": "Argon"
+      },
+      {
+        "command": "argon.unfollow",
+        "title": "Stop Following Agent Edits",
+        "category": "Argon"
+      },
+      {
+        "command": "argon.reloadConfig",
+        "title": "Reload Configuration",
+        "category": "Argon"
+      },
+      {
+        "command": "argon.setConfig",
+        "title": "Set Configuration",
+        "category": "Argon"
+      },
+      {
+        "command": "argon.saveConfig",
+        "title": "Save Configuration",
+        "category": "Argon"
+      },
+      {
+        "command": "argon.log",
+        "title": "Open Log",
+        "category": "Argon"
+      },
+      {
+        "command": "argon.restart",
+        "title": "Restart Analyzer",
+        "category": "Argon"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "argon.gui",
+        "key": "ctrl+\\",
+        "when": "argon.active && activeWebviewPanelId != 'argon.gui'"
+      },
+      {
+        "command": "argon.focusSource",
+        "key": "ctrl+\\",
+        "when": "activeWebviewPanelId == 'argon.gui'"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "argon.gui",
+          "when": "argon.active"
+        },
+        {
+          "command": "argon.focusSource",
+          "when": "activeWebviewPanelId == 'argon.gui'"
+        },
+        {
+          "command": "argon.openCell",
+          "when": "argon.active"
+        },
+        {
+          "command": "argon.newCell",
+          "when": "argon.active"
+        },
+        {
+          "command": "argon.renameCell",
+          "when": "argon.active"
+        },
+        {
+          "command": "argon.inst",
+          "when": "argon.active"
+        },
+        {
+          "command": "argon.sinst",
+          "when": "argon.active"
+        },
+        {
+          "command": "argon.device",
+          "when": "argon.active"
+        },
+        {
+          "command": "argon.diagnostics",
+          "when": "argon.active"
+        },
+        {
+          "command": "argon.follow",
+          "when": "argon.active && !argon.following"
+        },
+        {
+          "command": "argon.unfollow",
+          "when": "argon.active && argon.following"
+        },
+        {
+          "command": "argon.reloadConfig",
+          "when": "argon.active"
+        },
+        {
+          "command": "argon.setConfig",
+          "when": "argon.active"
+        },
+        {
+          "command": "argon.saveConfig",
+          "when": "argon.active"
+        },
+        {
+          "command": "argon.restart",
+          "when": "argon.active"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile && npm run build:gui",
+    "compile": "tsc -p .",
+    "watch": "tsc -p . -w",
+    "lint": "tsc -p . --noEmit",
+    "test:unit": "mocha 'out/test/unit/**/*.test.js'",
+    "test:integration": "node ./out/test/integration/run.js",
+    "test": "npm run compile && npm run test:unit && npm run test:integration",
+    "build:gui": "node ./scripts/build-gui.mjs"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.1.2"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^22.0.0",
+    "@types/vscode": "~1.100.0",
+    "@vscode/test-electron": "^3.1.0",
+    "mocha": "^12.0.3",
+    "puppeteer-core": "^25.15.0",
+    "typescript": "^5.9.3",
+    "ws": "^8.22.0"
+  }
+}

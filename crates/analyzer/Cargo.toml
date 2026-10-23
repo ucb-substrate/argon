@@ -13,6 +13,7 @@ name = "analyzer"
 
 [dependencies]
 argonc = { version = "0.1.0", path = "../compiler" }
+protocol = { package = "argon-protocol", path = "../protocol" }
 arc = { version = "0.1.0", path = "../arc" }
 
 tokio = { version = "1", features = ["full"] }

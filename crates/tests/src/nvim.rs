@@ -32,6 +32,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gui_commands_become_argon_command_lines() {
+        use analyzer::rpc::EditorCommand;
+
+        let commands = [
+            EditorCommand::Messages,
+            EditorCommand::prefill("inst", ""),
+            EditorCommand::prefill("openCell", "pad<1>("),
+            EditorCommand::run("diagnostics"),
+        ];
+        let mut command = crate::nvim_command();
+        command
+            .env(
+                "ARGON_EDITOR_COMMANDS",
+                serde_json::to_string(&commands).unwrap(),
+            )
+            .arg("-l")
+            .arg(crate::repository_root().join("crates/tests/fixtures/nvim/command_line.lua"));
+        let child = command.spawn().expect("start headless Neovim");
+        crate::finish_nvim(child).await;
+    }
+
+    #[tokio::test]
     async fn embedded_gui_leaves_ctrl_backslash_and_flags_the_analyzer() {
         let mut command = crate::nvim_command();
         command

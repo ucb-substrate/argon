@@ -38,6 +38,8 @@ allow-registry = [
     "https://github.com/rust-lang/crates.io-index",
     "https://github.com/substrate-labs/crates-index",
 ]
+# GPUI pins wgpu to an unreleased revision.
+allow-git = ["https://github.com/gfx-rs/wgpu"]
 
 [sources.allow-org]
 github = ["ucb-substrate", "zed-industries"]

@@ -1,0 +1,79 @@
+import {EditorName, Neovim, VSCode} from '@site/src/components/Editor';
+import OpenEditor from './open-editor.mdx';
+
+In this step you create a library, open it in <EditorName /> and the GUI, and draw two rectangles.
+
+## Create a library
+
+```bash
+arc new tutorial
+cd tutorial
+```
+
+This creates three files:
+
+```text
+tutorial/
+├── Argon.toml  # library manifest
+├── tech.toml   # units, layers, and display styles
+└── lib.ar      # Argon source
+```
+
+`lib.ar` starts with an empty `top()` cell. A cell is a layout definition you can call, like a parameterized block.
+
+## Open the editor
+
+From the library directory:
+
+<OpenEditor />
+
+<Neovim>
+
+This opens a window with Neovim on the left and the GUI on the right, and starts the analyzer. Neovim owns the source; the analyzer compiles it and sends the result to the GUI. <kbd>Cmd</kbd>+<kbd>Backslash</kbd> switches focus between Neovim and the GUI's canvas.
+
+</Neovim>
+
+<VSCode>
+
+The extension starts the analyzer when you open `lib.ar`. VS Code owns the source; the analyzer compiles it and sends the result to the GUI. <kbd>Ctrl</kbd>+<kbd>Backslash</kbd> switches focus between the source and the GUI.
+
+</VSCode>
+
+The GUI opens on a start screen that lists your library's cells. Click `top` to open it.
+
+You can also open a cell from the keyboard. Press <kbd>O</kbd> in the GUI, and <Neovim>the command line opens with `:Argon openCell` filled in</Neovim><VSCode>the **Argon: Open Cell** prompt opens</VSCode>. Type an invocation such as `top()` and press <kbd>Enter</kbd>.
+
+## Replace the starter cell
+
+Replace the contents of `lib.ar` with:
+
+```argon title="lib.ar"
+cell inset_rect() {
+}
+```
+
+Press <kbd>O</kbd> again and open `inset_rect()`. You don't need to save first: the analyzer compiles the <Neovim>buffer</Neovim><VSCode>open document</VSCode> as you type, and the canvas updates a moment after you stop.
+
+## Draw two rectangles
+
+1. Pick the `met2` layer in the layer sidebar.
+2. Press <kbd>R</kbd> and click two opposite corners.
+3. Pick `met1` and draw a larger rectangle around the first.
+4. Press <kbd>Esc</kbd> to return to selection mode.
+
+Look at `lib.ar` in <EditorName />: each rectangle is now a [`std::layout::rect`](/language/std-layout#rect) call, written with its full path so the file needs no import. The GUI writes into the <Neovim>buffer</Neovim><VSCode>open document</VSCode>, not the file, so these edits can be undone like any other. The calls use initial values such as `x0i` and `y1i`, which is what lets you drag unconstrained edges later.
+
+:::tip
+Press <kbd>U</kbd> in the GUI to undo its last edit and <kbd>Ctrl</kbd>+<kbd>R</kbd> to redo it. <kbd>F</kbd> fits the layout to the canvas.
+:::
+
+## Check the project
+
+Save `lib.ar`, then run:
+
+```bash
+arc fmt
+arc check
+```
+
+Next, [add constraints](./constraints) to replace the sketched positions with relationships.

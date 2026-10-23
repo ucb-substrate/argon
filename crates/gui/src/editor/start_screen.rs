@@ -1,7 +1,7 @@
 //! What the window shows before a cell is open.
 
-use analyzer::rpc::{CellEntry, RecentCell};
 use gpui::{prelude::FluentBuilder, *};
+use protocol::rpc::{CellEntry, EditorCommand, RecentCell};
 
 use crate::{
     actions::{NewCellCommand, OpenCellCommand},
@@ -235,10 +235,16 @@ impl Editor {
     /// invoking editor's command line.
     fn open_library_cell(&mut self, cell: &CellEntry, cx: &mut Context<Self>) {
         if cell.requires_arguments {
-            self.open_invoking_command(Some(&format!("Argon openCell {}(", cell.path)), true, cx);
+            self.open_invoking_command(
+                Some(EditorCommand::prefill(
+                    "openCell",
+                    format!("{}(", cell.path),
+                )),
+                true,
+                cx,
+            );
         } else {
-            let _ = self
-                .state
+            self.state
                 .read(cx)
                 .lang_server_client
                 .open_cell(format!("{}()", cell.path));
@@ -247,8 +253,7 @@ impl Editor {
 
     /// Reopens `recent` exactly as it was invoked.
     fn open_recent_cell(&self, recent: &RecentCell, cx: &mut Context<Self>) {
-        let _ = self
-            .state
+        self.state
             .read(cx)
             .lang_server_client
             .open_cell(recent.invocation.clone());

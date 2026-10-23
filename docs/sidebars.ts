@@ -5,22 +5,51 @@ import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';
 // and the tools reference read as separate books. Doc IDs are paths relative
 // to docs/docs/.
 const sidebars: SidebarsConfig = {
-  // One entry per guide: a category for a multi-page guide, a single doc
-  // otherwise. Add new guides here and as rows in docs/docs/guides/index.md.
+  // Each guide has a Neovim and a VS Code version, rendered from one partial in
+  // docs/docs/guides/_tutorial. Add new guides to both editors here and to
+  // docs/docs/guides/index.md.
   guides: [
     'guides/index',
     {
       type: 'category',
-      label: 'Getting started',
+      label: 'Neovim',
       collapsed: false,
       items: [
-        'guides/getting-started/installation',
-        'guides/getting-started/first-cell',
-        'guides/getting-started/constraints',
-        'guides/getting-started/hierarchy-export',
+        {
+          type: 'category',
+          label: 'Getting started',
+          key: 'neovim-getting-started',
+          collapsed: false,
+          items: [
+            'guides/getting-started/installation',
+            'guides/getting-started/first-cell',
+            'guides/getting-started/constraints',
+            'guides/getting-started/hierarchy-export',
+          ],
+        },
+        'guides/sky130-inverter',
       ],
     },
-    'guides/sky130-inverter',
+    {
+      type: 'category',
+      label: 'VS Code',
+      collapsed: false,
+      items: [
+        {
+          type: 'category',
+          label: 'Getting started',
+          key: 'vscode-getting-started',
+          collapsed: false,
+          items: [
+            'guides/vscode/getting-started/installation',
+            'guides/vscode/getting-started/first-cell',
+            'guides/vscode/getting-started/constraints',
+            'guides/vscode/getting-started/hierarchy-export',
+          ],
+        },
+        'guides/vscode/sky130-inverter',
+      ],
+    },
   ],
 
   language: [
@@ -84,6 +113,7 @@ const sidebars: SidebarsConfig = {
     'tools/argone',
     'tools/argonc',
     'tools/neovim',
+    'tools/vscode',
     'tools/agents',
   ],
 };

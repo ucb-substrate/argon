@@ -7,13 +7,10 @@ use std::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
 };
 
-use analyzer::rpc::{
-    DimensionParams, DrawSegmentConstraint, InitialConditionEdit, InstancePreview, PathParams,
-    PolygonParams, RectangleEditResult, ValueEdit, remap_span_after_value_edits,
-};
+use web_time::Instant;
+
 #[cfg(test)]
 use argonc::compile::RectInitialCondition;
 use argonc::{
@@ -27,13 +24,17 @@ use gpui::{
     App, AppContext, BorderStyle, Bounds, ContentMask, Context, Corners, DefiniteLength, Edges,
     Element, Entity, FillOptions, FocusHandle, Focusable, Half, InteractiveElement, IntoElement,
     KeyUpEvent, Length, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    ParentElement, PathBuilder, PathStyle, Pixels, Point, Render, RenderImage, Rgba,
-    ScrollWheelEvent, SharedString, Size, Style, Styled, Subscription, Task, TextRun, Window, div,
+    ParentElement, PathBuilder, PathStyle, Pixels, Point, Render, RenderImage, Rgba, ScrollEvent,
+    SharedString, Size, Style, Styled, Subscription, Task, TextAlign, TextRun, Window, div,
     pattern_slash, px, rgb, size, solid_background,
 };
 use indexmap::{IndexMap, IndexSet};
 use itertools::Itertools;
-use tower_lsp_server::ls_types::MessageType;
+use ls_types::MessageType;
+use protocol::rpc::{
+    DimensionParams, DrawSegmentConstraint, InitialConditionEdit, InstancePreview, PathParams,
+    PolygonParams, RectangleEditResult, ValueEdit, remap_span_after_value_edits,
+};
 
 use crate::{
     actions::*,
@@ -579,9 +580,7 @@ fn paint_polygon_fill(
     if let Ok(path) = fill.build() {
         let background = match layer.fill {
             ShapeFill::Solid => solid_background(layer.color),
-            ShapeFill::Stippling | ShapeFill::Pattern(_) => {
-                pattern_slash(layer.color.into(), 2., 8.)
-            }
+            ShapeFill::Stippling | ShapeFill::Pattern(_) => pattern_slash(layer.color, 2., 8.),
             ShapeFill::Hollow => unreachable!(),
         };
         window.paint_path(path, background);
@@ -1213,6 +1212,8 @@ pub(crate) struct SelectToolState {
 pub(crate) struct PlaceInstanceToolState {
     invocation: String,
     scope_span: Span,
+    /// Whether a placement is waiting for the analyzer, which ignores clicks.
+    in_flight: bool,
     rects: Vec<Rect>,
     polygons: Vec<Polygon>,
 }
@@ -3597,17 +3598,12 @@ fn paint_tiled_pattern_rect(
         while y < visible.bottom() {
             let mut x = first_x;
             while x < visible.right() {
+                let tile = Bounds::new(
+                    Point::new(x, y),
+                    Size::new(px(logical_tile_width), px(logical_tile_height)),
+                );
                 window
-                    .paint_image(
-                        Bounds::new(
-                            Point::new(x, y),
-                            Size::new(px(logical_tile_width), px(logical_tile_height)),
-                        ),
-                        Corners::all(px(0.)),
-                        image.clone(),
-                        0,
-                        false,
-                    )
+                    .paint_image(tile, tile, Corners::all(px(0.)), image.clone(), 0, false)
                     .unwrap();
                 x += px(logical_tile_width);
             }
@@ -5972,7 +5968,7 @@ fn get_paint_quad(
     );
     let background = match fill {
         ShapeFill::Solid => solid_background(color),
-        ShapeFill::Stippling | ShapeFill::Pattern(_) => pattern_slash(color.into(), 2., 8.),
+        ShapeFill::Stippling | ShapeFill::Pattern(_) => pattern_slash(color, 2., 8.),
         ShapeFill::Hollow => solid_background(Rgba { a: 0., ..color }),
     };
     PaintQuad {
@@ -7209,9 +7205,11 @@ impl Element for CanvasElement {
                     window.paint_layer(bounds, |window| {
                         let visible_tiles = visible_raster_tiles(tiles, bounds, scale, offset);
                         for cache in &visible_tiles {
+                            let tile = raster_bounds(cache, bounds, scale, offset);
                             window
                                 .paint_image(
-                                    raster_bounds(cache, bounds, scale, offset),
+                                    tile,
+                                    tile,
                                     Corners::all(px(0.)),
                                     cache.image.clone(),
                                     0,
@@ -7252,6 +7250,8 @@ impl Element for CanvasElement {
                                         ) + offset
                                             + bounds.origin,
                                         line_height,
+                                        TextAlign::Left,
+                                        None,
                                         window,
                                         cx,
                                     )
@@ -7290,7 +7290,7 @@ impl Element for CanvasElement {
                                 window
                                     .text_system()
                                     .shape_line(bbox.label.clone(), font_size, runs, None)
-                                    .paint(text_origin, line_height, window, cx)
+                                    .paint(text_origin, line_height, TextAlign::Left, None, window, cx)
                                     .unwrap();
                             }
                         }
@@ -7387,6 +7387,7 @@ impl Element for CanvasElement {
                                 ) {
                                     window
                                         .paint_image(
+                                            image_bounds,
                                             image_bounds,
                                             Corners::all(px(0.)),
                                             image.clone(),
@@ -7511,6 +7512,7 @@ impl Element for CanvasElement {
                             window
                                 .paint_image(
                                     image_bounds,
+                                    image_bounds,
                                     Corners::all(px(0.)),
                                     image.clone(),
                                     0,
@@ -7577,6 +7579,7 @@ impl Element for CanvasElement {
                             ) {
                                 window
                                     .paint_image(
+                                        image_bounds,
                                         image_bounds,
                                         Corners::all(px(0.)),
                                         image.clone(),
@@ -7672,6 +7675,7 @@ impl Element for CanvasElement {
                                     window
                                         .paint_image(
                                             image_bounds,
+                                            image_bounds,
                                             Corners::all(px(0.)),
                                             image.clone(),
                                             0,
@@ -7744,6 +7748,8 @@ impl Element for CanvasElement {
                                 ) + offset
                                     + bounds.origin,
                                 line_height,
+                                TextAlign::Left,
+                                None,
                                 window,
                                 cx,
                             )
@@ -7779,7 +7785,7 @@ impl Element for CanvasElement {
                                 window
                                     .text_system()
                                     .shape_line(bbox.label.clone(), font_size, runs, None)
-                                    .paint(text_origin, line_height, window, cx)
+                                    .paint(text_origin, line_height, TextAlign::Left, None, window, cx)
                                     .unwrap();
                             }
                         }
@@ -8101,7 +8107,7 @@ impl Element for CanvasElement {
                             window
                                 .text_system()
                                 .shape_line(text, font_size, runs, None)
-                                .paint(origin, px(16.), window, cx)
+                                .paint(origin, px(16.), TextAlign::Left, None, window, cx)
                                 .unwrap();
                         };
 
@@ -8692,7 +8698,7 @@ impl Render for LayoutCanvas {
             .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_middle_mouse_up))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_left_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_left_mouse_up))
-            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .on_scroll(cx.listener(Self::on_scroll_wheel))
             .child(CanvasElement {
                 inner: cx.entity().clone(),
             })
@@ -9915,6 +9921,7 @@ impl LayoutCanvas {
             *tool = ToolState::PlaceInstance(PlaceInstanceToolState {
                 invocation: preview.invocation,
                 scope_span: preview.scope_span,
+                in_flight: false,
                 rects,
                 polygons,
             });
@@ -10482,13 +10489,13 @@ impl LayoutCanvas {
                                 rect_tool.p0 = Some(snapped_layout_mouse_position);
                             }
                         } else {
-                            let _ = state.lang_server_client.show_message(
+                            state.lang_server_client.show_message(
                                 MessageType::ERROR,
                                 "Cannot draw on an invisible layer.",
                             );
                         }
                     } else {
-                        let _ = state
+                        state
                             .lang_server_client
                             .show_message(MessageType::ERROR, "No layer has been selected.");
                     }
@@ -10520,13 +10527,13 @@ impl LayoutCanvas {
                                 cx.notify();
                             }
                         } else {
-                            let _ = state.lang_server_client.show_message(
+                            state.lang_server_client.show_message(
                                 MessageType::ERROR,
                                 "Cannot draw on an invisible layer.",
                             );
                         }
                     } else {
-                        let _ = state
+                        state
                             .lang_server_client
                             .show_message(MessageType::ERROR, "No layer has been selected.");
                     }
@@ -10558,43 +10565,56 @@ impl LayoutCanvas {
                                 cx.notify();
                             }
                         } else {
-                            let _ = state.lang_server_client.show_message(
+                            state.lang_server_client.show_message(
                                 MessageType::ERROR,
                                 "Cannot draw on an invisible layer.",
                             );
                         }
                     } else {
-                        let _ = state
+                        state
                             .lang_server_client
                             .show_message(MessageType::ERROR, "No layer has been selected.");
                     }
                 }
                 ToolState::PlaceInstance(placement) => {
+                    if placement.in_flight {
+                        return edit_dim;
+                    }
+                    placement.in_flight = true;
                     let x = argonc::tech::snap(f64::from(snapped_layout_mouse_position.x), grid);
                     let y = argonc::tech::snap(f64::from(snapped_layout_mouse_position.y), grid);
-                    let result = self.state.read(cx).lang_server_client.place_instance(
-                        placement.scope_span.clone(),
-                        placement.invocation.clone(),
-                        x,
-                        y,
-                    );
-                    match result {
-                        Ok(Some(scope_span)) => {
-                            placement.scope_span = scope_span;
+                    let client = self.state.read(cx).lang_server_client.clone();
+                    let editor_state = self.state.clone();
+                    let scope_span = placement.scope_span.clone();
+                    let invocation = placement.invocation.clone();
+                    cx.spawn(async move |tool, cx| {
+                        let result = client
+                            .place_instance(scope_span, invocation.clone(), x, y)
+                            .await;
+                        let _ = tool.update(cx, |tool, cx| {
+                            let ToolState::PlaceInstance(placement) = tool else {
+                                return;
+                            };
+                            if placement.invocation != invocation {
+                                return;
+                            }
+                            placement.in_flight = false;
+                            if let Ok(Some(scope_span)) = result {
+                                placement.scope_span = scope_span;
+                            } else if let Ok(None) = result {
+                                editor_state.update(cx, |state, _cx| {
+                                    if state.message.is_none() {
+                                        state.show_message(
+                                            MessageType::ERROR,
+                                            SOURCE_EDIT_REJECTED_MESSAGE,
+                                        );
+                                    }
+                                });
+                            }
                             cx.notify();
-                        }
-                        Ok(None) => {
-                            self.state.update(cx, |state, _cx| {
-                                if state.message.is_none() {
-                                    state.show_message(
-                                        MessageType::ERROR,
-                                        SOURCE_EDIT_REJECTED_MESSAGE,
-                                    );
-                                }
-                            });
-                        }
-                        Err(_) => {}
-                    }
+                        });
+                    })
+                    .detach();
                 }
                 ToolState::DrawDim(dim_tool) => {
                     let enter_entry_mode = if dim_tool.edges.len() < 2 {
@@ -11070,8 +11090,7 @@ impl LayoutCanvas {
                                 self.sse_delta = Point::default();
                                 self.sse_targets = body.targets;
                             }
-                            let _ = self
-                                .state
+                            self.state
                                 .read(cx)
                                 .lang_server_client
                                 .select_span(span.clone());
@@ -11110,7 +11129,7 @@ impl LayoutCanvas {
         if edit_dim {
             self.text_input
                 .update(cx, |input, cx| input.start_dimension_edit(cx));
-            window.focus(&self.text_input_focus_handle);
+            window.focus(&self.text_input_focus_handle, cx);
             window.prevent_default();
         }
     }
@@ -11188,7 +11207,7 @@ impl LayoutCanvas {
             if draw_points.len() < minimum_points {
                 let shape = if is_path { "path" } else { "polygon" };
                 let count = if is_path { "two" } else { "three" };
-                let _ = self.state.read(cx).lang_server_client.show_message(
+                self.state.read(cx).lang_server_client.show_message(
                     MessageType::ERROR,
                     format!("A {shape} requires at least {count} points before pressing Enter."),
                 );
@@ -11221,75 +11240,99 @@ impl LayoutCanvas {
                 .as_ref()
                 .map(ToString::to_string)
             else {
-                let _ = self
-                    .state
+                self.state
                     .read(cx)
                     .lang_server_client
                     .show_message(MessageType::ERROR, "No layer has been selected.");
                 return;
             };
 
-            let mut inserted = false;
-            self.state.update(cx, |state, cx| {
-                let error: Option<SharedString> = state.solved_cell.update(cx, |cell, _cx| {
-                    let Some(cell) = cell.as_mut() else {
-                        return Some("no cell to edit".into());
-                    };
-                    let scope_address = &cell.selected_scope;
-                    let reachable_objs = cell
-                        .output
-                        .reachable_objs(scope_address.cell, scope_address.scope);
-                    let names: IndexSet<_> = reachable_objs.values().collect();
-                    let name_prefix = if is_path { "path" } else { "polygon" };
-                    let object_name = (0..)
-                        .map(|index| format!("{name_prefix}{index}"))
-                        .find(|name| !names.contains(name))
-                        .unwrap();
-                    let scope_span = cell.output.cells[&scope_address.cell]
-                        .scope_span(scope_address.scope)
-                        .clone();
-                    let result = if is_path {
-                        state.lang_server_client.draw_path(
+            let state = self.state.read(cx);
+            let target = state.solved_cell.read(cx).as_ref().map(|cell| {
+                let scope_address = &cell.selected_scope;
+                let reachable_objs = cell
+                    .output
+                    .reachable_objs(scope_address.cell, scope_address.scope);
+                let names: IndexSet<_> = reachable_objs.values().collect();
+                let name_prefix = if is_path { "path" } else { "polygon" };
+                let object_name = (0..)
+                    .map(|index| format!("{name_prefix}{index}"))
+                    .find(|name| !names.contains(name))
+                    .unwrap();
+                let scope_span = cell.output.cells[&scope_address.cell]
+                    .scope_span(scope_address.scope)
+                    .clone();
+                (scope_span, object_name)
+            });
+            let Some((scope_span, object_name)) = target else {
+                state
+                    .lang_server_client
+                    .show_message(MessageType::ERROR, "no cell to edit");
+                return;
+            };
+            let client = state.lang_server_client.clone();
+            let editor_state = self.state.clone();
+            let submitted = draw_points.clone();
+            cx.spawn(async move |tool, cx| {
+                let result = if is_path {
+                    client
+                        .draw_path(
                             scope_span,
                             object_name,
                             PathParams {
-                                layer: layer.clone(),
+                                layer,
                                 width: f64::from(DEFAULT_DRAW_PATH_WIDTH),
-                                points: points.clone(),
-                                constraints: source_constraints.clone(),
+                                points,
+                                constraints: source_constraints,
                             },
                         )
-                    } else {
-                        state.lang_server_client.draw_polygon(
+                        .await
+                } else {
+                    client
+                        .draw_polygon(
                             scope_span,
                             object_name,
                             PolygonParams {
-                                layer: layer.clone(),
-                                points: points.clone(),
-                                constraints: source_constraints.clone(),
+                                layer,
+                                points,
+                                constraints: source_constraints,
                             },
                         )
-                    };
-                    match result {
-                        Ok(Some(_)) => {
-                            inserted = true;
-                            None
-                        }
-                        Ok(None) => Some(SOURCE_EDIT_REJECTED_MESSAGE.into()),
-                        Err(_) => None,
+                        .await
+                };
+                match result {
+                    Ok(Some(_)) => {
+                        let _ = tool.update(cx, |tool, cx| {
+                            let (draw_points, constraints) = match tool {
+                                ToolState::DrawPolygon(tool) => {
+                                    (&mut tool.points, &mut tool.constraints)
+                                }
+                                ToolState::DrawPath(tool) => {
+                                    (&mut tool.points, &mut tool.constraints)
+                                }
+                                _ => return,
+                            };
+                            // Points added while the edit was in flight start the next shape.
+                            if draw_points.starts_with(&submitted) {
+                                draw_points.drain(..submitted.len());
+                                constraints.clear();
+                                cx.notify();
+                            }
+                        });
                     }
-                });
-                if state.message.is_none()
-                    && let Some(error) = error
-                {
-                    state.show_message(MessageType::ERROR, error);
+                    Ok(None) => {
+                        editor_state.update(cx, |state, cx| {
+                            if state.message.is_none() {
+                                state
+                                    .show_message(MessageType::ERROR, SOURCE_EDIT_REJECTED_MESSAGE);
+                                cx.notify();
+                            }
+                        });
+                    }
+                    Err(_) => {}
                 }
-            });
-            if inserted {
-                draw_points.clear();
-                constraints.clear();
-                cx.notify();
-            }
+            })
+            .detach();
         });
     }
 
@@ -11343,7 +11386,7 @@ impl LayoutCanvas {
             });
             self.text_input
                 .update(cx, |input, cx| input.start_dimension_edit(cx));
-            window.focus(&self.text_input_focus_handle);
+            window.focus(&self.text_input_focus_handle, cx);
             window.prevent_default();
             cx.notify();
         }
@@ -11956,7 +11999,7 @@ impl LayoutCanvas {
 
     pub(crate) fn on_scroll_wheel(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -13676,7 +13719,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                     assert!(
                         errors.errors.iter().all(|error| matches!(
                             error.kind,
-                            compile::ExecErrorKind::Underconstrained
+                            compile::ExecErrorKind::Underconstrained { .. }
                         ) || (cell == "reversed"
                             && matches!(error.kind, compile::ExecErrorKind::FlippedRect(_)))),
                         "{cell}: {:?}",
@@ -14328,18 +14371,18 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                 all_scopes_visible: true,
             };
             if let Some(previous) = &previous {
-                let started = std::time::Instant::now();
-                let prior = analyzer::rpc::CompilationSnapshot {
+                let started = web_time::Instant::now();
+                let prior = protocol::rpc::CompilationSnapshot {
                     revision: 1,
                     output: compile::CompileOutput::Valid(previous.output.as_ref().clone()),
                 };
-                let current = analyzer::rpc::CompilationSnapshot {
+                let current = protocol::rpc::CompilationSnapshot {
                     revision: 2,
                     output: compile::CompileOutput::Valid(solved.output.as_ref().clone()),
                 };
-                let update = analyzer::rpc::CompilationUpdate::new(current, Some(&prior));
+                let update = protocol::rpc::CompilationUpdate::new(current, Some(&prior));
                 let changed_cells = update.snapshot.data().unwrap().cells.len();
-                let encoded = analyzer::rpc::CompressedCompilationUpdate::encode(&update)
+                let encoded = protocol::rpc::CompressedCompilationUpdate::encode(&update)
                     .expect("encode SRAM delta");
                 eprintln!(
                     "sram_parent_delta_{label},encode_ms={},bytes={},changed_cells={changed_cells}",
@@ -14367,7 +14410,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                 true,
             );
             input.spatial_index = index.clone();
-            let started = std::time::Instant::now();
+            let started = web_time::Instant::now();
             let raster = build_navigation_raster(input).expect("render SRAM overview");
             eprintln!(
                 "sram_parent_raster_{label},render_ms={},bytes={}",
@@ -14393,7 +14436,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                 let editable = &solved.output.cells[&solved.selected_scope.cell];
                 editable.scopes.len() + editable.objects.len() <= UI_GEOMETRY_WORK_LIMIT / 2
             };
-            let started = std::time::Instant::now();
+            let started = web_time::Instant::now();
             let raster = build_navigation_raster(input).expect("render SRAM canvas");
             eprintln!(
                 "sram_parent_canvas_{label},render_ms={},bytes={}",

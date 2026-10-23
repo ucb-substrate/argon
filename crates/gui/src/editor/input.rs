@@ -1,14 +1,16 @@
 use std::ops::Range;
 use std::rc::Rc;
 
+use argonc::ast::Span;
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, div, fill, point,
-    prelude::*, px, relative, size,
+    SharedString, Style, TextAlign, TextRun, UTF16Selection, UnderlineStyle, Window, div, fill,
+    point, prelude::*, px, relative, size,
 };
-use tower_lsp_server::ls_types::MessageType;
+use ls_types::MessageType;
+use protocol::rpc::DimensionParams;
 use unicode_segmentation::*;
 
 use crate::{
@@ -38,12 +40,20 @@ pub(crate) struct TextInput {
     submit: Option<Submit>,
     /// What a prompt does on Escape.
     dismiss: Option<Dismiss>,
+    /// Whether a dimension edit is waiting for the analyzer.
+    dimension_in_flight: bool,
 }
 
 /// What a prompt does with its text on Enter.
 pub(crate) type Submit = Rc<dyn Fn(String, &mut Window, &mut App)>;
 /// What a prompt does on Escape.
 pub(crate) type Dismiss = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// A dimension edit sent to the analyzer.
+enum DimensionRequest {
+    Draw(Span, DimensionParams),
+    Edit(Span, String),
+}
 
 impl TextInput {
     pub(crate) fn start_dimension_edit(&mut self, cx: &mut Context<Self>) {
@@ -79,6 +89,7 @@ impl TextInput {
             px: 8.,
             submit: None,
             dismiss: None,
+            dimension_in_flight: false,
         }
     }
     pub(crate) fn new_filter(
@@ -103,6 +114,7 @@ impl TextInput {
             px: 4.,
             submit: None,
             dismiss: None,
+            dimension_in_flight: false,
         }
     }
 
@@ -133,6 +145,7 @@ impl TextInput {
             px: 4.,
             submit: Some(submit),
             dismiss: Some(dismiss),
+            dimension_in_flight: false,
         }
     }
 
@@ -324,16 +337,16 @@ impl TextInput {
         cx.notify()
     }
 
-    fn filter_cancel(&mut self, _: &Cancel, window: &mut Window, _cx: &mut Context<Self>) {
-        window.focus(&self.canvas_focus_handle);
+    fn filter_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.canvas_focus_handle, cx);
     }
 
-    fn filter_enter(&mut self, _: &Enter, window: &mut Window, _cx: &mut Context<Self>) {
-        window.focus(&self.canvas_focus_handle);
+    fn filter_enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.canvas_focus_handle, cx);
     }
 
     fn dimension_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.canvas_focus_handle);
+        window.focus(&self.canvas_focus_handle, cx);
         let tool = self.state.read(cx).tool.clone();
         tool.update(cx, |tool, cx| {
             *tool = match tool {
@@ -350,53 +363,64 @@ impl TextInput {
     }
 
     fn dimension_enter(&mut self, _: &Enter, window: &mut Window, cx: &mut Context<Self>) {
-        let reset = self.state.read(cx).tool.clone().update(cx, |tool, cx| {
-            if let ToolState::EditDim(EditDimToolState {
-                dim,
-                pending,
-                dim_mode,
-                ..
-            }) = tool
-            {
-                let client = &self.state.read(cx).lang_server_client;
-                let result = if let Some(pending) = pending {
-                    let mut params = pending.params.clone();
-                    params.value = self.content.to_string();
-                    client.draw_dimension(pending.scope_span.clone(), params)
-                } else if let Some(dim) = dim {
-                    client.edit_dimension(dim.clone(), self.content.to_string())
-                } else {
-                    Ok(None)
-                };
+        if self.dimension_in_flight {
+            return;
+        }
+        let state = self.state.read(cx);
+        let ToolState::EditDim(EditDimToolState { dim, pending, .. }) = state.tool.read(cx) else {
+            return;
+        };
+        let value = self.content.to_string();
+        let client = state.lang_server_client.clone();
+        let request = if let Some(pending) = pending {
+            let mut params = pending.params.clone();
+            params.value = value;
+            DimensionRequest::Draw(pending.scope_span.clone(), params)
+        } else if let Some(dim) = dim {
+            DimensionRequest::Edit(dim.clone(), value)
+        } else {
+            return;
+        };
+        let editor_state = self.state.clone();
+        self.dimension_in_flight = true;
+        cx.spawn_in(window, async move |input, cx| {
+            let result = match request {
+                DimensionRequest::Draw(scope_span, params) => {
+                    client.draw_dimension(scope_span, params).await
+                }
+                DimensionRequest::Edit(dim, value) => client.edit_dimension(dim, value).await,
+            };
+            let _ = input.update_in(cx, |input, window, cx| {
+                input.dimension_in_flight = false;
                 match result {
                     Ok(None) => {
-                        self.state.update(cx, |state, _cx| {
+                        editor_state.update(cx, |state, _cx| {
                             if state.message.is_none() {
                                 state
                                     .show_message(MessageType::ERROR, SOURCE_EDIT_REJECTED_MESSAGE);
                             }
                         });
-                        false
                     }
                     Ok(Some(_)) => {
-                        *tool = if *dim_mode {
-                            ToolState::DrawDim(DrawDimToolState::default())
-                        } else {
-                            ToolState::default()
-                        };
-                        cx.notify();
-                        true
+                        let tool = editor_state.read(cx).tool.clone();
+                        tool.update(cx, |tool, cx| {
+                            if let ToolState::EditDim(EditDimToolState { dim_mode, .. }) = tool {
+                                *tool = if *dim_mode {
+                                    ToolState::DrawDim(DrawDimToolState::default())
+                                } else {
+                                    ToolState::default()
+                                };
+                                cx.notify();
+                            }
+                        });
+                        input.reset();
+                        window.focus(&input.canvas_focus_handle, cx);
                     }
-                    Err(_) => false,
+                    Err(_) => {}
                 }
-            } else {
-                false
-            }
-        });
-        if reset {
-            self.reset();
-            window.focus(&self.canvas_focus_handle);
-        }
+            });
+        })
+        .detach();
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
@@ -753,8 +777,15 @@ impl Element for TextElement {
             window.paint_quad(selection)
         }
         let line = prepaint.line.take().unwrap();
-        line.paint(bounds.origin, window.line_height(), window, cx)
-            .unwrap();
+        line.paint(
+            bounds.origin,
+            window.line_height(),
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        )
+        .unwrap();
 
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()

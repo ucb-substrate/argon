@@ -624,7 +624,7 @@ pub(super) fn prepare(
     let mut scopes = HashMap::new();
     let mut used_layers = indexmap::IndexSet::new();
     if let (Some(previous), Some(previous_layers)) = (previous, previous_layers) {
-        let profile_start = std::time::Instant::now();
+        let profile_start = web_time::Instant::now();
         let reusable = reusable_cells(output, previous);
         let reusable_elapsed = profile_start.elapsed();
         let old_changed_layers = changed_cell_layers(&previous.output, &reusable);
@@ -907,7 +907,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             scope: before.cells[&before.top].root,
         };
         let mut old_state = ProcessScopeState::default();
-        let start = std::time::Instant::now();
+        let start = web_time::Instant::now();
         prepare(&before, old_root, &mut old_state, None, None, None);
         let cold = start.elapsed();
         let old_layers = old_state.layers.clone();
@@ -929,7 +929,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             scope: after.cells[&after.top].root,
         };
         let mut next_state = ProcessScopeState::default();
-        let start = std::time::Instant::now();
+        let start = web_time::Instant::now();
         prepare(
             &after,
             root,
@@ -977,7 +977,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             ("bulk_delete", without_rectangles),
         ] {
             compiler.set_source_text(workspace.join("lib.ar"), text);
-            let started = std::time::Instant::now();
+            let started = web_time::Instant::now();
             let output = compiler.compile_cell(&config, &cell, vec![]).unwrap_valid();
             let compile_ms = started.elapsed().as_millis();
             let next_root = ScopeAddress {
@@ -985,7 +985,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
                 scope: output.cells[&output.top].root,
             };
             let mut next = ProcessScopeState::default();
-            let started = std::time::Instant::now();
+            let started = web_time::Instant::now();
             prepare(
                 &output,
                 next_root,
@@ -999,7 +999,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
                 started.elapsed().as_millis(),
                 next.state.len()
             );
-            let started = std::time::Instant::now();
+            let started = web_time::Instant::now();
             let all_visible = next.state.values().all(|scope| scope.visible);
             eprintln!(
                 "sram_parent_{label},visibility_scan_ms={},all_visible={all_visible}",
@@ -1053,7 +1053,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             scope: after.cells[&after.top].root,
         };
         let mut next = ProcessScopeState::default();
-        let started = std::time::Instant::now();
+        let started = web_time::Instant::now();
         prepare(
             &after,
             root,

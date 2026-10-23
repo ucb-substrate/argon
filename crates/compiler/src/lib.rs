@@ -154,8 +154,8 @@ mod tests {
             Align, CellId, CompiledCell, CompiledData, DetachedReason, DeviceKind, Element,
             ExecErrorKind, MAX_TEXT_LEN, NetIdx, NodeIdx, NodeSource, ParamValue, PathSegment,
             PinLabel, Placement, RESERVED_CELL_FIELDS, RectInitialCondition, Schematic,
-            SolvedValue, StaticErrorKind, Symbol, SymbolItemKind, SymbolText, box_symbol,
-            device_symbol, generated_box, static_compile,
+            SolvedValue, StaticErrorKind, Symbol, SymbolItemKind, SymbolText, VarObject, VarRole,
+            box_symbol, device_symbol, generated_box, static_compile,
         },
         parse::{parse_source_text, parse_workspace_with_std, parse_workspace_with_std_and_deps},
     };
@@ -994,7 +994,7 @@ mod tests {
             errors
                 .errors
                 .iter()
-                .all(|e| matches!(e.kind, ExecErrorKind::Underconstrained)),
+                .all(|e| matches!(e.kind, ExecErrorKind::Underconstrained { .. })),
             "expected only underconstrained diagnostics: {:?}",
             errors.errors
         );
@@ -1096,7 +1096,7 @@ mod tests {
             errors
                 .errors
                 .iter()
-                .all(|e| matches!(e.kind, ExecErrorKind::Underconstrained)),
+                .all(|e| matches!(e.kind, ExecErrorKind::Underconstrained { .. })),
             "expected only underconstrained diagnostics: {:?}",
             errors.errors
         );
@@ -1143,7 +1143,7 @@ mod tests {
             errors
                 .errors
                 .iter()
-                .all(|e| matches!(e.kind, ExecErrorKind::Underconstrained)),
+                .all(|e| matches!(e.kind, ExecErrorKind::Underconstrained { .. })),
             "expected only underconstrained diagnostics: {:?}",
             errors.errors
         );
@@ -3012,7 +3012,8 @@ cell top() {
         assert!(!output.errors.is_empty());
         assert!(
             output.errors.iter().all(|error| {
-                matches!(error.kind, ExecErrorKind::Underconstrained) && error.cell == cells.top
+                matches!(error.kind, ExecErrorKind::Underconstrained { .. })
+                    && error.cell == cells.top
             }),
             "{:?}",
             output.errors
@@ -3935,7 +3936,7 @@ cell top() {
         let error = errors
             .errors
             .iter()
-            .find(|error| matches!(error.kind, ExecErrorKind::Underconstrained))
+            .find(|error| matches!(error.kind, ExecErrorKind::Underconstrained { .. }))
             .expect("expected an underconstrained error");
         let span = error
             .span
@@ -3971,7 +3972,7 @@ cell top() {
         .unwrap_exec_errors()
         .errors
         .into_iter()
-        .filter(|error| matches!(error.kind, ExecErrorKind::Underconstrained))
+        .filter(|error| matches!(error.kind, ExecErrorKind::Underconstrained { .. }))
         .collect::<Vec<_>>();
 
         assert_eq!(errors.len(), 2);
@@ -3988,6 +3989,94 @@ cell top() {
             vec!["rect(\"met1\")", "rect(\"met1\")"]
         );
         assert_ne!(spans[0], spans[1]);
+    }
+
+    #[test]
+    fn underconstrained_errors_name_the_free_values() {
+        let source = r#"
+            use std::layout::{inst, path, polygon, rect};
+            cell leaf() {
+                let r = rect("met1", x0=0., y0=0., x1=10., y1=10.);
+            }
+            cell top() {
+                let corner = rect("met1", x0=0., y0=0.);
+                let free = rect("met1");
+                let poly = polygon("met1", 3, x0=0., y0=0., x1=4., y1=0., x2=2.);
+                let route = path("met1", 2, x0=0., y0=0., x1=10., y1=0.);
+                let placed = inst(leaf(), x=0.);
+                let value = float();
+            }
+        "#;
+        let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+        let ast = crate::parse::with_std(root);
+
+        let errors = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_exec_errors()
+        .errors;
+        let messages = errors
+            .iter()
+            .filter(|error| matches!(error.kind, ExecErrorKind::Underconstrained { .. }))
+            .map(|error| {
+                let span = error.span.as_ref().expect("error should point to a value");
+                (
+                    &source[span.span.start()..span.span.end()],
+                    error.kind.to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [
+                (
+                    r#"rect("met1", x0=0., y0=0.)"#,
+                    "rectangle is underconstrained: x1 and y1 are not determined",
+                ),
+                (
+                    r#"rect("met1")"#,
+                    "rectangle is underconstrained: x0, y0, x1, and y1 are not determined",
+                ),
+                (
+                    r#"polygon("met1", 3, x0=0., y0=0., x1=4., y1=0., x2=2.)"#,
+                    "polygon is underconstrained: y2 is not determined",
+                ),
+                (
+                    r#"path("met1", 2, x0=0., y0=0., x1=10., y1=0.)"#,
+                    "path is underconstrained: width is not determined",
+                ),
+                (
+                    "inst(leaf(), x=0.)",
+                    "instance is underconstrained: y is not determined",
+                ),
+                ("float()", "value is underconstrained"),
+            ]
+            .map(|(span, message)| (span, message.to_owned()))
+        );
+    }
+
+    #[test]
+    fn underconstrained_messages_summarize_long_lists() {
+        let free = (0..3)
+            .flat_map(|i| [VarRole::X(Some(i)), VarRole::Y(Some(i))])
+            .collect();
+        let kind = ExecErrorKind::Underconstrained {
+            object: Some(VarObject::Polygon),
+            free,
+        };
+        assert_eq!(
+            kind.to_string(),
+            "polygon is underconstrained: x0, y0, x1, y1, and 2 more are not determined"
+        );
+        let kind = ExecErrorKind::Underconstrained {
+            object: None,
+            free: Vec::new(),
+        };
+        assert_eq!(kind.to_string(), "cell is underconstrained");
     }
 
     #[test]
@@ -6415,7 +6504,7 @@ cell top() {
                     output
                         .errors
                         .iter()
-                        .all(|error| matches!(error.kind, ExecErrorKind::Underconstrained)),
+                        .all(|error| matches!(error.kind, ExecErrorKind::Underconstrained { .. })),
                     "{:#?}",
                     output.errors
                 );
@@ -6522,7 +6611,7 @@ cell top() {
             |kind| matches!(kind, ExecErrorKind::EmptyField { field } if field == "layer"),
         );
         assert_reports(&kinds, |kind| {
-            matches!(kind, ExecErrorKind::Underconstrained)
+            matches!(kind, ExecErrorKind::Underconstrained { .. })
         });
         assert_reports(
             &kinds,

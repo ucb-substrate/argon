@@ -29,6 +29,28 @@ local function return_to_gui_after_command()
   })
 end
 
+---The command line for a command the GUI asked the editor to open.
+---@param command? string|table `"messages"`, or `{ argon = { name, argument, submit } }`
+---@return string|nil
+function M.command_line(command)
+  if command == 'messages' then
+    return 'messages<CR>'
+  end
+  local argon = type(command) == 'table' and command.argon
+  if type(argon) ~= 'table' or type(argon.name) ~= 'string' then
+    return nil
+  end
+  local line = 'Argon ' .. argon.name
+  local argument = (argon.argument or ''):gsub('<', '<lt>')
+  if not argon.submit then
+    return line .. ' ' .. argument
+  end
+  if argument ~= '' then
+    line = line .. ' ' .. argument
+  end
+  return line .. '<CR>'
+end
+
 ---Focus Neovim and open a command line on behalf of the GUI.
 ---@param command? string
 ---@param opts? { return_to_gui?: boolean }

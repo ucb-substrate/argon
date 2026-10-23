@@ -1,8 +1,8 @@
 //! A Claude Code `PreToolUse` hook that steers file tools on `.ar` files to
 //! the analyzer while an Argon session is running.
 //!
-//! Edits are always redirected so they land in Neovim. Reads are redirected
-//! only when Neovim holds unsaved changes the file on disk lacks.
+//! Edits are always redirected so they land in the editor. Reads are redirected
+//! only when the editor holds unsaved changes the file on disk lacks.
 
 use std::{
     io::{self, Read},
@@ -46,12 +46,12 @@ async fn decide(
             return None;
         }
         return Some(format!(
-            "{} has unsaved changes in the user's Neovim buffer, so the file on disk is out of date. Read it with the argon MCP server's read_file tool (mcp__argon__read_file) instead.",
+            "{} has unsaved changes in the user's editor, so the file on disk is out of date. Read it with the argon MCP server's read_file tool (mcp__argon__read_file) instead.",
             path.display()
         ));
     }
     Some(format!(
-        "An Argon session is running for {}. Change .ar files with the argon MCP server's edit_file or create_file tools (mcp__argon__edit_file, mcp__argon__create_file) so the change goes through the user's Neovim buffer and shows up live in Neovim and the GUI. Don't write .ar files directly.",
+        "An Argon session is running for {}. Change .ar files with the argon MCP server's edit_file or create_file tools (mcp__argon__edit_file, mcp__argon__create_file) so the change goes through the user's editor buffer and shows up live in the editor and the GUI. Don't write .ar files directly.",
         directory.display()
     ))
 }

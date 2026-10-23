@@ -13,6 +13,7 @@ pub fn capture_target() -> Option<String> {
 /// Initialize the GUI's return-focus target once. When the GUI was launched
 /// without the top-level `argone` command, the currently frontmost application
 /// is the best available fallback.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn initialize_target() {
     platform::initialize_target(std::env::var(TARGET_ENV).ok().as_deref());
 }
@@ -79,6 +80,7 @@ mod platform {
         None
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(super) fn initialize_target(_configured: Option<&str>) {}
 
     pub(super) fn activate_invoker() -> bool {
