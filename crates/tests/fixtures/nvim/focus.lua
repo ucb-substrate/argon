@@ -14,7 +14,9 @@ package.loaded['argon.client'] = {
 local focus = require('argon.focus')
 
 local stage = 1
-local exit_keys = { '<CR>', '<CR>', '<Esc>', '<C-C>', '<Esc>' }
+local exit_keys = { '<CR>', '<CR>', '<Esc>', '<C-C>', '<Esc>', '<CR>' }
+local pending_command = 'let g:argon_focus_pending = 1'
+local pending_replaced = false
 
 local function checked(callback)
   local ok, err = pcall(callback)
@@ -26,10 +28,25 @@ end
 
 vim.api.nvim_create_autocmd('CmdlineEnter', {
   callback = function()
+    -- The pending command line stays open until the GUI replaces it.
+    if stage == 6 and not pending_replaced then
+      return
+    end
     local exit_key = assert(exit_keys[stage])
     vim.schedule(function()
       vim.api.nvim_input(exit_key)
     end)
+  end,
+})
+
+vim.api.nvim_create_autocmd('CmdlineChanged', {
+  callback = function()
+    if stage == 6 and not pending_replaced and vim.fn.getcmdline() == pending_command then
+      pending_replaced = true
+      vim.schedule(function()
+        focus.editor('let g:argon_focus_replaced = 1')
+      end)
+    end
   end,
 })
 
@@ -57,9 +74,14 @@ vim.api.nvim_create_autocmd('CmdlineLeave', {
           assert(gui_focus_count == 3, 'interrupting a GUI command should focus the GUI')
           stage = 5
           vim.api.nvim_input(':let g:argon_ordinary_command = 1')
-        else
+        elseif stage == 5 then
           assert(vim.g.argon_ordinary_command == nil)
           assert(gui_focus_count == 3, 'cancelling an ordinary command should remain in Neovim')
+          stage = 6
+          vim.api.nvim_input(':' .. pending_command)
+        elseif vim.g.argon_focus_replaced == 1 then
+          assert(vim.g.argon_focus_pending == nil, 'a GUI command should abandon a pending command line')
+          assert(gui_focus_count == 4, 'executing a GUI command should focus the GUI')
           vim.cmd('quitall!')
         end
       end)
