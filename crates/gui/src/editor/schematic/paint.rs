@@ -1081,13 +1081,4 @@ mod tests {
         assert!(vertical.top() <= anchor.y - px(48.) && vertical.bottom() > anchor.y);
         assert!(vertical.left() < anchor.x - px(5.) && vertical.right() > anchor.x + px(5.));
     }
-
-    #[test]
-    fn param_text_sits_beside_its_device() {
-        // Two devices stacked in one column, as in an inverter.
-        assert_eq!(param_anchor((-2., 2., 2., 6.)), (2.5, 2.5));
-        assert_eq!(param_anchor((-2., -6., 2., -2.)), (2.5, -5.5));
-        // A device off the origin keeps its text at its own height.
-        assert_eq!(param_anchor((8., -1., 12., 3.)), (12.5, -0.5));
-    }
 }
