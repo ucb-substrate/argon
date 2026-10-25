@@ -456,6 +456,12 @@ fn intersects(a: Bounds<Pixels>, b: Bounds<Pixels>) -> bool {
         && b.origin.y <= a.origin.y + a.size.height
 }
 
+/// Where a device's parameter text starts: beside the bottom right corner of
+/// its symbol's bounds.
+fn param_anchor((_, y0, x1, _): WorldBounds) -> Pt {
+    (x1 + 0.5, y0 + 0.5)
+}
+
 fn paint_placed_symbol(
     window: &mut Window,
     cx: &mut App,
@@ -608,7 +614,6 @@ fn paint_scene(
         }
         // Key parameters beside a device, since its helper knows none.
         if !element.params.is_empty() {
-            let (x1, y0) = (element.bounds.2, element.bounds.0);
             let text = element
                 .params
                 .iter()
@@ -619,7 +624,7 @@ fn paint_scene(
                 window,
                 cx,
                 &text,
-                to_px(viewport, bounds, (x1 + 0.5, y0 + 0.5)),
+                to_px(viewport, bounds, param_anchor(element.bounds)),
                 0.8 * viewport.scale,
                 Align::Left,
                 false,
@@ -1075,5 +1080,14 @@ mod tests {
         let vertical = text_bounds("abcd", anchor, 10., Align::Left, true);
         assert!(vertical.top() <= anchor.y - px(48.) && vertical.bottom() > anchor.y);
         assert!(vertical.left() < anchor.x - px(5.) && vertical.right() > anchor.x + px(5.));
+    }
+
+    #[test]
+    fn param_text_sits_beside_its_device() {
+        // Two devices stacked in one column, as in an inverter.
+        assert_eq!(param_anchor((-2., 2., 2., 6.)), (2.5, 2.5));
+        assert_eq!(param_anchor((-2., -6., 2., -2.)), (2.5, -5.5));
+        // A device off the origin keeps its text at its own height.
+        assert_eq!(param_anchor((8., -1., 12., 3.)), (12.5, -0.5));
     }
 }
