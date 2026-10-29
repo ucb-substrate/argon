@@ -12905,7 +12905,9 @@ impl<'a> ExecPass<'a> {
     ) -> Result<Option<CellArg>, ()> {
         Ok(match val {
             Value::Linear(v) => {
-                if let Some(f) = self.cell_state_mut(cell_id).solver.eval_expr(v) {
+                // A scalar argument need not be a coordinate, so it is passed
+                // exactly rather than snapped to the grid.
+                if let Some(f) = self.cell_state_mut(cell_id).solver.eval_expr_exact(v) {
                     Some(CellArg::Float(f))
                 } else {
                     for (_, var) in v.coeffs.clone() {

@@ -227,6 +227,40 @@ mod tests {
         assert_eq!(rect.x1.0, 200.);
     }
 
+    #[test]
+    fn float_cell_arguments_pass_exactly_on_a_coarse_grid() {
+        // sky130's 5 nm grid once snapped `0.5` to 0 on its way into `child`.
+        let root = parse_source_text(
+            "use std::layout::{inst, rect};
+             cell child(scale: Float, pair: (Float, Float)) {
+                 rect(\"met1.drawing\", x0=0., y0=0., x1=1000. * scale, y1=1000. * pair.1);
+             }
+             cell top() { let c = inst(child(0.5, (0., 0.25,)), x=0., y=0.); }",
+            PathBuf::from("/virtual/lib.ar"),
+        )
+        .unwrap();
+        let ast = crate::parse::with_std(root);
+        let output = compile_sky130(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: vec![],
+            },
+        );
+        let CompileOutput::Valid(data) = &output else {
+            panic!("the child should compile: {output:?}");
+        };
+        let rect = data
+            .cells
+            .iter()
+            .filter(|(id, _)| **id != data.top)
+            .flat_map(|(_, cell)| cell.objects.values())
+            .find_map(|object| object.get_rect())
+            .expect("the child draws a rect");
+        assert_eq!(rect.x1.0, 500.);
+        assert_eq!(rect.y1.0, 250.);
+    }
+
     /// Compiles `cell` from a one-file workspace with the standard library.
     fn compile_source(source: &str, cell: &str, args: Vec<CellArg>) -> CompileOutput {
         let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
