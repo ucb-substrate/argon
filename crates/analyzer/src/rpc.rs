@@ -1228,9 +1228,12 @@ impl LangServer for State {
         mut edits: Vec<ValueEdit>,
         mut initial_conditions: Vec<InitialConditionEdit>,
         base_revision: Option<u64>,
-    ) -> Option<Vec<ValueEdit>> {
+    ) -> Option<ValueEditResult> {
         if edits.is_empty() && initial_conditions.is_empty() {
-            return Some(Vec::new());
+            return Some(ValueEditResult {
+                edits: Vec::new(),
+                revision: self.source_state.lock().await.revision,
+            });
         }
         // Drags are placed one at a time, each onto the text the one before
         // it left. Spans recorded against any other text would overwrite the
@@ -1392,8 +1395,9 @@ impl LangServer for State {
         if !self.apply_source_changes(changes, None).await {
             return None;
         }
+        let revision = self.source_state.lock().await.revision;
         history.record(base_revision, fresh, &texts, edits.clone());
-        Some(edits)
+        Some(ValueEditResult { edits, revision })
     }
 
     /// Rewrites the placement and route keywords of schematic calls in one

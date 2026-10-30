@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     panic::{self, AssertUnwindSafe},
     path::PathBuf,
     sync::{Arc, Mutex, mpsc},
@@ -18,6 +19,9 @@ use tracing::error;
 
 use crate::workspace_config;
 
+pub(crate) const INTERNAL_COMPILER_ERROR_MESSAGE: &str =
+    "internal compiler error; see the Argon log for details";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompileIdentity {
     pub(crate) revision: u64,
@@ -29,6 +33,10 @@ pub(crate) struct CompileRequest {
     pub(crate) identity: CompileIdentity,
     pub(crate) root_dir: PathBuf,
     pub(crate) preview_cell: Option<CellId>,
+    /// Whether the result is published to the editor and GUI. A queued
+    /// publishing request is skipped when a later one is queued behind it;
+    /// every other request is answered.
+    pub(crate) publish: bool,
 }
 
 pub(crate) struct CompilePreview {
@@ -150,7 +158,18 @@ fn spawn_worker() -> mpsc::Sender<Command> {
 
 fn run(commands: mpsc::Receiver<Command>) {
     let mut compiler = IncrementalCompiler::new();
-    while let Ok(command) = commands.recv() {
+    // Commands run in the order they were sent, so each compile sees exactly
+    // the source changes queued before it.
+    let mut queue = VecDeque::new();
+    loop {
+        if queue.is_empty() {
+            let Ok(command) = commands.recv() else {
+                return;
+            };
+            queue.push_back(command);
+        }
+        queue.extend(commands.try_iter());
+        let command = queue.pop_front().expect("the queue is not empty");
         match command {
             Command::SetSource { path, contents } => {
                 compiler.set_source_text(path, contents);
@@ -164,87 +183,52 @@ fn run(commands: mpsc::Receiver<Command>) {
                 preview,
             } => {
                 // GUI drawing can enqueue many source revisions faster than a
-                // large cell can compile. Apply all queued source changes, but
-                // compile only the newest request: older identities cannot be
-                // published once a later source revision exists. Dropping the
-                // older reply channels promptly also clears their progress.
-                let mut latest = (request, response, preview);
-                let mut source_changes_after_latest = Vec::new();
-                while let Ok(queued) = commands.try_recv() {
-                    match queued {
-                        Command::SetSource { .. } | Command::RemoveSource(_) => {
-                            source_changes_after_latest.push(queued);
-                        }
-                        Command::Compile {
-                            request,
-                            response,
-                            preview,
-                        } => {
-                            for change in source_changes_after_latest.drain(..) {
-                                match change {
-                                    Command::SetSource { path, contents } => {
-                                        compiler.set_source_text(path, contents);
-                                    }
-                                    Command::RemoveSource(path) => {
-                                        compiler.remove_source(&path);
-                                    }
-                                    Command::Compile { .. } => unreachable!(),
-                                }
-                            }
-                            latest = (request, response, preview);
-                        }
-                    }
-                }
-                let (request, response, preview) = latest;
-                // An internal compiler error must fail one request, not the
-                // session: the panic is reported as a message on this result
-                // and the worker keeps its incremental state.
-                let identity = request.identity.clone();
-                let root_dir = request.root_dir.clone();
-                let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    compile(&mut compiler, request, preview)
-                }))
-                .unwrap_or_else(|_| {
-                    error!("internal compiler error while compiling {root_dir:?}");
-                    // The panic may have left the incremental session
-                    // half-updated, so start a fresh one: losing the caches
-                    // costs a rebuild, keeping poisoned state costs
-                    // correctness.
-                    compiler = IncrementalCompiler::new();
-                    CompileResult {
-                        identity,
-                        config: WorkspaceConfig::new(root_dir.join("lib.ar")),
-                        root_dir,
-                        ast: WorkspaceParseAst::default(),
-                        // The fresh session has no index yet, and this
-                        // request never got far enough to ask for one.
-                        // Publishing treats that as "nothing to say"
-                        // rather than as an index to clear.
-                        nav: None,
-                        output: None,
-                        messages: vec![
-                            "internal compiler error; see the Argon log for details".to_owned(),
-                        ],
-                    }
-                });
-                let _ = response.send(result);
-                // A source edit with no matching compile request yet belongs
-                // after the request we just completed, even if it was already
-                // sitting in the channel when we drained the burst.
-                for change in source_changes_after_latest {
-                    match change {
-                        Command::SetSource { path, contents } => {
-                            compiler.set_source_text(path, contents);
-                        }
-                        Command::RemoveSource(path) => {
-                            compiler.remove_source(&path);
-                        }
-                        Command::Compile { .. } => unreachable!(),
-                    }
+                // large cell can compile. A publishing request with a later
+                // one queued behind it is skipped: older identities cannot be
+                // published once a later source revision exists. Dropping its
+                // reply channel promptly also clears its progress.
+                let superseded = request.publish
+                    && queue.iter().any(|queued| {
+                        matches!(queued, Command::Compile { request, .. } if request.publish)
+                    });
+                if !superseded {
+                    let _ = response.send(compile_catching_panics(&mut compiler, request, preview));
                 }
             }
         }
     }
+}
+
+/// [`compile`], turning an internal compiler error into a message on the
+/// result instead of ending the session.
+fn compile_catching_panics(
+    compiler: &mut IncrementalCompiler,
+    request: CompileRequest,
+    preview: Option<oneshot::Sender<CompilePreview>>,
+) -> CompileResult {
+    let identity = request.identity.clone();
+    let root_dir = request.root_dir.clone();
+    panic::catch_unwind(AssertUnwindSafe(|| compile(compiler, request, preview))).unwrap_or_else(
+        |_| {
+            error!("internal compiler error while compiling {root_dir:?}");
+            // The panic may have left the incremental session half-updated,
+            // so start a fresh one: losing the caches costs a rebuild,
+            // keeping poisoned state costs correctness.
+            *compiler = IncrementalCompiler::new();
+            CompileResult {
+                identity,
+                config: WorkspaceConfig::new(root_dir.join("lib.ar")),
+                root_dir,
+                ast: WorkspaceParseAst::default(),
+                // The fresh session has no index yet, and this request never
+                // got far enough to ask for one. Publishing treats that as
+                // "nothing to say" rather than as an index to clear.
+                nav: None,
+                output: None,
+                messages: vec![INTERNAL_COMPILER_ERROR_MESSAGE.to_owned()],
+            }
+        },
+    )
 }
 
 fn compile(
@@ -256,6 +240,7 @@ fn compile(
         identity,
         root_dir,
         preview_cell,
+        publish: _,
     } = request;
     let manifest_path = root_dir.join("Argon.toml");
     let library = if manifest_path.is_file() {
@@ -389,6 +374,7 @@ mod tests {
                         },
                         root_dir: directory.path().to_path_buf(),
                         preview_cell: None,
+                        publish: true,
                     },
                     response: reply,
                     preview: None,
@@ -403,6 +389,81 @@ mod tests {
         let result = replies.remove(0).await.unwrap();
         assert_eq!(result.identity.revision, 3);
         assert!(matches!(result.output, Some(CompileOutput::Valid(_))));
+    }
+
+    #[tokio::test]
+    async fn queued_requests_that_are_not_published_are_always_answered() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("lib.ar");
+        std::fs::write(&root, "cell top() {}\ncell other() {}\n").unwrap();
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+            directory.path().join("tech.toml"),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("Argon.toml"),
+            "name = \"worker-agent-test\"\ntech = \"tech.toml\"\n",
+        )
+        .unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let compile = |revision, cell: &str, publish| {
+            let (reply, result) = oneshot::channel();
+            sender
+                .send(Command::Compile {
+                    request: CompileRequest {
+                        identity: CompileIdentity {
+                            revision,
+                            cell: Some(cell.to_owned()),
+                        },
+                        root_dir: directory.path().to_path_buf(),
+                        preview_cell: None,
+                        publish,
+                    },
+                    response: reply,
+                    preview: None,
+                })
+                .unwrap();
+            result
+        };
+        // An agent compile queued behind the editor's must not displace it,
+        // and one queued ahead of it must not be displaced by it.
+        let agent_first = compile(1, "other()", false);
+        let editor_first = compile(1, "top()", true);
+        let agent_second = compile(1, "other()", false);
+        sender
+            .send(Command::SetSource {
+                path: root,
+                contents: "cell top() {}\ncell other() { missing; }\n".to_owned(),
+            })
+            .unwrap();
+        let editor_second = compile(2, "top()", true);
+        let agent_third = compile(2, "other()", false);
+        drop(sender);
+        run(receiver);
+
+        for (agent, valid) in [
+            (agent_first, true),
+            (agent_second, true),
+            (agent_third, false),
+        ] {
+            let result = agent.await.unwrap();
+            assert_eq!(result.identity.cell.as_deref(), Some("other()"));
+            assert_eq!(
+                matches!(result.output, Some(CompileOutput::Valid(_))),
+                valid,
+                "each request compiles the source queued before it"
+            );
+        }
+        // Only a later publishing request supersedes the editor's.
+        assert!(editor_first.await.is_err());
+        let result = editor_second.await.unwrap();
+        assert_eq!(result.identity.revision, 2);
+        assert!(matches!(
+            result.output,
+            Some(CompileOutput::StaticErrors(_))
+        ));
     }
 
     #[tokio::test]
@@ -438,6 +499,7 @@ mod tests {
                     },
                     root_dir: directory.path().to_path_buf(),
                     preview_cell: None,
+                    publish: true,
                 },
                 response: reply,
                 preview: None,
@@ -484,6 +546,7 @@ mod tests {
                 },
                 root_dir: directory.path().to_path_buf(),
                 preview_cell: None,
+                publish: true,
             })
             .await
             .unwrap();
@@ -499,6 +562,7 @@ mod tests {
                 },
                 root_dir: directory.path().to_path_buf(),
                 preview_cell: None,
+                publish: true,
             })
             .await
             .unwrap();
@@ -532,6 +596,7 @@ mod tests {
                 },
                 root_dir: directory.path().to_path_buf(),
                 preview_cell: None,
+                publish: true,
             })
             .await
             .unwrap();
@@ -554,6 +619,7 @@ mod tests {
             },
             root_dir: directory.path().to_path_buf(),
             preview_cell: Some(child),
+            publish: true,
         });
         let preview = preview.unwrap().await.unwrap();
         assert_eq!(preview.previous_cell, child);

@@ -910,6 +910,7 @@ impl Agent for Backend {
                 },
                 root_dir: root_dir.clone(),
                 preview_cell: None,
+                publish: false,
             })
             .await
             .ok_or_else(|| "The compiler is unavailable.".to_owned())?;

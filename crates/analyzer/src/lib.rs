@@ -32,14 +32,13 @@ use std::{
 use arc::Library;
 use argonc::{
     WorkspaceConfig,
-    ast::Span,
+    ast::{ModPath, Span},
     compile::{
         self, Arrayed, CompileOutput, DeviceKind, ExecErrorCompileOutput, StaticErrorCompileOutput,
-        TypedWorkspace,
     },
     diagnostics,
     nav::NavIndex,
-    parse::{self, CellInvocation, WorkspaceParseAst},
+    parse::{self, AnnotatedParseAst, WorkspaceParseAst},
 };
 use futures::prelude::*;
 use indexmap::IndexMap;
@@ -67,6 +66,7 @@ use tracing_subscriber::{
 use crate::command_completion::{CommandCompletion, CommandCompletionParams};
 use crate::compiler_worker::{
     CompileIdentity, CompilePreview, CompileRequest, CompileResult, CompilerWorker,
+    INTERNAL_COMPILER_ERROR_MESSAGE,
 };
 use crate::document::{Document, DocumentChange, PositionEncoding};
 
@@ -491,12 +491,74 @@ fn workspace_config(root_lib: PathBuf, library: Option<&Library>) -> WorkspaceCo
         )
 }
 
-fn compile_open_cell(
-    ast: &TypedWorkspace,
-    invocation: &CellInvocation,
-    config: &WorkspaceConfig,
-) -> CompileOutput {
-    compile::execute_cell_invocation(ast, invocation, config)
+/// Runs `f` on its own thread with the compiler's stack, so that a deep
+/// compile neither overflows nor blocks the async runtime. Returns `None` if
+/// `f` panicked or the thread could not start.
+async fn on_compile_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("argon-command-compile".to_owned())
+        .stack_size(argonc::COMPILE_STACK_SIZE)
+        .spawn(move || {
+            let _ = sender.send(f());
+        });
+    if let Err(error) = spawned {
+        error!("could not start a compilation thread: {error}");
+        return None;
+    }
+    let result = receiver.await.ok();
+    if result.is_none() {
+        error!("internal compiler error while running an editor command");
+    }
+    result
+}
+
+/// Compiles `open_cell` with `preview_source` in place of `module`, the
+/// module at `module_path`, or returns a message saying why it could not.
+fn compile_preview_workspace(
+    workspace_ast: &WorkspaceParseAst,
+    module_path: ModPath,
+    module: &AnnotatedParseAst,
+    preview_source: String,
+    open_cell: &str,
+    workspace: &WorkspaceConfig,
+    describe: &str,
+) -> std::result::Result<compile::CompiledData, String> {
+    let mut preview_module = parse::parse_source_text(preview_source, module.path.to_path_buf())
+        .map_err(|error| format!("Could not {describe}: {error}"))?;
+    preview_module.promote_last_declarations(module.generated_declarations);
+    let mut preview_ast = workspace_ast.clone();
+    preview_ast.insert(module_path, preview_module);
+    // Recompile the open cell against the preview. Splicing its invocation
+    // before static analysis lets argument expressions use normal name
+    // resolution and type checking.
+    let invocation = parse::splice_cell_invocation(&mut preview_ast, open_cell)
+        .map_err(|error| format!("Open cell is invalid: {error}"))?;
+    let (typed_ast, static_output) = compile::static_compile(&preview_ast)
+        .ok_or_else(|| "Could not analyze the preview".to_owned())?;
+    if !static_output.errors.is_empty() {
+        let message = static_output
+            .errors
+            .iter()
+            .map(|error| error.kind.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(format!("Could not {describe}: {message}"));
+    }
+    if workspace.tech.is_none() {
+        return Err("The Argon library does not configure a technology file".to_owned());
+    }
+    match compile::execute_cell_invocation(&typed_ast, &invocation, workspace) {
+        CompileOutput::Valid(output) => Ok(output),
+        CompileOutput::ExecErrors(ExecErrorCompileOutput {
+            output: Some(output),
+            errors,
+        }) if !errors.iter().any(|error| error.kind.is_invalid_cell()) => Ok(output),
+        output => {
+            let messages = blocking_compile_error_messages(&output).join("\n");
+            Err(format!("Could not {describe}: {messages}"))
+        }
+    }
 }
 
 /// Ranges compiler spans against the workspace files they came from.
@@ -1077,6 +1139,7 @@ impl Backend {
                 identity: identity.clone(),
                 root_dir,
                 preview_cell,
+                publish: true,
             })
         };
         if let Some(preview) = preview {
@@ -2137,15 +2200,28 @@ impl Backend {
                 .await;
             return Ok(());
         };
-        let mut rename = match cell_edit::rename_cell_edits(
-            &ast,
-            &current_invocation,
-            &params.name,
-            self.state.position_encoding(),
-        ) {
-            Ok(rename) => rename,
-            Err(error) => {
+        let rename = {
+            let invocation = current_invocation.clone();
+            let name = params.name.clone();
+            let encoding = self.state.position_encoding();
+            on_compile_stack(move || {
+                cell_edit::rename_cell_edits(&ast, &invocation, &name, encoding)
+            })
+            .await
+        };
+        let mut rename = match rename {
+            Some(Ok(rename)) => rename,
+            Some(Err(error)) => {
                 self.state.report_message(MessageType::ERROR, error).await;
+                return Ok(());
+            }
+            None => {
+                self.state
+                    .report_message(
+                        MessageType::ERROR,
+                        format!("Could not rename the cell: {INTERNAL_COMPILER_ERROR_MESSAGE}"),
+                    )
+                    .await;
                 return Ok(());
             }
         };
@@ -2233,20 +2309,6 @@ impl Backend {
         );
         let mut preview_source = ast.text.to_string();
         preview_source.insert_str(insertion.offset, &insertion.edit.new_text);
-        let mut preview_module =
-            match parse::parse_source_text(preview_source, scope_span.path.to_path_buf()) {
-                Ok(ast) => ast,
-                Err(error) => {
-                    self.state
-                        .editor_client
-                        .show_message(MessageType::ERROR, format!("Could not {describe}: {error}"))
-                        .await;
-                    return None;
-                }
-            };
-        preview_module.promote_last_declarations(ast.generated_declarations);
-        let mut preview_ast = (**workspace_ast).clone();
-        preview_ast.insert(module_path, preview_module);
         let Some(open_cell) = open_cell else {
             self.state
                 .editor_client
@@ -2254,66 +2316,38 @@ impl Backend {
                 .await;
             return None;
         };
-        // Recompile the open cell against the preview. Splicing its invocation
-        // before static analysis lets argument expressions use normal name
-        // resolution and type checking.
-        let invocation = match parse::splice_cell_invocation(&mut preview_ast, &open_cell) {
-            Ok(invocation) => invocation,
-            Err(error) => {
+        let compiled = {
+            let workspace_ast = workspace_ast.clone();
+            let workspace = workspace.clone();
+            let describe = describe.to_owned();
+            on_compile_stack(move || {
+                compile_preview_workspace(
+                    &workspace_ast,
+                    module_path,
+                    &ast,
+                    preview_source,
+                    &open_cell,
+                    &workspace,
+                    &describe,
+                )
+            })
+            .await
+        };
+        let output = match compiled {
+            Some(Ok(output)) => output,
+            Some(Err(message)) => {
                 self.state
                     .editor_client
-                    .show_message(MessageType::ERROR, format!("Open cell is invalid: {error}"))
+                    .show_message(MessageType::ERROR, message)
                     .await;
                 return None;
             }
-        };
-        let Some((typed_ast, static_output)) = compile::static_compile(&preview_ast) else {
-            self.state
-                .editor_client
-                .show_message(MessageType::ERROR, "Could not analyze the preview")
-                .await;
-            return None;
-        };
-        if !static_output.errors.is_empty() {
-            let message = static_output
-                .errors
-                .iter()
-                .map(|error| error.kind.to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            self.state
-                .editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    format!("Could not {describe}: {message}"),
-                )
-                .await;
-            return None;
-        }
-        if workspace.tech.is_none() {
-            self.state
-                .editor_client
-                .show_message(
-                    MessageType::ERROR,
-                    "The Argon library does not configure a technology file",
-                )
-                .await;
-            return None;
-        }
-        let compiled = compile_open_cell(&typed_ast, &invocation, workspace);
-        let output = match compiled {
-            CompileOutput::Valid(output) => output,
-            CompileOutput::ExecErrors(ExecErrorCompileOutput {
-                output: Some(output),
-                errors,
-            }) if !errors.iter().any(|error| error.kind.is_invalid_cell()) => output,
-            output => {
-                let messages = blocking_compile_error_messages(&output).join("\n");
+            None => {
                 self.state
                     .editor_client
                     .show_message(
                         MessageType::ERROR,
-                        format!("Could not {describe}: {messages}"),
+                        format!("Could not {describe}: {INTERNAL_COMPILER_ERROR_MESSAGE}"),
                     )
                     .await;
                 return None;
@@ -3084,6 +3118,43 @@ mod tests {
         let loaded = parse_config(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(loaded.gui.hierarchy_depth, Some(4));
         assert_eq!(loaded.analyzer.compile_debounce_ms, 150);
+    }
+
+    #[tokio::test]
+    async fn preview_compile_reports_deep_recursion_instead_of_overflowing() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        let source = "use std::layout::{inst, rect};\n\
+             cell forever(n: Int) {\n\
+                 let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n\
+                 let again = inst(forever(n + 1));\n\
+             }\n";
+        std::fs::write(&source_path, source).unwrap();
+        let ast = parse::parse_workspace_with_std(&source_path).ast();
+        let (module_path, module) = ast
+            .iter()
+            .find(|(_, module)| module.source_text.as_str() == source)
+            .map(|(module_path, module)| (module_path.clone(), module.clone()))
+            .unwrap();
+        let tech = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml");
+        let config = argonc::WorkspaceConfig::new(&source_path).with_tech(Some(tech));
+        // The test thread's stack is far smaller than this compile needs.
+        let message = super::on_compile_stack(move || {
+            super::compile_preview_workspace(
+                &ast,
+                module_path,
+                &module,
+                module.text.to_string(),
+                "forever(0)",
+                &config,
+                "place an instance",
+            )
+        })
+        .await
+        .expect("the compile should not panic")
+        .expect_err("unbounded recursion should not compile");
+        assert!(message.contains("recursion limit"), "{message}");
     }
 
     #[test]
