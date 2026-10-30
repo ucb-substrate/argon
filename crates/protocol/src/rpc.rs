@@ -107,6 +107,15 @@ pub struct InstancePreview {
     pub scope_span: Span,
 }
 
+/// Receipt for an accepted drag edit: the replacements applied, and the first
+/// source revision that includes them. A snapshot compiled from that revision
+/// or a later one shows the drag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValueEditResult {
+    pub edits: Vec<ValueEdit>,
+    pub revision: u64,
+}
+
 /// Receipt for an accepted rectangle insertion. Later snapshots can supersede
 /// it (for example, an undo) even if its first compiled frame was never shown.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -713,7 +722,7 @@ pub trait LangServer {
         edits: Vec<ValueEdit>,
         initial_conditions: Vec<InitialConditionEdit>,
         base_revision: Option<u64>,
-    ) -> Option<Vec<ValueEdit>>;
+    ) -> Option<ValueEditResult>;
     async fn add_eq_constraint(scope_span: Span, lhs: String, rhs: String);
     async fn place(request: PlaceRequest) -> Option<EditReceipt>;
     async fn add_signal(request: AddSignalRequest) -> Option<EditReceipt>;

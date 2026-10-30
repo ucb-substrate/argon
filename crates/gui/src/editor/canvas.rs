@@ -33,7 +33,7 @@ use itertools::Itertools;
 use ls_types::MessageType;
 use protocol::rpc::{
     DimensionParams, DrawSegmentConstraint, InitialConditionEdit, InstancePreview, PathParams,
-    PolygonParams, RectangleEditResult, ValueEdit, remap_span_after_value_edits,
+    PolygonParams, RectangleEditResult, ValueEdit, ValueEditResult, remap_span_after_value_edits,
 };
 
 use crate::{
@@ -406,6 +406,8 @@ struct TextLabel {
 struct DirectFrame {
     display: RasterDisplayTransform,
     content_revision: u64,
+    /// The snapshot whose object ids the shapes hold.
+    cell: Option<CompileOutputState>,
     rects: Vec<(Rect, LayerState)>,
     polygons: Vec<(Polygon, LayerState)>,
     texts: Vec<TextLabel>,
@@ -686,12 +688,6 @@ fn ordered_dimension_rects<'a>(
         .collect::<Vec<_>>();
     candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
     candidates.into_iter().map(|(rect, _, _)| rect).collect()
-}
-
-#[derive(Clone, Debug)]
-struct PendingSseValue {
-    span: Option<Span>,
-    value: f64,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -1249,7 +1245,9 @@ pub struct LayoutCanvas {
     // sends back the result compiled from the rewritten initial conditions.
     is_sse_persisting: bool,
     sse_source_edit_inflight: bool,
-    pending_sse_values: Vec<PendingSseValue>,
+    /// The source revision the drag's edit produced, once the analyzer has
+    /// applied it. The first snapshot from it or a later one ends the preview.
+    sse_persisted_revision: Option<u64>,
     deferred_snapshot: Option<PreparedCompilationSnapshot>,
     deferred_cell_preview: Option<(CellId, editor::ScopePath, PreparedCompilationSnapshot)>,
     sse_persist_after_revision: Option<u64>,
@@ -1288,6 +1286,10 @@ pub struct LayoutCanvas {
     screen_bounds: Bounds<Pixels>,
     // Retained to keep the canvas's observations active.
     _subscriptions: Vec<Subscription>,
+    /// The snapshot last painted, whose object ids `rects` and `scope_rects`
+    /// hold. While a cell preview is shown it is not `solved_cell`, whose ids
+    /// can name other objects.
+    hit_test_cell: Option<CompileOutputState>,
     rects: Vec<(Rect, LayerState)>,
     polygons: Vec<(Polygon, LayerState)>,
     scope_rects: Vec<LabeledBbox>,
@@ -5817,48 +5819,6 @@ fn drag_persistence_edits(
     }
 }
 
-fn pending_sse_values(
-    edits: &[ValueEdit],
-    initial_conditions: &[InitialConditionEdit],
-) -> Vec<PendingSseValue> {
-    let mut pending = edits
-        .iter()
-        .filter_map(|edit| {
-            Some(PendingSseValue {
-                span: Some(remap_span_after_value_edits(&edit.span, edits)),
-                value: edit.value.parse().ok()?,
-            })
-        })
-        .collect::<Vec<_>>();
-    // Missing initial-condition kwargs are returned by the analyzer as one
-    // aggregate insertion edit, whose text is not itself a number. Retain the
-    // requested values without a source span so an unrelated newer compile
-    // cannot dismiss the optimistic drag preview before those kwargs compile.
-    pending.extend(
-        initial_conditions
-            .iter()
-            .filter_map(|condition| condition.value.parse().ok())
-            .map(|value| PendingSseValue { span: None, value }),
-    );
-    pending
-}
-
-fn compiled_data_matches_pending_sse(data: &CompiledData, pending: &[PendingSseValue]) -> bool {
-    !pending.is_empty()
-        && pending.iter().all(|expected| {
-            data.cells
-                .values()
-                .flat_map(|cell| &cell.fallback_constraints_used)
-                .any(|fallback| {
-                    expected
-                        .span
-                        .as_ref()
-                        .is_none_or(|span| &fallback.span == span)
-                        && (-fallback.constraint.constant - expected.value).abs() < 1e-8
-                })
-        })
-}
-
 fn snapshot_follows_revision(snapshot_revision: u64, revision: Option<u64>) -> bool {
     revision.is_none_or(|revision| snapshot_revision > revision)
 }
@@ -6087,6 +6047,7 @@ impl Element for CanvasElement {
         });
         let inner = self.inner.read(cx);
         let solved_cell = inner.state.read(cx).displayed_cell(cx);
+        let mut hit_test_cell = solved_cell.clone();
         let hide_external_geometry = &inner.state.read(cx).hide_external_geometry;
         let state = inner.state.read(cx);
         let pattern_tiles = inner.pattern_tiles.clone();
@@ -6185,6 +6146,7 @@ impl Element for CanvasElement {
         let mut budget = GeometryWorkBudget(UI_GEOMETRY_WORK_LIMIT);
         let collected = (|| -> Option<()> {
             if let Some(frame) = &replay_direct {
+                hit_test_cell = frame.cell.clone();
                 rects = frame.rects.clone();
                 polygons = frame.polygons.clone();
                 texts = frame.texts.clone();
@@ -6860,6 +6822,7 @@ impl Element for CanvasElement {
                 presentation = Presentation::Raster { tiles, display };
                 shallow = true;
             } else if let Some(frame) = retained_direct {
+                hit_test_cell = frame.cell.clone();
                 rects = frame.rects.clone();
                 polygons = frame.polygons.clone();
                 texts = frame.texts.clone();
@@ -6894,6 +6857,7 @@ impl Element for CanvasElement {
                     offset: inner.offset,
                 },
                 content_revision: inner.raster_content_revision,
+                cell: hit_test_cell.clone(),
                 rects: rects.clone(),
                 polygons: polygons.clone(),
                 texts: texts.clone(),
@@ -8429,8 +8393,7 @@ impl Element for CanvasElement {
                                 match selected {
                                     Some(DimEdge::Edge((r, _, edge))) => {
                                         let path = {
-                                            let cell = inner.state.read(cx).solved_cell.read(cx);
-                                            if let Some(cell) = cell
+                                            if let Some(cell) = &hit_test_cell
                                                 && let selected_scope_addr = cell.selected_scope
                                                 && let (true, path) = find_obj_path(
                                                     &r.object_path,
@@ -8634,6 +8597,7 @@ impl Element for CanvasElement {
                 inner.painted_complete_frame = true;
                 inner.painted_rectangle_previews = painted_rectangle_previews;
             }
+            inner.hit_test_cell = hit_test_cell;
             inner.rects = rects;
             inner.polygons = polygons;
             inner.scope_rects = scope_rects;
@@ -8776,7 +8740,7 @@ impl LayoutCanvas {
             is_sse_dragging: false,
             is_sse_persisting: false,
             sse_source_edit_inflight: false,
-            pending_sse_values: Vec::new(),
+            sse_persisted_revision: None,
             deferred_snapshot: None,
             deferred_cell_preview: None,
             sse_persist_after_revision: None,
@@ -8856,6 +8820,7 @@ impl LayoutCanvas {
                 cx.observe(&tool, |_, _, cx| cx.notify()),
             ],
             state: state.clone(),
+            hit_test_cell: None,
             rects: Vec::new(),
             polygons: Vec::new(),
             scope_rects: Vec::new(),
@@ -10713,8 +10678,7 @@ impl LayoutCanvas {
                         match selected {
                             Some(DimEdge::Edge((r, name, edge))) => {
                                 let resolved = {
-                                    let cell = self.state.read(cx).solved_cell.read(cx);
-                                    if let Some(cell) = cell
+                                    if let Some(cell) = &self.hit_test_cell
                                         && let selected_scope_addr = cell.selected_scope
                                         && let (true, path) =
                                             find_obj_path(&r.object_path, cell, selected_scope_addr)
@@ -10797,9 +10761,9 @@ impl LayoutCanvas {
                     } else {
                         true
                     };
-                    let state = self.state.read(cx);
-
-                    if enter_entry_mode && let Some(cell) = state.solved_cell.read(cx) {
+                    // The edges name objects of the snapshot they were picked
+                    // from, so the dimension goes in that snapshot's scope.
+                    if enter_entry_mode && let Some(cell) = &self.hit_test_cell {
                         let selected_scope_addr = cell.selected_scope;
                         let grid = cell.output.tech.grid_step();
 
@@ -11059,12 +11023,7 @@ impl LayoutCanvas {
                         .find(|h| h.bounds.contains(&event.position))
                         .cloned();
                     if let Some(handle) = handle {
-                        if self.can_begin_sse_drag(cx) {
-                            self.is_sse_dragging = true;
-                            self.drag_start = event.position;
-                            self.sse_delta = Point::default();
-                            self.sse_targets = handle.targets;
-                        }
+                        self.begin_sse_drag(handle.targets, event.position, cx);
                         cx.notify();
                     } else {
                         let selected_hit = choose_selection_hit(
@@ -11083,12 +11042,8 @@ impl LayoutCanvas {
                                     body.span == span && body.bounds.contains(&event.position)
                                 })
                                 .cloned()
-                                && self.can_begin_sse_drag(cx)
                             {
-                                self.is_sse_dragging = true;
-                                self.drag_start = event.position;
-                                self.sse_delta = Point::default();
-                                self.sse_targets = body.targets;
+                                self.begin_sse_drag(body.targets, event.position, cx);
                             }
                             self.state
                                 .read(cx)
@@ -11813,9 +11768,6 @@ impl LayoutCanvas {
             let (edits, base_revision) = self.sse_source_edits(cx);
             if edits.values.is_empty() && edits.initial_conditions.is_empty() {
                 self.is_sse_dragging = false;
-                if !self.is_sse_persisting {
-                    self.pending_sse_values.clear();
-                }
                 // Earlier drags this one continued from remain on screen.
                 self.sse_delta = Point::default();
                 self.sse_targets.clear();
@@ -11825,8 +11777,7 @@ impl LayoutCanvas {
                 self.sse_source_edit_inflight = true;
                 self.sse_source_edit_generation += 1;
                 let generation = self.sse_source_edit_generation;
-                self.pending_sse_values =
-                    pending_sse_values(&edits.values, &edits.initial_conditions);
+                self.sse_persisted_revision = None;
                 self.sse_persist_after_revision = base_revision;
                 // Anything deferred during the gesture belongs to the old
                 // source. Keep the moved geometry visible while Neovim accepts
@@ -11835,15 +11786,10 @@ impl LayoutCanvas {
                 self.deferred_cell_preview = None;
                 let client = self.state.read(cx).lang_server_client.clone();
                 cx.spawn(async move |_, _| {
-                    let initial_conditions = edits.initial_conditions;
                     let result = client
-                        .update_values_async(
-                            edits.values,
-                            initial_conditions.clone(),
-                            base_revision,
-                        )
+                        .update_values_async(edits.values, edits.initial_conditions, base_revision)
                         .await;
-                    client.dispatch_sse_source_edit_result(generation, result, initial_conditions);
+                    client.dispatch_sse_source_edit_result(generation, result);
                 })
                 .detach();
             }
@@ -11855,12 +11801,11 @@ impl LayoutCanvas {
     pub(crate) fn complete_sse_source_edit(
         &mut self,
         generation: u64,
-        result: anyhow::Result<Option<Vec<ValueEdit>>>,
-        initial_conditions: &[InitialConditionEdit],
+        result: anyhow::Result<Option<ValueEditResult>>,
         cx: &mut Context<Self>,
     ) {
-        if let Ok(Some(applied_edits)) = &result {
-            self.sse_edit_batches.push(applied_edits.clone());
+        if let Ok(Some(applied)) = &result {
+            self.sse_edit_batches.push(applied.edits.clone());
         }
         // A newer drag's edit, sent after this one, now decides the preview.
         let superseded = generation != self.sse_source_edit_generation;
@@ -11877,10 +11822,9 @@ impl LayoutCanvas {
         }
         self.sse_source_edit_inflight = false;
         match result {
-            Ok(Some(applied_edits)) => {
+            Ok(Some(applied)) => {
                 if self.is_sse_persisting {
-                    self.pending_sse_values =
-                        pending_sse_values(&applied_edits, initial_conditions);
+                    self.sse_persisted_revision = Some(applied.revision);
                 }
             }
             Ok(None) => {
@@ -11908,29 +11852,20 @@ impl LayoutCanvas {
         cx.notify();
     }
 
-    /// Whether a new SSE drag may start from the displayed geometry.
-    ///
-    /// While an earlier drag is persisting, the new one continues from where
-    /// that drag left the geometry. A newer compile that never showed the
-    /// persisted values ends the wait instead; the editor applies that
-    /// deferred snapshot on mouse-up.
-    fn can_begin_sse_drag(&mut self, cx: &App) -> bool {
-        if !self.is_sse_persisting {
-            return true;
-        }
-        let superseded = !self.sse_source_edit_inflight
-            && self.deferred_snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot_follows_revision(snapshot.revision, self.sse_persist_after_revision)
+    /// Starts an SSE drag of `targets` at `position`. While an earlier drag is
+    /// persisting, the new one continues from where that drag left the
+    /// geometry.
+    fn begin_sse_drag(&mut self, targets: Vec<SseDragTarget>, position: Point<Pixels>, cx: &App) {
+        if self.is_sse_persisting {
+            self.sse_offset = self.state.read(cx).displayed_cell(cx).and_then(|solved| {
+                let cell = &solved.output.cells[&solved.selected_scope.cell];
+                self.sse_drag_delta(&self.sse_space(cell))
             });
-        if superseded {
-            self.end_sse_persist();
-            return false;
         }
-        self.sse_offset = self.state.read(cx).displayed_cell(cx).and_then(|solved| {
-            let cell = &solved.output.cells[&solved.selected_scope.cell];
-            self.sse_drag_delta(&self.sse_space(cell))
-        });
-        true
+        self.is_sse_dragging = true;
+        self.drag_start = position;
+        self.sse_delta = Point::default();
+        self.sse_targets = targets;
     }
 
     /// Moves the selection onto the text a newly displayed snapshot was
@@ -11958,23 +11893,13 @@ impl LayoutCanvas {
         if !self.is_sse_persisting {
             return true;
         }
-        if self.sse_source_edit_inflight {
+        if self.sse_source_edit_inflight
+            || !snapshot_follows_revision(snapshot.revision, self.sse_persist_after_revision)
+        {
             return false;
         }
-        if !snapshot_follows_revision(snapshot.revision, self.sse_persist_after_revision) {
-            return false;
-        }
-        let data = match &snapshot.output {
-            compile::CompileOutput::Valid(data) => Some(data),
-            compile::CompileOutput::ExecErrors(output) => output.output.as_ref(),
-            compile::CompileOutput::StaticErrors(_) | compile::CompileOutput::FatalParseErrors => {
-                None
-            }
-        };
-        self.pending_sse_values.is_empty()
-            || data.is_some_and(|data| {
-                compiled_data_matches_pending_sse(data, &self.pending_sse_values)
-            })
+        self.sse_persisted_revision
+            .is_none_or(|revision| snapshot.revision >= revision)
     }
 
     pub(crate) fn finish_sse_persist(&mut self, cx: &mut Context<Self>) {
@@ -11989,7 +11914,7 @@ impl LayoutCanvas {
             return false;
         }
         self.is_sse_persisting = false;
-        self.pending_sse_values.clear();
+        self.sse_persisted_revision = None;
         self.sse_persist_after_revision = None;
         self.sse_delta = Point::default();
         self.sse_targets.clear();
@@ -15090,96 +15015,6 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
 
         let remapped = remap_span_after_value_edits(&selected, &edits);
         assert_eq!(remapped.span, cfgrammar::Span::new(12, 34));
-    }
-
-    #[test]
-    fn pending_drag_values_track_their_compiled_source_spans() {
-        let path: std::sync::Arc<std::path::Path> = std::path::Path::new("lib.ar").into();
-        let edits = [
-            ValueEdit {
-                span: Span {
-                    path: path.clone(),
-                    span: cfgrammar::Span::new(10, 19),
-                },
-                value: "1.2".to_owned(),
-            },
-            ValueEdit {
-                span: Span {
-                    path,
-                    span: cfgrammar::Span::new(30, 32),
-                },
-                value: "0.".to_owned(),
-            },
-        ];
-
-        let pending = pending_sse_values(&edits, &[]);
-        assert_eq!(pending.len(), 2);
-        assert_eq!(
-            pending[0].span.as_ref().unwrap().span,
-            cfgrammar::Span::new(10, 13)
-        );
-        assert_eq!(pending[0].value, 1.2);
-        assert_eq!(
-            pending[1].span.as_ref().unwrap().span,
-            cfgrammar::Span::new(24, 26)
-        );
-        assert_eq!(pending[1].value, 0.);
-    }
-
-    #[test]
-    fn pending_drag_values_include_inserted_initial_conditions() {
-        let conditions = [InitialConditionEdit {
-            call_span: Span {
-                path: std::path::Path::new("lib.ar").into(),
-                span: cfgrammar::Span::new(10, 30),
-            },
-            name: "x0i".to_owned(),
-            value: "12.5".to_owned(),
-        }];
-
-        let pending = pending_sse_values(&[], &conditions);
-        assert_eq!(pending.len(), 1);
-        assert!(pending[0].span.is_none());
-        assert_eq!(pending[0].value, 12.5);
-    }
-
-    #[test]
-    fn stale_compile_output_does_not_finish_a_drag_preview() {
-        let directory = tempfile::tempdir().unwrap();
-        let source_path = directory.path().join("lib.ar");
-        std::fs::write(
-            &source_path,
-            "use std::layout::rect;\ncell top() {\n    let shape = rect(\"met1\", x0i=1.2, y0i=0., x1i=10.3, y1i=10.)!;\n}\n",
-        )
-        .unwrap();
-        let ast = argonc::parse::parse_workspace_with_std(&source_path).ast();
-        let output = compile(
-            &ast,
-            argonc::compile::CompileInput {
-                cell: &["top"],
-                args: vec![],
-            },
-        );
-        let output = match output {
-            compile::CompileOutput::Valid(output) => output,
-            compile::CompileOutput::ExecErrors(compile::ExecErrorCompileOutput {
-                output: Some(output),
-                ..
-            }) => output,
-            output => panic!("drag fixture should produce geometry: {output:?}"),
-        };
-        let fallback = output.cells[&output.top]
-            .fallback_constraints_used
-            .first()
-            .expect("rectangle should use its initial conditions");
-        let mut pending = vec![PendingSseValue {
-            span: Some(fallback.span.clone()),
-            value: -fallback.constraint.constant,
-        }];
-
-        assert!(compiled_data_matches_pending_sse(&output, &pending));
-        pending[0].value += 1.;
-        assert!(!compiled_data_matches_pending_sse(&output, &pending));
     }
 
     #[test]

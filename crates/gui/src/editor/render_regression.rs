@@ -123,17 +123,17 @@ fn minimap_keeps_its_previous_image_until_replacement_is_ready(cx: &mut gpui::Te
 }
 
 #[gpui::test]
-fn sse_keeps_the_moved_preview_until_its_source_edit_is_acknowledged(
-    cx: &mut gpui::TestAppContext,
-) {
+fn sse_preview_ends_at_the_revision_of_its_source_edit(cx: &mut gpui::TestAppContext) {
     let canvas = test_canvas(cx);
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("lib.ar");
-    std::fs::write(
-        &source,
-        "use std::layout::rect; cell top() { let r = rect(\"met1\", x0i=1., y0i=0., x1i=10., y1i=10.)!; }",
-    )
-    .unwrap();
+    // `examples/sse_basic` before and after dragging the top edge up by 10.
+    // `x1` fixes `y1`, so the compiler leaves the rewritten `y1i` unused.
+    let original = "use std::layout::rect; cell top() { let r = rect(\"met1\", x0=0., y0=0., x1i=100., y1i=200.); eq(r.x1, r.y1); }";
+    let dragged = original
+        .replace("x1i=100.", "x1i=110.")
+        .replace("y1i=200.", "y1i=110.");
+    std::fs::write(&source, &dragged).unwrap();
     let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
     ));
@@ -142,36 +142,45 @@ fn sse_keeps_the_moved_preview_until_its_source_edit_is_acknowledged(
         &["top".into()],
         vec![],
     );
-    let data = match &output {
-        CompileOutput::Valid(data) => data,
-        CompileOutput::ExecErrors(errors) => errors.output.as_ref().unwrap(),
-        _ => panic!("SSE fixture did not compile"),
+    let snapshot = |revision, cx: &mut gpui::TestAppContext| {
+        prepare_compilation_snapshot(
+            CompilationSnapshot {
+                revision,
+                output: output.clone(),
+            },
+            canvas.read_with(cx, |canvas, cx| {
+                canvas.state.read(cx).compilation_preparation_context(cx)
+            }),
+        )
     };
-    let fallback = data.cells[&data.top]
-        .fallback_constraints_used
-        .first()
-        .unwrap();
-    let pending = PendingSseValue {
-        span: Some(fallback.span.clone()),
-        value: -fallback.constraint.constant,
+    let (before_edit, after_edit) = (snapshot(2, cx), snapshot(3, cx));
+    let value_edit = |kwarg: &str| {
+        let start = original.find(kwarg).unwrap() + kwarg.len();
+        ValueEdit {
+            span: Span {
+                path: source.clone().into(),
+                span: cfgrammar::Span::new(start, start + 4),
+            },
+            value: "110.".to_owned(),
+        }
     };
-    let snapshot = prepare_compilation_snapshot(
-        CompilationSnapshot {
-            revision: 2,
-            output,
-        },
-        canvas.read_with(cx, |canvas, cx| {
-            canvas.state.read(cx).compilation_preparation_context(cx)
-        }),
-    );
-    canvas.update(cx, |canvas, _| {
+    canvas.update(cx, |canvas, cx| {
         canvas.is_sse_persisting = true;
         canvas.sse_source_edit_inflight = true;
         canvas.sse_persist_after_revision = Some(1);
-        canvas.pending_sse_values = vec![pending];
-        assert!(!canvas.accepts_snapshot(&snapshot));
-        canvas.sse_source_edit_inflight = false;
-        assert!(canvas.accepts_snapshot(&snapshot));
+        assert!(!canvas.accepts_snapshot(&after_edit));
+        let generation = canvas.sse_source_edit_generation;
+        canvas.complete_sse_source_edit(
+            generation,
+            Ok(Some(ValueEditResult {
+                edits: vec![value_edit("x1i="), value_edit("y1i=")],
+                revision: 3,
+            })),
+            cx,
+        );
+        assert!(canvas.is_sse_persisting);
+        assert!(!canvas.accepts_snapshot(&before_edit));
+        assert!(canvas.accepts_snapshot(&after_edit));
     });
 }
 
@@ -233,12 +242,16 @@ fn sse_drags_continue_from_a_drag_that_is_still_persisting(cx: &mut gpui::TestAp
                 .map(|edit| edit.value)
                 .collect::<Vec<_>>()
         };
+        let begin_drag = |canvas: &mut LayoutCanvas, cx: &mut Context<LayoutCanvas>| {
+            let targets = canvas.sse_targets.clone();
+            canvas.begin_sse_drag(targets, Point::default(), cx);
+        };
         // A drag moved `x1` by 5 and its source edit is still in flight.
         drag_x1(canvas, 5.);
         canvas.is_sse_persisting = true;
         canvas.sse_source_edit_inflight = true;
         canvas.sse_persist_after_revision = Some(1);
-        assert!(canvas.can_begin_sse_drag(cx));
+        begin_drag(canvas, cx);
         // The next drag starts where that one left `x1`.
         drag_x1(canvas, 3.);
         assert_eq!(x1_edits(canvas, cx), ["18."]);
@@ -249,15 +262,19 @@ fn sse_drags_continue_from_a_drag_that_is_still_persisting(cx: &mut gpui::TestAp
         drag_x1(canvas, -5.);
         assert_eq!(x1_edits(canvas, cx), ["10."]);
 
-        // A newer compile that never showed the persisted values ends the
-        // wait instead of continuing from outdated geometry.
+        // Once the edit is acknowledged at revision 3, a compile of revision
+        // 2 waiting to be shown predates it, so the next drag still continues
+        // from the persisted geometry.
+        canvas.sse_offset = None;
+        drag_x1(canvas, 5.);
         canvas.sse_source_edit_inflight = false;
+        canvas.sse_persisted_revision = Some(3);
+        assert!(!canvas.accepts_snapshot(&newer));
         canvas.deferred_snapshot = Some(newer);
-        assert!(!canvas.can_begin_sse_drag(cx));
-        assert!(!canvas.is_sse_persisting);
-        assert!(canvas.sse_offset.is_none());
-        assert!(canvas.deferred_snapshot.is_some());
-        assert!(canvas.can_begin_sse_drag(cx));
+        begin_drag(canvas, cx);
+        assert!(canvas.is_sse_persisting);
+        drag_x1(canvas, 3.);
+        assert_eq!(x1_edits(canvas, cx), ["18."]);
     });
 }
 
@@ -384,6 +401,109 @@ fn focused_preview_changes_canvas_geometry_without_retargeting_source_edits(
         canvas.update_raster_presentation(cx);
         assert_eq!(canvas.raster_output.as_ref().unwrap().top, full_top);
         assert_eq!(canvas.pending_rectangles[0].scope_path, scope);
+    });
+}
+
+#[gpui::test]
+fn dimension_tool_names_objects_of_the_cell_preview_it_shows(cx: &mut gpui::TestAppContext) {
+    let canvas = test_canvas(cx);
+    let editor = test_editor(&canvas, cx);
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    let original = "use std::layout::{inst, rect}; cell leaf() { let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); let b = rect(\"met1\", x0=20., y0=0., x1=30., y1=10.); } cell top() { let child = inst(leaf(), x=0., y=0.); }";
+    std::fs::write(&source, original).unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+    ));
+    let mut compiler = argonc::incremental::IncrementalCompiler::new();
+    let full = compiler.compile_cell(&config, &["top".to_owned()], vec![]);
+    let CompileOutput::Valid(ref full_data) = full else {
+        panic!("initial hierarchy did not compile");
+    };
+    let leaf = full_data
+        .cells
+        .iter()
+        .find_map(|(id, cell)| (cell.name == "leaf").then_some(*id))
+        .unwrap();
+    let scope = ScopeAddress {
+        cell: leaf,
+        scope: full_data.cells[&leaf].root,
+    };
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.update(cx, |state, cx| {
+            state.compilation_revision = Some(1);
+            state.update(cx, full);
+            state.solved_cell.update(cx, |cell, cx| {
+                cell.as_mut().unwrap().selected_scope = scope;
+                cx.notify();
+            });
+        });
+    });
+    // A shape added before `a` shifts the object ids of `a` and `b`, so the
+    // preview's id for `a` names `b` in the full snapshot.
+    compiler.set_source_text(
+        source,
+        original.replace(
+            "let a =",
+            "let n = rect(\"met1\", x0=40., y0=0., x1=50., y1=10.); let a =",
+        ),
+    );
+    let preview = prepare_compilation_snapshot(
+        CompilationSnapshot {
+            revision: 2,
+            output: compiler.compile_cell_preview(&config, &["leaf".to_owned()], vec![]),
+        },
+        canvas.read_with(cx, |canvas, cx| {
+            canvas.state.read(cx).compilation_preparation_context(cx)
+        }),
+    );
+    editor.update(cx, |editor, cx| {
+        assert!(editor.finish_cell_preview(cx, leaf, scope, preview));
+    });
+    canvas.update(cx, |canvas, cx| {
+        canvas.state.read(cx).tool.clone().update(cx, |tool, _| {
+            *tool = ToolState::DrawDim(DrawDimToolState::default());
+        });
+    });
+    let cx = cx.add_empty_window();
+    let size = Size::new(px(400.), px(400.));
+    let draw = |cx: &mut gpui::VisualTestContext| {
+        cx.draw(
+            Point::default(),
+            size.map(gpui::AvailableSpace::Definite),
+            |_, _| CanvasElement {
+                inner: canvas.clone(),
+            },
+        );
+    };
+    draw(cx);
+    cx.run_until_parked();
+    draw(cx);
+    cx.update(|window, cx| {
+        canvas.update(cx, |canvas, cx| {
+            assert!(!canvas.rects.is_empty(), "the preview should be painted");
+            // The right edge of `a`, as painted from the preview.
+            let position = canvas.layout_to_px(Point::new(10., 5.));
+            canvas.on_left_mouse_down(
+                &MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    ..Default::default()
+                },
+                window,
+                cx,
+            );
+        })
+    });
+    canvas.read_with(cx, |canvas, cx| {
+        let ToolState::DrawDim(tool) = canvas.state.read(cx).tool.read(cx) else {
+            panic!("the dimension tool should still be active");
+        };
+        let [DimEdge::Edge(edge)] = tool.edges.as_slice() else {
+            panic!("one edge should be picked: {:?}", tool.edges);
+        };
+        assert_eq!((edge.path.as_str(), edge.name.as_str()), ("a", "x1"));
+        assert_eq!(edge.exact.coord, 10.);
     });
 }
 
@@ -825,6 +945,95 @@ cell top() {
             "finished rendering must stop the spinner"
         );
         assert!(canvas.rects.len() <= UI_GEOMETRY_WORK_LIMIT);
+    });
+}
+
+#[gpui::test]
+fn dimension_placement_survives_a_paint_that_draws_nothing(cx: &mut gpui::TestAppContext) {
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("lib.ar");
+    std::fs::write(
+        &source,
+        r#"
+use std::layout::{inst, rect};
+cell leaf() { let shape = rect("met1", x0=0., y0=0., x1=10., y1=10.); }
+cell top() {
+    let a = rect("met1", x0=-100., y0=0., x1=-90., y1=10.);
+    for row in std::range(100) {
+        for col in std::range(100) {
+            let child = inst(leaf(), x=(col as Float)*12., y=(row as Float)*12.);
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/tech/basic.tech.toml"),
+    ));
+    let (solved, layers) = prepare(&source, &config);
+    let canvas = test_canvas(cx);
+    load_canvas(&canvas, solved, layers, cx);
+    canvas.update(cx, |canvas, cx| {
+        canvas.pending_init = false;
+        // Zoomed in on `a`, clear of most of the array.
+        canvas.scale = 10.;
+        canvas.offset = Point::new(px(1100.), px(300.));
+        canvas.raster_decision_refinement = None;
+        canvas.raster_cache_enabled = false;
+        canvas.raster_prefetch_enabled = false;
+        canvas.state.read(cx).tool.clone().update(cx, |tool, _| {
+            *tool = ToolState::DrawDim(DrawDimToolState::default());
+        });
+    });
+    let cx = cx.add_empty_window();
+    let size = Size::new(px(1200.), px(1200.));
+    let draw = |cx: &mut gpui::VisualTestContext| {
+        cx.draw(
+            Point::default(),
+            size.map(gpui::AvailableSpace::Definite),
+            |_, _| CanvasElement {
+                inner: canvas.clone(),
+            },
+        );
+    };
+    let click = |position: Point<Pixels>, cx: &mut gpui::VisualTestContext| {
+        cx.update(|window, cx| {
+            canvas.update(cx, |canvas, cx| {
+                canvas.on_left_mouse_down(
+                    &MouseDownEvent {
+                        button: MouseButton::Left,
+                        position,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+            })
+        });
+    };
+    draw(cx);
+    let edge = canvas.read_with(cx, |canvas, _| {
+        assert!(!canvas.rects.is_empty(), "`a` should be painted");
+        canvas.layout_to_px(Point::new(-90., 5.))
+    });
+    click(edge, cx);
+    // Zoomed out over the whole array, with no frame to replay, the paint
+    // exceeds its work budget and draws only the background.
+    canvas.update(cx, |canvas, _| {
+        canvas.scale = 1.;
+        canvas.offset = Point::new(px(0.), px(1200.));
+        canvas.retained_direct_frame = None;
+    });
+    draw(cx);
+    canvas.read_with(cx, |canvas, _| assert!(canvas.rects.is_empty()));
+    click(Point::new(px(600.), px(600.)), cx);
+    canvas.read_with(cx, |canvas, cx| {
+        let ToolState::EditDim(tool) = canvas.state.read(cx).tool.read(cx) else {
+            panic!("the click should place the dimension");
+        };
+        assert_eq!(tool.pending.as_ref().unwrap().params.p, "a.y1");
     });
 }
 
@@ -1365,15 +1574,10 @@ fn early_sse_cell_preview_is_applied_as_soon_as_neovim_acknowledges_the_edit(
         editor.finish_sse_source_edit(
             cx,
             0,
-            Ok(Some(vec![])),
-            vec![protocol::rpc::InitialConditionEdit {
-                call_span: Span {
-                    path: source.into(),
-                    span: cfgrammar::Span::new(0, original.len()),
-                },
-                name: "x1i".to_owned(),
-                value: "12.".to_owned(),
-            }],
+            Ok(Some(ValueEditResult {
+                edits: vec![],
+                revision: 2,
+            })),
         );
     });
     assert!(canvas.read_with(cx, |canvas, _| !canvas.is_sse_persisting));

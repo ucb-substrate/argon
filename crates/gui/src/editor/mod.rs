@@ -1208,11 +1208,10 @@ impl Editor {
         &self,
         cx: &mut App,
         generation: u64,
-        result: anyhow::Result<Option<Vec<protocol::rpc::ValueEdit>>>,
-        initial_conditions: Vec<protocol::rpc::InitialConditionEdit>,
+        result: anyhow::Result<Option<protocol::rpc::ValueEditResult>>,
     ) {
         self.canvas.update(cx, |canvas, cx| {
-            canvas.complete_sse_source_edit(generation, result, &initial_conditions, cx)
+            canvas.complete_sse_source_edit(generation, result, cx)
         });
         let deferred_preview = self
             .canvas
