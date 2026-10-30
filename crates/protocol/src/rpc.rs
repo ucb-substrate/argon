@@ -107,9 +107,9 @@ pub struct InstancePreview {
     pub scope_span: Span,
 }
 
-/// Receipt for an accepted drag edit: the replacements applied, and the source
-/// revision afterward. A snapshot compiled from that revision or a later one
-/// shows the drag.
+/// Receipt for an accepted drag edit: the replacements applied, and the first
+/// source revision that includes them. A snapshot compiled from that revision
+/// or a later one shows the drag.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValueEditResult {
     pub edits: Vec<ValueEdit>,

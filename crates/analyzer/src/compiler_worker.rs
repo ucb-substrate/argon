@@ -211,16 +211,14 @@ fn compile_catching_panics(
     panic::catch_unwind(AssertUnwindSafe(|| compile(compiler, request, preview))).unwrap_or_else(
         |_| {
             error!("internal compiler error while compiling {root_dir:?}");
-            // The panic may have left the incremental session half-updated,
-            // so start a fresh one: losing the caches costs a rebuild,
-            // keeping poisoned state costs correctness.
-            *compiler = IncrementalCompiler::new();
+            // The panic may have left the caches half-updated.
+            compiler.reset();
             CompileResult {
                 identity,
                 config: WorkspaceConfig::new(root_dir.join("lib.ar")),
                 root_dir,
                 ast: WorkspaceParseAst::default(),
-                // The fresh session has no index yet, and this request never
+                // The reset compiler has no index yet, and this request never
                 // got far enough to ask for one. Publishing treats that as
                 // "nothing to say" rather than as an index to clear.
                 nav: None,
@@ -240,7 +238,7 @@ fn compile(
         identity,
         root_dir,
         preview_cell,
-        publish: _,
+        publish,
     } = request;
     let manifest_path = root_dir.join("Argon.toml");
     let library = if manifest_path.is_file() {
@@ -306,7 +304,14 @@ fn compile(
                     output,
                 });
             }
-            match compiler.compile_invocation(&workspace, cell) {
+            // An unpublished compile keeps the cells the editor's next
+            // compile reuses.
+            let output = if publish {
+                compiler.compile_invocation(&workspace, cell)
+            } else {
+                compiler.compile_invocation_keeping_previous_graph(&workspace, cell)
+            };
+            match output {
                 Ok(output) => Some(output),
                 Err(error) => {
                     messages.push(format!("Open cell is invalid: {error}"));

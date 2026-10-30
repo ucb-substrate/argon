@@ -320,6 +320,9 @@ pub fn reload_log_filter(level: &str) -> std::result::Result<(), String> {
 /// debounce passes.
 pub(crate) const PENDING_EDIT_TIMEOUT: Duration = Duration::from_secs(1);
 
+const RENAME_SUPERSEDED_MESSAGE: &str =
+    "The source or open cell changed while renaming, so the cell was not renamed. Rename it again.";
+
 #[derive(Debug, Default)]
 pub(crate) struct SourceState {
     pub(crate) revision: u64,
@@ -2187,13 +2190,16 @@ impl Backend {
     }
 
     async fn rename_cell(&self, params: CellNameParams) -> Result<()> {
+        let (revision, current_invocation) = {
+            let source = self.state.source_state.lock().await;
+            (source.revision, source.cell.clone())
+        };
         let Some(ast) = self.state.current_editor_ast().await else {
             self.state
                 .report_message(MessageType::ERROR, rpc::OUT_OF_SYNC_MESSAGE)
                 .await;
             return Ok(());
         };
-        let current_invocation = self.state.source_state.lock().await.cell.clone();
         let Some(current_invocation) = current_invocation else {
             self.state
                 .report_message(MessageType::ERROR, "Open a cell before renaming it")
@@ -2232,6 +2238,14 @@ impl Backend {
         };
         let previous = {
             let mut source = self.state.source_state.lock().await;
+            // The edits address the source and open cell at `revision`.
+            if source.revision != revision || source.cell.as_ref() != Some(&current_invocation) {
+                drop(source);
+                self.state
+                    .report_message(MessageType::ERROR, RENAME_SUPERSEDED_MESSAGE)
+                    .await;
+                return Ok(());
+            }
             let pending_recent = source.pending_recent.as_deref().map(renamed);
             (
                 source.cell.replace(renamed(&current_invocation)),
@@ -2239,7 +2253,12 @@ impl Backend {
             )
         };
         let changes = std::mem::take(&mut rename.changes);
-        if !self.state.apply_source_changes(changes, None).await {
+        if self
+            .state
+            .apply_source_changes(changes, None)
+            .await
+            .is_none()
+        {
             let mut source = self.state.source_state.lock().await;
             (source.cell, source.pending_recent) = previous;
             return Ok(());
@@ -3459,9 +3478,8 @@ mod tests {
             }
 
             /// Asks the editor to set `a` to 3 and `b` to 4 in one edit,
-            /// returning whether it applied and the source revision once the
-            /// request returns.
-            fn edit(&self) -> tokio::task::JoinHandle<(bool, u64)> {
+            /// returning the source revision that includes it, if it applied.
+            fn edit(&self) -> tokio::task::JoinHandle<Option<u64>> {
                 let replacement = |line| TextEdit {
                     range: Range::new(Position::new(line, 12), Position::new(line, 14)),
                     new_text: if line == 1 { "3." } else { "4." }.to_owned(),
@@ -3469,10 +3487,7 @@ mod tests {
                 let changes =
                     HashMap::from([(self.uri.clone(), vec![replacement(1), replacement(2)])]);
                 let state = self.backend.state.clone();
-                tokio::spawn(async move {
-                    let applied = state.apply_source_changes(changes, None).await;
-                    (applied, state.source_state.lock().await.revision)
-                })
+                tokio::spawn(async move { state.apply_source_changes(changes, None).await })
             }
 
             /// The edits of the next workspace edit the analyzer asks for.
@@ -3529,7 +3544,7 @@ mod tests {
             editor.change(2, &edits[0]).await;
 
             // Revision 1 opened the file and revision 2 had half the edit.
-            assert_eq!(edit.await.unwrap(), (true, 3));
+            assert_eq!(edit.await.unwrap(), Some(3));
             let mut compiled = editor.backend.state.compiled_revisions.subscribe();
             tokio::time::timeout(
                 PENDING_EDIT_TIMEOUT * 10,
@@ -3556,7 +3571,9 @@ mod tests {
             editor.change(1, &edits[1]).await;
             editor.applied(id);
 
-            assert_eq!(edit.await.unwrap(), (true, 2));
+            // Revision 2 has half the edit, so the rest can only be in a
+            // later one.
+            assert_eq!(edit.await.unwrap(), Some(3));
             let state = &editor.backend.state;
             assert!(
                 state

@@ -151,6 +151,17 @@ impl IncrementalCompiler {
         self.revision
     }
 
+    /// Drops every cache, keeping the synchronized editor documents.
+    pub fn reset(&mut self) {
+        let sources = std::mem::take(&mut self.sources);
+        *self = Self {
+            revision: self.revision,
+            sources,
+            ..Self::default()
+        };
+        self.stats.revision = self.revision;
+    }
+
     pub fn stats(&self) -> IncrementalStats {
         self.stats
     }
@@ -473,6 +484,25 @@ impl IncrementalCompiler {
         config: &WorkspaceConfig,
         source: &str,
     ) -> Result<CompileOutput, anyhow::Error> {
+        self.compile_invocation_mode(config, source, false)
+    }
+
+    /// Like [`Self::compile_invocation`], but does not evict the previous
+    /// revision's graph, so the opened top cell's next compile still reuses it.
+    pub fn compile_invocation_keeping_previous_graph(
+        &mut self,
+        config: &WorkspaceConfig,
+        source: &str,
+    ) -> Result<CompileOutput, anyhow::Error> {
+        self.compile_invocation_mode(config, source, true)
+    }
+
+    fn compile_invocation_mode(
+        &mut self,
+        config: &WorkspaceConfig,
+        source: &str,
+        preserve_previous_graph: bool,
+    ) -> Result<CompileOutput, anyhow::Error> {
         self.ensure_analysis(config);
         let analysis = &self
             .static_cache
@@ -511,8 +541,10 @@ impl IncrementalCompiler {
         if let Some(output) = self.execution_cache.get(&key) {
             self.stats.execution_cache_hits += 1;
             let output = output.clone();
-            self.previous_revision_live.clear();
-            self.prune_execution_caches();
+            if !preserve_previous_graph {
+                self.previous_revision_live.clear();
+                self.prune_execution_caches();
+            }
             return Ok(output);
         }
 
@@ -549,7 +581,9 @@ impl IncrementalCompiler {
             compile::execute_cell_invocation_cached(&typed_ast, &invocation, config, None)
         });
         self.execution_cache.insert(key, output.clone());
-        self.previous_revision_live.clear();
+        if !preserve_previous_graph {
+            self.previous_revision_live.clear();
+        }
         self.prune_execution_caches();
         Ok(output)
     }
@@ -989,6 +1023,16 @@ mod tests {
             .unwrap();
         assert_eq!(compiler.source(&path), Some("cell main(value: Float) {}"));
         assert_eq!(compiler.revision(), 2);
+    }
+
+    #[test]
+    fn reset_keeps_editor_documents() {
+        let path = PathBuf::from("lib.ar");
+        let mut compiler = IncrementalCompiler::new();
+        compiler.set_source_text(path.clone(), "cell top() {}");
+        compiler.reset();
+        assert_eq!(compiler.source(&path), Some("cell top() {}"));
+        assert_eq!(compiler.revision(), 1);
     }
 
     #[test]
@@ -2479,6 +2523,52 @@ mod tests {
             .unwrap_valid();
         let after = compiler
             .compile_cell(&config, &["top".into()], vec![])
+            .unwrap_valid();
+        let stable_id = before
+            .cells
+            .iter()
+            .find_map(|(id, cell)| cell.name.ends_with("stable::stable").then_some(*id))
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &before.cells[&stable_id],
+            &after.cells[&stable_id]
+        ));
+    }
+
+    #[test]
+    fn invocation_kept_aside_does_not_evict_the_opened_top_graph() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("lib.ar");
+        let leaf = workspace.path().join("leaf.ar");
+        let stable = workspace.path().join("stable.ar");
+        std::fs::write(
+            &root,
+            "use std::layout::{inst, rect}; mod leaf; mod stable; cell top() { let a = inst(leaf::leaf(), x=0., y=0.); let b = inst(stable::stable(), x=20., y=0.); } cell other() { let r = rect(\"met1\", x0=0., y0=0., x1=1., y1=1.); }",
+        )
+        .unwrap();
+        let original = "use std::layout::rect; cell leaf() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }";
+        std::fs::write(&leaf, original).unwrap();
+        std::fs::write(
+            &stable,
+            "use std::layout::rect; cell stable() { let r = rect(\"met2\", x0=0., y0=0., x1=5., y1=5.); }",
+        )
+        .unwrap();
+        let config = WorkspaceConfig::new(&root).with_tech(Some(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+        ));
+        let mut compiler = IncrementalCompiler::new();
+        let before = compiler
+            .compile_invocation(&config, "top()")
+            .unwrap()
+            .unwrap_valid();
+        compiler.set_source_text(leaf, original.replace("x1=10.", "x1=12."));
+        compiler
+            .compile_invocation_keeping_previous_graph(&config, "other()")
+            .unwrap()
+            .unwrap_valid();
+        let after = compiler
+            .compile_invocation(&config, "top()")
+            .unwrap()
             .unwrap_valid();
         let stable_id = before
             .cells

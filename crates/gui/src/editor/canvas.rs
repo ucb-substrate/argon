@@ -1286,9 +1286,9 @@ pub struct LayoutCanvas {
     screen_bounds: Bounds<Pixels>,
     // Retained to keep the canvas's observations active.
     _subscriptions: Vec<Subscription>,
-    /// The snapshot whose object ids `rects` and `scope_rects` hold. While a
-    /// cell preview is shown it is not `solved_cell`, whose ids can name other
-    /// objects.
+    /// The snapshot last painted, whose object ids `rects` and `scope_rects`
+    /// hold. While a cell preview is shown it is not `solved_cell`, whose ids
+    /// can name other objects.
     hit_test_cell: Option<CompileOutputState>,
     rects: Vec<(Rect, LayerState)>,
     polygons: Vec<(Polygon, LayerState)>,
@@ -6832,7 +6832,6 @@ impl Element for CanvasElement {
             } else {
                 inner.bg_style.clone().paint(bounds, window, cx, |_, _| {});
                 self.inner.update(cx, |inner, cx| {
-                    inner.hit_test_cell = None;
                     inner.rects.clear();
                     inner.polygons.clear();
                     inner.scope_rects.clear();
@@ -11024,12 +11023,7 @@ impl LayoutCanvas {
                         .find(|h| h.bounds.contains(&event.position))
                         .cloned();
                     if let Some(handle) = handle {
-                        if self.can_begin_sse_drag(cx) {
-                            self.is_sse_dragging = true;
-                            self.drag_start = event.position;
-                            self.sse_delta = Point::default();
-                            self.sse_targets = handle.targets;
-                        }
+                        self.begin_sse_drag(handle.targets, event.position, cx);
                         cx.notify();
                     } else {
                         let selected_hit = choose_selection_hit(
@@ -11048,12 +11042,8 @@ impl LayoutCanvas {
                                     body.span == span && body.bounds.contains(&event.position)
                                 })
                                 .cloned()
-                                && self.can_begin_sse_drag(cx)
                             {
-                                self.is_sse_dragging = true;
-                                self.drag_start = event.position;
-                                self.sse_delta = Point::default();
-                                self.sse_targets = body.targets;
+                                self.begin_sse_drag(body.targets, event.position, cx);
                             }
                             self.state
                                 .read(cx)
@@ -11862,29 +11852,20 @@ impl LayoutCanvas {
         cx.notify();
     }
 
-    /// Whether a new SSE drag may start from the displayed geometry.
-    ///
-    /// While an earlier drag is persisting, the new one continues from where
-    /// that drag left the geometry. A newer compile that never showed the
-    /// persisted values ends the wait instead; the editor applies that
-    /// deferred snapshot on mouse-up.
-    fn can_begin_sse_drag(&mut self, cx: &App) -> bool {
-        if !self.is_sse_persisting {
-            return true;
-        }
-        let superseded = !self.sse_source_edit_inflight
-            && self.deferred_snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot_follows_revision(snapshot.revision, self.sse_persist_after_revision)
+    /// Starts an SSE drag of `targets` at `position`. While an earlier drag is
+    /// persisting, the new one continues from where that drag left the
+    /// geometry.
+    fn begin_sse_drag(&mut self, targets: Vec<SseDragTarget>, position: Point<Pixels>, cx: &App) {
+        if self.is_sse_persisting {
+            self.sse_offset = self.state.read(cx).displayed_cell(cx).and_then(|solved| {
+                let cell = &solved.output.cells[&solved.selected_scope.cell];
+                self.sse_drag_delta(&self.sse_space(cell))
             });
-        if superseded {
-            self.end_sse_persist();
-            return false;
         }
-        self.sse_offset = self.state.read(cx).displayed_cell(cx).and_then(|solved| {
-            let cell = &solved.output.cells[&solved.selected_scope.cell];
-            self.sse_drag_delta(&self.sse_space(cell))
-        });
-        true
+        self.is_sse_dragging = true;
+        self.drag_start = position;
+        self.sse_delta = Point::default();
+        self.sse_targets = targets;
     }
 
     /// Moves the selection onto the text a newly displayed snapshot was
@@ -11912,7 +11893,9 @@ impl LayoutCanvas {
         if !self.is_sse_persisting {
             return true;
         }
-        if self.sse_source_edit_inflight {
+        if self.sse_source_edit_inflight
+            || !snapshot_follows_revision(snapshot.revision, self.sse_persist_after_revision)
+        {
             return false;
         }
         self.sse_persisted_revision
