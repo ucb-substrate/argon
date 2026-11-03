@@ -1671,16 +1671,23 @@ cell top() {
             };
 
             // Lengthening `x0i` shifts every later span in the file.
-            assert!(update("x0i = ", "12345.", revision).await.is_some());
+            let first = update("x0i = ", "12345.", revision)
+                .await
+                .expect("the first edit should apply");
+            assert!(first.revision > revision, "the receipt names the edited source");
             // Sent before that edit has compiled.
-            assert!(update("y0i = ", "7.", revision).await.is_some());
+            let second = update("y0i = ", "7.", revision)
+                .await
+                .expect("the second edit should apply");
+            assert!(second.revision > first.revision);
+            // A layout at the receipt's revision shows both edits.
             loop {
                 if let GuiEvent::UpdateCell {
                     revision: edited,
                     kind: OutputKind::Data,
                     ..
                 } = session.next_event().await
-                    && edited > revision
+                    && edited >= second.revision
                 {
                     break;
                 }

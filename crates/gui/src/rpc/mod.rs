@@ -38,7 +38,7 @@ use protocol::rpc::{
     InitialConditionEdit, InstancePreview, LangServerAction, LangServerRequest, LangServerResponse,
     PasteRequest, PathParams, PlaceDeviceRequest, PlaceRequest, PlaceSchematicInstanceRequest,
     PolygonParams, RecentCell, RectangleEditResult, RenameRequest, SchematicInstancePreview,
-    SetArgumentRequest, ValueEdit,
+    SetArgumentRequest, ValueEdit, ValueEditResult,
 };
 use tracing::error;
 use web_time::Instant;
@@ -298,7 +298,7 @@ impl SyncLangServerClient {
         edits: Vec<ValueEdit>,
         initial_conditions: Vec<InitialConditionEdit>,
         base_revision: Option<u64>,
-    ) -> Result<Option<Vec<ValueEdit>>> {
+    ) -> Result<Option<ValueEditResult>> {
         request!(
             self,
             UpdateValues {
@@ -313,16 +313,13 @@ impl SyncLangServerClient {
     pub fn dispatch_sse_source_edit_result(
         &self,
         generation: u64,
-        result: Result<Option<Vec<ValueEdit>>>,
-        initial_conditions: Vec<InitialConditionEdit>,
+        result: Result<Option<ValueEditResult>>,
     ) {
         let _ = self
             .inner
             .to_exec
             .unbounded_send(Box::new(move |editor, cx| {
-                cx.update(|cx| {
-                    editor.finish_sse_source_edit(cx, generation, result, initial_conditions)
-                });
+                cx.update(|cx| editor.finish_sse_source_edit(cx, generation, result));
             }));
     }
 
@@ -999,7 +996,12 @@ mod tests {
         server
             .send(tarpc::Response {
                 request_id: request.id,
-                message: Ok(LangServerResponse::UpdateValues(Some(vec![]))),
+                message: Ok(LangServerResponse::UpdateValues(Some(
+                    super::ValueEditResult {
+                        edits: vec![],
+                        revision: 0,
+                    },
+                ))),
             })
             .now_or_never()
             .unwrap()

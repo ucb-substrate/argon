@@ -375,7 +375,8 @@ pub(crate) fn completion_context(source: &str, cursor: usize) -> CompletionConte
 fn code_mask(source: &str, cursor: usize) -> Vec<u8> {
     let source = source.as_bytes();
     let end = cursor.min(source.len());
-    let mut mask = source[..end].to_vec();
+    // Mask the full source so a token straddling the cursor stays in bounds.
+    let mut mask = source.to_vec();
     let mut index = 0;
     let mut block_depth = 0usize;
     let mut string = false;
@@ -438,6 +439,7 @@ fn code_mask(source: &str, cursor: usize) -> Vec<u8> {
             index += 1;
         }
     }
+    mask.truncate(end);
     mask
 }
 
@@ -1308,5 +1310,24 @@ mod tests {
         let context = call_context(source, source.len()).unwrap();
         assert_eq!(context.path, vec!["text"]);
         assert_eq!(context.active_positional, 2);
+    }
+
+    #[test]
+    fn call_context_handles_cursor_inside_comment_delimiters() {
+        for source in [
+            "f(1., // first\n2.)",
+            "f(1., /* first */ 2.)",
+            "f(1., /* a /* b */ c */ 2.)",
+        ] {
+            for cursor in 0..=source.len() {
+                call_context(source, cursor);
+            }
+        }
+
+        let source = "f(1., // first\n2.)";
+        let cursor = source.find("//").unwrap() + 1;
+        let context = call_context(source, cursor).unwrap();
+        assert_eq!(context.path, vec!["f"]);
+        assert_eq!(context.active_positional, 1);
     }
 }

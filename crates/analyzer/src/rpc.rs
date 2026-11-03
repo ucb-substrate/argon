@@ -170,6 +170,20 @@ pub(crate) fn editor_buffers_are_current(source: &SourceState, compiled: &Publis
     })
 }
 
+/// Withdraws the in-flight edit that leaves `uri` as `expected`, unless it has
+/// completed or a newer edit replaced it. Returns whether it was still in
+/// flight.
+fn withdraw_pending_edit(source: &mut SourceState, uri: &Uri, expected: &str) -> bool {
+    let in_flight = source
+        .pending_workspace_edits
+        .get(uri)
+        .is_some_and(|pending| pending == expected);
+    if in_flight {
+        source.pending_workspace_edits.shift_remove(uri);
+    }
+    in_flight
+}
+
 pub(crate) struct SourceInsertion {
     pub(crate) offset: usize,
     pub(crate) edit: TextEdit,
@@ -408,19 +422,9 @@ impl State {
             .insert(uri.clone(), expected);
     }
 
-    /// Withdraws the in-flight edit that leaves `uri` as `expected`, unless
-    /// it has completed or a newer edit replaced it. Returns whether it was
-    /// still in flight.
+    /// [`withdraw_pending_edit`] on the current source state.
     pub(crate) async fn end_pending_edit(&self, uri: &Uri, expected: &str) -> bool {
-        let mut state = self.source_state.lock().await;
-        let in_flight = state
-            .pending_workspace_edits
-            .get(uri)
-            .is_some_and(|pending| pending == expected);
-        if in_flight {
-            state.pending_workspace_edits.shift_remove(uri);
-        }
-        in_flight
+        withdraw_pending_edit(&mut *self.source_state.lock().await, uri, expected)
     }
 
     /// The text each file that `changes` alters will have once the editor
@@ -455,9 +459,11 @@ impl State {
         texts
     }
 
-    /// Waits until the editor reports all of each edit in `pending`,
-    /// withdrawing the ones it has not reported in time.
-    async fn wait_for_pending_edits(&self, pending: &[(Uri, String)]) {
+    /// Waits until the editor reports all of each edit in `pending`, returning
+    /// the source revision that includes them. Edits not reported in time are
+    /// withdrawn, and the result is then the next revision, the earliest that
+    /// can include the rest of them.
+    async fn wait_for_pending_edits(&self, pending: &[(Uri, String)]) -> u64 {
         let in_flight = |source: &SourceState| {
             pending
                 .iter()
@@ -465,14 +471,18 @@ impl State {
         };
         let arrived = self
             .wait_for_source(PENDING_EDIT_TIMEOUT, |source| {
-                (!in_flight(source)).then_some(())
+                (!in_flight(source)).then_some(source.revision)
             })
             .await;
-        if arrived.is_none() {
-            for (uri, expected) in pending {
-                self.end_pending_edit(uri, expected).await;
-            }
+        if let Some(revision) = arrived {
+            return revision;
         }
+        let mut source = self.source_state.lock().await;
+        let mut late = false;
+        for (uri, expected) in pending {
+            late |= withdraw_pending_edit(&mut source, uri, expected);
+        }
+        source.revision.saturating_add(u64::from(late))
     }
 
     /// The document GUI undo and redo apply to.
@@ -487,12 +497,13 @@ impl State {
     }
 
     /// Applies `changes` through the editor as one edit, returning once the
-    /// editor has reported all of it.
+    /// editor has reported all of it. Returns the source revision that
+    /// includes the edit, or `None` if the editor did not apply it.
     pub(crate) async fn apply_source_changes(
         &self,
         changes: HashMap<Uri, Vec<TextEdit>>,
         focus: Option<Uri>,
-    ) -> bool {
+    ) -> Option<u64> {
         let edited = match &focus {
             Some(uri) => Some(uri.clone()),
             None if changes.len() == 1 => changes.keys().next().cloned(),
@@ -545,16 +556,16 @@ impl State {
                 self.end_pending_edit(uri, expected).await;
             }
             self.report_message(MessageType::ERROR, error).await;
-            false
+            None
         } else {
-            self.wait_for_pending_edits(&pending).await;
-            true
+            Some(self.wait_for_pending_edits(&pending).await)
         }
     }
 
     pub(crate) async fn apply_source_edit(&self, uri: Uri, edit: TextEdit) -> bool {
         self.apply_source_changes(HashMap::from([(uri.clone(), vec![edit])]), Some(uri))
             .await
+            .is_some()
     }
 
     /// The published workspace and the snapshot the GUI holds, when a
@@ -646,7 +657,7 @@ impl State {
                 changes.insert(uri, edits);
             }
         }
-        if !changes.is_empty() && !self.apply_source_changes(changes, None).await {
+        if !changes.is_empty() && self.apply_source_changes(changes, None).await.is_none() {
             return None;
         }
         Some(self.source_state.lock().await.revision)
@@ -1228,9 +1239,12 @@ impl LangServer for State {
         mut edits: Vec<ValueEdit>,
         mut initial_conditions: Vec<InitialConditionEdit>,
         base_revision: Option<u64>,
-    ) -> Option<Vec<ValueEdit>> {
+    ) -> Option<ValueEditResult> {
         if edits.is_empty() && initial_conditions.is_empty() {
-            return Some(Vec::new());
+            return Some(ValueEditResult {
+                edits: Vec::new(),
+                revision: self.source_state.lock().await.revision,
+            });
         }
         // Drags are placed one at a time, each onto the text the one before
         // it left. Spans recorded against any other text would overwrite the
@@ -1389,11 +1403,9 @@ impl LangServer for State {
                 (uri, edits.into_iter().map(|(_, edit)| edit).collect())
             })
             .collect();
-        if !self.apply_source_changes(changes, None).await {
-            return None;
-        }
+        let revision = self.apply_source_changes(changes, None).await?;
         history.record(base_revision, fresh, &texts, edits.clone());
-        Some(edits)
+        Some(ValueEditResult { edits, revision })
     }
 
     /// Rewrites the placement and route keywords of schematic calls in one
