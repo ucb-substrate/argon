@@ -11,6 +11,8 @@ The hierarchy sidebar shows the open cell, its scopes, and the instances nested 
 
 The depth controls limit how many levels of hierarchy are drawn. When a child is collapsed to its bounding box, those edges are what [`std::layout::bbox(instance)`](/language/std-layout#bbox) refers to in the source, and a dimension drawn to one of them is written with that call.
 
+A child's own shapes show the child's constraints, so a fully constrained child looks solid wherever it is placed. To see whether the open cell has fixed an instance's position, draw one level with <kbd>1</kbd>: a box's left and right edges are dashed while its horizontal position still depends on an initial value, and its top and bottom while its vertical position does.
+
 Opening a child from the hierarchy opens it with the exact arguments of that instance.
 
 Set as Top Cell shows that child in every view, and lasts until you return with <kbd>Shift</kbd>+<kbd>E</kbd> in the schematic view, or descend elsewhere. The step is kept by its scope across compiles, so editing the source does not undo it.

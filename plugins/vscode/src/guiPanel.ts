@@ -166,6 +166,14 @@ try {
   window.addEventListener('message', (event) => receive(event.data));
   start((message) => vscode.postMessage(message));
   status.remove();
+  // The GUI reads keys from a hidden textarea, which loses focus whenever
+  // focus leaves the panel.
+  window.addEventListener('focus', () => {
+    const input = document.querySelector('textarea');
+    if (input && document.activeElement !== input) {
+      input.focus({ preventScroll: true });
+    }
+  });
 } catch (error) {
   status.textContent = 'Could not start the Argon GUI: ' + error;
 }

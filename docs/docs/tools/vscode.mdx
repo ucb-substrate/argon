@@ -52,6 +52,8 @@ VS Code owns the source. Edits made from the GUI or by an [agent](./agents) are 
 
 A file an agent creates opens as an unsaved document and is written when you save it. When a file changes on disk, VS Code reloads it if it has no unsaved changes; otherwise the analyzer warns you.
 
+The extension turns on `editor.autoIndentOnPaste` for Argon files, so pasted code is indented to fit where you paste it. Set it to `false` under `[argon]` in your settings to paste text unchanged.
+
 ## Agent edits
 
 Each agent edit briefly highlights the text it wrote. With `agent.approval = "always"`, VS Code shows each edit as a diff and asks before applying it.
