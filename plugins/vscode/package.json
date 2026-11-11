@@ -40,6 +40,11 @@
         "path": "./syntaxes/argon.tmLanguage.json"
       }
     ],
+    "configurationDefaults": {
+      "[argon]": {
+        "editor.autoIndentOnPaste": true
+      }
+    },
     "configuration": {
       "title": "Argon",
       "properties": {
