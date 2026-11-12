@@ -2,6 +2,8 @@
 
 pub mod full_stack;
 mod nvim;
+#[cfg(test)]
+mod sram_sizing;
 
 use std::{path::PathBuf, process::Stdio, time::Duration};
 

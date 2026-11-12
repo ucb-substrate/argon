@@ -27,7 +27,7 @@ import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReferenc
 
 <Returns type="(Int, Int, Float, Float, Float, Float, Int, Float)" href="/language/types/collections#tuples">Cuts in x and y; the bottom enclosure in x and y; the top enclosure in x and y; the total number of cuts; and the enclosure area that falls outside the shapes.</Returns>
 
-It tries the four orientations of the two enclosures and keeps the one with the most cuts, then the least enclosure area outside the shapes. The array is centered on the shapes' overlap, or on `bot` if they do not overlap. Like a comparison, it waits until the solver has fixed both shapes and compares values snapped to the manufacturing grid.
+It tries the four orientations of the two enclosures and keeps the one with the most cuts, then the least enclosure area outside the shapes. The array is centered on the shapes' overlap, or on `bot` if they do not overlap. Like a comparison, it waits until the solver has fixed both shapes. Because the search builds geometry, it compares values snapped to the manufacturing grid.
 
 ```argon
 let choice = max_via_array(170., 170., (0., 80.,), (30., 60.,), active, li, 0, 0, false, false);

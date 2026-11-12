@@ -19,6 +19,7 @@ pub enum TokenKind {
     KwUse,
     KwIf,
     KwFn,
+    KwExtern,
     KwElse,
     KwLet,
     KwPub,
@@ -91,6 +92,7 @@ impl TokenKind {
             KwUse => "'use'",
             KwIf => "'if'",
             KwFn => "'fn'",
+            KwExtern => "'extern'",
             KwElse => "'else'",
             KwLet => "'let'",
             KwPub => "'pub'",
@@ -192,13 +194,11 @@ pub fn keyword_or_ident(s: &[u8]) -> TokenKind {
             b"false" => KwFalse,
             _ => Ident,
         },
-        6 => {
-            if s == b"struct" {
-                KwStruct
-            } else {
-                Ident
-            }
-        }
+        6 => match s {
+            b"struct" => KwStruct,
+            b"extern" => KwExtern,
+            _ => Ident,
+        },
         _ => Ident,
     }
 }

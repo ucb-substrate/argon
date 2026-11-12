@@ -118,6 +118,23 @@ pub(super) fn unary(op: UnaryOp, value: &Value) -> OpResult {
     }
 }
 
+/// Relative difference below which two floats compare equal. It absorbs
+/// floating-point noise such as `0.1 + 0.2` against `0.3`, and nothing more.
+const FLOAT_TOLERANCE: f64 = 1e-9;
+
+/// How `a` orders against `b`, with values within floating-point noise of
+/// each other equal. Values are compared exactly, not on the grid: a
+/// coordinate is already on the grid once solved, and other values are not
+/// coordinates.
+fn compare_floats(a: f64, b: f64) -> Option<std::cmp::Ordering> {
+    let scale = 1f64.max(a.abs()).max(b.abs());
+    if (a - b).abs() <= FLOAT_TOLERANCE * scale {
+        Some(std::cmp::Ordering::Equal)
+    } else {
+        a.partial_cmp(&b)
+    }
+}
+
 pub(super) fn compare(
     solver: &Solver,
     op: ComparisonOp,
@@ -142,14 +159,15 @@ pub(super) fn compare(
     // an operator that those checks would have rejected can still arrive here.
     let res = match (left, right) {
         (Value::Linear(vl), Value::Linear(vr)) => {
-            let (Some(el), Some(er)) = (solver.eval_expr(vl), solver.eval_expr(vr)) else {
+            let (Some(el), Some(er)) = (solver.eval_expr_exact(vl), solver.eval_expr_exact(vr))
+            else {
                 return Err(wait([vl, vr]));
             };
             match op {
                 // Float equality is meaningless against a solved value, and
                 // is rejected statically whenever the type is known.
                 ComparisonOp::Eq | ComparisonOp::Ne => None,
-                _ => el.partial_cmp(&er).and_then(ordered),
+                _ => compare_floats(el, er).and_then(ordered),
             }
         }
         (Value::Int(vl), Value::Int(vr)) => ordered(vl.cmp(vr)),
@@ -402,10 +420,10 @@ pub(super) fn min_max(solver: &Solver, max: bool, a: &Value, b: &Value) -> OpRes
     let less = match (a, b) {
         (Value::Int(x), Value::Int(y)) => x < y,
         (Value::Linear(x), Value::Linear(y)) => {
-            let (Some(x), Some(y)) = (solver.eval_expr(x), solver.eval_expr(y)) else {
+            let (Some(x), Some(y)) = (solver.eval_expr_exact(x), solver.eval_expr_exact(y)) else {
                 return Err(wait([x, y]));
             };
-            x.partial_cmp(&y)
+            compare_floats(x, y)
                 .ok_or_else(|| error(ExecErrorKind::InvalidType))?
                 .is_lt()
         }

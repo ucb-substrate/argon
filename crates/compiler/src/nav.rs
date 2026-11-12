@@ -730,9 +730,9 @@ const PRIMITIVE_TYPES: [&str; 9] = [
     "Any", "Bool", "Float", "Int", "Path", "Point", "Polygon", "Rect", "String",
 ];
 
-const KEYWORDS: [&str; 17] = [
-    "_", "as", "cell", "else", "enum", "false", "fn", "for", "if", "in", "let", "match", "mod",
-    "pub", "true", "struct", "use",
+const KEYWORDS: [&str; 18] = [
+    "_", "as", "cell", "else", "enum", "extern", "false", "fn", "for", "if", "in", "let", "match",
+    "mod", "pub", "true", "struct", "use",
 ];
 
 fn completion_kind(kind: SymbolKind) -> CompletionKind {
@@ -918,15 +918,15 @@ fn native_signature(native: Native) -> SignatureInfo {
             &[],
         ),
         Native::Dimension => signature(
-            "fn dimension(x0: Float, y0: Float, x1: Float, y1: Float, offset: Float, label_offset: Float, flip: Bool)",
+            "fn dimension(p: Float, n: Float, value: Float, coord: Float, pstop: Float, nstop: Float, horizontal: Bool)",
             &[
-                "x0: Float",
-                "y0: Float",
-                "x1: Float",
-                "y1: Float",
-                "offset: Float",
-                "label_offset: Float",
-                "flip: Bool",
+                "p: Float",
+                "n: Float",
+                "value: Float",
+                "coord: Float",
+                "pstop: Float",
+                "nstop: Float",
+                "horizontal: Bool",
             ],
             &[],
         ),

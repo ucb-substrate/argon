@@ -8,8 +8,10 @@ members = [
     "crates/compiler",
     "crates/gui",
     "crates/gui-web",
+    "crates/guest",
     "crates/protocol",
     "crates/sram-sizing",
+    "crates/sram-sizing-wasm",
     "crates/sparse-linear-solver",
     "crates/tests",
 ]

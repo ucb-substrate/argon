@@ -1,0 +1,19 @@
+// Build the module first:
+//   cargo build --release --target wasm32-unknown-unknown --manifest-path routines/Cargo.toml
+
+use std::layout::rect;
+
+struct Ladder {
+    pitch: Float,
+    widths: [Float],
+}
+
+extern "routines" fn ladder(count: Int, total: Float) -> Ladder;
+
+cell top(count: Int, total: Float) {
+    let l = ladder(count, total);
+    for i in std::range(count) {
+        let x0 = (i as Float) * l.pitch;
+        rect("met1", x0=x0, y0=0., x1=x0 + l.widths[i], y1=100.)!;
+    }
+}

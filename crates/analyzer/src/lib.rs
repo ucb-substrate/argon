@@ -492,6 +492,12 @@ fn workspace_config(root_lib: PathBuf, library: Option<&Library>) -> WorkspaceCo
                 .iter()
                 .map(|(name, path)| (name.clone(), path.clone())),
         )
+        .with_wasm_modules(
+            library
+                .wasm
+                .iter()
+                .map(|(name, path)| (name.clone(), path.clone())),
+        )
 }
 
 /// Runs `f` on its own thread with the compiler's stack, so that a deep
@@ -1131,6 +1137,7 @@ impl Backend {
         &self,
         identity: CompileIdentity,
         preview_cell: Option<compile::CellId>,
+        slow_calls: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Option<CompilationSnapshot> {
         let (preview, result) = {
             let source = self.state.source_state.lock().await;
@@ -1138,12 +1145,15 @@ impl Backend {
                 return None;
             }
             let root_dir = self.state.root_dir.get().cloned()?;
-            self.state.compiler.compile_streamed(CompileRequest {
-                identity: identity.clone(),
-                root_dir,
-                preview_cell,
-                publish: true,
-            })
+            self.state.compiler.compile_streamed(
+                CompileRequest {
+                    identity: identity.clone(),
+                    root_dir,
+                    preview_cell,
+                    publish: true,
+                },
+                Some(slow_calls),
+            )
         };
         if let Some(preview) = preview {
             let backend = self.clone();
@@ -1469,22 +1479,38 @@ impl Backend {
             // cells used to leave Neovim showing an undifferentiated spinner
             // for tens of seconds, making healthy evaluation indistinguishable
             // from a wedged worker.
-            let mut compilation = Box::pin(self.compile_snapshot(identity.clone(), preview_cell));
+            let (slow_calls, mut slow_call) = tokio::sync::mpsc::unbounded_channel();
+            let mut compilation =
+                Box::pin(self.compile_snapshot(identity.clone(), preview_cell, slow_calls));
             let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // `interval`'s first tick is immediate; the begin notification
             // already describes that instant.
             heartbeat.tick().await;
+            // The `extern` function the compiler last reported as running long.
+            let mut running = None;
             let snapshot = loop {
-                tokio::select! {
+                let report = tokio::select! {
                     snapshot = &mut compilation => break snapshot?,
-                    _ = heartbeat.tick() => {
-                        activity.editor_progress.report(format!(
-                            "{} ({:.0}s elapsed)",
+                    Some(function) = slow_call.recv() => {
+                        running = Some(function);
+                        true
+                    }
+                    _ = heartbeat.tick() => true,
+                };
+                if report {
+                    let running = running
+                        .as_ref()
+                        .map(|function| format!("running extern function `{function}`, "))
+                        .unwrap_or_default();
+                    activity
+                        .editor_progress
+                        .report(format!(
+                            "{} ({running}{:.0}s elapsed)",
                             compilation_message(&identity),
                             pipeline_started.elapsed().as_secs_f64(),
-                        )).await;
-                    }
+                        ))
+                        .await;
                 }
             };
             self.send_cell_update(

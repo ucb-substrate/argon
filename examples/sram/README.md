@@ -20,6 +20,18 @@ when the untranslated inner layout is more convenient for debugging.
 `example_no_control_logic()` and `example_no_control_logic_inner()` build the
 same assembly without the control logic.
 
+To build another organization without regenerating the record, compile the
+sizer to WebAssembly from the workspace root and call it from Argon:
+
+```sh
+cargo build --release -p argon-sram-sizing-wasm --target wasm32-unknown-unknown
+arc run --cell 'example_sized_sram(8, 8, 1024, 32)' --gds
+```
+
+The arguments are write-mask granularity, mux ratio, number of words, and data
+width. [`sizing.ar`](sizing.ar) declares the sizer as an `extern` function, and
+`Argon.toml` names the module under `[wasm]`.
+
 The assembly is parametric. [`logic/floorplan.ar`](logic/floorplan.ar) places
 each block relative to the blocks before it, as SRAM22 does, from their
 measured bounding boxes, and splits the height beside the column peripherals

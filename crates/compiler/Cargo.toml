@@ -36,8 +36,13 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 tempfile = { workspace = true }
 postcard = { workspace = true }
+ciborium = "0.2"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+wasmtime = { version = "50", default-features = false, features = ["cranelift", "parallel-compilation", "runtime", "std"] }
 
 [dev-dependencies]
+wat = "1"
 const_format = "0.2"
 pegasus = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
 sky130 = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }

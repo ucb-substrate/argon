@@ -7,8 +7,12 @@ license.workspace = true
 [lib]
 name = "argon_sram_sizing"
 
+[features]
+serde = ["dep:serde"]
+
 [dependencies]
 geometry.workspace = true
+serde = { workspace = true, optional = true }
 
 [lints]
 workspace = true

@@ -14,7 +14,7 @@ Constraints relate [`Float`](/language/types/scalars#float) expressions; the sol
 
 <ApiItem id="float" name="float" signature={'float() -> Float'} summary={<>Creates a new solver variable.</>}>
 
-Use it for a value you want to name now and constrain later.
+Use it for a value you want to name now and constrain later. Its solved value is exact: only the coordinates of shapes and instances snap to the technology grid, so a `float()` holding a third of a width keeps its fraction.
 
 <Returns type="Float" href="/language/types/scalars#float">A variable with no constraints on it yet.</Returns>
 

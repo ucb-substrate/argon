@@ -1,0 +1,7 @@
+// The Rust sizer, run as WebAssembly. Build the module from the workspace root
+// with `cargo build --release -p argon-sram-sizing-wasm --target wasm32-unknown-unknown`.
+
+use lib::params::SramLayoutParams;
+
+extern "sizing" fn sram(wmask_granularity: Int, mux_ratio: Int, num_words: Int, data_width: Int)
+    -> SramLayoutParams;

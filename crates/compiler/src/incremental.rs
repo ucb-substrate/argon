@@ -394,6 +394,7 @@ impl IncrementalCompiler {
             &mut self.external_digests,
             config.tech.as_deref(),
             &config.gds_imports,
+            &config.wasm_modules,
         );
         if self.execution_environment != Some(environment) {
             self.execution_cache.clear();
@@ -467,7 +468,9 @@ impl IncrementalCompiler {
                 None,
             )
         });
-        self.execution_cache.insert(key, output.clone());
+        if !output.was_cancelled() {
+            self.execution_cache.insert(key, output.clone());
+        }
         if !preserve_previous_graph {
             self.previous_revision_live.clear();
         }
@@ -520,6 +523,7 @@ impl IncrementalCompiler {
             &mut self.external_digests,
             config.tech.as_deref(),
             &config.gds_imports,
+            &config.wasm_modules,
         );
         if self.execution_environment != Some(environment) {
             self.execution_cache.clear();
@@ -580,7 +584,9 @@ impl IncrementalCompiler {
         self.verify_against_uncached(&output, || {
             compile::execute_cell_invocation_cached(&typed_ast, &invocation, config, None)
         });
-        self.execution_cache.insert(key, output.clone());
+        if !output.was_cancelled() {
+            self.execution_cache.insert(key, output.clone());
+        }
         if !preserve_previous_graph {
             self.previous_revision_live.clear();
         }
@@ -842,13 +848,14 @@ fn execution_environment_key(
     digests: &mut ExternalDigests,
     tech_file: Option<&Path>,
     gds_imports: &[(String, PathBuf)],
+    wasm_modules: &[(String, PathBuf)],
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
     tech_file.hash(&mut hasher);
     tech_file
         .map(|path| digests.revision(path))
         .hash(&mut hasher);
-    for (name, path) in gds_imports {
+    for (name, path) in gds_imports.iter().chain(wasm_modules) {
         name.hash(&mut hasher);
         path.hash(&mut hasher);
         digests.revision(path).hash(&mut hasher);
@@ -2355,7 +2362,7 @@ mod tests {
             "{source}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); }}\n"
         );
         let edited = format!(
-            "{source}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); let r = rect(\"met1.drawing\", x0=0., y0=0., x1=100., y1=100.)!; }}\n"
+            "{source}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); let r = std::layout::rect(\"met1.drawing\", x0=0., y0=0., x1=100., y1=100.)!; }}\n"
         );
         let mut compiler = IncrementalCompiler::new();
         compiler.set_source_text(root.clone(), initial);

@@ -14,6 +14,7 @@ mod parser;
 pub mod solver;
 pub mod tech;
 mod via_array;
+pub mod wasm;
 pub mod workspace;
 
 pub use workspace::WorkspaceConfig;
@@ -3535,7 +3536,64 @@ cell top() {
             .as_ref()
             .expect("off-grid error should point to its solver variable");
         let source = std::fs::read_to_string(&span.path).unwrap();
-        assert_eq!(&source[span.span.start()..span.span.end()], "float()");
+        assert!(source[span.span.start()..span.span.end()].starts_with("rect("));
+    }
+
+    #[test]
+    fn float_comparisons_are_exact_up_to_rounding_noise() {
+        // On this grid of 0.1, rounding both sides made `0.37 > 0.36` false,
+        // made a width of 0.1 not exceed 0.05 (which rounds up to 0.1), and
+        // made `max_float` see a tie and keep its first argument.
+        let output = compile_source(
+            "use std::layout::rect;
+             cell top(ratio: Float) {
+                 let w = rect(\"met1\", x0=100., y0=0., x1=100.1, y1=1.)!;
+                 if ratio > 0.36 { rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!; }
+                 if w.x1 - w.x0 > 0.05 { rect(\"met1\", x0=10., y0=0., x1=11., y1=1.)!; }
+                 if 0.1 + 0.2 >= 0.3 { rect(\"met1\", x0=20., y0=0., x1=21., y1=1.)!; }
+                 if 0.1 + 0.2 > 0.3 { rect(\"met1\", x0=40., y0=0., x1=41., y1=1.)!; }
+                 rect(\"met1\", x0=30., y0=0., x1=30. + 1000. * max_float(0.36, ratio), y1=1.)!;
+             }",
+            "top",
+            vec![CellArg::Float(0.37)],
+        );
+        let data = output.unwrap_valid();
+        let mut rects = data.cells[&data.top]
+            .objects
+            .values()
+            .filter_map(|object| match object {
+                SolvedValue::Rect(rect) if rect.x0.0 < 100. => Some((rect.x0.0, rect.x1.0)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        rects.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(rects, [(0., 1.), (10., 11.), (20., 21.), (30., 400.)]);
+    }
+
+    #[test]
+    fn float_variables_stay_exact_and_only_geometry_snaps() {
+        // A third of 1000 is off the grid, but three of them land on it again,
+        // which they would not if the third had been snapped first.
+        let output = compile_source(
+            "use std::layout::rect;
+             cell top() {
+                 let pitch = float();
+                 eq(pitch, 1000. / 3.);
+                 let r = rect(\"met1\", x0=0., y0=0., x1=3. * pitch, y1=10.)!;
+             }",
+            "top",
+            Vec::new(),
+        );
+        let data = output.unwrap_valid();
+        let x1 = data.cells[&data.top]
+            .objects
+            .values()
+            .find_map(|object| match object {
+                SolvedValue::Rect(rect) => Some(rect.x1.0),
+                _ => None,
+            })
+            .expect("the rectangle is drawn");
+        assert_eq!(x1, 1000.);
     }
 
     #[test]
