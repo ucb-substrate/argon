@@ -1,2 +1,5 @@
 name = "sram"
 tech = "../../pdks/sky130/sky130.tech.toml"
+
+[wasm]
+sizing = "../../target/wasm32-unknown-unknown/release/argon_sram_sizing_wasm.wasm"

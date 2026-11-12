@@ -3,6 +3,7 @@
 
 mod params;
 mod generated;
+mod sizing;
 
 use std::layout::inst;
 use lib::params::ColParams;
@@ -176,6 +177,23 @@ cell example_wordline_enable_buffer() {
 // the origin.
 cell example_sram() {
     let native = inst(logic::sram::sram_macro(generated::sram(), true), x=0., y=0.);
+    let addr = native.addr;
+    let ce = native.ce;
+    let we = native.we;
+    let clk = native.clk;
+    let rstb = native.rstb;
+    let din = native.din;
+    let dout = native.dout;
+    let wmask = native.wmask;
+    let vdd = native.vdd;
+    let vss = native.vss;
+}
+
+// The complete SRAM for any organization the Rust sizer supports, sized when
+// the cell compiles.
+cell example_sized_sram(wmask_granularity: Int, mux_ratio: Int, num_words: Int, data_width: Int) {
+    let p = sizing::sram(wmask_granularity, mux_ratio, num_words, data_width);
+    let native = inst(logic::sram::sram_macro(p, true), x=0., y=0.);
     let addr = native.addr;
     let ce = native.ce;
     let we = native.we;

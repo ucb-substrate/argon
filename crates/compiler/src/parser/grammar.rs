@@ -18,11 +18,11 @@ use cfgrammar::Span;
 use crate::ast::{
     ArgDecl, Args, ArithOp, Ast, BinOp, BinOpExpr, BoolLiteral, BoolOp, CallExpr, CastExpr,
     CellDecl, ComparisonOp, ConstantDecl, Decl, EmitExpr, EnumDecl, EnumVariant, Expr,
-    FieldAccessExpr, FieldPattern, FloatLiteral, FnDecl, ForLoop, GenericArgs, Ident, IdentPath,
-    IfExpr, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, LetBinding, LetPattern,
-    ListCompExpr, MatchArm, MatchExpr, ModDecl, NilLiteral, Pattern, Scope, SeqLiteral, Statement,
-    StringLiteral, StructDecl, StructField, StructLitExpr, StructLitField, TupleExpr, TyParam,
-    TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, VariantPayload,
+    FieldAccessExpr, FieldPattern, FloatLiteral, FnDecl, ForLoop, ForeignModule, GenericArgs,
+    Ident, IdentPath, IfExpr, IndexExpr, IndexFieldAccessExpr, IntLiteral, KwArgValue, LetBinding,
+    LetPattern, ListCompExpr, MatchArm, MatchExpr, ModDecl, NilLiteral, Pattern, Scope, SeqLiteral,
+    Statement, StringLiteral, StructDecl, StructField, StructLitExpr, StructLitField, TupleExpr,
+    TyParam, TySpec, TySpecKind, UnaryOp, UnaryOpExpr, UseDecl, VariantPayload,
 };
 use crate::compile::BUILTINS;
 use crate::parse::ParseMetadata;
@@ -561,7 +561,9 @@ impl<'a> Parser<'a> {
         use TokenKind::*;
         while !self.at(Eof) {
             match self.cur.kind {
-                KwEnum | KwStruct | KwCell | KwFn | KwConst | KwMod | KwUse | KwPub => break,
+                KwEnum | KwStruct | KwCell | KwFn | KwExtern | KwConst | KwMod | KwUse | KwPub => {
+                    break;
+                }
                 _ => {
                     self.bump();
                 }
@@ -589,6 +591,7 @@ impl<'a> Parser<'a> {
             KwStruct => Decl::Struct(self.parse_struct_decl()),
             KwCell => Decl::Cell(self.parse_cell_decl()),
             KwFn => Decl::Fn(self.parse_fn_decl()),
+            KwExtern => Decl::Fn(self.parse_extern_fn_decl()),
             KwConst => Decl::Constant(self.parse_const_decl()),
             KwMod => Decl::Mod(self.parse_mod_decl()),
             KwUse => {
@@ -831,6 +834,77 @@ impl<'a> Parser<'a> {
             args,
             return_ty,
             scope,
+            foreign: None,
+            span: self.finish_span(lo),
+            metadata: (),
+        }
+    }
+
+    /// `externFnDecl : EXTERN STRLIT FN ident LPAREN argDecls RPAREN (ARROW tySpec)? SEMI`
+    fn parse_extern_fn_decl(&mut self) -> FnDecl<&'a str, Md> {
+        let lo = self.cur.start;
+        self.expect(TokenKind::KwExtern);
+        let module = if self.at(TokenKind::StrLit) {
+            let t = self.bump();
+            let span = self.span(t);
+            Some(ForeignModule {
+                name: self.slice_span(span).trim_matches('"').to_owned(),
+                span,
+            })
+        } else {
+            self.error_at(
+                self.span(self.cur),
+                format!(
+                    "expected a WASM module name string after 'extern', found {}",
+                    self.cur.kind.describe()
+                ),
+            );
+            None
+        };
+        self.expect(TokenKind::KwFn);
+        let name = self.ident(CompletionSite::NewIdentifier);
+        let params = self.parse_generic_params();
+        if let Some(param) = params.first() {
+            self.error_at(
+                param.span,
+                "an extern function cannot have type parameters".to_string(),
+            );
+        }
+        self.expect(TokenKind::LParen);
+        let mut args = self.parse_arg_decls();
+        self.expect(TokenKind::RParen);
+        for arg in &mut args {
+            if let Some(default) = arg.default.take() {
+                self.error_at(
+                    default.span(),
+                    "an extern function's parameters cannot have defaults".to_string(),
+                );
+            }
+        }
+        let return_ty = if self.at(TokenKind::Arrow) {
+            self.bump();
+            Some(self.parse_ty_spec())
+        } else {
+            None
+        };
+        let end = self.cur.start;
+        self.expect(TokenKind::Semi);
+        FnDecl {
+            name,
+            params,
+            args,
+            return_ty,
+            scope: Scope {
+                scope_order: 0,
+                span: Span::new(end as usize, end as usize),
+                stmts: Vec::new(),
+                tail: None,
+                metadata: (),
+            },
+            foreign: Some(module.unwrap_or_else(|| ForeignModule {
+                name: String::new(),
+                span: Span::new(lo as usize, lo as usize),
+            })),
             span: self.finish_span(lo),
             metadata: (),
         }

@@ -59,6 +59,9 @@ pub struct Manifest {
     /// GDS files imported as zero-argument cells.
     #[serde(default)]
     pub gds: IndexMap<String, PathBuf>,
+    /// WASM modules implementing `extern` functions, by module name.
+    #[serde(default)]
+    pub wasm: IndexMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +72,7 @@ pub struct Library {
     pub tech: Option<PathBuf>,
     pub dependencies: IndexMap<String, PathBuf>,
     pub gds: IndexMap<String, PathBuf>,
+    pub wasm: IndexMap<String, PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -88,6 +92,11 @@ impl Library {
             .into_iter()
             .map(|(name, path)| Ok((validate_cell_path(name)?, resolve_path(directory, path))))
             .collect::<Result<_>>()?;
+        let wasm = manifest
+            .wasm
+            .into_iter()
+            .map(|(name, path)| (name, resolve_path(directory, path)))
+            .collect();
         Ok(Self {
             name: manifest.name,
             manifest_path: manifest_path.to_path_buf(),
@@ -95,6 +104,7 @@ impl Library {
             tech: manifest.tech.map(|path| resolve_path(directory, path)),
             dependencies,
             gds,
+            wasm,
         })
     }
 

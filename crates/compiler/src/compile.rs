@@ -24,6 +24,7 @@ type FxIndexMap<K, V> = IndexMap<K, V, BuildHasherDefault<FxHasher>>;
 type FxIndexSet<T> = IndexSet<T, BuildHasherDefault<FxHasher>>;
 
 mod direct;
+mod foreign;
 mod ops;
 mod result;
 mod schematic;
@@ -220,6 +221,8 @@ enum Builtin {
     SymbolInstName,
     SymbolParam,
     SymbolPin,
+    /// A call of the `extern` function declared at this index.
+    Foreign(DeclIndex),
 }
 
 impl Builtin {
@@ -292,7 +295,8 @@ impl Builtin {
             | Self::MinInt
             | Self::MaxViaArray
             | Self::Float
-            | Self::Eq => return None,
+            | Self::Eq
+            | Self::Foreign(_) => return None,
         })
     }
 
@@ -638,7 +642,7 @@ pub fn execute_cell_cached(
             Err(error) => return invalid_tech_output(ast, error.to_string()),
         },
     };
-    let mut pass = ExecPass::new(ast, tech, &config.gds_imports);
+    let mut pass = ExecPass::new(ast, tech, &config.gds_imports, &config.wasm_modules);
     let mut checks = None;
     if let Some(session) = session {
         pass = pass
@@ -724,7 +728,7 @@ fn execute_invocation(
             Err(error) => return invalid_tech_output(ast, error.to_string()),
         },
     };
-    let mut pass = ExecPass::new(ast, tech, &config.gds_imports);
+    let mut pass = ExecPass::new(ast, tech, &config.gds_imports, &config.wasm_modules);
     if !debug_info {
         pass = pass.without_debug_info();
     }
@@ -818,7 +822,7 @@ pub(crate) fn compile_without_tech(
     if !static_output.errors.is_empty() {
         return CompileOutput::StaticErrors(static_output);
     }
-    ExecPass::new(&ast, Technology::empty(), &[]).execute(input)
+    ExecPass::new(&ast, Technology::empty(), &[], &[]).execute(input)
 }
 
 type ModDag<'a> = IndexMap<&'a ModPath, IndexMap<&'a ModPath, cfgrammar::Span>>;
@@ -3706,6 +3710,32 @@ impl<'a> VarIdTyPass<'a> {
         self.local_defs.get(&id).or_else(|| self.type_defs.get(&id))
     }
 
+    /// The first part of `ty` that cannot be passed to or from an `extern`
+    /// function, skipping the structs in `seen`.
+    fn unsupported_extern_ty(&self, ty: &Ty, seen: &mut Vec<VarId>) -> Option<Ty> {
+        match ty {
+            Ty::Unknown | Ty::Nil | Ty::Bool | Ty::Int | Ty::Float | Ty::String => None,
+            Ty::Seq(item) => self.unsupported_extern_ty(item, seen),
+            Ty::Tuple(items) => items
+                .iter()
+                .find_map(|item| self.unsupported_extern_ty(item, seen)),
+            Ty::Struct(struct_ty) if struct_ty.args.is_empty() => {
+                if seen.contains(&struct_ty.def) {
+                    return None;
+                }
+                seen.push(struct_ty.def);
+                let Some(AdtDef::Struct(def)) = self.adt_def(struct_ty.def) else {
+                    return None;
+                };
+                let fields = def.fields.values().cloned().collect::<Vec<_>>();
+                fields
+                    .iter()
+                    .find_map(|field| self.unsupported_extern_ty(field, seen))
+            }
+            other => Some(other.clone()),
+        }
+    }
+
     /// The type of the variant `ctor` names when used as a name: a unit
     /// variant is a value of its enum, a tuple variant is the constructor.
     /// `explicit` are turbofish arguments for the enum.
@@ -5857,12 +5887,35 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         &mut self,
         input: &FnDecl<Substr, Self::InputMetadata>,
         name: &Ident<Substr, Self::OutputMetadata>,
-        _args: &[ArgDecl<Substr, Self::OutputMetadata>],
+        args: &[ArgDecl<Substr, Self::OutputMetadata>],
         return_ty: &Option<TySpec<Substr, Self::OutputMetadata>>,
         scope: &Scope<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::FnDecl {
         let (var_id, ty) = self.lookup(&name.name).unwrap();
-        if let Ty::Fn(fn_ty) = &ty {
+        if input.foreign.is_some() {
+            let ret = match &ty {
+                Ty::Fn(fn_ty) => fn_ty.ret.clone(),
+                _ => Ty::Unknown,
+            };
+            let specs = args
+                .iter()
+                .map(|arg| (arg.ty.span, &arg.metadata.1))
+                .chain(return_ty.as_ref().map(|spec| (spec.span, &ret)));
+            for (span, ty) in specs {
+                if let Some(unsupported) = self.unsupported_extern_ty(ty, &mut Vec::new()) {
+                    self.errors.push(StaticError {
+                        span: self.span(span),
+                        kind: StaticErrorKind::UnsupportedExternType {
+                            ty: unsupported.to_string(),
+                        },
+                    });
+                }
+            }
+        }
+        // An `extern` function has no body to check.
+        if let Ty::Fn(fn_ty) = &ty
+            && input.foreign.is_none()
+        {
             let span = match (scope.tail.as_ref(), return_ty.as_ref()) {
                 (Some(tail), _) => tail.span(),
                 // Without a tail there is no expression to mark as the source of the error,
@@ -5908,6 +5961,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             args,
             return_ty,
             scope,
+            foreign: input.foreign.clone(),
             span: input.span,
             metadata,
         }
@@ -9076,7 +9130,12 @@ impl CellState {
     }
 
     fn new_solver_var(&mut self, span: &Span, object: VarObject, value: VarRole) -> Var {
-        let var = self.solver.new_var();
+        // Only coordinates of geometry snap to the grid; a `float()` is exact.
+        let var = if matches!(object, VarObject::Float) {
+            self.solver.new_exact_var()
+        } else {
+            self.solver.new_var()
+        };
         self.var_origins.insert(
             var,
             VarOrigin {
@@ -9109,6 +9168,8 @@ struct ExecPass<'a> {
     natives: FxHashMap<VarId, Builtin>,
     tech: Technology,
     gds_imports: HashMap<VarId, (String, PathBuf)>,
+    /// The WASM module files `extern` functions name, by module name.
+    wasm_modules: HashMap<String, PathBuf>,
     cell_states: FxIndexMap<CellId, CellState>,
     // These execution tables have integer keys and no observable iteration
     // order. FxHash avoids SipHash's cryptographic overhead in the evaluator's
@@ -9313,6 +9374,7 @@ impl<'a> ExecPass<'a> {
         workspace: &'a TypedWorkspace,
         tech: Technology,
         gds_imports: &[(String, PathBuf)],
+        wasm_modules: &[(String, PathBuf)],
     ) -> Self {
         let ast = &workspace.ast;
         let gds_imports = gds_imports
@@ -9348,6 +9410,7 @@ impl<'a> ExecPass<'a> {
                 .collect(),
             tech,
             gds_imports,
+            wasm_modules: wasm_modules.iter().cloned().collect(),
             cell_states: FxIndexMap::default(),
             values: ValueStore::new([
                 (1, DeferValue::Ready(Value::Nil)),
@@ -10778,12 +10841,16 @@ impl<'a> ExecPass<'a> {
         // A depth failure is charged against the *ambient* evaluation depth,
         // not against anything about this cell, so a cell that hit one is not
         // a fact about the program: its geometry is truncated by wherever it
-        // happened to be instantiated from. Never retain one.
+        // happened to be instantiated from. A cancelled `extern` call is not
+        // one either. Never retain such a cell.
         let errors = self.errors[errors_start..].to_vec();
-        if errors
-            .iter()
-            .any(|error| matches!(error.kind, ExecErrorKind::RecursionLimitExceeded { .. }))
-        {
+        if errors.iter().any(|error| {
+            matches!(
+                error.kind,
+                ExecErrorKind::RecursionLimitExceeded { .. }
+                    | ExecErrorKind::ExternCallCancelled { .. }
+            )
+        }) {
             return;
         }
         let Some(cell) = self.compiled_cells.get(&id).cloned() else {
@@ -12360,6 +12427,24 @@ impl<'a> ExecPass<'a> {
                             let index = *index;
                             let val = self.fn_decls[index.0 as usize];
                             let explicit = self.explicit_args(loc, c, &val.args);
+                            if val.foreign.is_some() {
+                                // The type checker requires every argument, since
+                                // an `extern` function has no defaults.
+                                let posargs = explicit
+                                    .into_iter()
+                                    .map(|arg| arg.unwrap_or(self.nil_value))
+                                    .collect();
+                                return self.new_deferred_value(loc, |_| {
+                                    PartialEvalState::Call(PartialCallExpr {
+                                        expr: c,
+                                        builtin: Some(Builtin::Foreign(index)),
+                                        state: CallExprState {
+                                            posargs,
+                                            kwargs: CallArgs::new(),
+                                        },
+                                    })
+                                });
+                            }
                             // Without debug information there are no scopes to
                             // show, so a pure function can skip them.
                             if !self.debug_info
@@ -13627,6 +13712,55 @@ impl<'a> ExecPass<'a> {
         let state = self.cell_states.get_mut(&cell_id).unwrap();
         let progress = match &mut vref.state {
             PartialEvalState::Call(c) => match c.builtin {
+                Some(Builtin::Foreign(index)) => {
+                    if let Some(&arg) = c
+                        .state
+                        .posargs
+                        .iter()
+                        .find(|arg| !self.values[*arg].is_ready())
+                    {
+                        self.add_value_dependent(arg, vid);
+                        return Ok(false);
+                    }
+                    let decl = self.fn_decls[index.0 as usize];
+                    let module = &decl
+                        .foreign
+                        .as_ref()
+                        .expect("a foreign call names an `extern` function")
+                        .name;
+                    let Ty::Fn(fn_ty) = &decl.metadata.2 else {
+                        unreachable!("an `extern` function has a function type")
+                    };
+                    let result = match self.wasm_modules.get(module) {
+                        Some(path) => {
+                            let args: CallArgs<&Value> = c
+                                .state
+                                .posargs
+                                .iter()
+                                .map(|arg| self.values[arg].as_ref().unwrap_ready())
+                                .collect();
+                            foreign::call(
+                                &state.solver,
+                                self.defs,
+                                path,
+                                &decl.name.name,
+                                &args,
+                                &fn_ty.ret,
+                            )
+                        }
+                        None => Err(OpFailure::Error(
+                            ExecErrorKind::ExternCall {
+                                function: decl.name.name.to_string(),
+                                message: format!(
+                                    "no WASM module named `{module}`; add it to `[wasm]` in Argon.toml"
+                                ),
+                            },
+                            ops::ErrorAt::Expr,
+                        )),
+                    };
+                    let span = c.expr.span;
+                    return self.finish_op(vid, &vref.loc, result, |_| span);
+                }
                 Some(Builtin::Crect | Builtin::Rect) => {
                     let f = c.expr.func.path.last().unwrap().name.as_str();
                     let layer_arg = if f == "crect" {

@@ -1,0 +1,13 @@
+[package]
+name = "argon-guest"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+description = "Write Argon extern functions in Rust, compiled to WebAssembly"
+
+[lints]
+workspace = true
+
+[dependencies]
+ciborium = "0.2"
+serde = { workspace = true }

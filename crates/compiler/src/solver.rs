@@ -195,6 +195,9 @@ pub struct Solver {
     /// constraint that couples several of them, so the diagnostic needs the
     /// number, not just the fact that a miss happened.
     off_grid_vars: FxIndexMap<Var, f64>,
+    /// Whether each variable, by index, is solved exactly rather than snapped
+    /// to the grid. Only coordinates of geometry are snapped.
+    exact: Vec<bool>,
     // Per-`solve()` scratch for the sparse elimination pre-pass (`eliminate_definitional`).
     // `elim_worklist` holds constraints to (re)examine for a small pivot; `substitutions`
     // records `var = expr` definitions for variables eliminated via a 2-variable
@@ -222,6 +225,7 @@ impl Default for Solver {
             back_substitute_stack: Vec::new(),
             inconsistent_constraints: FxIndexSet::default(),
             off_grid_vars: FxIndexMap::default(),
+            exact: Vec::new(),
             elim_worklist: VecDeque::new(),
             substitutions: Vec::new(),
             sparse_nullspace_cache: None,
@@ -245,11 +249,38 @@ impl Solver {
         }
     }
 
+    /// A new variable whose solved value is snapped to the grid, as a
+    /// coordinate of geometry is.
     pub fn new_var(&mut self) -> Var {
+        self.new_var_snapped(true)
+    }
+
+    /// A new variable whose solved value is kept exact, as a value that is
+    /// not a coordinate is.
+    pub fn new_exact_var(&mut self) -> Var {
+        self.new_var_snapped(false)
+    }
+
+    fn new_var_snapped(&mut self, snapped: bool) -> Var {
         let var = Var(self.next_var);
         self.unsolved_vars.insert(var);
+        self.exact.push(!snapped);
         self.next_var += 1;
         var
+    }
+
+    /// The value `var` is solved to: `val` snapped to the grid, unless `var`
+    /// is exact, and whether snapping moved it. A moved value is recorded.
+    fn settle(&mut self, var: Var, val: f64) -> (f64, bool) {
+        if self.exact.get(var.0 as usize).copied().unwrap_or(false) {
+            return (val, false);
+        }
+        let rounded = crate::tech::snap(val, self.grid);
+        let off_grid = is_off_grid(val, rounded, self.grid);
+        if off_grid {
+            self.off_grid_vars.insert(var, val);
+        }
+        (rounded, off_grid)
     }
 
     /// Returns true if all variables have been solved.
@@ -485,12 +516,7 @@ impl Solver {
     /// substitution would, and goes on to the constraints `var` is in.
     /// Returns whether the value was off the grid.
     fn solve_term(&mut self, var: Var, coeff: f64, constant: f64) -> bool {
-        let val = -constant / coeff;
-        let rounded_val = crate::tech::snap(val, self.grid);
-        let off_grid = is_off_grid(val, rounded_val, self.grid);
-        if off_grid {
-            self.off_grid_vars.insert(var, val);
-        }
+        let (rounded_val, off_grid) = self.settle(var, -constant / coeff);
         self.solve_var(var, rounded_val);
         if let Some(constraints) = self.var_to_constraints.get(&var) {
             self.back_substitute_stack
@@ -546,10 +572,7 @@ impl Solver {
                     self.inconsistent_constraints.insert(id);
                 }
             } else {
-                let rounded_val = crate::tech::snap(val, self.grid);
-                if is_off_grid(val, rounded_val, self.grid) {
-                    self.off_grid_vars.insert(var, val);
-                }
+                let (rounded_val, _) = self.settle(var, val);
                 self.solve_var(var, rounded_val);
             }
             self.constraints.swap_remove(&id);
@@ -751,10 +774,7 @@ impl Solver {
         if self.solved_vars.contains_key(&var) {
             return;
         }
-        let rounded = crate::tech::snap(val, self.grid);
-        if is_off_grid(val, rounded, self.grid) {
-            self.off_grid_vars.insert(var, val);
-        }
+        let (rounded, _) = self.settle(var, val);
         self.solve_var(var, rounded);
     }
 
@@ -929,11 +949,7 @@ impl Solver {
                 })
                 .sum::<f64>();
             if relative_eq!(recons, 1., epsilon = EPSILON) {
-                let val = sol[(i, 0)];
-                let rounded_val = crate::tech::snap(val, self.grid);
-                if is_off_grid(val, rounded_val, self.grid) {
-                    self.off_grid_vars.insert(*var, val);
-                }
+                let (rounded_val, _) = self.settle(*var, sol[(i, 0)]);
                 self.solve_var(*var, rounded_val);
             }
         }

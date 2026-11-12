@@ -61,7 +61,7 @@ Call a standard library item by its full path, such as `std::max(a, b)` or `std:
 
 ## Library manifest
 
-`Argon.toml` names the library and points at its technology file, dependencies, and GDS imports:
+`Argon.toml` names the library and points at its technology file, dependencies, GDS imports, and WebAssembly modules:
 
 ```toml
 name = "my-library"
@@ -72,9 +72,12 @@ devices = "../devices"
 
 [gds]
 "macros::sram" = "gds/sram.gds"
+
+[wasm]
+routines = "routines/target/wasm32-unknown-unknown/release/routines.wasm"
 ```
 
-Paths are relative to the manifest. Each GDS import becomes a zero-argument cell at the given module path.
+Paths are relative to the manifest. Each GDS import becomes a zero-argument cell at the given module path. Each WebAssembly module implements the [`extern` functions](/language/extern-functions) that name it.
 
 ## Project layout
 

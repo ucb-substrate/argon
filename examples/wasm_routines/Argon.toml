@@ -1,0 +1,5 @@
+name = "wasm_routines"
+tech = "../tech/basic.tech.toml"
+
+[wasm]
+routines = "routines/target/wasm32-unknown-unknown/release/routines.wasm"

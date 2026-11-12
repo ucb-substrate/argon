@@ -110,7 +110,8 @@ pub fn generate(library: &Library, output: impl AsRef<Path>) -> Result<DocReport
     let output = output.as_ref();
     let config = WorkspaceConfig::new(&library.root)
         .with_dependencies(library.dependencies.clone())
-        .with_gds_imports(library.gds.clone());
+        .with_gds_imports(library.gds.clone())
+        .with_wasm_modules(library.wasm.clone());
     let parsed = parse::parse_workspace_with_config(&config);
     let errors = parsed.static_errors();
     if !errors.is_empty() {

@@ -220,9 +220,19 @@ pub struct FnDecl<S, T: AstMetadata> {
     pub params: Vec<TyParam<S, T>>,
     pub args: Vec<ArgDecl<S, T>>,
     pub return_ty: Option<TySpec<S, T>>,
+    /// Empty for an `extern` function, which has no body.
     pub scope: Scope<S, T>,
+    /// The WASM module implementing an `extern` function.
+    pub foreign: Option<ForeignModule>,
     pub span: cfgrammar::Span,
     pub metadata: T::FnDecl,
+}
+
+/// The module named by `extern "module" fn`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignModule {
+    pub name: String,
+    pub span: cfgrammar::Span,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -1107,6 +1117,7 @@ pub trait AstTransformer {
             args,
             return_ty,
             scope,
+            foreign: input.foreign.clone(),
             span: input.span,
             metadata,
         }
