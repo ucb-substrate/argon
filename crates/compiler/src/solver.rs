@@ -78,11 +78,20 @@ pub struct Var(u64);
 /// The values of solved variables. A solver numbers its variables densely and
 /// solves almost all of them, so this is indexed by variable.
 #[derive(Clone, Default)]
-struct SolvedValues(Vec<Option<f64>>);
+struct SolvedValues {
+    values: Vec<f64>,
+    /// Whether each variable is solved, one bit per variable.
+    solved: Vec<u64>,
+}
 
 impl SolvedValues {
     fn get(&self, var: &Var) -> Option<&f64> {
-        self.0.get(var.0 as usize)?.as_ref()
+        let index = var.0 as usize;
+        let word = self.solved.get(index / 64)?;
+        if word & (1 << (index % 64)) == 0 {
+            return None;
+        }
+        self.values.get(index)
     }
 
     fn contains_key(&self, var: &Var) -> bool {
@@ -91,10 +100,16 @@ impl SolvedValues {
 
     fn insert(&mut self, var: Var, value: f64) -> Option<f64> {
         let index = var.0 as usize;
-        if index >= self.0.len() {
-            self.0.resize(index + 1, None);
+        let old = self.get(&var).copied();
+        if index >= self.values.len() {
+            self.values.resize(index + 1, 0.);
         }
-        self.0[index].replace(value)
+        if index / 64 >= self.solved.len() {
+            self.solved.resize(index / 64 + 1, 0);
+        }
+        self.values[index] = value;
+        self.solved[index / 64] |= 1 << (index % 64);
+        old
     }
 }
 
@@ -453,15 +468,15 @@ impl Solver {
     }
 
     /// When back substitution would leave the constraint `lhs - rhs = 0` with
-    /// one term, solves that term's variable as it would, and goes on to the
-    /// constraints the variable is in; such a constraint is then dropped, so it
-    /// is never recorded. Returns whether the value was off the grid, or `None`
-    /// if the constraint has to be recorded.
+    /// one unknown variable, possibly in several terms, solves it as it would,
+    /// and goes on to the constraints the variable is in; such a constraint is
+    /// then dropped, so it is never recorded. Returns whether the value was off
+    /// the grid, or `None` if the constraint has to be recorded.
     fn solve_at_once(&mut self, lhs: &LinearExpr, rhs: &LinearExpr) -> Option<bool> {
         // Each term as `LinearExpr::simplify` sees it: a value it removes, or
-        // the one variable it keeps.
-        let mut terms = SmallVec::<[Result<f64, (f64, Var)>; 4]>::new();
-        let mut unknown = None;
+        // a term of the one variable it keeps.
+        let mut terms = SmallVec::<[Result<f64, ()>; 4]>::new();
+        let mut unknown: Option<(f64, Var)> = None;
         for (coeff, var) in lhs
             .coeffs
             .iter()
@@ -471,18 +486,27 @@ impl Solver {
             let term = if relative_eq!(coeff, 0., epsilon = EPSILON) {
                 Ok(0.)
             } else {
-                match self.solved_vars.get(&var) {
-                    Some(value) => Ok(coeff * value),
-                    None if unknown.is_none() => {
+                match (self.solved_vars.get(&var), &mut unknown) {
+                    (Some(value), _) => Ok(coeff * value),
+                    (None, None) => {
                         unknown = Some((coeff, var));
-                        Err((coeff, var))
+                        Err(())
                     }
-                    None => return None,
+                    // Terms of one variable merge as `coalesce_terms` merges them.
+                    (None, Some((sum, seen))) if *seen == var => {
+                        *sum += coeff;
+                        Err(())
+                    }
+                    (None, Some(_)) => return None,
                 }
             };
             terms.push(term);
         }
         let (coeff, var) = unknown?;
+        if relative_eq!(coeff, 0., epsilon = EPSILON) {
+            // The variable cancels out, which only the recorded constraint reports.
+            return None;
+        }
         // The removed terms, summed left to right, are added to the constant.
         let mut removed: Option<f64> = None;
         for term in terms.into_iter().flatten() {
@@ -529,7 +553,10 @@ impl Solver {
     }
 
     /// Records the constraint `id`, `expr = 0`, and back-substitutes from it.
-    fn record_eq0(&mut self, id: ConstraintId, expr: LinearExpr) {
+    fn record_eq0(&mut self, id: ConstraintId, mut expr: LinearExpr) {
+        // One term per variable, so that back substitution sees how many
+        // unknowns are left.
+        coalesce_terms(&mut expr);
         for (_, var) in &expr.coeffs {
             self.var_to_constraints.entry(*var).or_default().insert(id);
         }
@@ -1896,6 +1923,31 @@ mod tests {
                 assert_eq!(&results[0], result, "expression {index}");
             }
         }
+    }
+
+    /// A variable in several terms, as in `bbox(i).x0 + bbox(i).x1`, counts as
+    /// one unknown, both at once and in back substitution.
+    #[test]
+    fn repeated_variable_is_one_unknown() {
+        let mut s = Solver::new();
+        let x = s.new_var();
+        s.constrain_eq0(c(vec![(1., x), (1., x)], -10.));
+        assert_eq!(s.value_of(x), Some(5.));
+        assert!(s.constraints.is_empty());
+
+        let (x, y) = (s.new_var(), s.new_var());
+        s.constrain_eq0(c(vec![(1., x), (-1., y), (1., x)], 0.));
+        assert_eq!(s.value_of(x), None);
+        s.constrain_eq0(c(vec![(1., y)], -10.));
+        assert_eq!(s.value_of(x), Some(5.));
+        assert!(s.constraints.is_empty());
+
+        let x = s.new_var();
+        let inconsistent = s.constrain_eq0(c(vec![(1., x), (-1., x)], -3.));
+        assert!(s.inconsistent_constraints().contains(&inconsistent));
+        let trivial = s.constrain_eq0(c(vec![(1., x), (-1., x)], 0.));
+        assert!(!s.inconsistent_constraints().contains(&trivial));
+        assert_eq!(s.value_of(x), None);
     }
 
     #[test]

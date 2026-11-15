@@ -7,3 +7,4 @@ mod floorplan;
 mod routing;
 mod power;
 mod sram;
+mod router;

@@ -3,13 +3,24 @@
 This example is a native port of SRAM22's column-peripheral layout construction,
 its replica-timed control logic, and its SRAM assembly. It does not import GDS.
 Rust/Substrate performs electrical sizing, architecture derivation, and
-replica-load partitioning in the `argon-sram-sizing` crate. Argon receives a
-concrete parameter record and only constructs devices, implants, wells,
-contacts, power straps, signal routing, taps, and boundary geometry. The fixed
+replica-load partitioning in the `argon-sram-sizing` crate. The
+`argon-sram-routing-wasm` crate exposes `argon-greedy-router`, a port of
+SRAM22's greedy grid router and power-strap placer. Argon receives a concrete
+parameter record and constructs devices, implants, wells, contacts, power
+straps, signal routing, taps, and boundary geometry, calling the router for
+the control logic's signal routes and the macro's power straps. The fixed
 foundry DFF, sense-amplifier, and standard-cell artwork is kept in separate
 native source modules.
 
-Generate the complete guarded SRAM example with:
+Both crates compile to WebAssembly modules that `Argon.toml` names under
+`[wasm]`. Build them once from the workspace root:
+
+```sh
+cargo build --release --target wasm32-unknown-unknown \
+  -p argon-sram-sizing-wasm -p argon-sram-routing-wasm
+```
+
+Then generate the complete guarded SRAM example with:
 
 ```sh
 arc run --cell 'example_sram()' --gds
@@ -20,17 +31,25 @@ when the untranslated inner layout is more convenient for debugging.
 `example_no_control_logic()` and `example_no_control_logic_inner()` build the
 same assembly without the control logic.
 
-To build another organization without regenerating the record, compile the
-sizer to WebAssembly from the workspace root and call it from Argon:
+To build another organization without regenerating the record, call the
+sizer from Argon:
 
 ```sh
-cargo build --release -p argon-sram-sizing-wasm --target wasm32-unknown-unknown
 arc run --cell 'example_sized_sram(8, 8, 1024, 32)' --gds
 ```
 
 The arguments are write-mask granularity, mux ratio, number of words, and data
 width. [`sizing.ar`](sizing.ar) declares the sizer as an `extern` function, and
-`Argon.toml` names the module under `[wasm]`.
+[`logic/router.ar`](logic/router.ar) declares the router's functions.
+
+The blocks share a few building blocks in
+[`columns/util.ar`](columns/util.ar): `mos`, a row of MOS devices drawn as
+sky130's MOS generator draws them; `gate`, a NAND or folded inverter built
+from it; and `contact`, the largest via array of a given rule between two
+shapes. Each block places its devices as rotated instances, centered or
+aligned by their bounding boxes, and routes from the ports the instances
+export. Tap cells read their neighbors' exported contacts and stripes from
+construction instances rather than recomputing them.
 
 The assembly is parametric. [`logic/floorplan.ar`](logic/floorplan.ar) places
 each block relative to the blocks before it, as SRAM22 does, from their
@@ -38,22 +57,22 @@ measured bounding boxes, and splits the height beside the column peripherals
 between the column decoder and the enable buffers.
 [`logic/routing.ar`](logic/routing.ar) draws every signal route from the
 blocks' exported ports on a 680 nm routing grid.
-[`logic/power.ar`](logic/power.ar) rings the grid with banks of alternating
-VDD and VSS rails, runs each block's supply rails to a bank, and fills the
-remaining free tracks with straps. Even tracks carry VDD and odd tracks VSS,
-and like supplies get a via wherever they cross. A strap is drawn only where
-it reaches another strap or a feeder. Block bounding boxes, the signal routes,
-and the feeders keep the straps away.
+[`logic/power.ar`](logic/power.ar) gathers the router's blockages (block
+shapes, port boxes, and the signal routes) and every block's supply pins,
+then calls the strap placer, which fills the free met1 and met2 tracks of a
+680 nm grid with straps. Even tracks carry VSS and odd tracks VDD; a strap
+gets a via wherever it crosses a strap or supply pin of its own net. The
+macro extends the straps that reach the inner layout's edge out to its guard
+rings.
 
 The assembly is built for a mux ratio of 4 or 8 and any word count the sizer
 produces. The row decoder is a tree of AND2 and AND3 stages, split as SRAM22
-splits it, and each stage ties its supply rails to the stage above it; the
+splits it, and each stage exports its supply pins to the strap placer; the
 column decoder is a single AND2 or AND3 stage. At all twenty-two of SRAM22's
-published mux-4 and mux-8 macros, from `sram22_64x22m4w22` to
-`sram22_2048x64m8w8`, its block positions, signal routes, and macro size match
-the published layout. KLayout's sky130 decks find no DRC errors, LVS matches
-the macro's netlist, pin names included, and every well and substrate tap
-reaches the supply pins through metal.
+published mux-4 and mux-8 organizations, from `sram22_64x22m4w22` to
+`sram22_2048x64m8w8`, a flat XOR on every layer finds no difference between
+the macro and the layout SRAM22's current generator produces. KLayout's sky130
+DRC deck finds no errors at 64 by 24 and 512 by 64.
 
 From this directory, generate the example column peripherals with:
 
@@ -76,14 +95,11 @@ generated record. It accepts any chain of at least two inverters, with at
 least six in the decoder replica and nine in the wordline pulse chain, which
 covers every length the sizer produces. The chains shift the cells after them
 in three of the five rows, and the right-side pins follow the cell's bounding
-box as in SRAM22. All top-level interconnect is hand-assigned on a 460 nm
-grid: met1 runs horizontally at y = 205 + 460k and met2 vertically at
-x = 350 + 460j, with 320 nm wires, so wires on distinct grid lines always meet
-the 140 nm spacing rule. Tracks are fixed per net. A route to a moving pin
-takes its column from the pin and steps past the few fixed columns that other
-nets cross in that row, so no two nets share a grid line where their wires
-overlap. As in SRAM22, each row rail is its own `vdd` or `vss` pin; the SRAM
-joins the rails with met2 feeders to its left power bank.
+box as in SRAM22. The greedy router connects the cells on a 460 nm grid, met1
+horizontal and met2 vertical with 320 nm wires, making SRAM22's routing
+requests in SRAM22's order so the routes come out the same. The rows' supply
+rails are merged into the block's `vdd` and `vss` pins, which the macro's
+straps reach like any other block's.
 
 The checked-in [`generated.ar`](generated.ar) contains the Rust-sized 64-by-24
 record used by the example cells. Regenerate it from the workspace root with:

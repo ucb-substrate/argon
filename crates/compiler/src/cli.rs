@@ -10,7 +10,7 @@ use crate::{
     compile::{self, CompileOutput},
     diagnostics::{self, Diagnostic},
     netlist::{NetlistFormat, NetlistOptions},
-    parse::{self, CellInvocation, parse_workspace_with_config},
+    parse::{self, CellInvocation},
 };
 use clap::{ArgGroup, Parser, ValueEnum};
 
@@ -189,7 +189,17 @@ fn execute(args: Args) -> Result<(), Failed> {
         Some(cell)
     };
 
-    let mut parse_output = parse_workspace_with_config(&workspace);
+    if entry.is_some() {
+        // Compiled while the workspace is parsed and analyzed.
+        crate::wasm::precompile(
+            workspace
+                .wasm_modules
+                .iter()
+                .map(|(_, path)| path.clone())
+                .collect(),
+        );
+    }
+    let mut parse_output = parse::parse_workspace_without_span_indexes(&workspace);
     let entry = match entry {
         Some(cell) => Some(
             parse::add_cell_invocation(&mut parse_output, cell)
@@ -197,6 +207,12 @@ fn execute(args: Args) -> Result<(), Failed> {
         ),
         None => None,
     };
+    // Neither analysis nor evaluation reads the span indexes, so neither the
+    // parsed nor the typed AST keeps them, including the modules the
+    // invocation re-parsed.
+    for (ast, _) in parse_output.asts.values_mut() {
+        ast.drop_span_indexes();
+    }
     let analysis = compile::analyze_workspace(parse_output);
     let Some(typed_ast) = analysis.typed_ast else {
         return Err(fail(

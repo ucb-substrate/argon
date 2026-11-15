@@ -4,6 +4,7 @@
 // exposed rail is one pin.
 
 use std::layout::{rect, text};
+use lib::logic::control::blocks;
 
 fn concat(a: [(Float, Float)], b: [(Float, Float)]) -> [(Float, Float)] {
     if a == [] { b } else { cons(head(a), concat(tail(a), b)) }
@@ -14,14 +15,14 @@ fn inv_chain_gaps(x: Float, n: Int, g: Int) -> [(Float, Float)] {
     if 7 * g >= n {
         []
     } else {
-        let tap_x1 = x + lib::logic::control::blocks::inv_chain_x(7 * g);
-        cons((tap_x1 - lib::logic::control::blocks::tap_w(), tap_x1,), inv_chain_gaps(x, n, g + 1))
+        let tap_x1 = x + blocks::inv_chain_x(7 * g);
+        cons((tap_x1 - blocks::tap_w(), tap_x1,), inv_chain_gaps(x, n, g + 1))
     }
 }
 
 // Rail span hidden by the output inverters of an SR latch at x.
 fn sr_latch_gaps(x: Float) -> [(Float, Float)] {
-    cons((x + lib::logic::control::blocks::sr_latch_inverters_x(), x + lib::logic::control::blocks::sr_latch_w(),), [])
+    cons((x + blocks::sr_latch_inverters_x(), x + blocks::sr_latch_w(),), [])
 }
 
 // The spans of [start, end] outside the sorted, disjoint `gaps`.
@@ -61,10 +62,11 @@ fn shared_spans(a: [(Float, Float)], b: [(Float, Float)]) -> [(Float, Float)] {
     coalesce_from(head(all), tail(all))
 }
 
-// Draws a labeled met1 pin over each span of the 490 nm rail centered at y.
-fn rail_pins(name: String, y: Float, spans: [(Float, Float)]) {
-    for s in spans {
-        rect("met1.pin", x0=s.0, y0=y - 245., x1=s.1, y1=y + 245.);
+// Draws a labeled met1 pin over each span of the 490 nm rail centered at y,
+// returning the pins.
+fn rail_pins(name: String, y: Float, spans: [(Float, Float)]) -> [Rect] {
+    [for s in spans {
         text(name, "met1.label", lib::columns::util::snap5((s.0 + s.1) / 2.), y);
-    }
+        rect("met1.pin", x0=s.0, y0=y - 245., x1=s.1, y1=y + 245.)
+    }]
 }

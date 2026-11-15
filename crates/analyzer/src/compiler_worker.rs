@@ -51,13 +51,16 @@ pub(crate) struct CompileResult {
     pub(crate) identity: CompileIdentity,
     pub(crate) root_dir: PathBuf,
     pub(crate) config: WorkspaceConfig,
-    pub(crate) ast: WorkspaceParseAst,
+    /// Shared with the compiler session's analysis.
+    pub(crate) ast: Arc<WorkspaceParseAst>,
     /// Position-indexed definitions and references. `None` until the workspace
     /// has type-checked once — after that the session keeps serving the last
     /// index that had content — and on the paths that answer without reaching
     /// the compiler at all: a manifest that would not load, or an internal
     /// compiler error. None of those means "there is no index".
     pub(crate) nav: Option<Arc<NavIndex>>,
+    /// The navigation index, when the worker builds it after answering.
+    pub(crate) nav_later: Option<oneshot::Receiver<Option<Arc<NavIndex>>>>,
     pub(crate) output: Option<CompileOutput>,
     pub(crate) messages: Vec<String>,
 }
@@ -218,16 +221,38 @@ fn run(commands: mpsc::Receiver<Command>) {
                         matches!(queued, Command::Compile { request, .. } if request.publish)
                     });
                 if !superseded {
-                    let result =
+                    let (mut result, nav_config) =
                         control.run(|| compile_catching_panics(&mut compiler, request, preview));
+                    let nav = nav_config.map(|config| {
+                        let (sender, receiver) = oneshot::channel();
+                        result.nav_later = Some(receiver);
+                        (config, sender)
+                    });
                     // The compile that cancelled this one answers instead.
                     if !control.is_cancelled() {
                         let _ = response.send(result);
+                    }
+                    // The index is built after answering, so that it does not
+                    // delay the layout.
+                    if let Some((config, sender)) = nav {
+                        let _ = sender.send(nav_catching_panics(&mut compiler, &config));
                     }
                 }
             }
         }
     }
+}
+
+/// [`IncrementalCompiler::nav`], resetting the compiler if it panics.
+fn nav_catching_panics(
+    compiler: &mut IncrementalCompiler,
+    config: &WorkspaceConfig,
+) -> Option<Arc<NavIndex>> {
+    panic::catch_unwind(AssertUnwindSafe(|| compiler.nav(config))).unwrap_or_else(|_| {
+        error!("internal compiler error while building the navigation index");
+        compiler.reset();
+        None
+    })
 }
 
 /// [`compile`], turning an internal compiler error into a message on the
@@ -236,7 +261,7 @@ fn compile_catching_panics(
     compiler: &mut IncrementalCompiler,
     request: CompileRequest,
     preview: Option<oneshot::Sender<CompilePreview>>,
-) -> CompileResult {
+) -> (CompileResult, Option<WorkspaceConfig>) {
     let identity = request.identity.clone();
     let root_dir = request.root_dir.clone();
     panic::catch_unwind(AssertUnwindSafe(|| compile(compiler, request, preview))).unwrap_or_else(
@@ -244,18 +269,20 @@ fn compile_catching_panics(
             error!("internal compiler error while compiling {root_dir:?}");
             // The panic may have left the caches half-updated.
             compiler.reset();
-            CompileResult {
+            let result = CompileResult {
                 identity,
                 config: WorkspaceConfig::new(root_dir.join("lib.ar")),
                 root_dir,
-                ast: WorkspaceParseAst::default(),
+                ast: Arc::default(),
                 // The reset compiler has no index yet, and this request never
                 // got far enough to ask for one. Publishing treats that as
                 // "nothing to say" rather than as an index to clear.
                 nav: None,
+                nav_later: None,
                 output: None,
                 messages: vec![INTERNAL_COMPILER_ERROR_MESSAGE.to_owned()],
-            }
+            };
+            (result, None)
         },
     )
 }
@@ -264,7 +291,7 @@ fn compile(
     compiler: &mut IncrementalCompiler,
     request: CompileRequest,
     preview: Option<oneshot::Sender<CompilePreview>>,
-) -> CompileResult {
+) -> (CompileResult, Option<WorkspaceConfig>) {
     let CompileRequest {
         identity,
         root_dir,
@@ -276,15 +303,17 @@ fn compile(
         match Library::load(&manifest_path) {
             Ok(library) => Some(library),
             Err(error) => {
-                return CompileResult {
+                let result = CompileResult {
                     identity,
                     config: WorkspaceConfig::new(root_dir.join("lib.ar")),
                     root_dir,
-                    ast: WorkspaceParseAst::default(),
+                    ast: Arc::default(),
                     nav: None,
+                    nav_later: None,
                     output: None,
                     messages: vec![error.to_string()],
                 };
+                return (result, None);
             }
         }
     } else {
@@ -292,11 +321,13 @@ fn compile(
     };
     let workspace = workspace_config(root_dir.join("lib.ar"), library.as_ref());
     let analysis = compiler.analyze_workspace(&workspace);
-    let nav = compiler.nav(&workspace);
+    // The caller builds the navigation index once the result is answered.
+    let nav_config = Some(workspace.clone());
     let ast = analysis.ast;
     let mut messages = Vec::new();
+    let typed = analysis.typed_ast.is_some();
 
-    let output = if analysis.typed_ast.is_some() {
+    let output = if typed {
         if !analysis.errors.is_empty() {
             Some(CompileOutput::StaticErrors(StaticErrorCompileOutput {
                 errors: analysis.errors,
@@ -315,15 +346,17 @@ fn compile(
                     )
                 };
                 messages.push(format!("Could not open cell: {message}"));
-                return CompileResult {
+                let result = CompileResult {
                     identity,
                     root_dir,
                     config: workspace,
                     ast,
-                    nav,
+                    nav: None,
+                    nav_later: None,
                     output: None,
                     messages,
                 };
+                return (result, nav_config);
             }
             if let Some((previous_cell, sender)) = preview_cell.zip(preview)
                 && let Some(output) =
@@ -356,15 +389,17 @@ fn compile(
         Some(CompileOutput::FatalParseErrors)
     };
 
-    CompileResult {
+    let result = CompileResult {
         identity,
         root_dir,
         config: workspace,
         ast,
-        nav,
+        nav: None,
+        nav_later: None,
         output,
         messages,
-    }
+    };
+    (result, nav_config)
 }
 
 #[cfg(test)]

@@ -2,6 +2,8 @@
 //! module and its result is decoded against the declared return type.
 
 use ciborium::Value as Cbor;
+use ciborium_io::Read as _;
+use ciborium_ll::{Decoder, Encoder, Header, simple};
 
 use super::ops::{OpFailure, OpResult};
 use super::*;
@@ -12,31 +14,23 @@ use crate::wasm::CallError;
 pub(super) fn call(
     solver: &Solver,
     defs: &TypeDefs,
+    layouts: &StructLayouts,
     path: &std::path::Path,
     name: &str,
     args: &[&Value],
     ret: &Ty,
 ) -> OpResult {
     let mut unsolved = SmallVec::new();
-    let encoded = args
-        .iter()
-        .enumerate()
-        .map(|(position, arg)| {
-            encode(
-                solver,
-                arg,
-                &mut unsolved,
-                &format!("argument {}", position + 1),
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|message| failure(name, message))?;
+    let mut input = Vec::new();
+    let mut encoder = Encoder::from(&mut input);
+    write(&mut encoder, Header::Array(Some(args.len())));
+    for (position, arg) in args.iter().enumerate() {
+        encode(&mut encoder, solver, arg, &mut unsolved)
+            .map_err(|error| failure(name, error.message(&format!("argument {}", position + 1))))?;
+    }
     if !unsolved.is_empty() {
         return Err(OpFailure::Wait(unsolved));
     }
-    let mut input = Vec::new();
-    ciborium::into_writer(&Cbor::Array(encoded), &mut input)
-        .map_err(|error| failure(name, error.to_string()))?;
     let output = crate::wasm::call(path, name, &input).map_err(|error| match error {
         CallError::Cancelled => OpFailure::Error(
             ExecErrorKind::ExternCallCancelled {
@@ -46,6 +40,11 @@ pub(super) fn call(
         ),
         CallError::Failed(message) => failure(name, message),
     })?;
+    if let Some(value) = decode_ok(defs, layouts, ret, &output) {
+        return Ok(value);
+    }
+    // Anything the direct decoding does not take, errors included, goes
+    // through the general decoding, which reports what is wrong.
     let result: Cbor = ciborium::from_reader(output.as_slice())
         .map_err(|error| failure(name, format!("invalid result encoding: {error}")))?;
     let value = match result {
@@ -65,7 +64,7 @@ pub(super) fn call(
         }
         _ => return Err(failure(name, "result is not `Ok` or `Err`".to_owned())),
     };
-    decode(defs, ret, value, "result").map_err(|message| failure(name, message))
+    decode(defs, layouts, ret, value, "result").map_err(|message| failure(name, message))
 }
 
 fn failure(name: &str, message: String) -> OpFailure {
@@ -78,20 +77,77 @@ fn failure(name: &str, message: String) -> OpFailure {
     )
 }
 
-/// Encodes `value`, collecting the solver variables it still depends on.
-fn encode(
+type CborWriter<'w> = Encoder<&'w mut Vec<u8>>;
+
+fn write(encoder: &mut CborWriter<'_>, header: Header) {
+    encoder
+        .push(header)
+        .expect("writing to a `Vec` does not fail");
+}
+
+/// A value that cannot be passed to a WASM function, and where it is within
+/// an argument, innermost step first.
+struct Unencodable<'v> {
+    kind: &'static str,
+    path: Vec<Step<'v>>,
+}
+
+/// One step into a sequence, tuple, or struct.
+enum Step<'v> {
+    Index(usize),
+    Position(usize),
+    Field(&'v str),
+}
+
+impl Unencodable<'_> {
+    fn message(&self, argument: &str) -> String {
+        let mut at = argument.to_owned();
+        for step in self.path.iter().rev() {
+            match step {
+                Step::Index(index) => at += &format!("[{index}]"),
+                Step::Position(index) => at += &format!(".{index}"),
+                Step::Field(field) => at += &format!(".{field}"),
+            }
+        }
+        format!(
+            "{at} is a {}, which cannot be passed to a WASM function",
+            self.kind
+        )
+    }
+}
+
+/// Writes `value` as CBOR, collecting the solver variables it still depends
+/// on. An unsolved number is written as null.
+fn encode<'v>(
+    encoder: &mut CborWriter<'_>,
     solver: &Solver,
-    value: &Value,
+    value: &'v Value,
     unsolved: &mut SmallVec<[Var; 4]>,
-    at: &str,
-) -> Result<Cbor, String> {
-    Ok(match value {
-        Value::Nil => Cbor::Null,
-        Value::Bool(value) => Cbor::Bool(*value),
-        Value::Int(value) => Cbor::Integer((*value).into()),
-        Value::String(value) => Cbor::Text(value.clone()),
+) -> Result<(), Unencodable<'v>> {
+    let within = |step: Step<'v>| {
+        move |mut error: Unencodable<'v>| {
+            error.path.push(step);
+            error
+        }
+    };
+    match value {
+        Value::Nil => write(encoder, Header::Simple(simple::NULL)),
+        Value::Bool(value) => write(
+            encoder,
+            Header::Simple(if *value { simple::TRUE } else { simple::FALSE }),
+        ),
+        Value::Int(value) => write(
+            encoder,
+            match u64::try_from(*value) {
+                Ok(value) => Header::Positive(value),
+                Err(_) => Header::Negative(*value as u64 ^ !0),
+            },
+        ),
+        Value::String(value) => encoder
+            .text(value, None)
+            .expect("writing to a `Vec` does not fail"),
         Value::Linear(expr) => match solver.eval_expr_exact(expr) {
-            Some(value) => Cbor::Float(value),
+            Some(value) => write(encoder, Header::Float(value)),
             None => {
                 unsolved.extend(
                     expr.coeffs
@@ -99,46 +155,146 @@ fn encode(
                         .map(|(_, var)| *var)
                         .filter(|var| !solver.is_solved(*var)),
                 );
-                Cbor::Null
+                write(encoder, Header::Simple(simple::NULL));
             }
         },
-        Value::Seq(items) => Cbor::Array(
-            items
-                .iter()
-                .enumerate()
-                .map(|(index, item)| encode(solver, item, unsolved, &format!("{at}[{index}]")))
-                .collect::<Result<_, _>>()?,
+        Value::Seq(items) => {
+            write(encoder, Header::Array(Some(items.len())));
+            for (index, item) in items.iter().enumerate() {
+                encode(encoder, solver, item, unsolved).map_err(within(Step::Index(index)))?;
+            }
+        }
+        Value::Tuple(items) => {
+            write(encoder, Header::Array(Some(items.len())));
+            for (index, item) in items.iter().enumerate() {
+                encode(encoder, solver, item, unsolved).map_err(within(Step::Position(index)))?;
+            }
+        }
+        Value::Struct(value) => {
+            write(encoder, Header::Map(Some(value.values().len())));
+            for (field, item) in value.fields() {
+                encoder
+                    .text(field, None)
+                    .expect("writing to a `Vec` does not fail");
+                encode(encoder, solver, item, unsolved).map_err(within(Step::Field(field)))?;
+            }
+        }
+        other => {
+            return Err(Unencodable {
+                kind: value_kind(other),
+                path: Vec::new(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// How deeply [`decode_ok`] nests before leaving a result to [`decode`].
+const MAX_DIRECT_DEPTH: usize = 64;
+
+/// A CBOR decoder over a whole encoded result.
+struct CborReader<'r> {
+    decoder: Decoder<&'r [u8]>,
+    len: usize,
+}
+
+impl CborReader<'_> {
+    fn pull(&mut self) -> Option<Header> {
+        self.decoder.pull().ok()
+    }
+
+    /// Reads a text item of definite length.
+    fn text(&mut self) -> Option<String> {
+        let Some(Header::Text(Some(len))) = self.pull() else {
+            return None;
+        };
+        if len > self.len - self.decoder.offset() {
+            return None;
+        }
+        let mut bytes = vec![0; len];
+        self.decoder.read_exact(&mut bytes).ok()?;
+        String::from_utf8(bytes).ok()
+    }
+}
+
+/// Decodes `output`, an `Ok` result of type `ty`, without building a CBOR
+/// tree. `None` for anything else, including results that [`decode`] would
+/// accept in another form, such as struct fields out of order.
+fn decode_ok(defs: &TypeDefs, layouts: &StructLayouts, ty: &Ty, output: &[u8]) -> Option<Value> {
+    let mut reader = CborReader {
+        decoder: Decoder::from(output),
+        len: output.len(),
+    };
+    if !matches!(reader.pull()?, Header::Map(Some(1))) || reader.text()? != "Ok" {
+        return None;
+    }
+    decode_direct(&mut reader, defs, layouts, ty, 0)
+}
+
+/// Decodes the next item as a value of type `ty`, as [`decode`] would.
+fn decode_direct(
+    reader: &mut CborReader<'_>,
+    defs: &TypeDefs,
+    layouts: &StructLayouts,
+    ty: &Ty,
+    depth: usize,
+) -> Option<Value> {
+    if depth > MAX_DIRECT_DEPTH {
+        return None;
+    }
+    if let Ty::String = ty {
+        return reader.text().map(Value::String);
+    }
+    let number = |value: f64| Value::Linear(LinearExpr::from(value));
+    Some(match (ty, reader.pull()?) {
+        (Ty::Nil, Header::Simple(simple::NULL)) => Value::Nil,
+        (Ty::Bool, Header::Simple(simple::FALSE)) => Value::Bool(false),
+        (Ty::Bool, Header::Simple(simple::TRUE)) => Value::Bool(true),
+        (Ty::Int, Header::Positive(value)) => Value::Int(i64::try_from(value).ok()?),
+        (Ty::Int, Header::Negative(value)) => Value::Int(!i64::try_from(value).ok()?),
+        (Ty::Float, Header::Float(value)) if value.is_finite() => number(value),
+        (Ty::Float, Header::Positive(value)) => number(value as f64),
+        (Ty::Float, Header::Negative(value)) => number((-1 - i128::from(value)) as f64),
+        (Ty::Seq(item), Header::Array(Some(len))) => seq_value(
+            (0..len)
+                .map(|_| decode_direct(reader, defs, layouts, item, depth + 1))
+                .collect::<Option<Seq>>()?,
         ),
-        Value::Tuple(items) => Cbor::Array(
-            items
-                .iter()
-                .enumerate()
-                .map(|(index, item)| encode(solver, item, unsolved, &format!("{at}.{index}")))
-                .collect::<Result<_, _>>()?,
+        (Ty::Tuple(tys), Header::Array(Some(len))) if len == tys.len() => Value::Tuple(
+            tys.iter()
+                .map(|ty| decode_direct(reader, defs, layouts, ty, depth + 1))
+                .collect::<Option<Arc<[Value]>>>()?,
         ),
-        Value::Struct(value) => Cbor::Map(
-            value
+        (Ty::Struct(struct_ty), Header::Map(Some(len))) => {
+            let def = defs.get(&struct_ty.def)?.as_struct()?;
+            if !def.params.is_empty() || len != def.fields.len() {
+                return None;
+            }
+            let layout = layouts.get(defs, struct_ty)?;
+            let values = def
                 .fields
                 .iter()
-                .map(|(field, item)| {
-                    Ok((
-                        Cbor::Text(field.clone()),
-                        encode(solver, item, unsolved, &format!("{at}.{field}"))?,
-                    ))
+                .map(|(field, ty)| {
+                    if reader.text()? != *field {
+                        return None;
+                    }
+                    decode_direct(reader, defs, layouts, ty, depth + 1)
                 })
-                .collect::<Result<_, String>>()?,
-        ),
-        other => {
-            return Err(format!(
-                "{at} is a {}, which cannot be passed to a WASM function",
-                value_kind(other)
-            ));
+                .collect::<Option<SmallVec<_>>>()?;
+            Value::Struct(Arc::new(StructValue::new(layout, values)))
         }
+        _ => return None,
     })
 }
 
 /// Decodes `value` as a value of type `ty`.
-fn decode(defs: &TypeDefs, ty: &Ty, value: Cbor, at: &str) -> Result<Value, String> {
+fn decode(
+    defs: &TypeDefs,
+    layouts: &StructLayouts,
+    ty: &Ty,
+    value: Cbor,
+    at: &str,
+) -> Result<Value, String> {
     let mismatch =
         |value: &Cbor| format!("{at} should be {}, found {}", ty_name(ty), cbor_kind(value));
     Ok(match (ty, value) {
@@ -154,7 +310,7 @@ fn decode(defs: &TypeDefs, ty: &Ty, value: Cbor, at: &str) -> Result<Value, Stri
             items
                 .into_iter()
                 .enumerate()
-                .map(|(index, value)| decode(defs, item, value, &format!("{at}[{index}]")))
+                .map(|(index, value)| decode(defs, layouts, item, value, &format!("{at}[{index}]")))
                 .collect::<Result<Seq, _>>()?,
         ),
         (Ty::Tuple(tys), Cbor::Array(items)) => {
@@ -169,7 +325,9 @@ fn decode(defs: &TypeDefs, ty: &Ty, value: Cbor, at: &str) -> Result<Value, Stri
                 tys.iter()
                     .zip(items)
                     .enumerate()
-                    .map(|(index, (ty, value))| decode(defs, ty, value, &format!("{at}.{index}")))
+                    .map(|(index, (ty, value))| {
+                        decode(defs, layouts, ty, value, &format!("{at}.{index}"))
+                    })
                     .collect::<Result<Arc<[Value]>, _>>()?,
             )
         }
@@ -190,29 +348,26 @@ fn decode(defs: &TypeDefs, ty: &Ty, value: Cbor, at: &str) -> Result<Value, Stri
                     other => Err(format!("{at} has a non-string key {}", cbor_kind(&other))),
                 })
                 .collect::<Result<IndexMap<String, Cbor>, _>>()?;
-            let fields = def
+            let values = def
                 .fields
                 .iter()
                 .map(|(field, ty)| {
                     let value = entries
                         .shift_remove(field)
                         .ok_or_else(|| format!("{at} is missing field `{field}`"))?;
-                    Ok((
-                        field.clone(),
-                        decode(defs, ty, value, &format!("{at}.{field}"))?,
-                    ))
+                    decode(defs, layouts, ty, value, &format!("{at}.{field}"))
                 })
-                .collect::<Result<FxIndexMap<_, _>, String>>()?;
+                .collect::<Result<SmallVec<_>, String>>()?;
             if let Some(field) = entries.keys().next() {
                 return Err(format!(
                     "{at} has field `{field}`, which struct `{}` does not declare",
                     struct_ty.name
                 ));
             }
-            Value::Struct(Arc::new(StructValue {
-                name: struct_ty.name.clone(),
-                fields,
-            }))
+            let layout = layouts
+                .get(defs, struct_ty)
+                .expect("the declaration is a struct");
+            Value::Struct(Arc::new(StructValue::new(layout, values)))
         }
         (
             Ty::Nil
@@ -307,6 +462,7 @@ mod tests {
   (data (i32.const 0) "\a1\62Ok")
   (data (i32.const 16) "\a1\63Err\64nope")
   (data (i32.const 32) "boom")
+  (data (i32.const 48) "\a1\62Ok\a2\61h\f9\44\00\61w\f9\40\00")
   (func (export "argon_abi_version") (result i32) (i32.const 0))
   (func (export "argon_alloc") (param $len i32) (result i32)
     (local $ptr i32)
@@ -327,6 +483,8 @@ mod tests {
   (func (export "argon_fn_fail") (param i32 i32) (result i64)
     (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 10)))
   (func (export "argon_fn_boom") (param i32 i32) (result i64) (unreachable))
+  (func (export "argon_fn_swapped") (param i32 i32) (result i64)
+    (i64.or (i64.shl (i64.const 48) (i64.const 32)) (i64.const 15)))
   (func (export "argon_fn_spin") (param i32 i32) (result i64)
     (loop $again (br $again))
     (i64.const 0)))
@@ -397,6 +555,20 @@ cell top() {
 }
 "#);
         assert_eq!(rects(&output), [[0., 0., 7., 6.]]);
+    }
+
+    #[test]
+    fn struct_fields_may_arrive_in_any_order() {
+        let output = run(r#"
+struct Size { w: Float, h: Float }
+extern "fixture" fn swapped() -> Size;
+
+cell top() {
+    let s = swapped();
+    std::layout::rect("met1", x0=0., y0=0., x1=s.w, y1=s.h)!;
+}
+"#);
+        assert_eq!(rects(&output), [[0., 0., 2., 4.]]);
     }
 
     #[test]

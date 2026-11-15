@@ -98,10 +98,10 @@ impl CallControl {
         f()
     }
 
-    /// The control installed on this thread, or one that never stops a call.
+    /// The control installed on this thread, if any.
     #[cfg(not(target_family = "wasm"))]
-    fn current() -> Self {
-        CONTROL.with(|control| control.borrow().clone().unwrap_or_default())
+    fn installed() -> Option<Self> {
+        CONTROL.with(|control| control.borrow().clone())
     }
 }
 
@@ -110,7 +110,11 @@ thread_local! {
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub use host::call;
+pub use host::{call, precompile};
+
+/// Does nothing, since this build cannot call WASM functions.
+#[cfg(target_family = "wasm")]
+pub fn precompile(_paths: Vec<std::path::PathBuf>) {}
 
 /// Calls the function `name` of the module at `path` with CBOR-encoded
 /// arguments, returning its CBOR-encoded result.
@@ -126,7 +130,7 @@ mod host {
     use std::{
         collections::HashMap,
         path::{Path, PathBuf},
-        sync::{Mutex, OnceLock},
+        sync::{Arc, Mutex, OnceLock},
         time::{Duration, Instant, SystemTime},
     };
 
@@ -144,11 +148,18 @@ mod host {
     /// Results kept before the memo is cleared.
     const MAX_MEMOIZED: usize = 1024;
 
-    /// The engine, with a clock thread that makes running calls check their
-    /// control without the cost of counting instructions.
-    fn engine() -> &'static Engine {
-        static ENGINE: OnceLock<Engine> = OnceLock::new();
-        ENGINE.get_or_init(|| {
+    /// The engine for calls under a [`CallControl`], with a clock thread that
+    /// makes running calls check their control without the cost of counting
+    /// instructions, or for calls nothing can stop, which skip the checks.
+    fn engine(controlled: bool) -> &'static Engine {
+        static CONTROLLED: OnceLock<Engine> = OnceLock::new();
+        static UNCONTROLLED: OnceLock<Engine> = OnceLock::new();
+        if !controlled {
+            return UNCONTROLLED.get_or_init(|| {
+                Engine::new(&Config::new()).expect("the WASM engine configuration is valid")
+            });
+        }
+        CONTROLLED.get_or_init(|| {
             let mut config = Config::new();
             config.epoch_interruption(true);
             let engine = Engine::new(&config).expect("the WASM engine configuration is valid");
@@ -176,22 +187,32 @@ mod host {
     /// each gets a fresh instance with no imports.
     static RESULTS: OnceLock<Mutex<HashMap<CallKey, Vec<u8>>>> = OnceLock::new();
 
-    /// Compiles the module at `path`, reusing the compilation while the file
-    /// is unchanged.
-    fn module(path: &Path) -> Result<(Stamp, Module), String> {
-        static MODULES: OnceLock<Mutex<HashMap<PathBuf, (Stamp, Module)>>> = OnceLock::new();
+    /// Compiles the module at `path` for [`engine`]`(controlled)`, reusing the
+    /// compilation while the file is unchanged.
+    fn module(path: &Path, controlled: bool) -> Result<(Stamp, Module), String> {
+        type Slot = Arc<Mutex<Option<(Stamp, Module)>>>;
+        static MODULES: OnceLock<Mutex<HashMap<(PathBuf, bool), Slot>>> = OnceLock::new();
         let metadata = std::fs::metadata(path)
             .map_err(|error| format!("cannot read `{}`: {error}", path.display()))?;
         let stamp = (metadata.len(), metadata.modified().ok());
-        let modules = MODULES.get_or_init(Default::default);
-        if let Some((cached, module)) = modules.lock().unwrap().get(path)
+        let slot = MODULES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .entry((path.to_path_buf(), controlled))
+            .or_default()
+            .clone();
+        // Held while compiling, so that a compilation already under way, as
+        // [`precompile`] starts, is waited for rather than repeated.
+        let mut slot = slot.lock().unwrap();
+        if let Some((cached, module)) = &*slot
             && *cached == stamp
         {
             return Ok((stamp, module.clone()));
         }
         let bytes = std::fs::read(path)
             .map_err(|error| format!("cannot read `{}`: {error}", path.display()))?;
-        let module = Module::new(engine(), &bytes)
+        let module = Module::new(engine(controlled), &bytes)
             .map_err(|error| format!("invalid WASM module `{}`: {error}", path.display()))?;
         if let Some(import) = module.imports().next() {
             return Err(format!(
@@ -201,11 +222,20 @@ mod host {
                 import.name()
             ));
         }
-        modules
-            .lock()
-            .unwrap()
-            .insert(path.to_path_buf(), (stamp, module.clone()));
+        *slot = Some((stamp, module.clone()));
         Ok((stamp, module))
+    }
+
+    /// Compiles the modules at `paths` on other threads, for calls made later
+    /// on this one. A module that fails to compile is reported by its call.
+    pub fn precompile(paths: Vec<PathBuf>) {
+        let controlled = CallControl::installed().is_some();
+        for path in paths {
+            // Without the thread, the module is compiled at its first call.
+            let _ = std::thread::Builder::new()
+                .name("argon-wasm-compile".to_owned())
+                .spawn(move || module(&path, controlled));
+        }
     }
 
     struct State {
@@ -219,14 +249,14 @@ mod host {
     /// a successful result is reused for the same module and arguments. The
     /// call runs until it finishes unless this thread's [`CallControl`] stops it.
     pub fn call(path: &Path, name: &str, input: &[u8]) -> Result<Vec<u8>, CallError> {
-        let (stamp, module) = module(path)?;
+        let control = CallControl::installed();
+        let (stamp, module) = module(path, control.is_some())?;
         let key = (path.to_path_buf(), stamp, name.to_owned(), input.to_vec());
         let results = RESULTS.get_or_init(Default::default);
         if let Some(output) = results.lock().unwrap().get(&key) {
             return Ok(output.clone());
         }
-        let control = CallControl::current();
-        if control.is_cancelled() {
+        if control.as_ref().is_some_and(CallControl::is_cancelled) {
             return Err(CallError::Cancelled);
         }
         let output = run(&module, path, name, input, control)?;
@@ -243,10 +273,10 @@ mod host {
         path: &Path,
         name: &str,
         input: &[u8],
-        control: CallControl,
+        control: Option<CallControl>,
     ) -> Result<Vec<u8>, CallError> {
         let mut store = Store::new(
-            engine(),
+            engine(control.is_some()),
             State {
                 limits: StoreLimitsBuilder::new()
                     .memory_size(MAX_MEMORY)
@@ -255,24 +285,26 @@ mod host {
             },
         );
         store.limiter(|state| &mut state.limits);
-        // Each clock tick, check whether the call should stop or be reported.
-        store.set_epoch_deadline(1);
-        let started = Instant::now();
-        let mut reported = false;
-        let watched = control.clone();
-        let function_name = name.to_owned();
-        store.epoch_deadline_callback(move |_| {
-            if watched.is_cancelled() {
-                return Ok(UpdateDeadline::Interrupt);
-            }
-            if !reported && started.elapsed() >= SLOW_CALL {
-                reported = true;
-                if let Some(report) = &watched.on_slow_call {
-                    report(&function_name);
+        if let Some(watched) = control.clone() {
+            // Each clock tick, check whether the call should stop or be
+            // reported.
+            store.set_epoch_deadline(1);
+            let started = Instant::now();
+            let mut reported = false;
+            let function_name = name.to_owned();
+            store.epoch_deadline_callback(move |_| {
+                if watched.is_cancelled() {
+                    return Ok(UpdateDeadline::Interrupt);
                 }
-            }
-            Ok(UpdateDeadline::Continue(1))
-        });
+                if !reported && started.elapsed() >= SLOW_CALL {
+                    reported = true;
+                    if let Some(report) = &watched.on_slow_call {
+                        report(&function_name);
+                    }
+                }
+                Ok(UpdateDeadline::Continue(1))
+            });
+        }
         let instance = Instance::new(&mut store, module, &[])
             .map_err(|error| format!("cannot instantiate `{}`: {error}", path.display()))?;
         let abi = instance
@@ -312,7 +344,7 @@ mod host {
             Ok(packed) => packed,
             Err(error) => {
                 if let Some(Trap::Interrupt) = error.downcast_ref::<Trap>()
-                    && control.is_cancelled()
+                    && control.as_ref().is_some_and(CallControl::is_cancelled)
                 {
                     return Err(CallError::Cancelled);
                 }

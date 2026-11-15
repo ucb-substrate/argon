@@ -10,9 +10,9 @@ use argonc::{
 
 use crate::repository_root;
 
-/// Builds the sizer module into its own target directory, so the build does
-/// not wait on the lock held by the build running these tests.
-fn build_sizer() -> PathBuf {
+/// Builds the sizer and router modules into their own target directory, so
+/// the build does not wait on the lock held by the build running these tests.
+fn build_modules() -> [(String, PathBuf); 2] {
     let root = repository_root();
     let target = root.join("target/wasm-tests");
     let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
@@ -23,6 +23,8 @@ fn build_sizer() -> PathBuf {
             "--release",
             "-p",
             "argon-sram-sizing-wasm",
+            "-p",
+            "argon-sram-routing-wasm",
             "--target",
             "wasm32-unknown-unknown",
             "--target-dir",
@@ -32,9 +34,19 @@ fn build_sizer() -> PathBuf {
         .expect("run cargo");
     assert!(
         status.success(),
-        "building the sizer module failed; is the wasm32-unknown-unknown target installed?"
+        "building the WASM modules failed; is the wasm32-unknown-unknown target installed?"
     );
-    target.join("wasm32-unknown-unknown/release/argon_sram_sizing_wasm.wasm")
+    let release = target.join("wasm32-unknown-unknown/release");
+    [
+        (
+            "sizing".to_owned(),
+            release.join("argon_sram_sizing_wasm.wasm"),
+        ),
+        (
+            "routing".to_owned(),
+            release.join("argon_sram_routing_wasm.wasm"),
+        ),
+    ]
 }
 
 /// Every cell but the top, described by its shapes and instances.
@@ -101,7 +113,7 @@ fn the_wasm_sizer_reproduces_the_generated_record() {
     let example = root.join("examples/sram");
     let config = WorkspaceConfig::new(example.join("lib.ar"))
         .with_tech(Some(root.join("pdks/sky130/sky130.tech.toml")))
-        .with_wasm_modules([("sizing".to_owned(), build_sizer())]);
+        .with_wasm_modules(build_modules());
     let generated =
         IncrementalCompiler::new().compile_cell(&config, &["example_sram".to_owned()], Vec::new());
     let sized = IncrementalCompiler::new().compile_cell(

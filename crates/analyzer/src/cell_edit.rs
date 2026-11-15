@@ -8,7 +8,7 @@ use std::{
 use arcstr::Substr;
 use argonc::{
     ast::{AstMetadata, Decl, Ident, ModPath, UseDecl},
-    compile::{self, BUILTINS},
+    compile::{self, BUILTINS, ModuleImports},
     parse::{self, ParseMetadata, WorkspaceParseAst},
 };
 use tower_lsp_server::ls_types::{Range, TextEdit, Uri};
@@ -25,6 +25,9 @@ pub(crate) struct RenameCellEdit {
     /// The names in each module that resolve to the renamed cell, mapped to
     /// their names after the edit.
     target_names: HashMap<ModPath, HashMap<String, String>>,
+    /// The modules the root module imports, which an invocation's path may
+    /// start with.
+    root_imports: ModuleImports,
 }
 
 impl RenameCellEdit {
@@ -33,7 +36,7 @@ impl RenameCellEdit {
     pub(crate) fn rename_invocation(&self, invocation: &str) -> Option<String> {
         let call = parse::parse_cell(invocation).ok()?;
         let name = call.func.path.last()?;
-        let module = reference_module_path(&ModPath::new(), &call.func.path);
+        let module = reference_module_path(&ModPath::new(), &self.root_imports, &call.func.path);
         let renamed = self.target_names.get(&module)?.get(name.name)?;
         if renamed == name.name {
             return None;
@@ -142,7 +145,11 @@ fn use_module_path(current_path: &ModPath, use_decl: &UseDecl<Substr, ParseMetad
     )
 }
 
-fn reference_module_path<S, M>(current_path: &ModPath, path: &[Ident<S, M>]) -> ModPath
+fn reference_module_path<S, M>(
+    current_path: &ModPath,
+    imports: &ModuleImports,
+    path: &[Ident<S, M>],
+) -> ModPath
 where
     S: AsRef<str>,
     M: AstMetadata,
@@ -150,11 +157,23 @@ where
     if path.len() <= 1 {
         return current_path.clone();
     }
-    compile::module_prefix(
+    imports.module_prefix(
         current_path,
         path.iter().map(|ident| ident.name.as_ref()),
         1,
     )
+}
+
+/// The modules `module_path` imports with `use`.
+fn module_imports(workspace: &WorkspaceParseAst, module_path: &ModPath) -> ModuleImports {
+    workspace
+        .get(module_path)
+        .map(|module| {
+            ModuleImports::new(module_path, &module.ast.decls, |module| {
+                workspace.contains_key(module)
+            })
+        })
+        .unwrap_or_default()
 }
 
 /// Names in each module that resolve to the renamed cell, mapped to the name
@@ -313,11 +332,12 @@ pub(crate) fn rename_cell_edits(
         let Some(source_module) = workspace.get(module_path) else {
             continue;
         };
+        let imports = module_imports(workspace, module_path);
         for call in module.span2call.values() {
             let Some(name) = call.func.path.last() else {
                 continue;
             };
-            let referenced_module = reference_module_path(module_path, &call.func.path);
+            let referenced_module = reference_module_path(module_path, &imports, &call.func.path);
             let renamed = target_names
                 .get(&referenced_module)
                 .and_then(|module_names| module_names.get(name.name.as_str()));
@@ -372,6 +392,7 @@ pub(crate) fn rename_cell_edits(
     Ok(RenameCellEdit {
         changes,
         target_names,
+        root_imports: module_imports(workspace, &ModPath::new()),
     })
 }
 
@@ -484,6 +505,42 @@ mod tests {
         );
         assert_eq!(rename.rename_invocation("child()"), None);
         assert_eq!(rename.rename_invocation("inv(2)"), None);
+    }
+
+    #[test]
+    fn rename_follows_calls_through_module_imports() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("lib.ar");
+        fs::write(
+            &source_path,
+            "mod blocks;\nmod user;\nuse lib::blocks as b;\ncell top() { blocks::child(); }\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join("blocks.ar"), "cell child() {}\n").unwrap();
+        fs::write(
+            directory.path().join("user.ar"),
+            "use lib::blocks;\nuse lib::blocks as parts;\n\
+             cell other() { blocks::child(); parts::child(); }\n",
+        )
+        .unwrap();
+        let workspace = parse::parse_workspace_with_std(&source_path).ast();
+        let rename =
+            rename_cell_edits(&workspace, "b::child()", "unit", PositionEncoding::Utf16).unwrap();
+
+        assert_eq!(
+            rename.rename_invocation("b::child()").as_deref(),
+            Some("b::unit()")
+        );
+        // The declaration, the root's call, and both calls in `user`.
+        assert_eq!(
+            rename
+                .changes
+                .values()
+                .flat_map(|edits| edits.iter())
+                .filter(|edit| edit.new_text == "unit")
+                .count(),
+            4
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 // Native transcription of SRAM22's fixed, tapped Sky130 DFF tile.
 // Parameterized array placement lives in dff.ar.
+// arc-fmt: no-wrap
 
 use std::layout::polygon;
 

@@ -54,6 +54,9 @@ use crate::editor::{Editor, prepare_compilation_snapshot};
 
 pub const LANG_SERVER_CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 static NEXT_SNAPSHOT_PREPARATION_ID: AtomicU64 = AtomicU64::new(1);
+/// How long after a snapshot is applied freed memory is returned to the
+/// system.
+const RELEASE_DELAY: Duration = Duration::from_secs(1);
 
 fn lock_unpoisoned<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
     lock.lock().unwrap_or_else(|poisoned| {
@@ -697,6 +700,18 @@ impl GuiServer {
         self.to_exec
             .send(Box::new(move |editor, app| {
                 app.update(|cx| editor.finish_snapshot_preparation(cx, preparation_id, snapshot));
+                // Returns the memory of the replaced layout to the system once
+                // the canvas has dropped it.
+                let executor = app.background_executor().clone();
+                executor
+                    .spawn({
+                        let executor = executor.clone();
+                        async move {
+                            executor.timer(RELEASE_DELAY).await;
+                            protocol::release_free_memory();
+                        }
+                    })
+                    .detach();
             }))
             .await
             .ok();

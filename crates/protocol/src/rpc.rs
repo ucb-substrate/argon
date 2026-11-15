@@ -2,13 +2,15 @@
 
 use std::{
     io::{BufRead, BufReader},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use argonc::{
     ast::Span,
     compile::{
-        Align, BasicRect, CellId, CompileOutput, CompiledData, DeviceKind, PreviewGeometry, Symbol,
+        Align, BasicRect, CellId, CompileOutput, CompiledCell, CompiledData, DeviceKind,
+        NodeSource, PreviewGeometry, SolvedValue, Symbol,
     },
     parse,
 };
@@ -484,14 +486,26 @@ impl CompressedCompilationUpdate {
     }
 
     pub fn decode(self) -> Result<CompilationUpdate, String> {
-        let decoder = decompress(self.bytes.as_slice())?;
-        let arena = Bump::new();
-        let mut deserializer = postcard::Deserializer::from_flavor(StreamFlavor {
-            reader: BufReader::new(decoder),
-            arena: &arena,
-            scratch: Vec::new(),
-        });
-        CompilationUpdate::deserialize(&mut deserializer).map_err(|error| error.to_string())
+        let mut update = {
+            let decoder = decompress(self.bytes.as_slice())?;
+            let arena = Bump::new();
+            let mut deserializer = postcard::Deserializer::from_flavor(StreamFlavor {
+                reader: BufReader::new(decoder),
+                arena: &arena,
+                scratch: Vec::new(),
+            });
+            CompilationUpdate::deserialize(&mut deserializer).map_err(|error| error.to_string())?
+        };
+        drop(self.bytes);
+        if let Some(data) = update.snapshot.data_mut() {
+            let mut paths = SpanPaths::default();
+            for cell in data.cells.values_mut() {
+                if let Some(cell) = Arc::get_mut(cell) {
+                    paths.share_cell(cell);
+                }
+            }
+        }
+        Ok(update)
     }
 
     pub fn encoded_len(&self) -> usize {
@@ -553,6 +567,86 @@ impl<'de, R: BufRead + 'de> postcard::de_flavors::Flavor<'de> for StreamFlavor<'
 
     fn finalize(self) -> postcard::Result<()> {
         Ok(())
+    }
+}
+
+/// The source paths of decoded spans. Decoding gives every span its own copy
+/// of its path; this makes spans of the same file share one.
+#[derive(Default)]
+struct SpanPaths {
+    paths: Vec<Arc<Path>>,
+    /// The index of the path matched last.
+    last: usize,
+}
+
+impl SpanPaths {
+    fn share(&mut self, span: &mut Span) {
+        let path = span.path.as_os_str();
+        let index = match self.paths.get(self.last) {
+            Some(last) if last.as_os_str() == path => self.last,
+            _ => match self
+                .paths
+                .iter()
+                .position(|known| known.as_os_str() == path)
+            {
+                Some(index) => index,
+                None => {
+                    self.paths.push(span.path.clone());
+                    self.paths.len() - 1
+                }
+            },
+        };
+        self.last = index;
+        if !Arc::ptr_eq(&self.paths[index], &span.path) {
+            span.path = self.paths[index].clone();
+        }
+    }
+
+    fn share_opt(&mut self, span: &mut Option<Span>) {
+        if let Some(span) = span {
+            self.share(span);
+        }
+    }
+
+    /// Shares the paths of the spans a cell holds in bulk: those of emits,
+    /// objects, used fallbacks, and schematic elements.
+    fn share_cell(&mut self, cell: &mut CompiledCell) {
+        for scope in cell.scopes.values_mut() {
+            for (_, emit) in scope.emit.iter_mut() {
+                self.share(&mut emit.span);
+            }
+        }
+        for object in cell.objects.values_mut() {
+            match object {
+                SolvedValue::Rect(rect) => self.share_opt(&mut rect.span),
+                SolvedValue::Polygon(polygon) => self.share_opt(&mut polygon.span),
+                SolvedValue::Path(path) => self.share_opt(&mut path.span),
+                SolvedValue::Text(text) => self.share_opt(&mut text.span),
+                SolvedValue::Dimension(dimension) => self.share_opt(&mut dimension.span),
+                SolvedValue::Instance(instance) => self.share(&mut instance.span),
+            }
+        }
+        for fallback in &mut cell.fallback_constraints_used {
+            self.share(&mut fallback.span);
+        }
+        let schematic = &mut cell.schematic;
+        for instance in &mut schematic.instances {
+            self.share_opt(&mut instance.span);
+        }
+        for device in &mut schematic.devices {
+            self.share_opt(&mut device.span);
+            for span in &mut device.terminal_spans {
+                self.share_opt(span);
+            }
+        }
+        for connection in &mut schematic.connections {
+            self.share(&mut connection.span);
+        }
+        for node in &mut schematic.nodes {
+            if let NodeSource::Signal { span, .. } = &mut node.source {
+                self.share(span);
+            }
+        }
     }
 }
 

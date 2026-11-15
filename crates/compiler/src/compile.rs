@@ -4,7 +4,7 @@
 //! Pass 2: assign variable IDs/type checking
 //! Pass 3: solving
 use std::cell::RefCell;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
@@ -27,6 +27,7 @@ mod direct;
 mod foreign;
 mod ops;
 mod result;
+mod route;
 mod schematic;
 mod symbol;
 
@@ -208,6 +209,8 @@ enum Builtin {
     Dimension,
     Inst,
     Bbox,
+    Shapes,
+    RouteTracks,
     Signal,
     Connect,
     Device,
@@ -266,6 +269,8 @@ impl Builtin {
             Self::Dimension => Native::Dimension,
             Self::Inst => Native::LayoutInst,
             Self::Bbox => Native::Bbox,
+            Self::Shapes => Native::Shapes,
+            Self::RouteTracks => Native::RouteTracks,
             Self::Signal => Native::Signal,
             Self::Connect => Native::Connect,
             Self::Device => Native::Device,
@@ -312,6 +317,8 @@ impl Builtin {
             Native::Dimension => Self::Dimension,
             Native::LayoutInst => Self::Inst,
             Native::Bbox => Self::Bbox,
+            Native::Shapes => Self::Shapes,
+            Native::RouteTracks => Self::RouteTracks,
             Native::Signal => Self::Signal,
             Native::Connect => Self::Connect,
             Native::Device => Self::Device,
@@ -357,10 +364,12 @@ pub enum Native {
     SymbolInstName,
     SymbolParam,
     SymbolPin,
+    Shapes,
+    RouteTracks,
 }
 
 impl Native {
-    pub const ALL: [Native; 22] = [
+    pub const ALL: [Native; 24] = [
         Native::Rect,
         Native::Crect,
         Native::Polygon,
@@ -369,6 +378,8 @@ impl Native {
         Native::Dimension,
         Native::LayoutInst,
         Native::Bbox,
+        Native::Shapes,
+        Native::RouteTracks,
         Native::Signal,
         Native::Connect,
         Native::Device,
@@ -395,7 +406,9 @@ impl Native {
             | Native::Text
             | Native::Dimension
             | Native::LayoutInst
-            | Native::Bbox => &["std", "layout"],
+            | Native::Bbox
+            | Native::Shapes
+            | Native::RouteTracks => &["std", "layout"],
             Native::Signal
             | Native::Connect
             | Native::Device
@@ -424,6 +437,8 @@ impl Native {
             Native::Dimension => "dimension",
             Native::LayoutInst => "inst",
             Native::Bbox => "bbox",
+            Native::Shapes => "shapes",
+            Native::RouteTracks => "route_tracks",
             Native::Signal => "Signal",
             Native::Connect => "connect",
             Native::Device => "device",
@@ -515,9 +530,111 @@ pub fn module_prefix<'a>(
     }
 }
 
+/// The modules a module imports with `use`, by the name each import binds.
+///
+/// After `use lib::shapes;`, a path of the importing module whose first
+/// segment is `shapes` resolves inside `lib::shapes`. Paths in other modules
+/// and in `use` declarations are unaffected.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModuleImports(IndexMap<String, ModPath>);
+
+impl ModuleImports {
+    /// The module imports among `decls`, the declarations of `current`.
+    /// `is_module` says whether a path names a module of the workspace.
+    pub fn new<S: AsRef<str>, M: AstMetadata>(
+        current: &ModPath,
+        decls: &[Decl<S, M>],
+        is_module: impl Fn(&ModPath) -> bool,
+    ) -> Self {
+        let mut imports = IndexMap::new();
+        for decl in decls {
+            let Decl::Use(use_decl) = decl else {
+                continue;
+            };
+            let Some(module) = imported_module(current, use_decl, &is_module) else {
+                continue;
+            };
+            let name = use_decl.local_name().name.as_ref();
+            // `lib` and `std` always start an absolute path.
+            if name != "lib" && name != "std" {
+                imports.insert(name.to_owned(), module);
+            }
+        }
+        Self(imports)
+    }
+
+    /// The module imported as `name`, if any.
+    pub fn get(&self, name: &str) -> Option<&ModPath> {
+        self.0.get(name)
+    }
+
+    /// Each import's name and module, in declaration order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &ModPath)> {
+        self.0.iter().map(|(name, module)| (name.as_str(), module))
+    }
+
+    /// [`module_prefix`], reading a first segment that names an import as the
+    /// module it imports.
+    pub fn module_prefix<'a>(
+        &self,
+        current: &ModPath,
+        path: impl IntoIterator<Item = &'a str>,
+        items: usize,
+    ) -> ModPath {
+        let path: Vec<&str> = path.into_iter().collect();
+        if path.len() > items
+            && let Some(module) = self.get(path[0])
+        {
+            return module
+                .iter()
+                .cloned()
+                .chain(
+                    path[1..path.len() - items]
+                        .iter()
+                        .map(|name| name.to_string()),
+                )
+                .collect();
+        }
+        module_prefix(current, path, items)
+    }
+}
+
+/// The module `use_decl`, declared in `current`, imports, if its whole path
+/// names one.
+pub fn imported_module<S: AsRef<str>, M: AstMetadata>(
+    current: &ModPath,
+    use_decl: &UseDecl<S, M>,
+    is_module: impl Fn(&ModPath) -> bool,
+) -> Option<ModPath> {
+    let module = module_prefix(
+        current,
+        use_decl.path.iter().map(|ident| ident.name.as_ref()),
+        0,
+    );
+    is_module(&module).then_some(module)
+}
+
 pub fn static_compile(
     ast: &WorkspaceParseAst,
 ) -> Option<(TypedWorkspace, StaticErrorCompileOutput)> {
+    static_compile_with(ast, true)
+}
+
+/// Like [`static_compile`], giving a typed module span indexes only when
+/// `span_indexes` is set and its parsed module has them.
+pub(crate) fn static_compile_with(
+    ast: &WorkspaceParseAst,
+    span_indexes: bool,
+) -> Option<(TypedWorkspace, StaticErrorCompileOutput)> {
+    static_compile_keeping_scope(ast, span_indexes).map(|(typed, output, _)| (typed, output))
+}
+
+/// [`static_compile_with`], also returning the [`RootScope`] the typing ended
+/// with when it ran.
+fn static_compile_keeping_scope(
+    ast: &WorkspaceParseAst,
+    span_indexes: bool,
+) -> Option<(TypedWorkspace, StaticErrorCompileOutput, Option<RootScope>)> {
     if !ast.contains_key(&vec![]) {
         return None;
     }
@@ -529,11 +646,12 @@ pub fn static_compile(
         return Some((
             TypedWorkspace::default(),
             StaticErrorCompileOutput { errors },
+            None,
         ));
     }
-    let (ast, new_errors) = execute_var_id_ty_pass(ast, &dag);
+    let (ast, new_errors, scope) = execute_var_id_ty_pass(ast, &dag, span_indexes);
     errors.extend(new_errors);
-    Some((ast, StaticErrorCompileOutput { errors }))
+    Some((ast, StaticErrorCompileOutput { errors }, Some(scope)))
 }
 
 /// A type-checked workspace: the annotated modules and the struct and enum
@@ -557,28 +675,40 @@ impl std::ops::Deref for TypedWorkspace {
 /// Runs static analysis for a parsed workspace and folds parser diagnostics
 /// into the same error collection as import and type-checking errors.
 pub fn analyze_workspace(parse_output: ParseOutput) -> StaticAnalysis {
-    let parse_errors = parse_output.static_errors();
-    let ast = parse_output.ast();
-    let (typed_ast, errors) = match static_compile(&ast) {
-        Some((typed_ast, mut output)) => {
-            output.errors.extend(parse_errors);
-            (Some(typed_ast), output.errors)
-        }
-        None => (None, parse_errors),
-    };
-    StaticAnalysis {
-        ast,
-        typed_ast,
-        errors,
-    }
+    analyze_workspace_with(parse_output, true).0
 }
 
+/// Like [`analyze_workspace`], giving the typed AST span indexes only when
+/// `typed_span_indexes` is set, and also returning the [`RootScope`] the
+/// typing ended with. See [`static_compile_with`].
+pub(crate) fn analyze_workspace_with(
+    parse_output: ParseOutput,
+    typed_span_indexes: bool,
+) -> (StaticAnalysis, Option<RootScope>) {
+    let parse_errors = parse_output.static_errors();
+    let ast = parse_output.ast();
+    let (typed_ast, errors, scope) = match static_compile_keeping_scope(&ast, typed_span_indexes) {
+        Some((typed_ast, mut output, scope)) => {
+            output.errors.extend(parse_errors);
+            (Some(Arc::new(typed_ast)), output.errors, scope)
+        }
+        None => (None, parse_errors, None),
+    };
+    let analysis = StaticAnalysis {
+        ast: Arc::new(ast),
+        typed_ast,
+        errors,
+    };
+    (analysis, scope)
+}
+
+/// The result of static analysis. The trees are shared, so a clone is cheap.
 #[derive(Clone)]
 pub struct StaticAnalysis {
     /// Parsed source AST used for source-aware tooling.
-    pub ast: WorkspaceParseAst,
+    pub ast: Arc<WorkspaceParseAst>,
     /// Type-annotated AST, absent only when the workspace has no root module.
-    pub typed_ast: Option<TypedWorkspace>,
+    pub typed_ast: Option<Arc<TypedWorkspace>>,
     /// Parser, import-resolution, and type-checking diagnostics.
     pub errors: Vec<StaticError>,
 }
@@ -688,6 +818,7 @@ fn execute_cell_invocation_once(
     let items = Arc::new(ItemIndex::build(ast));
     execute_invocation(
         ast,
+        None,
         invocation,
         config,
         Some(SessionCaches {
@@ -708,11 +839,24 @@ pub fn execute_cell_invocation_cached(
     config: &WorkspaceConfig,
     session: Option<SessionCaches<'_>>,
 ) -> CompileOutput {
-    execute_invocation(ast, invocation, config, session, true)
+    execute_invocation(ast, None, invocation, config, session, true)
+}
+
+/// [`execute_cell_invocation_cached`] for an entry cell typed by
+/// [`RootScope::type_cell`] rather than spliced into `ast`.
+pub(crate) fn execute_appended_invocation_cached(
+    ast: &TypedWorkspace,
+    entry: &CellDecl<Substr, VarIdTyMetadata>,
+    invocation: &CellInvocation,
+    config: &WorkspaceConfig,
+    session: Option<SessionCaches<'_>>,
+) -> CompileOutput {
+    execute_invocation(ast, Some(entry), invocation, config, session, true)
 }
 
 fn execute_invocation(
     ast: &TypedWorkspace,
+    entry: Option<&CellDecl<Substr, VarIdTyMetadata>>,
     invocation: &CellInvocation,
     config: &WorkspaceConfig,
     session: Option<SessionCaches<'_>>,
@@ -731,6 +875,9 @@ fn execute_invocation(
     let mut pass = ExecPass::new(ast, tech, &config.gds_imports, &config.wasm_modules);
     if !debug_info {
         pass = pass.without_debug_info();
+    }
+    if let Some(entry) = entry {
+        pass = pass.with_appended_cell(entry);
     }
     let mut checks = None;
     if let Some(session) = session {
@@ -834,23 +981,48 @@ pub(crate) struct ImportPass<'a> {
     /// declarations, its imports, and the prelude. `Name::Variant` on one of
     /// them is an enum variant rather than a module item.
     local_items: IndexSet<&'a str>,
+    /// The modules this module imports with `use`.
+    imports: ModuleImports,
     deps: IndexMap<&'a ModPath, cfgrammar::Span>,
     errors: Vec<StaticError>,
+    /// Imports of an item its module does not have. The type checker reports
+    /// them, unless the module graph is invalid and typing never runs.
+    unresolved_imports: Vec<StaticError>,
 }
 
 pub(crate) fn construct_dag(ast: &WorkspaceParseAst) -> (ModDag<'_>, Vec<StaticError>) {
     let mut errors = Vec::new();
+    let mut unresolved_imports = Vec::new();
     let dag = ast
         .keys()
         .map(|path| {
-            let (children, new_errors) = ImportPass::new(ast, path).execute();
-            errors.extend(new_errors);
-
-            (path, children)
+            let pass = ImportPass::new(ast, path).execute();
+            errors.extend(pass.errors);
+            unresolved_imports.extend(pass.unresolved_imports);
+            (path, pass.deps)
         })
         .collect();
     errors.extend(dependency_cycle_errors(ast, &dag));
+    // A misspelled module import surfaces as missing modules where its name
+    // is used, so report the import as well.
+    if !errors.is_empty() {
+        errors.extend(unresolved_imports);
+    }
     (dag, errors)
+}
+
+/// Whether `module` declares or imports an item named `name`.
+fn declares_item(ast: &WorkspaceParseAst, module: &ModPath, name: &str) -> bool {
+    ast.get(module).is_some_and(|module| {
+        module.ast.decls.iter().any(|decl| match decl {
+            Decl::Enum(e) => e.name.name == name,
+            Decl::Struct(s) => s.name.name == name,
+            Decl::Fn(f) => f.name.name == name,
+            Decl::Cell(c) => c.name.name == name,
+            Decl::Use(u) => u.local_name().name == name,
+            Decl::Mod(_) | Decl::Constant(_) => false,
+        })
+    })
 }
 
 fn module_name(path: &ModPath) -> String {
@@ -944,12 +1116,17 @@ impl<'a> ImportPass<'a> {
             })
             .chain(["Option"])
             .collect();
+        let imports = ModuleImports::new(current_path, &ast[current_path].ast.decls, |module| {
+            ast.contains_key(module)
+        });
         Self {
             ast,
             current_path,
             local_items,
+            imports,
             deps: Default::default(),
             errors: Default::default(),
+            unresolved_imports: Vec::new(),
         }
     }
 
@@ -978,7 +1155,7 @@ impl<'a> ImportPass<'a> {
         }
     }
 
-    pub(crate) fn execute(mut self) -> (IndexMap<&'a ModPath, cfgrammar::Span>, Vec<StaticError>) {
+    pub(crate) fn execute(mut self) -> Self {
         for decl in &self.ast[self.current_path].ast.decls {
             match decl {
                 Decl::Fn(f) => {
@@ -988,9 +1165,7 @@ impl<'a> ImportPass<'a> {
                     self.transform_cell_decl(c);
                 }
                 Decl::Mod(_) => {}
-                Decl::Use(u) => {
-                    self.record_qualified_path(&u.path, u.span, false);
-                }
+                Decl::Use(u) => self.record_use_decl(u),
                 Decl::Enum(e) => {
                     self.transform_enum_decl(e);
                 }
@@ -1002,8 +1177,47 @@ impl<'a> ImportPass<'a> {
                 Decl::Constant(_) => continue,
             }
         }
+        self
+    }
 
-        (self.deps, self.errors)
+    /// Records the modules a `use` declaration needs: the module it imports,
+    /// or the module of the item it imports, or both when the path names a
+    /// module and its parent also declares an item of that name. A `use`
+    /// path never starts with a module import.
+    fn record_use_decl(&mut self, use_decl: &UseDecl<Substr, ParseMetadata>) {
+        let path = &use_decl.path;
+        let names = || path.iter().map(|ident| ident.name.as_str());
+        if let Some(module) = imported_module(self.current_path, use_decl, |module| {
+            self.ast.contains_key(module)
+        }) {
+            if module.first().is_none_or(|first| first != "std") {
+                self.record_dependency(module, use_decl.span);
+            }
+            let parent = module_prefix(self.current_path, names(), 1);
+            let item = path.last().expect("use paths are non-empty");
+            if !declares_item(self.ast, &parent, &item.name) {
+                return;
+            }
+        }
+        if path.len() < 2 || path[0].name == "std" {
+            return;
+        }
+        let item_module = module_prefix(self.current_path, names(), 1);
+        let enum_module = module_prefix(self.current_path, names(), 2);
+        let item = &path[path.len() - 1].name;
+        if item_module != *self.current_path
+            && self.ast.contains_key(&item_module)
+            && !declares_item(self.ast, &item_module, item)
+            && !["Option", "Some", "None"].contains(&item.as_str())
+        {
+            self.unresolved_imports.push(StaticError {
+                span: self.span(use_decl.span),
+                kind: StaticErrorKind::UnresolvedImport {
+                    path: names().join("::"),
+                },
+            });
+        }
+        self.record_path_modules(path, use_decl.span, item_module, enum_module, false);
     }
 
     /// Records the module a qualified path names: the path less one segment
@@ -1020,9 +1234,29 @@ impl<'a> ImportPass<'a> {
         if path.len() < 2 || path[0].name == "std" {
             return;
         }
+        // `std` modules are typed before any other, so they are never an edge.
+        if self
+            .imports
+            .get(&path[0].name)
+            .is_some_and(|module| module.first().is_some_and(|first| first == "std"))
+        {
+            return;
+        }
         let names = || path.iter().map(|ident| ident.name.as_str());
-        let item_module = module_prefix(self.current_path, names(), 1);
-        let enum_module = module_prefix(self.current_path, names(), 2);
+        let item_module = self.imports.module_prefix(self.current_path, names(), 1);
+        let enum_module = self.imports.module_prefix(self.current_path, names(), 2);
+        self.record_path_modules(path, span, item_module, enum_module, lenient);
+    }
+
+    /// [`Self::record_qualified_path`] once the path's two readings are known.
+    fn record_path_modules(
+        &mut self,
+        path: &[Ident<Substr, ParseMetadata>],
+        span: cfgrammar::Span,
+        item_module: ModPath,
+        enum_module: ModPath,
+        lenient: bool,
+    ) {
         let local_enum = enum_module == *self.current_path
             && self
                 .local_items
@@ -1335,7 +1569,7 @@ fn run_output_checks(
     checks: Option<&mut CheckCache>,
     errs: &mut Vec<ExecError>,
 ) {
-    let mut layers = IndexSet::new();
+    let mut layers = FxIndexSet::default();
     for layer in &data.tech.layers {
         layers.insert(layer.name.clone());
     }
@@ -1379,7 +1613,7 @@ fn run_output_checks(
 fn check_cell_layers(
     cell_id: CellId,
     cell: &CompiledCell,
-    layers: &IndexSet<String>,
+    layers: &FxIndexSet<String>,
     tech_file: &FsPath,
     errs: &mut Vec<ExecError>,
 ) {
@@ -1392,7 +1626,7 @@ fn check_cell_layers(
 fn check_object_layer(
     cell_id: CellId,
     obj: &SolvedValue,
-    layers: &IndexSet<String>,
+    layers: &FxIndexSet<String>,
     tech_file: &FsPath,
     errs: &mut Vec<ExecError>,
 ) {
@@ -1624,7 +1858,10 @@ struct CellField {
 
 pub(crate) struct VarIdTyPass<'a> {
     ast: &'a AnnotatedAst<ParseMetadata>,
-    mod_bindings: &'a IndexMap<&'a ModPath, VarIdTyFrame>,
+    /// Whether the typed module gets span indexes, which it then has when
+    /// `ast` does.
+    span_indexes: bool,
+    mod_bindings: &'a IndexMap<ModPath, VarIdTyFrame>,
     /// Fields of the cells of every module typed before this one.
     cell_fields: &'a IndexMap<VarId, CellFields>,
     /// Struct and enum definitions of every module typed before this one.
@@ -1638,6 +1875,8 @@ pub(crate) struct VarIdTyPass<'a> {
     /// Inference variables of the unit being typed.
     infer: InferCtx,
     current_path: &'a ModPath,
+    /// The modules this module imports with `use`.
+    imports: ModuleImports,
     next_id: VarId,
     bindings: Vec<VarIdTyFrame>,
     errors: Vec<StaticError>,
@@ -1775,8 +2014,8 @@ struct Attempt {
 }
 
 /// State shared by every module of a workspace while it is typed.
-struct WorkspaceTyping<'a> {
-    mod_bindings: IndexMap<&'a ModPath, VarIdTyFrame>,
+struct WorkspaceTyping {
+    mod_bindings: IndexMap<ModPath, VarIdTyFrame>,
     /// Fields of every fully typed cell, by the cell's id.
     cell_fields: IndexMap<VarId, CellFields>,
     /// Struct and enum definitions of every typed module.
@@ -1786,13 +2025,19 @@ struct WorkspaceTyping<'a> {
     ast: WorkspaceAst<VarIdTyMetadata>,
     errors: Vec<StaticError>,
     next_id: VarId,
+    /// Whether typed modules get span indexes. See [`static_compile_with`].
+    span_indexes: bool,
 }
 
+/// Types every module of `ast`, returning the typed workspace, its diagnostics,
+/// and the state [`RootScope::type_cell`] continues from.
 pub(crate) fn execute_var_id_ty_pass<'a>(
     ast: &'a WorkspaceParseAst,
     dag: &'a ModDag<'a>,
-) -> (TypedWorkspace, Vec<StaticError>) {
+    span_indexes: bool,
+) -> (TypedWorkspace, Vec<StaticError>, RootScope) {
     let mut typing = WorkspaceTyping {
+        span_indexes,
         mod_bindings: IndexMap::new(),
         cell_fields: IndexMap::new(),
         type_defs: TypeDefs::new(),
@@ -1812,6 +2057,16 @@ pub(crate) fn execute_var_id_ty_pass<'a>(
             execute_var_id_ty_pass_inner(ast, dag, path, &mut typing);
         }
     }
+    let scope = RootScope {
+        mod_bindings: typing.mod_bindings,
+        cell_fields: typing.cell_fields,
+        next_id: typing.next_id,
+        root_deps: dag
+            .get(&ModPath::new())
+            .into_iter()
+            .flat_map(|deps| deps.keys().map(|path| (*path).clone()))
+            .collect(),
+    };
     (
         TypedWorkspace {
             ast: typing.ast,
@@ -1819,22 +2074,105 @@ pub(crate) fn execute_var_id_ty_pass<'a>(
             natives: Arc::new(typing.natives),
         },
         typing.errors,
+        scope,
     )
+}
+
+/// The typing state a whole-workspace pass ends with, from which one more cell
+/// of the root module is typed without typing the workspace again.
+pub(crate) struct RootScope {
+    mod_bindings: IndexMap<ModPath, VarIdTyFrame>,
+    cell_fields: IndexMap<VarId, CellFields>,
+    next_id: VarId,
+    /// The modules the root module refers to.
+    root_deps: IndexSet<ModPath>,
+}
+
+impl RootScope {
+    /// Types `entry`, whose only declaration is a cell appended to the root
+    /// module of `ast`, as typing the whole extended workspace would.
+    ///
+    /// The cell's ids follow every id of `typed`, which keeps the ids of
+    /// `typed` valid. Returns `None` when the cell refers to a module the root
+    /// module does not, since that changes the order modules are typed in.
+    pub(crate) fn type_cell(
+        &self,
+        ast: &WorkspaceParseAst,
+        typed: &TypedWorkspace,
+        entry: &AnnotatedAst<ParseMetadata>,
+    ) -> Option<Result<CellDecl<Substr, VarIdTyMetadata>, Vec<StaticError>>> {
+        let [Decl::Cell(decl)] = entry.ast.decls.as_slice() else {
+            return None;
+        };
+        let (root, _) = ast.get_key_value(&ModPath::new())?;
+        let mut imports = ImportPass::new(ast, root);
+        imports.local_items.insert(decl.name.name.as_str());
+        imports.transform_cell_decl(decl);
+        if !imports.errors.is_empty()
+            || imports
+                .deps
+                .keys()
+                .any(|module| !self.root_deps.contains(*module))
+        {
+            return None;
+        }
+        // Only `std` modules bind natives, so typing a cell adds none.
+        let mut natives = (*typed.natives).clone();
+        let mut pass = VarIdTyPass {
+            ast: entry,
+            span_indexes: false,
+            mod_bindings: &self.mod_bindings,
+            cell_fields: &self.cell_fields,
+            type_defs: &typed.defs,
+            natives: &mut natives,
+            local_defs: TypeDefs::new(),
+            struct_decls: IndexMap::new(),
+            infer: InferCtx::default(),
+            current_path: root,
+            imports: ModuleImports::new(root, &ast[root].ast.decls, |module| {
+                ast.contains_key(module)
+            }),
+            next_id: self.next_id,
+            bindings: vec![self.mod_bindings.get(root)?.clone()],
+            errors: vec![],
+            cells: IndexMap::new(),
+            decl_cells: IndexMap::new(),
+            decl_adts: IndexMap::new(),
+            finished_cell_fields: IndexMap::new(),
+            goals: Vec::new(),
+            poisoned: IndexSet::new(),
+            attempt: None,
+        };
+        pass.declare_cell_decl(0, decl);
+        let cell = pass.decl_cells[&0];
+        pass.goals.push(Goal {
+            cell,
+            target: None,
+            attempting: None,
+        });
+        pass.run_goals();
+        let typed_decl = pass.finish_cell(cell);
+        Some(if pass.errors.is_empty() {
+            Ok(typed_decl)
+        } else {
+            Err(pass.errors)
+        })
+    }
 }
 
 fn execute_var_id_ty_pass_inner<'a>(
     ast: &'a WorkspaceParseAst,
     dag: &'a ModDag<'a>,
     current_path: &'a ModPath,
-    typing: &mut WorkspaceTyping<'a>,
+    typing: &mut WorkspaceTyping,
 ) {
     // TODO: fix hacky way to track visited modules.
-    if typing.mod_bindings.contains_key(&current_path) {
+    if typing.mod_bindings.contains_key(current_path) {
         return;
     }
     typing
         .mod_bindings
-        .insert(current_path, VarIdTyFrame::default());
+        .insert(current_path.clone(), VarIdTyFrame::default());
 
     for children in dag[&current_path].keys() {
         execute_var_id_ty_pass_inner(ast, dag, children, typing);
@@ -1842,6 +2180,7 @@ fn execute_var_id_ty_pass_inner<'a>(
 
     let mut pass = VarIdTyPass {
         ast: &ast[current_path],
+        span_indexes: typing.span_indexes,
         mod_bindings: &typing.mod_bindings,
         cell_fields: &typing.cell_fields,
         type_defs: &typing.type_defs,
@@ -1850,6 +2189,9 @@ fn execute_var_id_ty_pass_inner<'a>(
         struct_decls: IndexMap::new(),
         infer: InferCtx::default(),
         current_path,
+        imports: ModuleImports::new(current_path, &ast[current_path].ast.decls, |module| {
+            ast.contains_key(module)
+        }),
         next_id: typing.next_id,
         bindings: vec![VarIdTyFrame::default()],
         errors: vec![],
@@ -1870,7 +2212,9 @@ fn execute_var_id_ty_pass_inner<'a>(
     let local_defs = pass.local_defs;
     typing.cell_fields.extend(cell_fields);
     typing.type_defs.extend(local_defs);
-    typing.mod_bindings.insert(current_path, module_frame);
+    typing
+        .mod_bindings
+        .insert(current_path.clone(), module_frame);
 }
 
 #[derive(Debug, Clone)]
@@ -2756,6 +3100,41 @@ mod builtin_sig {
             Ty::Bool,
         ])
     });
+    /// A cell or instance, which has no nameable type, then a layer name.
+    pub(super) static SHAPES: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::Any, Ty::String]));
+
+    fn list(item: Ty) -> Ty {
+        Ty::Seq(Box::new(item))
+    }
+
+    /// A layer index and a rectangle on it.
+    fn layer_rect() -> Ty {
+        Ty::Tuple(vec![Ty::Int, Ty::Rect])
+    }
+
+    /// The area; `(width, space, horizontal)` per layer; `(size, space,
+    /// bot_enc, top_enc)` per via; obstacles; and `(name, pins)` per net.
+    pub(super) static ROUTE_TRACKS: LazyLock<Signature> = LazyLock::new(|| {
+        let pair = || Ty::Tuple(vec![Ty::Float, Ty::Float]);
+        Signature::positional([
+            Ty::Rect,
+            list(Ty::Tuple(vec![Ty::Float, Ty::Float, Ty::Bool])),
+            list(Ty::Tuple(vec![Ty::Float, Ty::Float, pair(), pair()])),
+            list(layer_rect()),
+            list(Ty::Tuple(vec![Ty::String, list(layer_rect())])),
+        ])
+    });
+
+    /// Per net: its wires, its vias as `(lower layer, cuts, lower landing,
+    /// upper landing)`, and its pin stubs.
+    pub(super) fn route_tracks_result() -> Ty {
+        list(Ty::Tuple(vec![
+            list(layer_rect()),
+            list(Ty::Tuple(vec![Ty::Int, list(Ty::Rect), Ty::Rect, Ty::Rect])),
+            list(layer_rect()),
+        ]))
+    }
     /// The single positional parameter is a cell, which has no nameable type;
     /// `Ty::Any` checks the arity and leaves the category to
     /// `assert_ty_is_cell`.
@@ -3104,14 +3483,15 @@ impl<'a> VarIdTyPass<'a> {
             }
         }
 
-        let mut annotated = AnnotatedAst::new(
-            self.ast.text.clone(),
-            &Ast {
-                decls,
-                span: self.ast.ast.span,
-            },
-            self.ast.path.clone(),
-        );
+        let ast = Ast {
+            decls,
+            span: self.ast.ast.span,
+        };
+        let mut annotated = if self.span_indexes && self.ast.has_span_indexes() {
+            AnnotatedAst::new(self.ast.text.clone(), &ast, self.ast.path.clone())
+        } else {
+            AnnotatedAst::without_span_indexes(self.ast.text.clone(), ast, self.ast.path.clone())
+        };
         // Re-annotating starts from a clean slate; carry over what describes
         // the file rather than the declarations that were just transformed.
         annotated.source_text = self.ast.source_text.clone();
@@ -3670,22 +4050,39 @@ impl<'a> VarIdTyPass<'a> {
     /// is already invalid.
     ///
     /// Modules are exempt: `mod m;` is resolved through `mod_bindings`, never
-    /// through this frame, so `mod m;` and `fn m` do not collide.
+    /// through this frame, so `mod m;` and `fn m` do not collide. A `mod m;`
+    /// and an import of another module as `m` do, since both start paths.
     fn check_duplicate_decls(&mut self) {
         let mut seen = IndexSet::new();
+        // The module each name binds, by `mod` or by an import of a module.
+        let mut modules = IndexMap::new();
         for decl in &self.ast.ast.decls {
-            let name = match decl {
-                Decl::Enum(e) => &e.name,
-                Decl::Struct(s) => &s.name,
-                Decl::Fn(f) => &f.name,
-                Decl::Cell(c) => &c.name,
-                Decl::Use(u) => u
-                    .alias
-                    .as_ref()
-                    .unwrap_or_else(|| u.path.last().expect("use paths are non-empty")),
-                Decl::Mod(_) | Decl::Constant(_) => continue,
+            let (name, module) = match decl {
+                Decl::Enum(e) => (&e.name, None),
+                Decl::Struct(s) => (&s.name, None),
+                Decl::Fn(f) => (&f.name, None),
+                Decl::Cell(c) => (&c.name, None),
+                Decl::Use(u) => (
+                    u.local_name(),
+                    imported_module(self.current_path, u, |module| {
+                        self.mod_bindings.contains_key(module)
+                    }),
+                ),
+                Decl::Mod(m) => {
+                    let mut child = self.current_path.clone();
+                    child.push(m.ident.name.to_string());
+                    (&m.ident, Some(child))
+                }
+                Decl::Constant(_) => continue,
             };
-            if !seen.insert(name.name.as_str()) {
+            let mut duplicate = !matches!(decl, Decl::Mod(_)) && !seen.insert(name.name.as_str());
+            if let Some(module) = module {
+                // A `mod` and an import may bind one name to the same module.
+                duplicate |= modules
+                    .insert(name.name.as_str(), module.clone())
+                    .is_some_and(|other| other != module);
+            }
+            if duplicate {
                 self.errors.push(StaticError {
                     span: self.span(name.span),
                     kind: StaticErrorKind::DuplicateNameDeclaration,
@@ -3832,13 +4229,45 @@ impl<'a> VarIdTyPass<'a> {
         &mut self,
         path: &[Ident<Substr, M>],
     ) -> Result<(VarId, Ty), QualifiedError> {
+        self.resolve_path(path, true)
+    }
+
+    /// Resolves the path of a `use`, which never starts with a module import.
+    fn resolve_import<M: AstMetadata>(
+        &mut self,
+        path: &[Ident<Substr, M>],
+    ) -> Result<(VarId, Ty), QualifiedError> {
+        self.resolve_path(path, false)
+    }
+
+    /// [`Self::resolve_qualified`], reading a first segment that names a
+    /// module import as that module only if `through_imports` is set.
+    fn resolve_path<M: AstMetadata>(
+        &mut self,
+        path: &[Ident<Substr, M>],
+        through_imports: bool,
+    ) -> Result<(VarId, Ty), QualifiedError> {
         let len = path.len();
         debug_assert!(len >= 2, "a qualified path has at least two segments");
         let names = || path.iter().map(|ident| ident.name.as_str());
-        let enum_module = module_prefix(self.current_path, names(), 2);
+        let prefix = |items| {
+            if through_imports {
+                self.imports
+                    .module_prefix(self.current_path, names(), items)
+            } else {
+                module_prefix(self.current_path, names(), items)
+            }
+        };
+        let enum_module = prefix(2);
         let enum_ident = &path[len - 2];
         let item = &path[len - 1];
-        if let Some((_, Ty::Enum(enum_ty))) = self.module_item(&enum_module, &enum_ident.name) {
+        // `name::item` reads `name` as an import of a module even where a
+        // local value of an enum type shares that name.
+        let imports_module =
+            through_imports && len == 2 && self.imports.get(&enum_ident.name).is_some();
+        if !imports_module
+            && let Some((_, Ty::Enum(enum_ty))) = self.module_item(&enum_module, &enum_ident.name)
+        {
             let variant = self
                 .adt_def(enum_ty.def)
                 .and_then(AdtDef::as_enum)
@@ -3859,7 +4288,7 @@ impl<'a> VarIdTyPass<'a> {
                 }),
             };
         }
-        let module = module_prefix(self.current_path, names(), 1);
+        let module = prefix(1);
         if let Some(binding) = self.module_item(&module, &item.name) {
             return Ok(binding);
         }
@@ -3962,8 +4391,33 @@ impl<'a> VarIdTyPass<'a> {
     }
 
     fn declare_use_decl(&mut self, use_decl: &UseDecl<Substr, ParseMetadata>) {
-        let item = use_decl.path.last().expect("use paths are non-empty");
-        let local_name = use_decl.alias.as_ref().unwrap_or(item);
+        let local_name = use_decl.local_name();
+        if imported_module(self.current_path, use_decl, |module| {
+            self.mod_bindings.contains_key(module)
+        })
+        .is_some()
+        {
+            // `ModuleImports` binds the module. `lib` and `std` always start
+            // an absolute path, so an import under either name is unusable.
+            if matches!(local_name.name.as_str(), "lib" | "std") {
+                self.errors.push(StaticError {
+                    span: self.span(local_name.span),
+                    kind: StaticErrorKind::RedeclarationOfBuiltin,
+                });
+            }
+            // The parent module may also have an item of that name, which is
+            // imported as well.
+            if !BUILTINS.contains(&local_name.name.as_str())
+                && let Ok(binding) = self.resolve_import(&use_decl.path)
+            {
+                self.bindings
+                    .last_mut()
+                    .unwrap()
+                    .var_bindings
+                    .insert(local_name.name.clone(), binding);
+            }
+            return;
+        }
         // A call of a one-segment builtin name types as the builtin before the
         // name is looked up, so an import under that name would be ignored.
         if BUILTINS.contains(&local_name.name.as_str()) {
@@ -3973,7 +4427,7 @@ impl<'a> VarIdTyPass<'a> {
             });
             return;
         }
-        match self.resolve_qualified(&use_decl.path) {
+        match self.resolve_import(&use_decl.path) {
             Ok(binding) => {
                 self.bindings
                     .last_mut()
@@ -5035,7 +5489,7 @@ impl<'a> VarIdTyPass<'a> {
                 // must still be fetched fallibly, as the sibling natives do.
                 if let Some(arg) = args.posargs.first() {
                     let argty = self.shallow(&arg.ty());
-                    if !matches!(argty, Ty::Cell(_) | Ty::Inst(_)) {
+                    if !matches!(argty, Ty::Cell(_) | Ty::Inst(_) | Ty::Any) {
                         self.errors.push(StaticError {
                             span: self.span(call_span),
                             kind: StaticErrorKind::IncorrectTyCategory {
@@ -5046,6 +5500,26 @@ impl<'a> VarIdTyPass<'a> {
                     }
                 }
                 Ty::Rect
+            }
+            Native::Shapes => {
+                self.typecheck_args(call_span, args, &builtin_sig::SHAPES);
+                if let Some(arg) = args.posargs.first() {
+                    let argty = self.shallow(&arg.ty());
+                    if !matches!(argty, Ty::Cell(_) | Ty::Inst(_) | Ty::Any) {
+                        self.errors.push(StaticError {
+                            span: self.span(arg.span()),
+                            kind: StaticErrorKind::IncorrectTyCategory {
+                                found: self.display(&argty),
+                                expected: "Cell/Inst".to_string(),
+                            },
+                        });
+                    }
+                }
+                Ty::Seq(Box::new(Ty::Rect))
+            }
+            Native::RouteTracks => {
+                self.typecheck_args(call_span, args, &builtin_sig::ROUTE_TRACKS);
+                builtin_sig::route_tracks_result()
             }
             Native::Dimension => {
                 self.typecheck_args(call_span, args, &builtin_sig::DIMENSION);
@@ -8243,6 +8717,10 @@ pub(crate) struct DynLoc {
 /// The fewest values created between two collections of a cell's values.
 const MIN_COLLECT_VALUES: ValueId = 1 << 20;
 
+/// The fewest values a cell creates for its garbage to be collected before
+/// it is emitted.
+const MIN_EMIT_COLLECT_VALUES: ValueId = 1 << 20;
+
 /// The most finished deferred-value boxes kept for reuse.
 const MAX_SPARE_EVALS: usize = 1 << 16;
 
@@ -8572,12 +9050,25 @@ struct CallSite {
 const VALUE_CHUNK_LEN: usize = 4096;
 type ValueChunk<'a> = Box<[Option<DeferValue<'a>>]>;
 
+/// The most emptied chunks kept for reuse.
+const MAX_SPARE_CHUNKS: usize = 32;
+
 struct ValueStore<'a> {
     chunks: Vec<Option<ValueChunk<'a>>>,
     /// Values of chunks that collection released, which had few live values.
     sparse: FxHashMap<ValueId, DeferValue<'a>>,
     /// Indices of the released chunks, whose values are found in `sparse`.
     sparse_chunks: ValueBits,
+    /// Emptied chunks, reused rather than allocated and cleared anew.
+    spare: Vec<ValueChunk<'a>>,
+}
+
+/// Empties `chunk` and keeps it in `spare` for reuse, if there is room.
+fn recycle_chunk<'a>(spare: &mut Vec<ValueChunk<'a>>, mut chunk: ValueChunk<'a>) {
+    if spare.len() < MAX_SPARE_CHUNKS {
+        chunk.iter_mut().for_each(|value| *value = None);
+        spare.push(chunk);
+    }
 }
 
 impl<'a> ValueStore<'a> {
@@ -8586,6 +9077,7 @@ impl<'a> ValueStore<'a> {
             chunks: Vec::new(),
             sparse: FxHashMap::default(),
             sparse_chunks: ValueBits::default(),
+            spare: Vec::new(),
         };
         for (id, value) in initial {
             store.insert(id, value);
@@ -8607,11 +9099,14 @@ impl<'a> ValueStore<'a> {
         while self.chunks.len() <= chunk {
             self.chunks.push(None);
         }
+        let spare = &mut self.spare;
         let values = self.chunks[chunk].get_or_insert_with(|| {
-            std::iter::repeat_with(|| None)
-                .take(VALUE_CHUNK_LEN)
-                .collect::<Vec<_>>()
-                .into_boxed_slice()
+            spare.pop().unwrap_or_else(|| {
+                std::iter::repeat_with(|| None)
+                    .take(VALUE_CHUNK_LEN)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            })
         });
         &mut values[id % VALUE_CHUNK_LEN]
     }
@@ -8727,13 +9222,14 @@ impl<'a> ValueStore<'a> {
             if (index + 1) * VALUE_CHUNK_LEN > end as usize || kept > VALUE_CHUNK_LEN / 16 {
                 continue;
             }
-            let chunk = self.chunks[index].take().expect("checked above");
-            for (offset, value) in chunk.into_vec().into_iter().enumerate() {
-                if let Some(value) = value {
+            let mut chunk = self.chunks[index].take().expect("checked above");
+            for (offset, value) in chunk.iter_mut().enumerate() {
+                if let Some(value) = value.take() {
                     self.sparse
                         .insert((index * VALUE_CHUNK_LEN + offset) as ValueId, value);
                 }
             }
+            recycle_chunk(&mut self.spare, chunk);
             self.sparse_chunks.insert(index as u64);
         }
         self.sparse.retain(|id, _| {
@@ -8747,41 +9243,70 @@ impl<'a> ValueStore<'a> {
         remaining
     }
 
-    /// Remove a monotonic allocation range and release every completely
-    /// covered chunk rather than leaving a large array of empty enum slots.
-    fn remove_range(&mut self, start: ValueId, end: ValueId, preserve: &HashSet<ValueId>) {
+    /// Removes the values in `start..end` other than those in `keep`, freeing
+    /// each chunk the range empties entirely. Values moved to `sparse` are
+    /// left to [`Self::remove_sparse`].
+    fn remove_range(&mut self, start: ValueId, end: ValueId, keep: &BTreeSet<ValueId>) {
         if start >= end {
             return;
         }
-        if !self.sparse.is_empty() {
-            self.sparse
-                .retain(|id, _| !(start..end).contains(id) || preserve.contains(id));
-        }
         let start = usize::try_from(start).expect("value ID does not fit usize");
         let end = usize::try_from(end).expect("value ID does not fit usize");
-        let first_chunk = start / VALUE_CHUNK_LEN;
-        let last_chunk = (end - 1) / VALUE_CHUNK_LEN;
-        for chunk_index in first_chunk..=last_chunk {
+        for chunk_index in start / VALUE_CHUNK_LEN..=(end - 1) / VALUE_CHUNK_LEN {
             let Some(chunk) = self.chunks.get_mut(chunk_index) else {
                 break;
             };
             let chunk_start = chunk_index * VALUE_CHUNK_LEN;
-            let from = start.saturating_sub(chunk_start).min(VALUE_CHUNK_LEN);
-            let to = end.saturating_sub(chunk_start).min(VALUE_CHUNK_LEN);
-            let preserved_in_chunk = preserve.iter().any(|id| {
-                usize::try_from(*id)
-                    .is_ok_and(|id| id >= chunk_start + from && id < chunk_start + to)
-            });
-            if from == 0 && to == VALUE_CHUNK_LEN && !preserved_in_chunk {
-                *chunk = None;
+            let from = start.max(chunk_start);
+            let to = end.min(chunk_start + VALUE_CHUNK_LEN);
+            let mut kept = keep
+                .range(from as ValueId..to as ValueId)
+                .copied()
+                .peekable();
+            if to - from == VALUE_CHUNK_LEN && kept.peek().is_none() {
+                if let Some(values) = chunk.take() {
+                    recycle_chunk(&mut self.spare, values);
+                }
             } else if let Some(values) = chunk.as_mut() {
-                for (offset, value) in values[from..to].iter_mut().enumerate() {
-                    let id = ValueId::try_from(chunk_start + from + offset)
-                        .expect("value ID does not fit u64");
-                    if !preserve.contains(&id) {
+                for (offset, value) in values[from - chunk_start..to - chunk_start]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    if kept.next_if_eq(&((from + offset) as ValueId)).is_none() {
                         *value = None;
                     }
                 }
+            }
+        }
+    }
+
+    /// Removes the values in `start..end` that collection moved to `sparse`,
+    /// other than those in `keep`.
+    fn remove_sparse(&mut self, start: ValueId, end: ValueId, keep: &BTreeSet<ValueId>) {
+        if !self.sparse.is_empty() {
+            self.sparse
+                .retain(|id, _| !(start..end).contains(id) || keep.contains(id));
+        }
+    }
+
+    /// Frees every chunk lying entirely within `start..end` that holds none of
+    /// `keep`, rather than leaving a large array of empty enum slots.
+    fn free_chunks(&mut self, start: ValueId, end: ValueId, keep: &BTreeSet<ValueId>) {
+        let first = usize::try_from(start)
+            .expect("value ID does not fit usize")
+            .div_ceil(VALUE_CHUNK_LEN);
+        let last = (usize::try_from(end).expect("value ID does not fit usize") / VALUE_CHUNK_LEN)
+            .min(self.chunks.len());
+        for chunk_index in first..last {
+            let chunk_start = (chunk_index * VALUE_CHUNK_LEN) as ValueId;
+            if self.chunks[chunk_index].is_some()
+                && keep
+                    .range(chunk_start..chunk_start + VALUE_CHUNK_LEN as ValueId)
+                    .next()
+                    .is_none()
+                && let Some(values) = self.chunks[chunk_index].take()
+            {
+                recycle_chunk(&mut self.spare, values);
             }
         }
     }
@@ -9164,6 +9689,8 @@ struct ExecPass<'a> {
     /// Struct and enum definitions, read for cell-argument checks and struct
     /// literal field order.
     defs: &'a TypeDefs,
+    /// The layout of each struct's values.
+    struct_layouts: StructLayouts,
     /// The builtin implementing each native item, by the item's id.
     natives: FxHashMap<VarId, Builtin>,
     tech: Technology,
@@ -9209,6 +9736,14 @@ struct ExecPass<'a> {
     /// The ready `Value::Cell` naming each compiled cell, which is what a
     /// proxy of a child instance's geometry points its `Instance::cell` at.
     cell_values: HashMap<CellId, ValueId>,
+    /// The values of `cell_values`, ordered by id.
+    cell_value_ids: BTreeSet<ValueId>,
+    /// Former entries of `cell_values` within `reclaimed_ranges`, kept until
+    /// the enclosing cell's value range is reclaimed.
+    stale_cell_values: BTreeSet<ValueId>,
+    /// Value ranges of finished cells that were already reclaimed, in order.
+    /// A cell's own entry replaces those of the cells nested in it.
+    reclaimed_ranges: Vec<std::ops::Range<ValueId>>,
     /// Imported GDS hierarchies retained across source edits. `None` for a
     /// one-shot compile, which has nothing to reuse across.
     gds_cache: Option<&'a mut GdsCache>,
@@ -9222,18 +9757,22 @@ struct ExecPass<'a> {
     items_arc: Option<Arc<ItemIndex>>,
     /// Compiled cells retained across source edits.
     cell_cache: Option<&'a mut CellCache>,
-    compiled_cell_cache: HashMap<CellExecKey, CellId>,
+    compiled_cell_cache: FxHashMap<CellExecKey, CellId>,
     /// Cell declaration generated for a compiler entry point's invocation, and
     /// the cell it executed as. A call made directly by that cell is the
     /// top-level invocation rather than a nested instantiation, so it is named
     /// as if it were the entry point.
     entry_cell_var: Option<VarId>,
     entry_cell: Option<CellId>,
+    /// A cell declared as if it followed the root module's declarations, but
+    /// typed apart from the workspace. See [`RootScope::type_cell`].
+    appended_cell: Option<&'a CellDecl<Substr, VarIdTyMetadata>>,
     /// Module-qualified source name of every declared cell, by declaration.
     /// See [`CompiledCell::name`].
     cell_names: HashMap<VarId, String>,
     /// Memoized `bbox` results, keyed by cell. See [`ExecPass::bbox`].
     bbox_cache: RefCell<HashMap<CellId, Option<Rect<f64>>>>,
+    shapes_cache: RefCell<HashMap<(CellId, String), CellShapes>>,
     /// Native recursion depth of `visit_expr`, guarded by [`MAX_EVAL_DEPTH`].
     ///
     /// A `fn` call is inlined eagerly and recursively, and a cell
@@ -9301,7 +9840,7 @@ fn restore_rects(value: &Value, objects: &mut Vec<(ObjectId, Object)>) {
             }
         }
         Value::Struct(value) => {
-            for value in value.fields.values() {
+            for value in value.values() {
                 restore_rects(value, objects);
             }
         }
@@ -9403,6 +9942,7 @@ impl<'a> ExecPass<'a> {
             fn_decls: Vec::new(),
             cell_decls: Vec::new(),
             defs: &workspace.defs,
+            struct_layouts: StructLayouts::new(&workspace.defs),
             natives: workspace
                 .natives
                 .iter()
@@ -9448,15 +9988,20 @@ impl<'a> ExecPass<'a> {
             partial_cells: VecDeque::new(),
             compiled_cells: IndexMap::new(),
             cell_values: HashMap::new(),
+            cell_value_ids: BTreeSet::new(),
+            stale_cell_values: BTreeSet::new(),
+            reclaimed_ranges: Vec::new(),
             gds_cache: None,
             items: None,
             items_arc: None,
             cell_cache: None,
-            compiled_cell_cache: HashMap::new(),
+            compiled_cell_cache: FxHashMap::default(),
             entry_cell_var: None,
             entry_cell: None,
+            appended_cell: None,
             cell_names: HashMap::new(),
             bbox_cache: RefCell::default(),
+            shapes_cache: RefCell::default(),
             eval_depth: 0,
             eager_nesting: 0,
             operands: Vec::new(),
@@ -10032,9 +10577,10 @@ impl<'a> ExecPass<'a> {
     }
 
     /// Executes a cell invocation spliced into the root module by
-    /// [`crate::parse::add_cell_invocation`]. The generated entry cell binds
-    /// the invocation, so evaluating it runs the invocation through the
-    /// ordinary expression evaluator; the cell it produced becomes the top.
+    /// [`crate::parse::add_cell_invocation`], or appended to it as
+    /// [`Self::with_appended_cell`]. The generated entry cell binds the
+    /// invocation, so evaluating it runs the invocation through the ordinary
+    /// expression evaluator; the cell it produced becomes the top.
     pub(crate) fn execute_invocation(mut self, invocation: &CellInvocation) -> CompileOutput {
         self.declare_globals();
         let ast = self.ast;
@@ -10043,10 +10589,12 @@ impl<'a> ExecPass<'a> {
             .ast
             .decls
             .iter()
-            .find_map(|decl| match decl {
-                Decl::Cell(cell) if cell.name.name == invocation.entry_cell => Some(cell),
+            .filter_map(|decl| match decl {
+                Decl::Cell(cell) => Some(cell),
                 _ => None,
             })
+            .chain(self.appended_cell)
+            .find(|cell| cell.name.name == invocation.entry_cell)
             .expect("generated entry cell should be declared");
         let value = entry
             .scope
@@ -10377,6 +10925,7 @@ impl<'a> ExecPass<'a> {
         let cell_errors_start = self.errors.len();
         let ids_start = self.next_id;
         let values_start = self.next_value_id;
+        let nested_ranges = self.reclaimed_ranges.len();
         self.cell_start = values_start;
         if let Some((declared_name, path)) = self.gds_imports.get(&cell).cloned() {
             if !args.is_empty() {
@@ -10756,6 +11305,17 @@ impl<'a> ExecPass<'a> {
             return Err(());
         }
 
+        // Garbage is dropped before the compiled form is built, so that the
+        // two are not held at once. Nested cells reclaimed their own values.
+        let nested_values: ValueId = self.reclaimed_ranges[nested_ranges..]
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum();
+        if self.next_value_id - values_start - nested_values >= MIN_EMIT_COLLECT_VALUES {
+            let collect_at = self.collect_at;
+            self.collect_values(cell_id, values_start);
+            self.collect_at = collect_at;
+        }
         let cell = self.emit(cell_id);
         assert!(
             self.compiled_cells
@@ -10777,7 +11337,7 @@ impl<'a> ExecPass<'a> {
         // returns to discover which compiled cell is the requested top.
         if self.entry_cell != Some(cell_id) {
             self.cell_states.shift_remove(&cell_id);
-            self.reclaim_cell_values(values_start, self.next_value_id);
+            self.reclaim_cell_values(values_start, self.next_value_id, nested_ranges);
         }
         // Allocate the compiled cell's handle after reclaiming its temporary
         // range. A parent may still project through one of this cell's nested
@@ -10833,9 +11393,10 @@ impl<'a> ExecPass<'a> {
         ids_start: u64,
         invocation_args: Vec<CellArg>,
     ) {
-        // A cell is named by content only when the session supplied
-        // fingerprints, and the generated entry cell is never named at all.
-        if self.items_arc.is_none() || !is_content_id(id) {
+        // Only a session with a cache retains cells. A cell is named by content
+        // only when the session supplied fingerprints, and the generated entry
+        // cell is never named at all.
+        if self.cell_cache.is_none() || self.items_arc.is_none() || !is_content_id(id) {
             return;
         }
         // A depth failure is charged against the *ambient* evaluation depth,
@@ -10899,6 +11460,12 @@ impl<'a> ExecPass<'a> {
                 },
             );
         }
+    }
+
+    /// Declares `cell` as if it were the last declaration of the root module.
+    fn with_appended_cell(mut self, cell: &'a CellDecl<Substr, VarIdTyMetadata>) -> Self {
+        self.appended_cell = Some(cell);
+        self
     }
 
     /// Keeps only what the GDS output needs. See `debug_info`.
@@ -11556,7 +12123,7 @@ impl<'a> ExecPass<'a> {
         // dropped: one that is not drawn, not an instance, not named by a
         // public field, and that the output checks would not report.
         let mut named = FxHashSet::default();
-        let mut layers = IndexSet::new();
+        let mut layers = FxIndexSet::default();
         if !debug_info {
             // Construction rects with nothing to report were not stored; the
             // ones a public field names are put back in their place.
@@ -11589,6 +12156,8 @@ impl<'a> ExecPass<'a> {
             !reports.is_empty()
         };
 
+        // Nearly every object is kept, so the solved forms are allocated once.
+        ccell.objects.reserve(objects.len());
         // Taken from the back while the source shrinks, so the two forms are
         // never both held whole, then put back in order.
         while let Some((id, obj)) = objects.pop() {
@@ -11617,17 +12186,25 @@ impl<'a> ExecPass<'a> {
         id
     }
 
-    fn reclaim_cell_values(&mut self, start: ValueId, end: ValueId) {
-        // Compiled instance fields retain a value ID naming their referenced
-        // cell. Preserve exactly the current handle for each compiled cell;
-        // every other evaluator value in the completed cell is temporary.
-        let preserve = self
-            .cell_values
-            .values()
-            .copied()
-            .filter(|value| *value >= start && *value < end)
-            .collect::<HashSet<_>>();
-        self.values.remove_range(start, end, &preserve);
+    /// Drops the values in `start..end`, the range of a finished cell, except
+    /// the current handle of each compiled cell. The ranges recorded from
+    /// `nested` on were reclaimed when their cells finished and hold only
+    /// handles, so only replaced handles are dropped from them.
+    fn reclaim_cell_values(&mut self, start: ValueId, end: ValueId, nested: usize) {
+        let mut from = start;
+        for range in self.reclaimed_ranges.drain(nested..) {
+            self.values
+                .remove_range(from, range.start, &self.cell_value_ids);
+            from = range.end;
+        }
+        self.values.remove_range(from, end, &self.cell_value_ids);
+        self.values.remove_sparse(start, end, &self.cell_value_ids);
+        // Handles replaced since the range holding them was reclaimed.
+        for id in self.stale_cell_values.split_off(&start) {
+            self.values.remove(&id);
+        }
+        self.values.free_chunks(start, end, &self.cell_value_ids);
+        self.reclaimed_ranges.push(start..end);
         // Nested cells reclaim nested ranges, so an outer range is mostly
         // already empty. Walk whichever of the range and the table is smaller.
         if (self.value_dependents.len() as u64) < end.saturating_sub(start) {
@@ -11649,8 +12226,35 @@ impl<'a> ExecPass<'a> {
         let vid = self.value_id();
         self.values
             .insert(vid, DeferValue::Ready(Value::Cell(cell)));
-        self.cell_values.insert(cell, vid);
+        self.set_cell_value(cell, vid);
         vid
+    }
+
+    /// Makes `vid` the handle of `cell`. A replaced handle stays readable
+    /// until the range holding it is reclaimed.
+    fn set_cell_value(&mut self, cell: CellId, vid: ValueId) {
+        let old = self.cell_values.insert(cell, vid);
+        if old == Some(vid) {
+            return;
+        }
+        if let Some(old) = old {
+            self.cell_value_ids.remove(&old);
+            // A handle outside the reclaimed ranges lies between them, where
+            // the enclosing cell's reclaim drops it anyway.
+            let index = self
+                .reclaimed_ranges
+                .partition_point(|range| range.end <= old);
+            if self
+                .reclaimed_ranges
+                .get(index)
+                .is_some_and(|range| range.contains(&old))
+            {
+                self.stale_cell_values.insert(old);
+            }
+        }
+        let inserted = self.cell_value_ids.insert(vid);
+        debug_assert!(inserted, "a value is the handle of at most one cell");
+        self.stale_cell_values.remove(&vid);
     }
 
     fn frame_id(&mut self) -> FrameId {
@@ -11792,33 +12396,7 @@ impl<'a> ExecPass<'a> {
                                 .is_none()
                         );
                     }
-                    Decl::Cell(c) => {
-                        let vid = self.value_id();
-                        // Record the module-qualified identity now, while the
-                        // module path is in hand; the GDS exporter needs it and
-                        // `CellDecl` alone does not carry it.
-                        let qualified = mod_path
-                            .iter()
-                            .map(String::as_str)
-                            .chain([c.name.name.as_str()])
-                            .join("::");
-                        self.cell_names.insert(c.metadata.1, qualified);
-                        let index = DeclIndex(self.cell_decls.len() as u32);
-                        self.cell_decls.push(c);
-                        assert!(
-                            self.values
-                                .insert(vid, DeferValue::Ready(Value::CellFn(index)))
-                                .is_none()
-                        );
-                        assert!(
-                            self.frames
-                                .get_mut(&self.global_frame)
-                                .unwrap()
-                                .bindings
-                                .insert(c.metadata.1, vid)
-                                .is_none()
-                        );
-                    }
+                    Decl::Cell(c) => self.declare_global_cell(mod_path, c),
                     // A unit variant is a value; a tuple variant is a
                     // constructor awaiting its payload. A variant with named
                     // fields is built by a literal, so its name has no value
@@ -11858,7 +12436,44 @@ impl<'a> ExecPass<'a> {
                     _ => (),
                 }
             }
+            if mod_path.is_empty()
+                && let Some(cell) = self.appended_cell
+            {
+                self.declare_global_cell(mod_path, cell);
+            }
         }
+    }
+
+    fn declare_global_cell(
+        &mut self,
+        mod_path: &ModPath,
+        c: &'a CellDecl<Substr, VarIdTyMetadata>,
+    ) {
+        let vid = self.value_id();
+        // Record the module-qualified identity now, while the module path is
+        // in hand; the GDS exporter needs it and `CellDecl` alone does not
+        // carry it.
+        let qualified = mod_path
+            .iter()
+            .map(String::as_str)
+            .chain([c.name.name.as_str()])
+            .join("::");
+        self.cell_names.insert(c.metadata.1, qualified);
+        let index = DeclIndex(self.cell_decls.len() as u32);
+        self.cell_decls.push(c);
+        assert!(
+            self.values
+                .insert(vid, DeferValue::Ready(Value::CellFn(index)))
+                .is_none()
+        );
+        assert!(
+            self.frames
+                .get_mut(&self.global_frame)
+                .unwrap()
+                .bindings
+                .insert(c.metadata.1, vid)
+                .is_none()
+        );
     }
 
     fn eval_for_loop(
@@ -12840,13 +13455,13 @@ impl<'a> ExecPass<'a> {
                     .map(|arg| self.bind_cell_arg(cell_id, span, arg))
                     .collect(),
             )),
-            CellArg::Struct { name, fields } => Value::Struct(Arc::new(StructValue {
-                name: name.clone(),
-                fields: fields
+            CellArg::Struct { name, fields } => {
+                let fields = fields
                     .iter()
                     .map(|(field, arg)| (field.clone(), self.bind_cell_arg(cell_id, span, arg)))
-                    .collect(),
-            })),
+                    .collect::<Vec<_>>();
+                Value::Struct(Arc::new(StructValue::from_fields(name.clone(), fields)))
+            }
             CellArg::Rect {
                 layer,
                 drawable,
@@ -13043,15 +13658,15 @@ impl<'a> ExecPass<'a> {
                 Some(CellArg::Seq(args))
             }
             Value::Struct(value) => {
-                let mut fields = Vec::with_capacity(value.fields.len());
-                for (name, v) in value.fields.iter() {
+                let mut fields = Vec::with_capacity(value.values().len());
+                for (name, v) in value.fields() {
                     match self.cell_arg_from_value(cell_id, dependent_vid, v, span)? {
                         Some(arg) => fields.push((name.clone(), arg)),
                         None => return Ok(None),
                     }
                 }
                 Some(CellArg::Struct {
-                    name: value.name.clone(),
+                    name: value.name().to_owned(),
                     fields,
                 })
             }
@@ -13742,6 +14357,7 @@ impl<'a> ExecPass<'a> {
                             foreign::call(
                                 &state.solver,
                                 self.defs,
+                                &self.struct_layouts,
                                 path,
                                 &decl.name.name,
                                 &args,
@@ -14356,6 +14972,117 @@ impl<'a> ExecPass<'a> {
                         false
                     }
                 }
+                Some(Builtin::Shapes) => {
+                    let (target, layer) = (c.state.posargs[0], c.state.posargs[1]);
+                    for arg in [target, layer] {
+                        if !self.values[&arg].is_ready() {
+                            self.add_value_dependent(arg, vid);
+                            return Ok(false);
+                        }
+                    }
+                    let span = self.span(&vref.loc, c.expr.span);
+                    let Value::String(layer) = self.values[&layer].as_ref().unwrap_ready() else {
+                        unreachable!("the type checker requires a layer name")
+                    };
+                    let layer = layer.clone();
+                    let (cell, placement) = match self.values[&target].as_ref().unwrap_ready() {
+                        Value::Inst(i) => {
+                            let Defer::Ready(cell) = &self.values[&i.cell] else {
+                                self.add_value_dependent(i.cell, vid);
+                                return Ok(false);
+                            };
+                            let placement = (i.reflect, i.angle, i.x.clone(), i.y.clone());
+                            (*cell.as_ref().unwrap_cell(), Some(placement))
+                        }
+                        Value::Cell(c) => (*c, None),
+                        _ => {
+                            self.errors.push(ExecError {
+                                span: Some(span),
+                                cell: cell_id,
+                                kind: ExecErrorKind::InvalidType,
+                            });
+                            return self.poison(vid);
+                        }
+                    };
+                    let shapes = self.shapes_on(cell, &layer);
+                    let mut items = Seq::new();
+                    for r in shapes.iter() {
+                        let (x0, y0, x1, y1) = match &placement {
+                            Some((reflect, angle, x, y)) => {
+                                let [x0, y0, x1, y1] = transform_bounds(*r, *reflect, *angle);
+                                (
+                                    LinearExpr::from(x0) + x.clone(),
+                                    LinearExpr::from(y0) + y.clone(),
+                                    LinearExpr::from(x1) + x.clone(),
+                                    LinearExpr::from(y1) + y.clone(),
+                                )
+                            }
+                            None => (r[0].into(), r[1].into(), r[2].into(), r[3].into()),
+                        };
+                        let rect = Arc::new(Rect {
+                            id: object_id(&mut self.next_id),
+                            layer: None,
+                            x0,
+                            y0,
+                            x1,
+                            y1,
+                            construction: true,
+                            span: Some(span.clone()),
+                        });
+                        let state = self.cell_states.get_mut(&cell_id).unwrap();
+                        // Without debug information, emission drops a
+                        // construction rect that has nothing to report, so
+                        // one is stored only when it may have something.
+                        let quiet = !self.debug_info
+                            && match [&rect.x0, &rect.y0, &rect.x1, &rect.y1]
+                                .map(|coordinate| state.solver.eval_expr(coordinate))
+                            {
+                                [Some(x0), Some(y0), Some(x1), Some(y1)] => {
+                                    let mut reports = Vec::new();
+                                    check_coordinates(
+                                        [x0, y0, x1, y1],
+                                        &self.tech,
+                                        cell_id,
+                                        &None,
+                                        &mut reports,
+                                    );
+                                    x0 <= x1 && y0 <= y1 && reports.is_empty()
+                                }
+                                _ => false,
+                            };
+                        if !quiet {
+                            state.objects.push((rect.id, Object::Rect(rect.clone())));
+                        }
+                        items.push_back(Value::Rect(rect));
+                    }
+                    self.values
+                        .insert(vid, Defer::Ready(Value::Seq(Arc::new(items))));
+                    true
+                }
+                Some(Builtin::RouteTracks) => {
+                    if let Some(&arg) = c
+                        .state
+                        .posargs
+                        .iter()
+                        .find(|arg| !self.values[*arg].is_ready())
+                    {
+                        self.add_value_dependent(arg, vid);
+                        return Ok(false);
+                    }
+                    let result = {
+                        let args: CallArgs<&Value> = c
+                            .state
+                            .posargs
+                            .iter()
+                            .map(|arg| self.values[arg].as_ref().unwrap_ready())
+                            .collect();
+                        route::route_tracks(&state.solver, &args)
+                    };
+                    let span = self.span(&vref.loc, c.expr.span);
+                    let result = result.map(|routed| self.routed_value(cell_id, &span, routed));
+                    let expr_span = c.expr.span;
+                    return self.finish_op(vid, &vref.loc, result, |_| expr_span);
+                }
                 Some(Builtin::Bbox) => {
                     let arg = &self.values[&c.state.posargs[0]];
                     if let Some(val) = arg.get_ready() {
@@ -14765,14 +15492,11 @@ impl<'a> ExecPass<'a> {
                         let id = object_id(&mut self.next_id);
                         let span = self.span(&vref.loc, c.expr.span);
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
+                        let vars = [state.solver.new_var(), state.solver.new_var()];
                         let inst = Instance {
                             id,
-                            x: state
-                                .new_solver_var(&span, VarObject::Instance, VarRole::X(None))
-                                .into(),
-                            y: state
-                                .new_solver_var(&span, VarObject::Instance, VarRole::Y(None))
-                                .into(),
+                            x: vars[0].into(),
+                            y: vars[1].into(),
                             cell: *c.state.posargs.first().unwrap(),
                             reflect: refl.unwrap_or_default(),
                             angle: angle.unwrap_or_default(),
@@ -14816,6 +15540,25 @@ impl<'a> ExecPass<'a> {
                                 kwarg.value.span(),
                                 initial_condition,
                             );
+                        }
+                        // Only a variable left unsolved or solved off the grid
+                        // is ever reported, so only such a one needs its origin.
+                        let state = self.cell_states.get_mut(&cell_id).unwrap();
+                        for (var, value) in
+                            vars.into_iter().zip([VarRole::X(None), VarRole::Y(None)])
+                        {
+                            if state.solver.value_of(var).is_none()
+                                || state.solver.off_grid_vars().contains_key(&var)
+                            {
+                                state.var_origins.insert(
+                                    var,
+                                    VarOrigin {
+                                        span: inst.span.clone(),
+                                        object: VarObject::Instance,
+                                        value,
+                                    },
+                                );
+                            }
                         }
                         self.values.insert(vid, Defer::Ready(Value::Inst(inst)));
                         true
@@ -15532,7 +16275,13 @@ impl<'a> ExecPass<'a> {
                             .and_then(|(_, value)| values[value].get_ready())
                     };
                     let base = lit.base.and_then(|base| values[&base].get_ready());
-                    let result = ops::struct_lit(self.defs, &lit.target, explicit, base);
+                    let result = ops::struct_lit(
+                        self.defs,
+                        &self.struct_layouts,
+                        &lit.target,
+                        explicit,
+                        base,
+                    );
                     let expr = lit.expr;
                     return self.finish_op(vid, &vref.loc, result, |at| match at {
                         ErrorAt::Base => expr.base.as_ref().expect("only a base fails").span(),
@@ -15548,9 +16297,9 @@ impl<'a> ExecPass<'a> {
                         ValueRef::Struct(value)
                             if d.struct_name
                                 .as_ref()
-                                .is_none_or(|name| *name == value.name) =>
+                                .is_none_or(|name| name == value.name()) =>
                         {
-                            value.fields.get(&d.field).cloned()
+                            value.get(&d.field).cloned()
                         }
                         _ => None,
                     };
@@ -15639,7 +16388,7 @@ impl<'a> ExecPass<'a> {
                 });
                 let cell = self.execute_cell(c.expr.metadata.0.unwrap(), arg_vals, scope_name)?;
                 self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
-                self.cell_values.insert(cell, vid);
+                self.set_cell_value(cell, vid);
                 true
             } else {
                 for arg_vid in unready {
@@ -16050,9 +16799,9 @@ impl<'a> ExecPass<'a> {
             }
             Pattern::Struct { fields, .. } => {
                 let values = match value {
-                    Value::Struct(value) => &value.fields,
+                    Value::Struct(value) => NamedFields::Struct(value),
                     Value::Enum(value) => match &value.payload {
-                        VariantValues::Struct(values) => values,
+                        VariantValues::Struct(values) => NamedFields::Variant(values),
                         VariantValues::Tuple(_) => return,
                     },
                     _ => return,
@@ -16116,7 +16865,103 @@ impl<'a> ExecPass<'a> {
         self.bbox_cache.borrow_mut().insert(cell, bbox.clone());
         bbox
     }
+
+    /// The bounding rectangles of `cell`'s geometry on `layer`, through every
+    /// level of its instances, in `cell`'s own coordinate frame.
+    ///
+    /// Memoized per cell and layer, for the reason given on [`Self::bbox`].
+    pub fn shapes_on(&self, cell: CellId, layer: &str) -> CellShapes {
+        let key = (cell, layer.to_owned());
+        if let Some(cached) = self.shapes_cache.borrow().get(&key) {
+            return cached.clone();
+        }
+        let mut shapes = Vec::new();
+        let bounds = |r: Rect<f64>| [r.x0, r.y0, r.x1, r.y1];
+        for (_, o) in self.compiled_cells[&cell].objects.iter() {
+            if !o.is_layout() {
+                continue;
+            }
+            match o {
+                SolvedValue::Rect(r) if r.layer.as_deref() == Some(layer) => {
+                    shapes.push([r.x0.0, r.y0.0, r.x1.0, r.y1.0])
+                }
+                SolvedValue::Polygon(p) if p.layer == layer => shapes.extend(p.bbox().map(bounds)),
+                SolvedValue::Path(p) if p.layer == layer => shapes.extend(p.bbox().map(bounds)),
+                SolvedValue::Instance(i) => {
+                    shapes.extend(self.shapes_on(i.cell, layer).iter().map(|r| {
+                        let [x0, y0, x1, y1] = transform_bounds(*r, i.reflect, i.angle);
+                        [x0 + i.x, y0 + i.y, x1 + i.x, y1 + i.y]
+                    }))
+                }
+                _ => (),
+            }
+        }
+        shapes.shrink_to_fit();
+        let shapes = Arc::new(shapes);
+        self.shapes_cache.borrow_mut().insert(key, shapes.clone());
+        shapes
+    }
+
+    /// The value of a `route_tracks` call: per net, a tuple of its wires,
+    /// vias, and stubs, whose rectangles become construction rectangles of
+    /// the cell.
+    fn routed_value(&mut self, cell_id: CellId, span: &Span, routed: route::Routed) -> Value {
+        let grid = routed.grid;
+        let mut rect = |r: argon_greedy_router::geom::Rect| {
+            let coord = |v: i64| LinearExpr::from(crate::tech::snap(v as f64 * grid, grid));
+            let rect = Arc::new(Rect {
+                id: object_id(&mut self.next_id),
+                layer: None,
+                x0: coord(r.left()),
+                y0: coord(r.bottom()),
+                x1: coord(r.right()),
+                y1: coord(r.top()),
+                construction: true,
+                span: Some(span.clone()),
+            });
+            let state = self.cell_states.get_mut(&cell_id).unwrap();
+            state.objects.push((rect.id, Object::Rect(rect.clone())));
+            Value::Rect(rect)
+        };
+        let tuple = |items: Vec<Value>| Value::Tuple(items.into());
+        let nets = routed
+            .nets
+            .into_iter()
+            .map(|net| {
+                let mut layer_rects = |shapes: Vec<(usize, argon_greedy_router::geom::Rect)>| {
+                    seq_value(
+                        shapes
+                            .into_iter()
+                            .map(|(layer, r)| tuple(vec![Value::Int(layer as i64), rect(r)]))
+                            .collect(),
+                    )
+                };
+                let wires = layer_rects(net.wires);
+                let stubs = layer_rects(net.stubs);
+                let vias = seq_value(
+                    net.vias
+                        .into_iter()
+                        .map(|via| {
+                            let cuts = seq_value(via.cuts.into_iter().map(&mut rect).collect());
+                            tuple(vec![
+                                Value::Int(via.bot as i64),
+                                cuts,
+                                rect(via.bot_rect),
+                                rect(via.top_rect),
+                            ])
+                        })
+                        .collect(),
+                );
+                tuple(vec![wires, vias, stubs])
+            })
+            .collect();
+        seq_value(nets)
+    }
 }
+
+/// A cell's flattened shape bounds on one layer, each `[x0, y0, x1, y1]`,
+/// shared by every instance.
+type CellShapes = Arc<Vec<[f64; 4]>>;
 
 /// Persistent immutable sequence backing `Value::Seq`.
 ///
@@ -16339,10 +17184,12 @@ fn pattern_matches(pattern: &Pattern<Substr, VarIdTyMetadata>, value: &Value) ->
         }
         Pattern::Struct { path, fields, .. } => {
             let values = match (&path.metadata.1, value) {
-                (Ty::Struct(ty), Value::Struct(value)) if value.name == ty.name => &value.fields,
+                (Ty::Struct(ty), Value::Struct(value)) if value.name() == ty.name => {
+                    NamedFields::Struct(value)
+                }
                 (Ty::Struct(_), _) => return false,
                 _ => match enum_value(path, value).map(|value| &value.payload) {
-                    Some(VariantValues::Struct(values)) => values,
+                    Some(VariantValues::Struct(values)) => NamedFields::Variant(values),
                     _ => return false,
                 },
             };
@@ -16351,6 +17198,22 @@ fn pattern_matches(pattern: &Pattern<Substr, VarIdTyMetadata>, value: &Value) ->
                     .get(field.name.name.as_str())
                     .is_some_and(|element| pattern_matches(&field.pattern, element))
             })
+        }
+    }
+}
+
+/// The named fields of a struct value or of a variant with named fields.
+#[derive(Clone, Copy)]
+enum NamedFields<'a> {
+    Struct(&'a StructValue),
+    Variant(&'a FxIndexMap<String, Value>),
+}
+
+impl<'a> NamedFields<'a> {
+    fn get(self, name: &str) -> Option<&'a Value> {
+        match self {
+            Self::Struct(value) => value.get(name),
+            Self::Variant(fields) => fields.get(name),
         }
     }
 }
@@ -16380,9 +17243,9 @@ fn for_each_pattern_binding(
         }
         Pattern::Struct { fields, .. } => {
             let values = match value {
-                Value::Struct(value) => &value.fields,
+                Value::Struct(value) => NamedFields::Struct(value),
                 Value::Enum(value) => match &value.payload {
-                    VariantValues::Struct(values) => values,
+                    VariantValues::Struct(values) => NamedFields::Variant(values),
                     VariantValues::Tuple(_) => return,
                 },
                 _ => return,
@@ -16495,14 +17358,120 @@ fn values_equal(left: &Value, right: &Value) -> Option<bool> {
 }
 
 /// A struct value. See [`Value::Struct`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StructValue {
+    /// The struct's name and field names, shared by its values.
+    layout: Arc<StructLayout>,
+    /// One value per field of `layout`, in the same order.
+    values: SmallVec<[Value; 4]>,
+}
+
+/// The name and field names of a struct.
+#[derive(Debug)]
+struct StructLayout {
     /// The module-qualified name of the declaring struct, matching
     /// `StructTy::name`, so that `..base` and cell arguments can check that a
     /// value which arrived as `Any` is the struct they expect.
-    pub name: String,
+    name: String,
     /// The fields in declaration order.
-    pub fields: FxIndexMap<String, Value>,
+    fields: FxIndexSet<String>,
+}
+
+impl StructLayout {
+    fn new(name: String, fields: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            name,
+            fields: fields.into_iter().collect(),
+        }
+    }
+}
+
+impl StructValue {
+    /// A value of the struct `layout` with one value per field, in order.
+    fn new(layout: Arc<StructLayout>, values: SmallVec<[Value; 4]>) -> Self {
+        debug_assert_eq!(layout.fields.len(), values.len());
+        Self { layout, values }
+    }
+
+    /// A value of the struct `name` with `fields` in declaration order.
+    fn from_fields(name: String, fields: impl IntoIterator<Item = (String, Value)>) -> Self {
+        let (names, values): (Vec<_>, SmallVec<_>) = fields.into_iter().unzip();
+        Self::new(Arc::new(StructLayout::new(name, names)), values)
+    }
+
+    /// The module-qualified name of the declaring struct.
+    pub fn name(&self) -> &str {
+        &self.layout.name
+    }
+
+    /// The value of the field `name`.
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        self.layout
+            .fields
+            .get_index_of(name)
+            .map(|index| &self.values[index])
+    }
+
+    /// The fields and their values in declaration order.
+    pub fn fields(&self) -> impl ExactSizeIterator<Item = (&String, &Value)> {
+        self.layout.fields.iter().zip(&self.values)
+    }
+
+    /// The field values in declaration order.
+    pub fn values(&self) -> &[Value] {
+        &self.values
+    }
+}
+
+impl std::fmt::Debug for StructValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StructValue")
+            .field("name", &self.layout.name)
+            .field("fields", &DebugFields(self))
+            .finish()
+    }
+}
+
+/// Formats a struct's fields as a map.
+struct DebugFields<'a>(&'a StructValue);
+
+impl std::fmt::Debug for DebugFields<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.0.fields()).finish()
+    }
+}
+
+/// The layout of every struct a workspace declares, by declaration.
+#[derive(Default)]
+struct StructLayouts(FxHashMap<VarId, Arc<StructLayout>>);
+
+impl StructLayouts {
+    fn new(defs: &TypeDefs) -> Self {
+        Self(
+            defs.iter()
+                .filter_map(|(id, def)| {
+                    let def = def.as_struct()?;
+                    let layout = StructLayout::new(def.name.clone(), def.fields.keys().cloned());
+                    Some((*id, Arc::new(layout)))
+                })
+                .collect(),
+        )
+    }
+
+    /// The layout of values of `ty`, or `None` when its declaration is not a
+    /// struct.
+    fn get(&self, defs: &TypeDefs, ty: &StructTy) -> Option<Arc<StructLayout>> {
+        match self.0.get(&ty.def) {
+            Some(layout) if layout.name == ty.name => Some(layout.clone()),
+            _ => {
+                let def = defs.get(&ty.def).and_then(AdtDef::as_struct)?;
+                Some(Arc::new(StructLayout::new(
+                    ty.name.clone(),
+                    def.fields.keys().cloned(),
+                )))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16775,11 +17744,19 @@ impl FieldValue {
         nets: &HashMap<NodeId, NetIdx>,
     ) -> Result<Self, Self> {
         let solve = |value: &Value| Self::try_solve(value, solver, nets);
-        let solve_fields = |fields: &FxIndexMap<String, Value>| {
-            fields
-                .iter()
-                .map(|(name, value)| Ok((name.clone(), solve(value)?)))
-                .collect::<Result<Vec<_>, _>>()
+        let solve_all = |values: &mut dyn ExactSizeIterator<Item = &Value>| {
+            let mut solved = Vec::with_capacity(values.len());
+            for value in values {
+                solved.push(solve(value)?);
+            }
+            Ok(solved)
+        };
+        let solve_fields = |fields: &mut dyn ExactSizeIterator<Item = (&String, &Value)>| {
+            let mut solved = Vec::with_capacity(fields.len());
+            for (name, value) in fields {
+                solved.push((name.clone(), solve(value)?));
+            }
+            Ok(solved)
         };
         let exact =
             |expr: &LinearExpr| solver.eval_expr_exact(expr).expect("cell field not solved");
@@ -16795,20 +17772,20 @@ impl FieldValue {
             Value::Point(point) => Self::Point(exact(&point.0), exact(&point.1)),
             Value::Cell(cell) => Self::Cell(*cell),
             Value::Nil => Self::Nil,
-            Value::Seq(items) => Self::Seq(items.iter().map(solve).collect::<Result<_, _>>()?),
-            Value::Tuple(items) => Self::Tuple(items.iter().map(solve).collect::<Result<_, _>>()?),
+            Value::Seq(items) => Self::Seq(solve_all(&mut items.iter())?),
+            Value::Tuple(items) => Self::Tuple(solve_all(&mut items.iter())?),
             Value::Struct(value) => Self::Struct {
-                name: value.name.clone(),
-                fields: solve_fields(&value.fields)?,
+                name: value.name().to_owned(),
+                fields: solve_fields(&mut value.fields())?,
             },
             Value::Enum(value) => match &value.payload {
                 VariantValues::Tuple(items) => Self::Enum {
                     variant: value.variant.clone(),
-                    payload: items.iter().map(solve).collect::<Result<_, _>>()?,
+                    payload: solve_all(&mut items.iter())?,
                 },
                 VariantValues::Struct(fields) => Self::StructVariant {
                     variant: value.variant.clone(),
-                    fields: solve_fields(fields)?,
+                    fields: solve_fields(&mut fields.iter())?,
                 },
             },
             Value::Signal(signal) => match nets.get(&signal.node) {
@@ -16817,19 +17794,11 @@ impl FieldValue {
             },
             Value::SchematicInst(instance) => Self::SchematicInst {
                 cell: instance.cell,
-                terminals: instance
-                    .terminals
-                    .iter()
-                    .map(solve)
-                    .collect::<Result<_, _>>()?,
+                terminals: solve_all(&mut instance.terminals.iter())?,
             },
             Value::Device(device) => Self::Device {
                 kind: device.kind,
-                terminals: device
-                    .terminals
-                    .iter()
-                    .map(solve)
-                    .collect::<Result<_, _>>()?,
+                terminals: solve_all(&mut device.terminals.iter())?,
             },
             Value::Detached(detached) => Self::Detached(detached.clone()),
             Value::Poison => return Err(Self::Poison),
@@ -16884,10 +17853,10 @@ impl FieldValue {
                     .collect(),
             ),
             Self::Tuple(items) => Value::Tuple(tuple(items, reader).into()),
-            Self::Struct { name, fields } => Value::Struct(Arc::new(StructValue {
-                name: name.clone(),
-                fields: named(fields, reader),
-            })),
+            Self::Struct { name, fields } => Value::Struct(Arc::new(StructValue::from_fields(
+                name.clone(),
+                named(fields, reader),
+            ))),
             Self::Enum { variant, payload } => Value::Enum(Arc::new(EnumValue {
                 variant: variant.clone(),
                 payload: VariantValues::Tuple(tuple(payload, reader)),
@@ -17613,12 +18582,21 @@ impl CompiledCell {
     /// Compute this once when caching the cell, not on every editor edit.
     pub(crate) fn span_paths(&self) -> HashSet<PathBuf> {
         let mut paths = HashSet::new();
+        // Consecutive spans mostly share one path, which is then inserted once.
+        let mut last = std::ptr::null();
+        let mut insert = |path: &Arc<FsPath>| {
+            let address = Arc::as_ptr(path).cast::<()>();
+            if address != last {
+                last = address;
+                paths.insert(path.clone());
+            }
+        };
         for metadata in &self.scope_metadata {
-            paths.insert(&metadata.span.path);
+            insert(&metadata.span.path);
         }
         for scope in self.scopes.values() {
             for (_, emit) in &scope.emit {
-                paths.insert(&emit.span.path);
+                insert(&emit.span.path);
             }
         }
         for object in self.objects.values() {
@@ -17631,11 +18609,11 @@ impl CompiledCell {
                 SolvedValue::Instance(instance) => Some(&instance.span),
             };
             if let Some(span) = span {
-                paths.insert(&span.path);
+                insert(&span.path);
             }
         }
         for fallback in &self.fallback_constraints_used {
-            paths.insert(&fallback.span.path);
+            insert(&fallback.span.path);
         }
         paths.into_iter().map(|path| path.to_path_buf()).collect()
     }

@@ -1,0 +1,313 @@
+// The greedy track router and strap placer, run as WebAssembly, and the
+// geometry around them: gridded li1-to-met1 contacts, track lookups, and
+// router operations.
+
+use std::layout::{crect, rect, shapes, text, union};
+use lib::columns::util;
+use lib::columns::util::Via;
+
+struct RouterBox {
+    x0: Float,
+    y0: Float,
+    x1: Float,
+    y1: Float,
+}
+
+struct GridLayer {
+    line: Int,
+    space: Int,
+    horizontal: Bool,
+}
+
+struct Grid {
+    area: RouterBox,
+    layers: [GridLayer],
+}
+
+// One router operation; see `block`, `occupy`, and `route_req`.
+struct RouterOp {
+    kind: Int,
+    layer: Int,
+    rect: RouterBox,
+    net: String,
+    dst_layer: Int,
+    dst: RouterBox,
+}
+
+struct RouterJob {
+    grid: Grid,
+    ops: [RouterOp],
+    pin_layer: Int,
+    edge_nets: [String],
+}
+
+struct Wire {
+    layer: Int,
+    rect: RouterBox,
+}
+
+struct RoutedVia {
+    bot_layer: Int,
+    bot: RouterBox,
+    top_layer: Int,
+    top: RouterBox,
+}
+
+struct Routed {
+    wires: [Wire],
+    vias: [RoutedVia],
+    order: Int,
+}
+
+// Runs the operations in order, then the routes, retrying the routes in other
+// orders until every one succeeds.
+extern "routing" fn route(job: RouterJob) -> Routed;
+
+// Expands a rectangle onto the grid's tracks; see `corner_ll` and its siblings.
+extern "routing" fn expand_to_grid(grid: Grid, rect: RouterBox, strategy: Int) -> RouterBox;
+
+// Joins port shapes as merging ports does: the first group as is, then each
+// later group appended and the list coalesced, which depends on the order.
+extern "routing" fn merge_ports(groups: [[RouterBox]]) -> [RouterBox];
+
+fn merge_rects(groups: [[Rect]]) -> [Rect] {
+    [for b in merge_ports([for g in groups { [for r in g { to_box(r) }] }]) { from_box(b) }]
+}
+
+fn m1() -> Int { 0 }
+fn m2() -> Int { 1 }
+
+// Expansion strategies: the smallest expansion, one side's track, or one
+// corner's tracks kept inside the rectangle.
+fn minimum() -> Int { 0 }
+fn side_right() -> Int { 3 }
+fn corner_ll() -> Int { 6 }
+fn corner_lr() -> Int { 7 }
+fn corner_ul() -> Int { 8 }
+fn corner_ur() -> Int { 9 }
+
+// Met1 and met2 tracks over `area`, 320 nm wide with `space` between them;
+// met1 runs horizontally if `m1_horizontal`, and met2 the other way.
+fn track_grid(area: Rect, space: Int, m1_horizontal: Bool) -> Grid {
+    Grid {
+        area: to_box(area),
+        layers: [
+            GridLayer { line: 320, space: space, horizontal: m1_horizontal },
+            GridLayer { line: 320, space: space, horizontal: !m1_horizontal },
+        ],
+    }
+}
+
+// The control logic's grid: met1 horizontal on a 460 nm pitch.
+fn control_grid(area: Rect) -> Grid {
+    track_grid(area, 140, true)
+}
+
+fn to_box(r: Rect) -> RouterBox {
+    RouterBox { x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1 }
+}
+
+fn from_box(b: RouterBox) -> Rect {
+    crect(x0=b.x0, y0=b.y0, x1=b.x1, y1=b.y1)
+}
+
+fn expand(r: Rect, d: Float) -> Rect {
+    crect(x0=r.x0 - d, y0=r.y0 - d, x1=r.x1 + d, y1=r.y1 + d)
+}
+
+fn snap_to(g: Grid, r: Rect, strategy: Int) -> Rect {
+    from_box(expand_to_grid(g, to_box(r), strategy))
+}
+
+fn no_box() -> RouterBox {
+    RouterBox { x0: 0., y0: 0., x1: 0., y1: 0. }
+}
+
+fn block(layer: Int, r: Rect) -> RouterOp {
+    RouterOp { kind: 0, layer: layer, rect: to_box(r), net: "", dst_layer: 0, dst: no_box() }
+}
+
+// Gives `r` to `net`, then blocks the tracks within one space of it that it
+// does not fully cover.
+fn occupy(layer: Int, r: Rect, net: String) -> [RouterOp] {
+    [
+        RouterOp { kind: 1, layer: layer, rect: to_box(r), net: net, dst_layer: 0, dst: no_box() },
+        RouterOp { kind: 2, layer: layer, rect: to_box(r), net: net, dst_layer: 0, dst: no_box() },
+    ]
+}
+
+fn route_req(src_layer: Int, src: Rect, dst_layer: Int, dst: Rect, net: String) -> RouterOp {
+    RouterOp {
+        kind: 3,
+        layer: src_layer,
+        rect: to_box(src),
+        net: net,
+        dst_layer: dst_layer,
+        dst: to_box(dst),
+    }
+}
+
+// The router blockages from one placed cell: each met1 and met2 shape,
+// expanded by `grow`.
+fn blockages_grown(i: Any, grow: Float) -> [RouterOp] {
+    let on_m1 = std::concat(shapes(i, "met1.drawing"), shapes(i, "met1.pin"));
+    let on_m2 = std::concat(shapes(i, "met2.drawing"), shapes(i, "met2.pin"));
+    std::concat(
+        [for r in on_m1 { block(m1(), expand(r, grow)) }],
+        [for r in on_m2 { block(m2(), expand(r, grow)) }],
+    )
+}
+
+fn blockages(i: Any) -> [RouterOp] {
+    blockages_grown(i, 40.)
+}
+
+// Draws the routed wires and the vias between them.
+fn draw_routes(r: Routed) {
+    for w in r.wires {
+        rect(
+            if w.layer == 0 { "met1.drawing" } else { "met2.drawing" },
+            x0=w.rect.x0,
+            y0=w.rect.y0,
+            x1=w.rect.x1,
+            y1=w.rect.y1,
+        );
+    }
+    for v in r.vias {
+        util::contact(Via::Via1, from_box(v.bot), from_box(v.top), later=true);
+    }
+}
+
+// Track indices on uniform tracks starting at `start`, 320 nm wide on a
+// 460 nm pitch, for a position.
+fn starts_before(start: Float, pos: Float) -> Int { ((pos - start) / 460.) as Int }
+fn starts_after(start: Float, pos: Float) -> Int { ((pos - start - 1.) / 460.) as Int + 1 }
+fn ends_before(start: Float, pos: Float) -> Int { starts_before(start, pos - 320.) }
+fn ends_after(start: Float, pos: Float) -> Int { starts_after(start, pos - 320.) }
+
+fn track(start: Float, i: Int) -> (Float, Float) {
+    (start + 460. * i as Float, start + 460. * i as Float + 320.,)
+}
+
+// The track nearest `pos`, preferring the one that starts before it on a tie.
+fn nearest(start: Float, pos: Float) -> Int {
+    let before = starts_before(start, pos);
+    let after = ends_after(start, pos);
+    if span_distance(track(start, after), pos) < span_distance(track(start, before), pos) {
+        after
+    } else {
+        before
+    }
+}
+
+fn span_distance(s: (Float, Float), p: Float) -> Float {
+    min_float(max_float(p - s.0, s.0 - p), max_float(p - s.1, s.1 - p))
+}
+
+// `v` snapped to the nearest multiple of `g`, rounding halfway values down.
+fn snap_to_grid(v: Float, g: Float) -> Float {
+    let q = (v / g) as Int;
+    let fl = if q as Float * g > v { q - 1 } else { q };
+    let rem = v - fl as Float * g;
+    if rem <= ((g as Int) / 2) as Float { v - rem } else { v + g - rem }
+}
+
+// A single li1-to-met1 contact centered on `pin`'s center on the 5 nm grid,
+// with its met1 extended vertically. Returns the met1.
+fn via01(pin: Rect) -> Rect {
+    via01_at(util::snap5(util::cx_i(pin)), util::snap5(util::cy_i(pin)))
+}
+
+// Like `via01`, with the contact's right edge on `pin`'s.
+fn via01_right(pin: Rect) -> Rect {
+    via01_at(pin.x1 - 115., util::snap5(util::cy_i(pin)))
+}
+
+fn via01_at(cx: Float, cy: Float) -> Rect {
+    rect("li1.drawing", x0=cx - 85., y0=cy - 85., x1=cx + 85., y1=cy + 85.);
+    rect("mcon.drawing", x0=cx - 85., y0=cy - 85., x1=cx + 85., y1=cy + 85.);
+    rect("met1.drawing", x0=cx - 115., y0=cy - 145., x1=cx + 115., y1=cy + 145.)
+}
+
+// A contact on `pin` whose met1 is expanded onto the grid with `strategy`,
+// drawn and given to `net`.
+struct Access {
+    rect: Rect,
+    ops: [RouterOp],
+}
+
+fn access(g: Grid, pin: Rect, strategy: Int, net: String) -> Access {
+    let r = snap_to(g, via01(pin), strategy);
+    rect("met1.drawing", x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1);
+    Access { rect: r, ops: occupy(m1(), r, net) }
+}
+
+// The same for a met1 pin, which needs no contact.
+fn m1_access(g: Grid, pin: Rect, strategy: Int, net: String) -> Access {
+    let r = snap_to(g, pin, strategy);
+    rect("met1.drawing", x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1);
+    Access { rect: r, ops: occupy(m1(), r, net) }
+}
+
+// A horizontal S-shaped met1 jog from `src` to `dst` with a 230 nm vertical
+// leg on a 10 nm grid, drawn and blocked.
+fn s_jog(src: Rect, dst: Rect) -> [RouterOp] {
+    let c = if src.x0 > dst.x0 {
+        ((src.x0 + dst.x1) / 2.) as Int as Float
+    } else {
+        ((dst.x0 + src.x1) / 2.) as Int as Float
+    };
+    let c0 = snap_to_grid(c - 115., 10.);
+    let r1 = crect(x0=min_float(src.x0, c0), y0=src.y0, x1=max_float(src.x1, c0 + 230.), y1=src.y1);
+    let r2 = crect(x0=c0, y0=min_float(src.y0, dst.y0), x1=c0 + 230., y1=max_float(src.y1, dst.y1));
+    let r3 = crect(x0=min_float(dst.x0, c0), y0=dst.y0, x1=max_float(dst.x1, c0 + 230.), y1=dst.y1);
+    [for r in [r1, r2, r3] {
+        rect("met1.drawing", x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1);
+        block(m1(), r)
+    }]
+}
+
+// Like `access`, with the contact's right edge on `pin`'s.
+fn access_right(g: Grid, pin: Rect, strategy: Int, net: String) -> Access {
+    let r = snap_to(g, via01_right(pin), strategy);
+    rect("met1.drawing", x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1);
+    Access { rect: r, ops: occupy(m1(), r, net) }
+}
+
+fn all_ops(a: [Access]) -> [RouterOp] {
+    std::flatten([for x in a { x.ops }])
+}
+
+fn rects(a: [Access]) -> [Rect] {
+    [for x in a { x.rect }]
+}
+
+// Routes from the first rectangle to each of the others on `net`.
+fn fan_out(rs: [Rect], net: String) -> [RouterOp] {
+    [for d in tail(rs) { route_req(m1(), head(rs), m1(), d, net) }]
+}
+
+fn union_all(rs: [Rect]) -> Rect {
+    if std::len(rs) == 1 { head(rs) } else { union(head(rs), union_all(tail(rs))) }
+}
+
+fn rect_from(h: (Float, Float), v: (Float, Float)) -> Rect {
+    crect(x0=h.0, y0=v.0, x1=h.1, y1=v.1)
+}
+
+fn draw_m1(r: Rect) -> Rect {
+    rect("met1.drawing", x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1);
+    r
+}
+
+fn draw_m2(r: Rect) -> Rect {
+    rect("met2.drawing", x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1);
+    r
+}
+
+// A labeled boundary pin over `r`.
+fn pin(name: String, pin_layer: String, label_layer: String, r: Rect) -> Rect {
+    rect(pin_layer, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1);
+    text(name, label_layer, (r.x0 + r.x1) / 2., (r.y0 + r.y1) / 2.);
+    r
+}

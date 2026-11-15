@@ -1,96 +1,469 @@
-use std::layout::{crect, rect};
+use std::layout::{crect, inst, rect};
 
-fn word_length(cols: Int, mux: Int) -> Int {
-    cols / mux
+// The contacts between adjacent layers: li1 to met1, met1 to met2, and tap
+// or poly to li1.
+enum Via { Mcon, Via1, Tap, Poly }
+
+// A contact's cut and the layers it joins, its cut size and spacing, and each
+// layer's enclosure of the cuts as (short side, long side).
+struct ViaRule {
+    cut: String,
+    bot: String,
+    top: String,
+    size: Float,
+    space: Float,
+    bot_enc: (Float, Float),
+    top_enc: (Float, Float),
 }
 
-fn wmask_granularity(cols: Int, mux: Int) -> Int {
-    let words = word_length(cols, mux);
-    if words < 2 { 1 } else { 2 }
-}
-
-fn wmask_bits(cols: Int, mux: Int, gran: Int) -> Int {
-    word_length(cols, mux) / gran
-}
-
-fn column_w(mux: Int) -> Float {
-    mux as Float * 1200.
-}
-
-fn fmax(a: Float, b: Float) -> Float { max_float(a, b) }
-
-fn fmin(a: Float, b: Float) -> Float { min_float(a, b) }
-
-fn imax(a: Int, b: Int) -> Int { max_int(a, b) }
-
-fn imin(a: Int, b: Int) -> Int { min_int(a, b) }
-
-fn clamp(v: Float, lo: Float, hi: Float) -> Float {
-    min_float(max_float(v, lo), hi)
-}
-
-fn band(a: Bool, b: Bool) -> Bool { a && b }
-
-fn bor(a: Bool, b: Bool) -> Bool { a || b }
-
-fn cbox(x0: Float, y0: Float, x1: Float, y1: Float) -> Rect {
-    crect(x0=x0, y0=y0, x1=x1, y1=y1)
-}
-
-fn draw_box(layer: Any, r: Rect) -> Rect {
-    rect(layer, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
-}
-
-fn draw_clip(layer: Any, r: Rect, width: Float) -> Rect {
-    let x0 = max_float(r.x0, 0.);
-    let x1 = min_float(r.x1, width);
-    if x1 > x0 {
-        rect(layer, x0=x0, y0=r.y0, x1=x1, y1=r.y1)
-    } else {
-        crect(x0=x0, y0=r.y0, x1=x0, y1=r.y1)
+fn via_rule(v: Via) -> ViaRule {
+    match v {
+        Via::Mcon => ViaRule {
+            cut: "mcon.drawing",
+            bot: "li1.drawing",
+            top: "met1.drawing",
+            size: 170.,
+            space: 190.,
+            bot_enc: (0., 0.),
+            top_enc: (30., 60.),
+        },
+        Via::Via1 => ViaRule {
+            cut: "via.drawing",
+            bot: "met1.drawing",
+            top: "met2.drawing",
+            size: 150.,
+            space: 170.,
+            bot_enc: (55., 85.),
+            top_enc: (55., 85.),
+        },
+        Via::Tap => ViaRule {
+            cut: "licon1.drawing",
+            bot: "tap.drawing",
+            top: "li1.drawing",
+            size: 170.,
+            space: 170.,
+            bot_enc: (0., 120.),
+            top_enc: (0., 80.),
+        },
+        Via::Poly => ViaRule {
+            cut: "licon1.drawing",
+            bot: "poly.drawing",
+            top: "li1.drawing",
+            size: 170.,
+            space: 170.,
+            bot_enc: (50., 80.),
+            top_enc: (0., 80.),
+        },
     }
 }
 
-fn rect_w(r: Rect) -> Float {
-    r.x1 - r.x0
+// A contact: `nx` by `ny` cuts filling `cuts`, and its two layers' metal.
+struct Contact {
+    via: Via,
+    nx: Int,
+    ny: Int,
+    cuts: Rect,
+    bot: Rect,
+    top: Rect,
+    bbox: Rect,
 }
 
-fn rect_h(r: Rect) -> Float {
-    r.y1 - r.y0
+// The contact with the most `v` cuts that fit where `bot` and `top` overlap,
+// or in `bot` if they don't, centered there and moved right by `dx`.
+// `bot_dir`, `top_dir`, `longer`, and `later` choose its enclosures as in
+// `max_via_array`. It is drawn, cut to x in [0, clip] when `clip` is positive,
+// unless `draw` is false.
+fn contact(
+    v: Via,
+    bot: Rect,
+    top: Rect,
+    bot_dir: Int = 0,
+    top_dir: Int = 0,
+    longer: Bool = false,
+    later: Bool = false,
+    draw: Bool = true,
+    clip: Float = 0.,
+    dx: Float = 0.,
+) -> Contact {
+    let r = via_rule(v);
+    let n = max_via_array(
+        r.size, r.space, r.bot_enc, r.top_enc, bot, top, bot_dir, top_dir, longer, later,
+    );
+    let w = (r.size + r.space) * n.0 as Float - r.space;
+    let h = (r.size + r.space) * n.1 as Float - r.space;
+    // The center of the overlap, rounded toward zero.
+    let x0 = max_float(bot.x0, top.x0);
+    let y0 = max_float(bot.y0, top.y0);
+    let x1 = min_float(bot.x1, top.x1);
+    let y1 = min_float(bot.y1, top.y1);
+    let hit = x1 >= x0 && y1 >= y0;
+    let cx = ((if hit { x0 + x1 } else { bot.x0 + bot.x1 }) / 2.) as Int as Float;
+    let cy = ((if hit { y0 + y1 } else { bot.y0 + bot.y1 }) / 2.) as Int as Float;
+    let cuts = crect(x0=snap5(cx - w / 2.) + dx, y0=snap5(cy - h / 2.), w=w, h=h);
+    let ex = max_float(n.2, n.4);
+    let ey = max_float(n.3, n.5);
+    let c = Contact {
+        via: v,
+        nx: n.0,
+        ny: n.1,
+        cuts,
+        bot: grow(cuts, n.2, n.3),
+        top: grow(cuts, n.4, n.5),
+        bbox: grow(cuts, ex, ey),
+    };
+    if draw {
+        draw_contact(c, clip=clip);
+    }
+    c
 }
 
-fn rect_cx(r: Rect) -> Float {
-    (r.x0 + r.x1) / 2.
+// A tap contact: the most licon cuts at a 340 nm pitch that fit in `area`
+// less `enc` on each side, centered in it, with tap and li1 grown from the
+// cuts by `tap` and `li`.
+fn tap_contact(
+    area: Rect,
+    enc: (Float, Float),
+    tap: (Float, Float),
+    li: (Float, Float),
+) -> Contact {
+    let nx = max_int(((area.w + 170. - 2. * enc.0) / 340. + 0.000001) as Int, 1);
+    let ny = max_int(((area.h + 170. - 2. * enc.1) / 340. + 0.000001) as Int, 1);
+    let w = 340. * nx as Float - 170.;
+    let h = 340. * ny as Float - 170.;
+    let cuts = crect(x0=snap5(cx_i(area) - w / 2.), y0=snap5(cy_i(area) - h / 2.), w=w, h=h);
+    let c = Contact {
+        via: Via::Tap,
+        nx,
+        ny,
+        cuts,
+        bot: grow(cuts, tap.0, tap.1),
+        top: grow(cuts, li.0, li.1),
+        bbox: grow(cuts, max_float(tap.0, li.0), max_float(tap.1, li.1)),
+    };
+    draw_contact(c);
+    c
 }
 
-fn rect_cy(r: Rect) -> Float {
-    (r.y0 + r.y1) / 2.
+fn cut_count(len: Float, enc: Float) -> Int {
+    max_int(((len + 170. - 2. * enc) / 340. + 0.000001) as Int, 1)
 }
 
-fn rect_cx_i(r: Rect) -> Float {
-    ((r.x0 + r.x1) / 2.) as Int as Float
+// A tap contact filling `area`, enclosed along whichever axis fits more cuts.
+fn tap(area: Rect) -> Contact {
+    if cut_count(area.w, 0.) * cut_count(area.h, 120.) > cut_count(area.w, 120.) * cut_count(area.h, 0.) {
+        tap_contact(area, (0., 120.), (0., 120.), (0., 80.))
+    } else {
+        tap_contact(area, (120., 0.), (120., 0.), (80., 0.))
+    }
 }
 
-fn rect_cy_i(r: Rect) -> Float {
-    ((r.y0 + r.y1) / 2.) as Int as Float
+// Draws contact `c`, cut to x in [0, clip] when `clip` is positive.
+fn draw_contact(c: Contact, clip: Float = 0.) {
+    let r = via_rule(c.via);
+    let pitch = r.size + r.space;
+    if clip > 0. {
+        for i in std::range(c.nx) {
+            for j in std::range(c.ny) {
+                trim(
+                    r.cut,
+                    crect(
+                        x0=c.cuts.x0 + i as Float * pitch,
+                        y0=c.cuts.y0 + j as Float * pitch,
+                        w=r.size,
+                        h=r.size,
+                    ),
+                    clip,
+                );
+            }
+        }
+    } else {
+        for i in std::range(c.nx) {
+            for j in std::range(c.ny) {
+                rect(
+                    r.cut,
+                    x0=c.cuts.x0 + i as Float * pitch,
+                    y0=c.cuts.y0 + j as Float * pitch,
+                    w=r.size,
+                    h=r.size,
+                );
+            }
+        }
+    }
+    trim(r.bot, c.bot, clip);
+    trim(r.top, c.top, clip);
 }
 
-fn rect_union(a: Rect, b: Rect) -> Rect {
-    cbox(min_float(a.x0, b.x0), min_float(a.y0, b.y0), max_float(a.x1, b.x1), max_float(a.y1, b.y1))
+// Contact `c` moved right by `dx`.
+fn moved(c: Contact, dx: Float) -> Contact {
+    Contact {
+        via: c.via,
+        nx: c.nx,
+        ny: c.ny,
+        cuts: shift(c.cuts, dx),
+        bot: shift(c.bot, dx),
+        top: shift(c.top, dx),
+        bbox: shift(c.bbox, dx),
+    }
 }
 
-fn rect_intersection(a: Rect, b: Rect) -> Rect {
+// Draws `r` on `layer`, cut to x in [0, clip] when `clip` is positive.
+fn trim(layer: String, r: Rect, clip: Float) -> Rect {
+    if clip > 0. {
+        let x0 = max_float(r.x0, 0.);
+        let x1 = min_float(r.x1, clip);
+        if x1 > x0 {
+            rect(layer, x0=x0, y0=r.y0, x1=x1, y1=r.y1)
+        } else {
+            crect(x0=x0, y0=r.y0, x1=x0, y1=r.y1)
+        }
+    } else {
+        rect(layer, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
+    }
+}
+
+// The overlap of `a` and `b`, or `a` if they don't overlap.
+fn overlap(a: Rect, b: Rect) -> Rect {
     let x0 = max_float(a.x0, b.x0);
     let y0 = max_float(a.y0, b.y0);
     let x1 = min_float(a.x1, b.x1);
     let y1 = min_float(a.y1, b.y1);
-    if (x1 >= x0 && y1 >= y0) { cbox(x0, y0, x1, y1) } else { cbox(a.x0, a.y0, a.x0, a.y0) }
+    if x1 >= x0 && y1 >= y0 { crect(x0=x0, y0=y0, x1=x1, y1=y1) } else { a }
 }
 
-fn rect_has_area(r: Rect) -> Bool {
-    (r.x1 >= r.x0 && r.y1 >= r.y0)
+// `r` grown by `dx` on the left and right and `dy` at the bottom and top.
+fn grow(r: Rect, dx: Float, dy: Float) -> Rect {
+    crect(x0=r.x0 - dx, y0=r.y0 - dy, x1=r.x1 + dx, y1=r.y1 + dy)
 }
 
+fn shift(r: Rect, dx: Float, dy: Float = 0.) -> Rect {
+    crect(x0=r.x0 + dx, y0=r.y0 + dy, x1=r.x1 + dx, y1=r.y1 + dy)
+}
+
+// The center of `r`, rounded toward zero as integer coordinates are.
+fn cx_i(r: Rect) -> Float { ((r.x0 + r.x1) / 2.) as Int as Float }
+
+fn cy_i(r: Rect) -> Float { ((r.y0 + r.y1) / 2.) as Int as Float }
+
+// The span `w` long centered on `c`, starting on the grid.
+fn centered(c: Float, w: Float) -> (Float, Float) {
+    let x0 = snap5(c - w / 2.);
+    (x0, x0 + w)
+}
+
+// The smallest rectangle containing all of `rs`.
+fn hull(rs: [Rect]) -> Rect { hull_from(tail(rs), head(rs)) }
+
+fn hull_from(rs: [Rect], acc: Rect) -> Rect {
+    if rs == [] { acc } else { hull_from(tail(rs), std::layout::union(acc, head(rs))) }
+}
+
+// Slot and tap x positions of a row of `n` slots `width` wide from x =
+// `left`, with a tap `tap` wide at the left edge and after every `period`
+// slots.
+struct Slots {
+    gates: [Float],
+    taps: [Float],
+}
+
+fn slots(left: Float, n: Int, width: Float, tap: Float, period: Int) -> Slots {
+    Slots {
+        gates: [for i in std::range(n) {
+            left + tap + i as Float * width + (i / period) as Float * tap
+        }],
+        taps: [for g in std::range(ceil_div(n, period) + 1) {
+            if g == 0 {
+                left
+            } else {
+                left + tap + min_int(g * period, n) as Float * width + (g - 1) as Float * tap
+            }
+        }],
+    }
+}
+
+fn ceil_div(a: Int, b: Int) -> Int { (a + b - 1) / b }
+
+// The x spans of a 1.2 um column's met1 bitline tracks: four toward the
+// bitcells, with half tracks at the edges, and three toward the sense amp.
+fn in_tracks() -> [(Float, Float)] { [(0., 70.), (345., 485.), (715., 855.), (1130., 1200.)] }
+
+fn out_tracks() -> [(Float, Float)] { [(160., 300.), (530., 670.), (900., 1040.)] }
+
+// Jogs 140 nm met1 tracks from the `src` x spans to the `dst` ones, starting
+// at `y`. Returns where the jog ends, 420 nm higher.
+fn jog(y: Float, src: [(Float, Float)], dst: [(Float, Float)]) -> Float {
+    for i in std::range(std::len(src)) {
+        let s = src[i];
+        let d = dst[i];
+        rect("met1.drawing", x0=s.0, y0=y, x1=s.1, h=280.);
+        rect("met1.drawing", x0=d.0, y0=y + 140., x1=d.1, h=280.);
+        rect("met1.drawing", x0=min_float(s.0, d.1), y0=y + 140., x1=max_float(s.0, d.1), h=140.);
+    }
+    y + 420.
+}
+
+// A device of a `mos` row: its width and whether it is a PMOS.
+struct Device {
+    w: Int,
+    pmos: Bool,
+}
+
+fn nmos(w: Int) -> Device { Device { w, pmos: false } }
+
+fn pmos(w: Int) -> Device { Device { w, pmos: true } }
+
+// How a `mos` row contacts its gate fingers: once per finger on the left or
+// on both sides, or once on the left for all of them.
+enum Gates { Left, Both, Merged }
+
+// A row of devices along x under `nf` shared gate fingers of length `l`, as
+// sky130's MOS generator draws it: diffusions 270 nm apart (520 nm between an
+// NMOS and a PMOS) in their implants and wells, poly fingers along x with li1
+// gate contacts, and a row of li1 source/drain contacts below, between, and
+// above the fingers. `sd[j][i]` is row `i` of device `j`; `skip` lists the
+// (device, row) contacts left undrawn.
+cell mos(devs: [Device], l: Int, nf: Int, gates: Gates = Gates::Left, skip: [(Int, Int)] = []) {
+    let n = std::len(devs);
+    let pitch = l as Float + 280.;
+    let h = nf as Float * pitch + 250.;
+    let xs = [for j in std::range(n) {
+        std::sum([for k in std::range(j) {
+            devs[k].w + if devs[k].pmos == devs[k + 1].pmos { 270 } else { 520 }
+        }]) as Float
+    }];
+    pub let diffs = [for j in std::range(n) {
+        rect("diff.drawing", x0=xs[j], y0=0., w=devs[j].w as Float, h=h)
+    }];
+    for j in std::range(n) {
+        let x1 = xs[j] + devs[j].w as Float;
+        let joined = j > 0 && devs[j - 1].pmos == devs[j].pmos;
+        let implant_x0 = if joined { xs[j - 1] + devs[j - 1].w as Float } else { xs[j] };
+        rect(
+            if devs[j].pmos { "psdm.drawing" } else { "nsdm.drawing" },
+            x0=implant_x0 - 125.,
+            y0=-125.,
+            x1=x1 + 125.,
+            y1=h + 125.,
+        );
+        if devs[j].pmos {
+            rect("nwell.drawing", x0=xs[j] - 180., y0=-180., x1=x1 + 180., y1=h + 180.);
+        }
+    }
+    let both = match gates { Gates::Both => true, _ => false, };
+    let poly_x1 = xs[n - 1] + devs[n - 1].w as Float + if both { 190. } else { 130. };
+    for k in std::range(nf) {
+        rect("poly.drawing", x0=-190., y0=265. + k as Float * pitch, x1=poly_x1, h=l as Float);
+    }
+    let fingers = nf as Float * pitch - 280.;
+    pub let gate = match gates {
+        Gates::Merged => {
+            let poly = rect("poly.drawing", x0=-520., y0=265., x1=-190., h=fingers);
+            let c = contact(Via::Poly, poly, poly, longer=true, later=true);
+            draw_box("npc.drawing", grow(c.cuts, 100., 100.));
+            [c.top]
+        },
+        _ => gate_contacts(-520., 265. + fingers / 2., nf),
+    };
+    pub let gate_x = if both { gate_contacts(poly_x1, 265. + fingers / 2., nf) } else { gate };
+    pub let sd = [for j in std::range(n) {
+        [for i in std::range(nf + 1) {
+            sd_contact(
+                xs[j],
+                devs[j].w as Float,
+                i as Float * pitch,
+                !std::any([for s in skip { s.0 == j && s.1 == i }]),
+            )
+        }]
+    }];
+}
+
+// A logic gate: a NAND of `inputs` inputs, its NMOS fingers in series and its
+// PMOS fingers in parallel, or for one input a folded inverter of two fingers
+// each half as wide. `gates` are its li1 inputs; `vss` and `vdd` its sources.
+cell gate(inputs: Int, nw: Int, pw: Int, pins: Bool = false) {
+    let inv = inputs == 1;
+    let nf = if inv { 2 } else { inputs };
+    let n = if inv { half(nw) } else { nw };
+    let p = if inv { half(pw) } else { pw };
+    let m = inst(
+        mos(
+            [nmos(n), pmos(p)],
+            150,
+            nf,
+            gates=if inv { Gates::Merged } else { Gates::Left },
+            skip=[for i in std::range(inputs - 1) { (0, i + 1) }],
+        ),
+        x=0.,
+        y=0.,
+    );
+    let sd = m.sd;
+    let row = if inv { 1 } else { nf };
+    pub let out = draw_box("li1.drawing", std::layout::union(sd[0][row], sd[1][row]));
+    if !inv {
+        // The other PMOS drain joins the output through a strap between the devices.
+        let drain = sd[1][nf - 2];
+        let x = snap5((((sd[0][row].x1 + drain.x0) as Int) / 2) as Float - out.h / 2.);
+        rect("li1.drawing", x0=x, y0=drain.y0, x1=x + out.h, y1=out.y1);
+        rect("li1.drawing", x0=x, y0=drain.y0, x1=drain.x1, y1=drain.y1);
+    }
+    pub let gates = m.gate;
+    pub let a = m.gate[0];
+    pub let vss = if inv { [sd[0][0], sd[0][2]] } else { [sd[0][0]] };
+    pub let vdd = [for i in std::range(nf + 1) if (i % 2 == 0) == (inv || nf % 2 == 1) {
+        sd[1][i]
+    }];
+    if pins {
+        for r in std::concat(std::concat([a, out], vss), vdd) {
+            draw_box("li1.pin", r);
+        }
+    }
+}
+
+// Half of `w`, rounded to 10 nm.
+fn half(w: Int) -> Int {
+    ((w as Float * 0.5 / 10. + 0.5) as Int) * 10
+}
+
+// A column of `nf` poly-to-li1 gate contacts at `x`, 480 nm apart and
+// centered on `y`, and the npc around them. Returns their li1.
+fn gate_contacts(x: Float, y: Float, nf: Int) -> [Rect] {
+    let y0 = snap5(y - (480. * nf as Float - 210.) / 2.);
+    rect("npc.drawing", x0=x - 20., y0=y0 - 50., x1=x + 350., y1=y0 + 480. * nf as Float - 160.);
+    [for i in std::range(nf) {
+        let y = y0 + 480. * i as Float;
+        rect("poly.drawing", x0=x, y0=y, x1=x + 330., h=270.);
+        rect("licon1.drawing", x0=x + 80., y0=y + 50., x1=x + 250., h=170.);
+        rect("li1.drawing", x0=x, y0=y + 50., x1=x + 330., h=170.)
+    }]
+}
+
+// The li1 of a row of source/drain contacts across a `w`-wide diffusion at
+// (x, y), drawn with its cuts unless `draw` is false.
+fn sd_contact(x: Float, w: Float, y: Float, draw: Bool) -> Rect {
+    let n = max_int(((w + 10.) / 340.) as Int, 1);
+    let aw = 340. * n as Float - 170.;
+    let x0 = snap5(x + w / 2. - aw / 2.);
+    let li = crect(x0=x0 - 80., y0=y + 40., x1=x0 + aw + 80., y1=y + 210.);
+    if draw {
+        for i in std::range(n) {
+            rect("licon1.drawing", x0=x0 + i as Float * 340., y0=y + 40., w=170., h=170.);
+        }
+        rect("diff.drawing", x0=x0 - 60., y0=y, x1=x0 + aw + 60., y1=y + 250.);
+        draw_box("li1.drawing", li);
+    }
+    li
+}
+
+// The width of a column of `mux` 1.2 um bitline pairs.
+fn column_w(mux: Int) -> Float {
+    mux as Float * 1200.
+}
+
+// Draws rectangle `r` on `layer`.
+fn draw_box(layer: String, r: Rect) -> Rect {
+    rect(layer, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
+}
+
+// `v` rounded to the 5 nm grid, halves away from zero.
 fn snap5(v: Float) -> Float {
     if v < 0. {
         (((v / 5.) - 0.5) as Int) as Float * 5.
@@ -99,393 +472,7 @@ fn snap5(v: Float) -> Float {
     }
 }
 
-// Boundary kind: 0=Space, 1=HalfSpace, 2=Track, 3=HalfTrack.
-fn boundary_num_tracks(kind: Int) -> Int {
-    if kind == 2 {
-        1
-    } else {
-        if kind == 3 { 1 } else { 0 }
-    }
-}
-
-fn boundary_width(kind: Int, line: Float, space: Float) -> Float {
-    if kind == 0 {
-        space
-    } else {
-        if kind == 1 {
-            space / 2.
-        } else {
-            if kind == 2 { line } else { line / 2. }
-        }
-    }
-}
-
-fn centered_track_index(
-    line: Float,
-    space: Float,
-    span_len: Float,
-    num: Int,
-    lower: Int,
-    upper: Int,
-    index: Int,
-) -> (Float, Float) {
-    let lower_tracks = boundary_num_tracks(lower);
-    let upper_tracks = boundary_num_tracks(upper);
-    let interior = num - lower_tracks - upper_tracks;
-    let lower_width = boundary_width(lower, line, space);
-    let upper_width = boundary_width(upper, line, space);
-    let margin = span_len - lower_width - upper_width - line * interior as Float - space * (interior - 1) as Float;
-    let boundary_space = margin / 2.;
-    if index < lower_tracks {
-        (0., lower_width,)
-    } else {
-        let adj = index - lower_tracks;
-        if adj >= interior {
-            let start = lower_width + boundary_space + (line + space) * (interior - 1) as Float + line + boundary_space;
-            (start, start + upper_width,)
-        } else {
-            let start = lower_width + boundary_space + (line + space) * adj as Float;
-            (start, start + line,)
-        }
-    }
-}
-
-fn precharge_in_track(index: Int) -> (Float, Float) {
-    centered_track_index(140., 230., 1200., 4, 3, 3, index)
-}
-
-fn precharge_out_track(index: Int) -> (Float, Float) {
-    centered_track_index(140., 230., 1200., 3, 1, 1, index)
-}
-
-fn rect_from_spans(h: (Float, Float), v: (Float, Float)) -> Rect {
-    cbox(h.0, v.0, h.1, v.1)
-}
-
-fn rect_expand_xy(r: Rect, dx: Float, dy: Float) -> Rect {
-    cbox(r.x0 - dx, r.y0 - dy, r.x1 + dx, r.y1 + dy)
-}
-
-fn rect_expand_vert(r: Rect, d: Float) -> Rect {
-    cbox(r.x0, r.y0 - d, r.x1, r.y1 + d)
-}
-
-fn rect_translate(r: Rect, dx: Float, dy: Float) -> Rect {
-    cbox(r.x0 + dx, r.y0 + dy, r.x1 + dx, r.y1 + dy)
-}
-
-fn span_union(a: (Float, Float), b: (Float, Float)) -> (Float, Float) {
-    (min_float(a.0, b.0), max_float(a.1, b.1),)
-}
-
-fn span_add_point(span: (Float, Float), point: Float) -> (Float, Float) {
-    (min_float(span.0, point), max_float(span.1, point),)
-}
-
-fn span_with_points(a: Float, b: Float) -> (Float, Float) {
-    (min_float(a, b), max_float(a, b),)
-}
-
-fn span_with_stop_and_length(stop: Float, length: Float) -> (Float, Float) {
-    (stop - length, stop,)
-}
-
-fn center_span_gridded(center: Float, width: Float) -> (Float, Float) {
-    let start = snap5(center - width / 2.);
-    (start, start + width,)
-}
-
-fn rect_with_vspan(r: Rect, span: (Float, Float)) -> Rect {
-    cbox(r.x0, span.0, r.x1, span.1)
-}
-
-fn rect_with_hspan(r: Rect, span: (Float, Float)) -> Rect {
-    cbox(span.0, r.y0, span.1, r.y1)
-}
-
-fn rect_hspan(r: Rect) -> (Float, Float) {
-    (r.x0, r.x1,)
-}
-
-fn rect_vspan(r: Rect) -> (Float, Float) {
-    (r.y0, r.y1,)
-}
-
-fn double_left(r: Rect) -> Rect {
-    cbox(r.x0 - rect_w(r), r.y0, r.x1, r.y1)
-}
-
-fn double_right(r: Rect) -> Rect {
-    cbox(r.x0, r.y0, r.x1 + rect_w(r), r.y1)
-}
-
-fn contact_size(via: Int) -> Float {
-    if via == 0 { 170. } else { if via == 1 { 150. } else { 170. } }
-}
-
-fn contact_space(via: Int) -> Float {
-    if via == 0 { 190. } else { if via == 1 { 170. } else { 170. } }
-}
-
-fn contact_bot_enc(via: Int) -> (Float, Float) {
-    if via == 0 {
-        (0., 0.,)
-    } else {
-        if via == 1 {
-            (55., 85.,)
-        } else {
-            // Via 2 is tap-to-LI; via 3 is poly-to-LI.
-            if via == 2 { (0., 120.,) } else { (50., 80.,) }
-        }
-    }
-}
-
-fn contact_top_enc(via: Int) -> (Float, Float) {
-    if via == 0 {
-        (30., 60.,)
-    } else {
-        if via == 1 { (55., 85.,) } else { (0., 80.,) }
-    }
-}
-
-fn contact_max_n(len: Float, ext2: Float, size: Float, space: Float) -> Int {
-    // Layout coordinates are integral nanometers. A tiny epsilon prevents
-    // solver roundoff in translated rectangles from turning an exact integer
-    // quotient such as 14.0 into 13.999999999999998 before truncation.
-    max_int((((len + space - ext2) / (size + space)) + 0.000001) as Int, 0)
-}
-
-fn contact_n_dir(
-    bot_len: Float,
-    top_len: Float,
-    overlap_len: Float,
-    bot_ext: Float,
-    top_ext: Float,
-    size: Float,
-    space: Float,
-) -> Int {
-    max_int(0, min_int(min_int(contact_max_n(bot_len, 2. * bot_ext, size, space), contact_max_n(top_len, 2. * top_ext, size, space)), contact_max_n(overlap_len, 0., size, space)))
-}
-
-fn contact_center(bot: Rect, top: Rect) -> Rect {
-    let x0 = max_float(bot.x0, top.x0);
-    let y0 = max_float(bot.y0, top.y0);
-    let x1 = min_float(bot.x1, top.x1);
-    let y1 = min_float(bot.y1, top.y1);
-    if (x1 >= x0 && y1 >= y0) { cbox(x0, y0, x1, y1) } else { bot }
-}
-
-// Extension direction: 0=None, 1=Horiz, 2=Vert.
-fn contact_choice(
-    via: Int,
-    bot: Rect,
-    top: Rect,
-    bot_ext_dir: Int,
-    top_ext_dir: Int,
-    longer: Bool,
-) -> (Int, Int, Float, Float, Float, Float, Int, Float) {
-    max_via_array(contact_size(via), contact_space(via), contact_bot_enc(via), contact_top_enc(via), bot, top, bot_ext_dir, top_ext_dir, longer, false)
-}
-
-// Like `contact_choice`, but a later enclosure orientation wins an exact tie.
-fn contact_choice_later(
-    via: Int,
-    bot: Rect,
-    top: Rect,
-    bot_ext_dir: Int,
-    top_ext_dir: Int,
-    longer: Bool,
-) -> (Int, Int, Float, Float, Float, Float, Int, Float) {
-    max_via_array(contact_size(via), contact_space(via), contact_bot_enc(via), contact_top_enc(via), bot, top, bot_ext_dir, top_ext_dir, longer, true)
-}
-
-fn draw_contact_clip(
-    via: Int,
-    bot_layer: Any,
-    top_layer: Any,
-    bot: Rect,
-    top: Rect,
-    bot_ext_dir: Int,
-    top_ext_dir: Int,
-    longer: Bool,
-    width: Float,
-) -> (Rect, Rect, Rect) {
-    let choice = contact_choice(via, bot, top, bot_ext_dir, top_ext_dir, longer);
-    let size = contact_size(via);
-    let space = contact_space(via);
-    let nx = choice.0;
-    let ny = choice.1;
-    let center = contact_center(bot, top);
-    let aw = size * nx as Float + space * (nx - 1) as Float;
-    let ah = size * ny as Float + space * (ny - 1) as Float;
-    let ax0 = snap5(rect_cx_i(center) - aw / 2.);
-    let ay0 = snap5(rect_cy_i(center) - ah / 2.);
-    for ix in std::range(nx) {
-        for iy in std::range(ny) {
-            draw_clip(
-                if via == 1 { "via.drawing" } else { if via == 0 { "mcon.drawing" } else { "licon1.drawing" } },
-                cbox(ax0 + ix as Float * (size + space), ay0 + iy as Float * (size + space), ax0 + ix as Float * (size + space) + size, ay0 + iy as Float * (size + space) + size),
-                width,
-            );
-        }
-    }
-    let arr = cbox(ax0, ay0, ax0 + aw, ay0 + ah);
-    let bot_rect = rect_expand_xy(arr, choice.2, choice.3);
-    let top_rect = rect_expand_xy(arr, choice.4, choice.5);
-    draw_clip(bot_layer, bot_rect, width);
-    draw_clip(top_layer, top_rect, width);
-    (bot_rect, top_rect, rect_union(bot_rect, top_rect),)
-}
-
-fn draw_contact_full(
-    via: Int,
-    bot_layer: Any,
-    top_layer: Any,
-    bot: Rect,
-    top: Rect,
-    bot_ext_dir: Int,
-    top_ext_dir: Int,
-    longer: Bool,
-) -> (Rect, Rect, Rect) {
-    let choice = contact_choice(via, bot, top, bot_ext_dir, top_ext_dir, longer);
-    let size = contact_size(via);
-    let space = contact_space(via);
-    let nx = choice.0;
-    let ny = choice.1;
-    let center = contact_center(bot, top);
-    let aw = size * nx as Float + space * (nx - 1) as Float;
-    let ah = size * ny as Float + space * (ny - 1) as Float;
-    let ax0 = snap5(rect_cx_i(center) - aw / 2.);
-    let ay0 = snap5(rect_cy_i(center) - ah / 2.);
-    for ix in std::range(nx) {
-        for iy in std::range(ny) {
-            draw_box(
-                if via == 1 { "via.drawing" } else { if via == 0 { "mcon.drawing" } else { "licon1.drawing" } },
-                cbox(ax0 + ix as Float * (size + space), ay0 + iy as Float * (size + space), ax0 + ix as Float * (size + space) + size, ay0 + iy as Float * (size + space) + size),
-            );
-        }
-    }
-    let arr = cbox(ax0, ay0, ax0 + aw, ay0 + ah);
-    let bot_rect = rect_expand_xy(arr, choice.2, choice.3);
-    let top_rect = rect_expand_xy(arr, choice.4, choice.5);
-    draw_box(bot_layer, bot_rect);
-    draw_box(top_layer, top_rect);
-    (bot_rect, top_rect, rect_union(bot_rect, top_rect),)
-}
-
-fn draw_contact_full_later(
-    via: Int,
-    bot_layer: Any,
-    top_layer: Any,
-    bot: Rect,
-    top: Rect,
-    bot_ext_dir: Int,
-    top_ext_dir: Int,
-    longer: Bool,
-) -> (Rect, Rect, Rect) {
-    let choice = contact_choice_later(via, bot, top, bot_ext_dir, top_ext_dir, longer);
-    let size = contact_size(via);
-    let space = contact_space(via);
-    let nx = choice.0;
-    let ny = choice.1;
-    let center = contact_center(bot, top);
-    let aw = size * nx as Float + space * (nx - 1) as Float;
-    let ah = size * ny as Float + space * (ny - 1) as Float;
-    let ax0 = snap5(rect_cx_i(center) - aw / 2.);
-    let ay0 = snap5(rect_cy_i(center) - ah / 2.);
-    for ix in std::range(nx) {
-        for iy in std::range(ny) {
-            draw_box(
-                if via == 1 { "via.drawing" } else { if via == 0 { "mcon.drawing" } else { "licon1.drawing" } },
-                cbox(ax0 + ix as Float * (size + space), ay0 + iy as Float * (size + space), ax0 + ix as Float * (size + space) + size, ay0 + iy as Float * (size + space) + size),
-            );
-        }
-    }
-    let arr = cbox(ax0, ay0, ax0 + aw, ay0 + ah);
-    let bot_rect = rect_expand_xy(arr, choice.2, choice.3);
-    let top_rect = rect_expand_xy(arr, choice.4, choice.5);
-    draw_box(bot_layer, bot_rect);
-    draw_box(top_layer, top_rect);
-    (bot_rect, top_rect, rect_union(bot_rect, top_rect),)
-}
-
-fn contact_cut_bbox_later(
-    via: Int,
-    bot: Rect,
-    top: Rect,
-    bot_ext_dir: Int,
-    top_ext_dir: Int,
-    longer: Bool,
-) -> Rect {
-    let choice = contact_choice_later(via, bot, top, bot_ext_dir, top_ext_dir, longer);
-    let size = contact_size(via);
-    let space = contact_space(via);
-    let center = contact_center(bot, top);
-    let aw = size * choice.0 as Float + space * (choice.0 - 1) as Float;
-    let ah = size * choice.1 as Float + space * (choice.1 - 1) as Float;
-    let x0 = snap5(rect_cx_i(center) - aw / 2.);
-    let y0 = snap5(rect_cy_i(center) - ah / 2.);
-    cbox(x0, y0, x0 + aw, y0 + ah)
-}
-
-fn contact_top_bbox_later(
-    via: Int,
-    bot: Rect,
-    top: Rect,
-    bot_ext_dir: Int,
-    top_ext_dir: Int,
-    longer: Bool,
-) -> Rect {
-    let choice = contact_choice_later(via, bot, top, bot_ext_dir, top_ext_dir, longer);
-    let cuts = contact_cut_bbox_later(via, bot, top, bot_ext_dir, top_ext_dir, longer);
-    rect_expand_xy(cuts, choice.4, choice.5)
-}
-
-fn contact_bbox(
-    via: Int,
-    bot: Rect,
-    top: Rect,
-    bot_ext_dir: Int,
-    top_ext_dir: Int,
-    longer: Bool,
-) -> Rect {
-    let choice = contact_choice(via, bot, top, bot_ext_dir, top_ext_dir, longer);
-    let size = contact_size(via);
-    let space = contact_space(via);
-    let nx = choice.0;
-    let ny = choice.1;
-    let center = contact_center(bot, top);
-    let aw = size * nx as Float + space * (nx - 1) as Float;
-    let ah = size * ny as Float + space * (ny - 1) as Float;
-    let ax0 = snap5(rect_cx_i(center) - aw / 2.);
-    let ay0 = snap5(rect_cy_i(center) - ah / 2.);
-    let arr = cbox(ax0, ay0, ax0 + aw, ay0 + ah);
-    let bot_rect = rect_expand_xy(arr, choice.2, choice.3);
-    let top_rect = rect_expand_xy(arr, choice.4, choice.5);
-    rect_union(bot_rect, top_rect)
-}
-
-fn simple_jog_clip(
-    layer: Any,
-    src_pos: Float,
-    src0: (Float, Float),
-    src1: (Float, Float),
-    dst0: (Float, Float),
-    dst1: (Float, Float),
-    line: Float,
-    space: Float,
-    width: Float,
-) -> Float {
-    let dst_pos = src_pos + space + line + space;
-    draw_clip(layer, cbox(src0.0, src_pos, src0.1, src_pos + space + line), width);
-    draw_clip(layer, cbox(dst0.0, dst_pos - space - line, dst0.1, dst_pos), width);
-    draw_clip(layer, cbox(min_float(src0.0, dst0.1), src_pos + space, max_float(src0.0, dst0.1), src_pos + space + line), width);
-    draw_clip(layer, cbox(src1.0, src_pos, src1.1, src_pos + space + line), width);
-    draw_clip(layer, cbox(dst1.0, dst_pos - space - line, dst1.1, dst_pos), width);
-    draw_clip(layer, cbox(min_float(src1.0, dst1.1), src_pos + space, max_float(src1.0, dst1.1), src_pos + space + line), width);
-    dst_pos
-}
-
+// Draws a met1 rectangle and its pin. Returns the drawn rectangle.
 fn met1_port(x0: Float, y0: Float, x1: Float, y1: Float) -> Rect {
     let draw = rect("met1.drawing", x0=x0, y0=y0, x1=x1, y1=y1);
     rect("met1.pin", x0=x0, y0=y0, x1=x1, y1=y1);
@@ -504,8 +491,10 @@ fn li1_port(x0: Float, y0: Float, x1: Float, y1: Float) -> Rect {
     draw
 }
 
+// The width of a row of columns, with a 1.3 um tap between columns and at
+// each end.
 fn row_w(cols: Int, mux: Int) -> Float {
-    let words = word_length(cols, mux);
+    let words = cols / mux;
     1300. + words as Float * column_w(mux) + (words - 1) as Float * 1300. + 1300.
 }
 
@@ -513,6 +502,7 @@ fn wmask_unit_w(cols: Int, mux: Int, gran: Int) -> Float {
     gran as Float * (column_w(mux) + 1300.)
 }
 
+// The left edge of column `group`, and of bitline pair `idx`.
 fn word_x(group: Int, mux: Int) -> Float {
     1300. + group as Float * (column_w(mux) + 1300.)
 }
@@ -523,46 +513,32 @@ fn bit_x(idx: Int, mux: Int) -> Float {
     word_x(group, mux) + bit as Float * 1200.
 }
 
-fn column_bitline_ports(idx: Int, cols: Int, mux: Int, right: Bool) -> [Rect] {
-    [for i in range_full(idx, cols, 1) {
-        let x = bit_x(i, mux) + if right { 750. } else { 150. };
-        met2_port(x, 0., x + 300., 80640.)
-    }]
+// Whether two rects have the same extent along one axis and overlap or touch
+// along the other.
+fn rects_coalesce(a: Rect, b: Rect) -> Bool {
+    let same_x = a.x0 <= b.x0 && a.x0 >= b.x0 && a.x1 <= b.x1 && a.x1 >= b.x1;
+    let same_y = a.y0 <= b.y0 && a.y0 >= b.y0 && a.y1 <= b.y1 && a.y1 >= b.y1;
+    (same_x && a.y0 <= b.y1 && b.y0 <= a.y1) || (same_y && a.x0 <= b.x1 && b.x0 <= a.x1)
 }
 
-fn column_din_ports(group: Int, words: Int, mux: Int, y0: Float) -> [Rect] {
-    [for g in range_full(group, words, 1) {
-        let x = word_x(g, mux) + 120.;
-        met1_port(x - 140., y0, x + 140., 3260.)
-    }]
+// Adds r to rects no two of which coalesce, merging it with the first one it
+// coalesces with until it coalesces with none.
+fn coalesce_into(acc: [Rect], r: Rect) -> [Rect] {
+    let hits = [for i in std::range(std::len(acc)) if rects_coalesce(acc[i], r) { i }];
+    if hits == [] {
+        std::concat(acc, [r])
+    } else {
+        let k = head(hits);
+        coalesce_into(
+            [for i in std::range(std::len(acc)) if i != k { acc[i] }],
+            std::layout::union(acc[k], r),
+        )
+    }
 }
 
-fn column_dout_ports(group: Int, words: Int, mux: Int, y0: Float) -> [Rect] {
-    [for g in range_full(group, words, 1) {
-        let x = word_x(g, mux) + 120.;
-        met1_port(x - 560., y0, x - 280., 19440.)
-    }]
+fn coalesce_from(l: [Rect], i: Int, acc: [Rect]) -> [Rect] {
+    if i == std::len(l) { acc } else { coalesce_from(l, i + 1, coalesce_into(acc, l[i])) }
 }
 
-fn column_select_segments(group: Int, words: Int, mux: Int, bit: Int, complement: Bool) -> [Rect] {
-    let y = 54150. + bit as Float * 260. + if complement { 1040. } else { 0. };
-    [for g in range_full(group, words, 1) {
-        let x = word_x(g, mux);
-        met1_port(x, y, x + column_w(mux), y + 180.)
-    }]
-}
-
-fn column_select_ports(bit: Int, mux: Int, words: Int, complement: Bool) -> [[Rect]] {
-    [for b in range_full(bit, mux, 1) { column_select_segments(0, words, mux, b, complement) }]
-}
-
-fn wmask_ports(bit: Int, bits: Int, unit_w: Float, y0: Float) -> [Rect] {
-    [for b in range_full(bit, bits, 1) {
-        let x = 650. + b as Float * unit_w + 260.;
-        met1_port(x, y0, x + 280., y0 + 5600.)
-    }]
-}
-
-fn concat_rects(a: [Rect], b: [Rect]) -> [Rect] { std::concat(a, b) }
-
-fn shift_rects(l: [Rect], dx: Float, dy: Float) -> [Rect] { [for r in l { rect_translate(r, dx, dy) }] }
+// Merges rects that coalesce until no two do.
+fn coalesce_rects(l: [Rect]) -> [Rect] { coalesce_from(l, 0, []) }

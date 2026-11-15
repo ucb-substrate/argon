@@ -761,7 +761,7 @@ impl<'a> Parser<'a> {
         if path.path.len() < 2 {
             self.error_at(
                 path.span,
-                "a use path must name an item in a module".to_string(),
+                "a use path must name an item or module inside a module".to_string(),
             );
         }
         let alias = self.parse_use_alias();

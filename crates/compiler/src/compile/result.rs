@@ -303,8 +303,8 @@ pub enum StaticErrorKind {
     /// A referenced module does not exist in the loaded workspace.
     #[error("module `{module}` does not exist or could not be loaded")]
     InvalidMod { module: String },
-    /// A `use` path names an item that does not exist in the target module.
-    #[error("unresolved import `{path}`")]
+    /// A `use` path names neither a module nor an item of its module.
+    #[error("unresolved import `{path}`: no module or item has this path")]
     UnresolvedImport { path: String },
     /// Module references form a dependency cycle.
     #[error("cyclic module dependency: {cycle}")]
@@ -532,6 +532,9 @@ pub enum ExecErrorKind {
     /// A placeholder read through an instance was used.
     #[error("{0}")]
     DetachedValue(Arc<Detached>),
+    /// `std::layout::route_tracks` could not route its nets.
+    #[error("routing failed: {0}")]
+    Routing(String),
 }
 
 /// The message of [`StaticErrorKind::SignalCellParam`].

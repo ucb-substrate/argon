@@ -1304,7 +1304,7 @@ fn walk<'v>(
             }
         }
         Value::Struct(value) => {
-            for (name, field) in &value.fields {
+            for (name, field) in value.fields() {
                 enter(Segment::Field(name), field, path, visit);
             }
         }

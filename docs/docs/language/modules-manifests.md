@@ -21,7 +21,7 @@ cell top() {
 
 `mod utils;` loads `utils.ar`. A module can also be a directory containing a `mod.ar`.
 
-Paths start with `std::` for the standard library, `lib::` for the root of the current library, or a dependency's name for that dependency.
+Paths start with `std::` for the standard library, `lib::` for the root of the current library, a dependency's name for that dependency, or a module imported with [`use`](#module-imports).
 
 ## Imports
 
@@ -47,6 +47,28 @@ A group imports several items from one module: `use utils::{default_spacing, pad
 - Imports and declarations share one namespace per module, so a module can't import a name it also declares. Use `as` to import the item under another name.
 - A `use` can't bind the name of a [built-in function](/language/builtins), such as `eq` or `float`.
 
+### Module imports
+
+A `use` whose path names a module imports the module. Paths in the importing module can then start with the module's name, or with the name after `as`:
+
+```argon title="blocks/top.ar"
+use lib::blocks::geometry;
+use lib::blocks::{pads, wires as w};
+
+cell top() {
+    let pitch = geometry::pitch();
+    let pad = std::layout::inst(pads::pad(geometry::Size { w: pitch, h: pitch }), x=0., y=0.);
+    w::strap(pad, geometry::Side::Left);
+}
+```
+
+Here `geometry::pitch()` is `lib::blocks::geometry::pitch()`. Functions, cells, structs, enum variants, and nested modules can all be reached through an imported module.
+
+- A module import follows the same rules as an item import: it applies only to its own module, and its name can't also be declared, imported, or used by a `mod` for a different module.
+- `lib` and `std` always start an absolute path, so they can't be used as import names.
+- A `use` path itself never starts with an imported module. Write `use lib::blocks::geometry::Size;`, not `use geometry::Size;`.
+- If the module's parent also has an item of the same name, the `use` imports both.
+
 ## Standard library
 
 `std` is available in every library without a manifest entry. It is split into modules:
@@ -54,7 +76,7 @@ A group imports several items from one module: `use utils::{default_spacing, pad
 | Module | Contents |
 | --- | --- |
 | [`std`](/language/std) | `max`, `min`, `Option`, and sequence helpers |
-| [`std::layout`](/language/std-layout) | Geometry constructors, `inst`, `bbox`, `dimension`, and rectangle helpers |
+| [`std::layout`](/language/std-layout) | Geometry constructors, `inst`, `bbox`, `shapes`, `autoroute`, `dimension`, and rectangle helpers |
 | [`std::schematic`](/language/std-schematic) | `Signal`, `connect`, `device`, `inst`, and `DeviceKind` |
 
 Call a standard library item by its full path, such as `std::max(a, b)` or `std::layout::rect("met1")`, or import it with `use`. `Option`, `Some`, and `None` are in scope in every module without an import.

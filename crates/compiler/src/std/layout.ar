@@ -109,3 +109,79 @@ fn center_rects(r1: Rect, r2: Rect) {
 fn crect2rect(r: Rect) -> Rect {
     rect(r.layer, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
 }
+
+// A routing layer for `autoroute`: the layer to draw on, its wire width and
+// spacing, and whether its wires run horizontally.
+struct RouteLayer {
+    name: String,
+    width: Float,
+    space: Float,
+    horizontal: Bool,
+}
+
+// The via from one routing layer to the next: its cut layer, square cut size,
+// spacing between cuts, and the enclosure of the cuts by the lower and upper
+// layers, each as (short side, long side).
+struct RouteVia {
+    cut: String,
+    size: Float,
+    space: Float,
+    bot_enc: (Float, Float),
+    top_enc: (Float, Float),
+}
+
+// A pin: a rectangle on the routing layer at index `layer`.
+struct RoutePin {
+    layer: Int,
+    rect: Rect,
+}
+
+// A net to route. Its first pin is routed to each of the others.
+struct RouteNet {
+    name: String,
+    pins: [RoutePin],
+}
+
+// What `autoroute` drew for a net: its metal on routing layers (wires, pin
+// stubs, gap fills, and via landings) and its via cuts.
+struct RoutedNet {
+    name: String,
+    wires: [Rect],
+    cuts: [Rect],
+}
+
+// Routes `nets` in order within `area` and draws them. `obstacles[i]` holds
+// the obstacles on `layers[i]`, and `vias[i]` joins `layers[i]` to the next.
+fn autoroute(
+    area: Rect,
+    layers: [RouteLayer],
+    vias: [RouteVia],
+    obstacles: [[Rect]],
+    nets: [RouteNet],
+) -> [RoutedNet] {
+    let routed = route_tracks(
+        area,
+        [for l in layers { (l.width, l.space, l.horizontal) }],
+        [for v in vias { (v.size, v.space, v.bot_enc, v.top_enc) }],
+        std::flatten([for i in std::range(std::len(obstacles)) {
+            [for r in obstacles[i] { (i, r) }]
+        }]),
+        [for n in nets { (n.name, [for p in n.pins { (p.layer, p.rect) }]) }],
+    );
+    [for i in std::range(std::len(nets)) {
+        let net = routed[i];
+        let wires = [for w in std::concat(net.2, net.0) {
+            rect(layers[w.0].name, x0=w.1.x0, y0=w.1.y0, x1=w.1.x1, y1=w.1.y1)
+        }];
+        let landings = std::flatten([for v in net.1 {
+            [
+                rect(layers[v.0].name, x0=v.2.x0, y0=v.2.y0, x1=v.2.x1, y1=v.2.y1),
+                rect(layers[v.0 + 1].name, x0=v.3.x0, y0=v.3.y0, x1=v.3.x1, y1=v.3.y1),
+            ]
+        }]);
+        let cuts = std::flatten([for v in net.1 {
+            [for c in v.1 { rect(vias[v.0].cut, x0=c.x0, y0=c.y0, x1=c.x1, y1=c.y1) }]
+        }]);
+        RoutedNet { name: nets[i].name, wires: std::concat(wires, landings), cuts: cuts }
+    }]
+}

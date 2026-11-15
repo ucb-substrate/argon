@@ -1,5 +1,6 @@
 // Native transcriptions of the sky130_fd_sc_hs standard cells and SVT inverters used by
 // the control logic. Each cell exports its outline and pin rectangles; Y and X outputs are named out.
+// arc-fmt: no-wrap
 
 use std::layout::{crect, polygon, rect};
 
@@ -43,6 +44,9 @@ cell sky130_fd_sc_hs__tap_2() {
     let outline = crect(x0=0., y0=0., x1=960., y1=3330.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=960., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=960., y1=3575.);
+    // Supply pins, in drawing order.
+    pub let vpwr = [crect(layer="met1.pin", x0=0., y0=3085., x1=960., y1=3575.)];
+    pub let vgnd = [crect(layer="met1.pin", x0=0., y0=-245., x1=960., y1=245.)];
 }
 
 cell sky130_fd_sc_hs__inv_2() {
@@ -101,6 +105,9 @@ cell sky130_fd_sc_hs__inv_2() {
     pub let out = crect(layer="li1.drawing", x0=605., y0=350., x1=890., y1=2980.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=1440., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=1440., y1=3575.);
+    // Supply pins, in drawing order.
+    pub let vpwr = [crect(layer="met1.pin", x0=0., y0=3085., x1=1440., y1=3575.)];
+    pub let vgnd = [crect(layer="met1.pin", x0=0., y0=-245., x1=1440., y1=245.)];
 }
 
 cell sky130_fd_sc_hs__inv_4() {
@@ -172,6 +179,9 @@ cell sky130_fd_sc_hs__inv_4() {
     pub let out = crect(layer="li1.drawing", x0=2045., y0=1180., x1=2275., y1=1950.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=2400., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=2400., y1=3575.);
+    // Supply pins, in drawing order.
+    pub let vpwr = [crect(layer="met1.pin", x0=0., y0=3085., x1=2400., y1=3575.)];
+    pub let vgnd = [crect(layer="met1.pin", x0=0., y0=-245., x1=2400., y1=245.)];
 }
 
 cell sky130_fd_sc_hs__inv_16() {
@@ -364,6 +374,9 @@ cell sky130_fd_sc_hs__inv_16() {
     pub let out = crect(layer="met1.drawing", x0=585., y0=1920., x1=7575., y1=2150.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=8160., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=8160., y1=3575.);
+    // Supply pins, in drawing order.
+    pub let vpwr = [crect(layer="met1.pin", x0=0., y0=3085., x1=8160., y1=3575.)];
+    pub let vgnd = [crect(layer="met1.pin", x0=0., y0=-245., x1=8160., y1=245.)];
 }
 
 cell sky130_fd_sc_hs__and2_2() {
@@ -438,6 +451,9 @@ cell sky130_fd_sc_hs__and2_2() {
     pub let out = crect(layer="li1.drawing", x0=1840., y0=1020., x1=2010., y1=1720.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=2400., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=2400., y1=3575.);
+    // Supply pins, in drawing order.
+    pub let vpwr = [crect(layer="met1.pin", x0=0., y0=3085., x1=2400., y1=3575.)];
+    pub let vgnd = [crect(layer="met1.pin", x0=0., y0=-245., x1=2400., y1=245.)];
 }
 
 cell sky130_fd_sc_hs__and2_4() {
@@ -542,6 +558,9 @@ cell sky130_fd_sc_hs__and2_4() {
     pub let out = crect(layer="li1.drawing", x0=545., y0=1550., x1=815., y1=2015.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=4320., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=4320., y1=3575.);
+    // Supply pins, in drawing order.
+    pub let vpwr = [crect(layer="met1.pin", x0=0., y0=3085., x1=4320., y1=3575.)];
+    pub let vgnd = [crect(layer="met1.pin", x0=0., y0=-245., x1=4320., y1=245.)];
 }
 
 cell sky130_fd_sc_hs__nand2_4() {
@@ -655,11 +674,14 @@ cell sky130_fd_sc_hs__nand2_4() {
     rect("lvtn.drawing", x0=190., y0=190., x1=4130., y1=1300.);
     rect("layout_boundary.boundary", x0=0., y0=0., x1=4320., y1=3330.);
     let outline = crect(x0=0., y0=0., x1=4320., y1=3330.);
-    pub let a = crect(layer="li1.drawing", x0=3515., y0=1580., x1=3685., y1=1750.);
-    pub let b = crect(layer="li1.drawing", x0=2075., y0=1580., x1=2245., y1=1750.);
-    pub let out = crect(layer="li1.drawing", x0=3995., y0=1580., x1=4165., y1=1750.);
+    pub let a = crect(layer="li1.drawing", x0=2555., y0=1580., x1=2725., y1=1750.);
+    pub let b = crect(layer="li1.drawing", x0=1115., y0=1580., x1=1285., y1=1750.);
+    pub let out = crect(layer="li1.drawing", x0=3995., y0=1210., x1=4165., y1=1380.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=4320., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=4320., y1=3575.);
+    // Supply pins, in drawing order.
+    pub let vpwr = [crect(layer="met1.pin", x0=0., y0=3085., x1=4320., y1=3575.)];
+    pub let vgnd = [crect(layer="met1.pin", x0=0., y0=-245., x1=4320., y1=245.)];
 }
 
 cell sky130_fd_sc_hs__nand2_8() {
@@ -820,6 +842,9 @@ cell sky130_fd_sc_hs__nand2_8() {
     pub let out = crect(layer="li1.drawing", x0=4380., y0=1130., x1=4710., y1=2120.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=8160., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=8160., y1=3575.);
+    // Supply pins, in drawing order.
+    pub let vpwr = [crect(layer="met1.pin", x0=0., y0=3085., x1=8160., y1=3330.), crect(layer="met1.pin", x0=0., y0=3085., x1=8160., y1=3575.)];
+    pub let vgnd = [crect(layer="met1.pin", x0=0., y0=-245., x1=8160., y1=245.)];
 }
 
 cell sky130_fd_sc_hs__nor2_4() {
@@ -929,6 +954,9 @@ cell sky130_fd_sc_hs__nor2_4() {
     pub let out = crect(layer="li1.drawing", x0=2365., y0=1180., x1=2755., y1=1410.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=4320., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=4320., y1=3575.);
+    // Supply pins, in drawing order.
+    pub let vpwr = [crect(layer="met1.pin", x0=0., y0=3085., x1=4320., y1=3575.)];
+    pub let vgnd = [crect(layer="met1.pin", x0=0., y0=-245., x1=4320., y1=245.)];
 }
 
 cell sky130_fd_sc_hs__mux2_4() {
@@ -1077,6 +1105,9 @@ cell sky130_fd_sc_hs__mux2_4() {
     pub let s = crect(layer="li1.drawing", x0=425., y0=1350., x1=835., y1=1780.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=8640., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=8640., y1=3575.);
+    // Supply pins, in drawing order.
+    pub let vpwr = [crect(layer="met1.pin", x0=0., y0=3085., x1=8640., y1=3575.)];
+    pub let vgnd = [crect(layer="met1.pin", x0=0., y0=-245., x1=8640., y1=245.)];
 }
 
 cell sky130_fd_sc_hs__buf_16() {
@@ -1314,6 +1345,9 @@ cell sky130_fd_sc_hs__buf_16() {
     pub let out = crect(layer="met1.drawing", x0=575., y0=1920., x1=7255., y1=2150.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=10560., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=10560., y1=3575.);
+    // Supply pins, in drawing order.
+    pub let vpwr = [crect(layer="met1.pin", x0=0., y0=3085., x1=10560., y1=3575.)];
+    pub let vgnd = [crect(layer="met1.pin", x0=0., y0=-245., x1=10560., y1=245.)];
 }
 
 cell sramgen_svt_inv_2() {
@@ -1371,6 +1405,9 @@ cell sramgen_svt_inv_2() {
     let out = crect(layer="li1.drawing", x0=605., y0=350., x1=890., y1=2980.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=1440., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=1440., y1=3575.);
+    // Supply pins, in drawing order.
+    pub let vpwr = [crect(layer="met1.pin", x0=0., y0=3085., x1=1440., y1=3575.)];
+    pub let vgnd = [crect(layer="met1.pin", x0=0., y0=-245., x1=1440., y1=245.)];
 }
 
 cell sramgen_svt_inv_4() {
@@ -1441,4 +1478,7 @@ cell sramgen_svt_inv_4() {
     let out = crect(layer="li1.drawing", x0=2045., y0=1180., x1=2275., y1=1950.);
     let vgnd = crect(layer="met1.drawing", x0=0., y0=-245., x1=2400., y1=245.);
     let vpwr = crect(layer="met1.drawing", x0=0., y0=3085., x1=2400., y1=3575.);
+    // Supply pins, in drawing order.
+    pub let vpwr = [crect(layer="met1.pin", x0=0., y0=3085., x1=2400., y1=3575.)];
+    pub let vgnd = [crect(layer="met1.pin", x0=0., y0=-245., x1=2400., y1=245.)];
 }

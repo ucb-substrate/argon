@@ -50,8 +50,24 @@ cell device_inv(pw: Float, nw: Float) {
     pub let vdd = Signal(x=0, y=8);
     pub let vss = Signal(x=0, y=-8);
 
-    let mp = device(DeviceKind::Pmos, signals(4), "sky130_fd_pr__pfet_01v8", w=pw, l=0.15, x=0, y=4);
-    let mn = device(DeviceKind::Nmos, signals(4), "sky130_fd_pr__nfet_01v8", w=nw, l=0.15, x=0, y=-4);
+    let mp = device(
+        DeviceKind::Pmos,
+        signals(4),
+        "sky130_fd_pr__pfet_01v8",
+        w=pw,
+        l=0.15,
+        x=0,
+        y=4,
+    );
+    let mn = device(
+        DeviceKind::Nmos,
+        signals(4),
+        "sky130_fd_pr__nfet_01v8",
+        w=nw,
+        l=0.15,
+        x=0,
+        y=-4,
+    );
 
     connect(a, mp.g, route=[(-4, 0), (-4, 4)]);
     connect(a, mn.g, route=[(-4, 0), (-4, -4)]);

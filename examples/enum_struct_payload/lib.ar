@@ -35,5 +35,11 @@ cell top() {
     let shapes = cons(Shape::Circle { r: 50. }, cons(Shape::Box { w, h }, []));
     let first = inst(shape_rect("met1", head(shapes)), x=0., y=0.);
     let second = inst(shape_rect("met2", std::last(shapes)), x=0., y=200.);
-    let outline = rect("met1", x0=0., y0=0., w=width(head(shapes)) + width(std::last(shapes)), h=height(std::last(shapes)));
+    let outline = rect(
+        "met1",
+        x0=0.,
+        y0=0.,
+        w=width(head(shapes)) + width(std::last(shapes)),
+        h=height(std::last(shapes)),
+    );
 }

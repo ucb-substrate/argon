@@ -288,7 +288,14 @@ impl<'a> ExecPass<'a> {
                         .find(|(field, _)| field.name.name == *name)
                         .map(|(_, value)| value)
                 };
-                ops::struct_lit(self.defs, &target, explicit, base.as_ref()).ok()
+                ops::struct_lit(
+                    self.defs,
+                    &self.struct_layouts,
+                    &target,
+                    explicit,
+                    base.as_ref(),
+                )
+                .ok()
             }
         }
     }

@@ -33,8 +33,8 @@ use indexmap::{IndexMap, IndexSet};
 
 use crate::{
     ast::{
-        ArgDecl, Decl, Expr, ForLoop, IdentPath, ModPath, Pattern, Scope, Statement, WorkspaceAst,
-        annotated::AnnotatedAst,
+        ArgDecl, CellDecl, Decl, Expr, ForLoop, IdentPath, ModPath, Pattern, Scope, Statement,
+        WorkspaceAst, annotated::AnnotatedAst,
     },
     compile::{Native, Ty, TypeDefs, TypedWorkspace, VarId, VarIdTyMetadata},
 };
@@ -77,6 +77,8 @@ pub struct ItemSite {
     /// Byte range of the declaration within its module's backing text, which
     /// is what every `cfgrammar::Span` in that module indexes.
     pub span: Range<usize>,
+    /// The fingerprint of the declaration's strongly-connected component.
+    component: Fingerprint,
 }
 
 /// Fingerprints and locations for every top-level declaration in a workspace.
@@ -119,6 +121,102 @@ impl ItemIndex {
     pub fn iter(&self) -> impl Iterator<Item = (VarId, &ItemSite)> {
         self.sites.iter().map(|(var, site)| (*var, site))
     }
+
+    /// This index of `workspace` with `cell` added as [`Self::build`] would add
+    /// it to the workspace with `cell` appended to the root module, whose path
+    /// is `path` and whose text, with `cell`, is `text`.
+    ///
+    /// Nothing may refer to `cell`, so it is a component of its own and every
+    /// other fingerprint is unchanged.
+    pub(crate) fn with_appended_cell(
+        &self,
+        workspace: &TypedWorkspace,
+        path: &Arc<Path>,
+        text: &str,
+        cell: &CellDecl<arcstr::Substr, VarIdTyMetadata>,
+    ) -> Self {
+        let mut builder = Builder {
+            items: IndexMap::new(),
+            variants: HashMap::new(),
+            defs: &workspace.defs,
+            natives: &workspace.natives,
+        };
+        builder.collect_variants(&workspace.ast);
+        let var = cell.metadata.1;
+        let span = span_range(cell.span);
+        let own = self_hash(
+            ItemKind::Cell,
+            path,
+            &ModPath::new(),
+            &cell.name.name,
+            &text[span.clone()],
+        );
+        let mut deps = builder.cell_dependencies(cell);
+        deps.shift_remove(&var);
+        let own = builder.with_natives(own, &deps);
+        let mut external = deps
+            .iter()
+            .filter_map(|dep| self.sites.get(dep).map(|site| site.component))
+            .collect::<Vec<_>>();
+        external.sort_unstable();
+        external.dedup();
+        let component = component_hash(&[own], &external);
+        let mut sites = self.sites.clone();
+        sites.insert(
+            var,
+            ItemSite {
+                fingerprint: member_hash(component, own),
+                kind: ItemKind::Cell,
+                path: path.clone(),
+                span,
+                component,
+            },
+        );
+        Self { sites }
+    }
+}
+
+/// A declaration's own hash: what it is and where it is declared, but not what
+/// it refers to.
+fn self_hash(kind: ItemKind, path: &Path, module: &ModPath, name: &str, text: &str) -> u64 {
+    let mut hasher = hasher();
+    hasher.write_u8(kind.tag());
+    // The file and module qualify the name. This is load-bearing rather than
+    // decorative: `CompiledCell::name` becomes the GDS structure name, so two
+    // byte-identical cells in different modules must not share a fingerprint
+    // -- and it is what makes a `use` re-pointed at an identically-written
+    // declaration elsewhere invalidate its dependents.
+    write_str(&mut hasher, &path.to_string_lossy());
+    write_module(&mut hasher, module);
+    write_str(&mut hasher, name);
+    // A declaration's span runs from its keyword to its closing brace with no
+    // surrounding trivia, so this is exactly the declaration's text.
+    write_str(&mut hasher, text);
+    hasher.finish()
+}
+
+/// The fingerprint of a component from its members' own hashes and its
+/// dependencies' component fingerprints, both sorted and deduplicated.
+fn component_hash(self_hashes: &[u64], external: &[Fingerprint]) -> Fingerprint {
+    let mut hasher = hasher();
+    hasher.write_usize(self_hashes.len());
+    for hash in self_hashes {
+        hasher.write_u64(*hash);
+    }
+    hasher.write_usize(external.len());
+    for fingerprint in external {
+        hasher.write_u64(*fingerprint);
+    }
+    hasher.finish()
+}
+
+/// A member's fingerprint, mixed with its own hash so that two mutually
+/// recursive declarations, which share a component, still differ.
+fn member_hash(component: Fingerprint, self_hash: u64) -> Fingerprint {
+    let mut hasher = hasher();
+    hasher.write_u64(component);
+    hasher.write_u64(self_hash);
+    hasher.finish()
 }
 
 /// One declaration, before its dependencies are known.
@@ -166,19 +264,7 @@ impl Builder<'_> {
     fn collect_declarations(&mut self, ast: &WorkspaceAst<VarIdTyMetadata>) {
         // Variants first: a declaration walked below may name a variant of an
         // enum declared in any module, and resolving that needs the whole map.
-        for annotated in ast.values() {
-            for decl in declarations(annotated) {
-                if let Decl::Enum(decl) = decl
-                    && let Some(enum_id) = decl.metadata
-                {
-                    for variant in &decl.variants {
-                        if let Some(variant_id) = variant.metadata {
-                            self.variants.insert(variant_id, enum_id);
-                        }
-                    }
-                }
-            }
-        }
+        self.collect_variants(ast);
 
         for (module, annotated) in ast.iter() {
             for decl in declarations(annotated) {
@@ -222,32 +308,40 @@ impl Builder<'_> {
                     }
                 };
 
-                let mut hasher = hasher();
-                hasher.write_u8(kind.tag());
-                // The file and module qualify the name. This is load-bearing
-                // rather than decorative: `CompiledCell::name` becomes the GDS
-                // structure name, so two byte-identical cells in different
-                // modules must not share a fingerprint -- and it is what makes
-                // a `use` re-pointed at an identically-written declaration
-                // elsewhere invalidate its dependents.
-                write_str(&mut hasher, &annotated.path.to_string_lossy());
-                write_module(&mut hasher, module);
-                write_str(&mut hasher, name);
-                // A declaration's span runs from its keyword to its closing
-                // brace with no surrounding trivia, so this is exactly the
-                // declaration's text.
-                write_str(&mut hasher, &annotated.text[span.clone()]);
-
+                let self_hash = self_hash(
+                    kind,
+                    &annotated.path,
+                    module,
+                    name,
+                    &annotated.text[span.clone()],
+                );
                 self.items.insert(
                     var,
                     Item {
                         kind,
                         path: annotated.path.clone(),
                         span,
-                        self_hash: hasher.finish(),
+                        self_hash,
                         deps: IndexSet::new(),
                     },
                 );
+            }
+        }
+    }
+
+    /// Records the enum of every enum variant.
+    fn collect_variants(&mut self, ast: &WorkspaceAst<VarIdTyMetadata>) {
+        for annotated in ast.values() {
+            for decl in declarations(annotated) {
+                if let Decl::Enum(decl) = decl
+                    && let Some(enum_id) = decl.metadata
+                {
+                    for variant in &decl.variants {
+                        if let Some(variant_id) = variant.metadata {
+                            self.variants.insert(variant_id, enum_id);
+                        }
+                    }
+                }
             }
         }
     }
@@ -260,14 +354,7 @@ impl Builder<'_> {
         for annotated in ast.values() {
             for decl in declarations(annotated) {
                 let (var, mut deps) = match decl {
-                    Decl::Cell(decl) => {
-                        let mut deps = IndexSet::new();
-                        for arg in &decl.args {
-                            self.arg_decl(arg, &mut deps);
-                        }
-                        self.scope(&decl.scope, &mut deps);
-                        (decl.metadata.1, deps)
-                    }
+                    Decl::Cell(decl) => (decl.metadata.1, self.cell_dependencies(decl)),
                     Decl::Fn(decl) => {
                         let mut deps = IndexSet::new();
                         for arg in &decl.args {
@@ -308,31 +395,54 @@ impl Builder<'_> {
                     Decl::Constant(_) | Decl::Mod(_) | Decl::Use(_) => continue,
                 };
                 deps.shift_remove(&var);
-                // A native has no declaration to depend on, so the natives a
-                // declaration calls are folded into its own hash by path: an
-                // alias re-pointed at another native must change it.
-                let mut natives = deps
-                    .iter()
-                    .filter_map(|dep| self.natives.get(dep))
-                    .map(|native| native.path())
-                    .collect::<Vec<_>>();
-                natives.sort_unstable();
-                natives.dedup();
+                let Some(self_hash) = self.items.get(&var).map(|item| item.self_hash) else {
+                    continue;
+                };
+                let self_hash = self.with_natives(self_hash, &deps);
                 deps.retain(|dep| self.items.contains_key(dep));
-                if let Some(item) = self.items.get_mut(&var) {
-                    item.deps = deps;
-                    if !natives.is_empty() {
-                        let mut hasher = hasher();
-                        hasher.write_u64(item.self_hash);
-                        hasher.write_usize(natives.len());
-                        for native in &natives {
-                            write_str(&mut hasher, native);
-                        }
-                        item.self_hash = hasher.finish();
-                    }
-                }
+                let item = self.items.get_mut(&var).expect("checked above");
+                item.deps = deps;
+                item.self_hash = self_hash;
             }
         }
+    }
+
+    /// What a cell's parameters and body refer to.
+    fn cell_dependencies(
+        &self,
+        decl: &CellDecl<arcstr::Substr, VarIdTyMetadata>,
+    ) -> IndexSet<VarId> {
+        let mut deps = IndexSet::new();
+        for arg in &decl.args {
+            self.arg_decl(arg, &mut deps);
+        }
+        self.scope(&decl.scope, &mut deps);
+        deps
+    }
+
+    /// `self_hash` with the natives among `deps` folded in.
+    ///
+    /// A native has no declaration to depend on, so the natives a declaration
+    /// calls are folded into its own hash by path: an alias re-pointed at
+    /// another native must change it.
+    fn with_natives(&self, self_hash: u64, deps: &IndexSet<VarId>) -> u64 {
+        let mut natives = deps
+            .iter()
+            .filter_map(|dep| self.natives.get(dep))
+            .map(|native| native.path())
+            .collect::<Vec<_>>();
+        natives.sort_unstable();
+        natives.dedup();
+        if natives.is_empty() {
+            return self_hash;
+        }
+        let mut hasher = hasher();
+        hasher.write_u64(self_hash);
+        hasher.write_usize(natives.len());
+        for native in &natives {
+            write_str(&mut hasher, native);
+        }
+        hasher.finish()
     }
 
     /// A parameter depends on the declarations its checked type and its
@@ -619,33 +729,19 @@ impl Builder<'_> {
             external.sort_unstable();
             external.dedup();
 
-            let mut scc_hasher = hasher();
-            scc_hasher.write_usize(self_hashes.len());
-            for hash in &self_hashes {
-                scc_hasher.write_u64(*hash);
-            }
-            scc_hasher.write_usize(external.len());
-            for fingerprint in &external {
-                scc_hasher.write_u64(*fingerprint);
-            }
-            let scc = scc_hasher.finish();
+            let scc = component_hash(&self_hashes, &external);
             component_fp.push(scc);
 
             for member in members {
                 let item = &self.items[member];
-                // Mixed with the member's own hash so that two mutually
-                // recursive declarations, which share a component and so share
-                // `scc`, still fingerprint differently.
-                let mut member_hasher = hasher();
-                member_hasher.write_u64(scc);
-                member_hasher.write_u64(item.self_hash);
                 sites.insert(
                     *member,
                     ItemSite {
-                        fingerprint: member_hasher.finish(),
+                        fingerprint: member_hash(scc, item.self_hash),
                         kind: item.kind,
                         path: item.path.clone(),
                         span: item.span.clone(),
+                        component: scc,
                     },
                 );
             }
@@ -1315,7 +1411,15 @@ impl SpanRebase {
         &self,
         span: &crate::ast::Span,
     ) -> Result<Option<(&Arc<Path>, isize)>, RebaseError> {
-        let Some(extents) = self.from.get(&span.path) else {
+        // Spans mostly share their file's path with the index they were
+        // recorded against, which finds them without hashing the path.
+        let extents = self
+            .from
+            .iter()
+            .find(|(path, _)| Arc::ptr_eq(path, &span.path))
+            .map(|(_, extents)| extents)
+            .or_else(|| self.from.get(&span.path));
+        let Some(extents) = extents else {
             return Ok(None);
         };
         let start = span.span.start();

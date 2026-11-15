@@ -1,1397 +1,906 @@
-use std::layout::{bbox, crect, inst, rect};
-use lib::params::DecoderParams;
-use lib::params::PrimitiveGateParams;
-use lib::params::BufferSizing;
-use lib::params::AndStageSizing;
-use lib::params::RowDecoderSizing;
-use lib::params::DecoderNodeSizing;
+use std::layout::{bbox, crect, inst, rect, shapes, union};
+use lib::params::{
+    AndStageSizing, BufferSizing, DecoderNodeSizing, DecoderParams, PrimitiveGateParams,
+    RowDecoderSizing,
+};
+use lib::columns::util;
+use lib::columns::util::Via;
 
-fn dec_total_x(nw: Int, pw: Int) -> Float {
-    nw as Float + 520. + pw as Float
-}
+// Decoders and buffers are rows of gates turned to run up slots 1.58 um wide
+// (1.9 um or 3.16 um in some decoders), with tap columns between groups of
+// slots. Each gate's supply straps run across its slot.
 
-fn dec_raw_bbox(nw: Int, pw: Int) -> Rect {
-    lib::columns::util::cbox(-540., -180., dec_total_x(nw, pw) + 180., 1290.)
-}
-
-fn dec_gate_dx(nw: Int, pw: Int) -> Float {
-    let raw = dec_raw_bbox(nw, pw);
-    let q1 = lib::columns::mux::xf_q1(raw, 0., 0.);
-    790. - (((q1.x0 + q1.x1) as Int) / 2) as Float
-}
-
-fn dec_gate_dx_w(nw: Int, pw: Int, width: Int) -> Float {
-    let raw = dec_raw_bbox(nw, pw);
-    let q1 = lib::columns::mux::xf_q1(raw, 0., 0.);
-    width as Float / 2. - (((q1.x0 + q1.x1) as Int) / 2) as Float
-}
-
-fn dec_half_width(width: Int) -> Int {
-    (((width as Float * 0.5 / 10.) + 0.5) as Int) * 10
-}
-
-fn dec_inv_half_nw(nw: Int) -> Int {
-    dec_half_width(nw)
-}
-
-fn dec_inv_half_pw(pw: Int) -> Int {
-    dec_half_width(pw)
-}
-
-fn dec_inv_raw_bbox(nw: Int, pw: Int) -> Rect {
-    dec_raw_bbox(dec_inv_half_nw(nw), dec_inv_half_pw(pw))
-}
-
-fn dec_inv_gate_dx(nw: Int, pw: Int) -> Float {
-    let raw = dec_inv_raw_bbox(nw, pw);
-    let q1 = lib::columns::mux::xf_q1(raw, 0., 0.);
-    790. - (((q1.x0 + q1.x1) as Int) / 2) as Float
-}
-
-fn dec_sd_contact_count_floor(limit: Float, n: Int) -> Int {
-    if (n + 1) as Float * 340. <= limit {
-        dec_sd_contact_count_floor(limit, n + 1)
+// Supply straps across implant `r`, as y spans: one centered strap half the
+// implant's height (at least 320 nm), or 1.92 um straps 3.84 um apart across
+// an implant taller than 3.84 um.
+fn straps(r: Rect) -> [(Float, Float)] {
+    let c = (((r.y0 + r.y1) as Int) / 2) as Float;
+    if r.h > 3840. {
+        let n = (r.h / 3840.) as Int;
+        let first = util::centered(
+            c,
+            ((1920. * (2 * n - 1) as Float / 5.) as Int * 5) as Float,
+        ).0 + 960.;
+        [for i in std::range(n) { util::centered(first + 3840. * i as Float, 1920.) }]
     } else {
-        n
+        [util::centered(c, max_float(((r.h / 20.) as Int * 10) as Float, 320.))]
     }
 }
 
-fn dec_sd_contact_count(w: Float) -> Int {
-    max_int(dec_sd_contact_count_floor(w + 10., 0), 1)
-}
-
-fn dec_sd_port_raw(x: Float, w: Float, row: Int) -> Rect {
-    let cy = row as Float * 430.;
-    let nx = dec_sd_contact_count(w);
-    let aw = 170. * nx as Float + 170. * (nx - 1) as Float;
-    let ax0 = lib::columns::util::snap5(x + w / 2. - aw / 2.);
-    lib::columns::util::cbox(ax0 - 80., cy + 40., ax0 + aw + 80., cy + 210.)
-}
-
-fn draw_dec_sd_contact(x: Float, w: Float, row: Int) -> Rect {
-    let cy = row as Float * 430.;
-    let nx = dec_sd_contact_count(w);
-    let aw = 170. * nx as Float + 170. * (nx - 1) as Float;
-    let ax0 = lib::columns::util::snap5(x + w / 2. - aw / 2.);
-    for i in std::range(nx) {
-        lib::columns::util::draw_box("licon1.drawing", lib::columns::util::cbox(ax0 + i as Float * 340., cy + 40., ax0 + i as Float * 340. + 170., cy + 210.));
-    }
-    lib::columns::util::draw_box("diff.drawing", lib::columns::util::cbox(ax0 - 60., cy, ax0 + aw + 60., cy + 250.));
-    let li = dec_sd_port_raw(x, w, row);
-    lib::columns::util::draw_box("li1.drawing", li);
-    li
-}
-
-fn dec_gate_contact_raw(idx: Int) -> Rect {
-    let y = if idx == 0 { 230. } else { 710. };
-    lib::columns::util::cbox(-520., y, -190., y + 170.)
-}
-
-fn draw_dec_gate_contact(idx: Int) -> Rect {
-    let y = if idx == 0 { 230. } else { 710. };
-    lib::columns::util::draw_box("poly.drawing", lib::columns::util::cbox(-520., y - 50., -190., y + 220.));
-    lib::columns::util::draw_box("licon1.drawing", lib::columns::util::cbox(-440., y, -270., y + 170.));
-    let li = lib::columns::util::draw_box("li1.drawing", lib::columns::util::cbox(-520., y, -190., y + 170.));
-    lib::columns::util::draw_box("npc.drawing", lib::columns::util::cbox(-540., y - 100., -170., y + 270.));
-    li
-}
-
-fn dec_nsdm(nw: Int) -> Rect {
-    lib::columns::util::cbox(-125., -125., nw as Float + 125., 1235.)
-}
-
-fn dec_psdm(nw: Int, pw: Int) -> Rect {
-    let px = nw as Float + 520.;
-    lib::columns::util::cbox(px - 125., -125., px + pw as Float + 125., 1235.)
-}
-
-fn dec_nwell(nw: Int, pw: Int) -> Rect {
-    let px = nw as Float + 520.;
-    lib::columns::util::cbox(px - 180., -180., px + pw as Float + 180., 1290.)
-}
-
-fn draw_dec_base_diff_poly(nw: Int, pw: Int) -> Rect {
-    let tx = dec_total_x(nw, pw);
-    lib::columns::util::draw_box("nsdm.drawing", dec_nsdm(nw));
-    lib::columns::util::draw_box("psdm.drawing", dec_psdm(nw, pw));
-    lib::columns::util::draw_box("nwell.drawing", dec_nwell(nw, pw));
-    lib::columns::util::draw_box("diff.drawing", lib::columns::util::cbox(0., 0., nw as Float, 1110.));
-    lib::columns::util::draw_box("diff.drawing", lib::columns::util::cbox(nw as Float + 520., 0., tx, 1110.));
-    lib::columns::util::draw_box("poly.drawing", lib::columns::util::cbox(-190., 265., tx + 130., 415.));
-    lib::columns::util::draw_box("poly.drawing", lib::columns::util::cbox(-190., 695., tx + 130., 845.));
-    dec_raw_bbox(nw, pw)
-}
-
-cell dec_nand2_raw(nw: Int, pw: Int, draw: Int) {
-    let tx = dec_total_x(nw, pw);
-    let p0 = nw as Float + 520.;
-    let gate_0 = dec_gate_contact_raw(0);
-    let gate_1 = dec_gate_contact_raw(1);
-    let sd_0_0 = dec_sd_port_raw(0., nw as Float, 0);
-    let sd_0_2 = dec_sd_port_raw(0., nw as Float, 2);
-    let sd_1_0 = dec_sd_port_raw(p0, pw as Float, 0);
-    let sd_1_1 = dec_sd_port_raw(p0, pw as Float, 1);
-    let sd_1_2 = dec_sd_port_raw(p0, pw as Float, 2);
-    pub let y_out = lib::columns::util::rect_union(sd_0_2, sd_1_2);
-    pub let vss = sd_0_0;
-    pub let vdd = sd_1_1;
-    pub let a = gate_0;
-    pub let b = gate_1;
-    pub let nwell_bbox = dec_nwell(nw, pw);
-    pub let nsdm_bbox = dec_nsdm(nw);
-    pub let psdm_bbox = dec_psdm(nw, pw);
-    pub let outline = dec_raw_bbox(nw, pw);
-    if draw == 1 {
-        let bbox = draw_dec_base_diff_poly(nw, pw);
-        draw_dec_gate_contact(0);
-        draw_dec_gate_contact(1);
-        lib::columns::util::draw_box("npc.drawing", lib::columns::util::cbox(-540., 130., -170., 980.));
-        draw_dec_sd_contact(0., nw as Float, 0);
-        draw_dec_sd_contact(0., nw as Float, 2);
-        draw_dec_sd_contact(p0, pw as Float, 0);
-        draw_dec_sd_contact(p0, pw as Float, 1);
-        draw_dec_sd_contact(p0, pw as Float, 2);
-        lib::columns::util::draw_box("li1.drawing", y_out);
-        let space = (sd_0_2.x1, sd_1_0.x0,);
-        let hspan = lib::columns::util::center_span_gridded((((space.0 + space.1) as Int) / 2) as Float, lib::columns::util::rect_h(sd_0_2));
-        lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_from_spans(hspan, (sd_1_0.y0, sd_0_2.y1,)));
-        lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_from_spans((hspan.0, sd_1_0.x1,), lib::columns::util::rect_vspan(sd_1_0)));
+// Where `a` crosses `b`, or `a`'s lower-left corner if they don't cross.
+fn crossing(a: Rect, b: Rect) -> Rect {
+    let x0 = max_float(a.x0, b.x0);
+    let y0 = max_float(a.y0, b.y0);
+    let x1 = min_float(a.x1, b.x1);
+    let y1 = min_float(a.y1, b.y1);
+    if x1 >= x0 && y1 >= y0 {
+        crect(x0=x0, y0=y0, x1=x1, y1=y1)
     } else {
-        crect(x0=0., y0=0., x1=0., y1=0.);
-    };
-}
-
-// A three-finger NAND: three series NMOS fingers and three parallel PMOS
-// fingers, contacted on one side.
-fn dec_nand3_total_y() -> Float { 1540. }
-
-fn dec_nand3_raw_bbox(nw: Int, pw: Int) -> Rect {
-    lib::columns::util::cbox(-540., -180., dec_total_x(nw, pw) + 180., 1720.)
-}
-
-fn dec_nand3_gate_contact_raw(idx: Int) -> Rect {
-    let y = 205. + 480. * idx as Float;
-    lib::columns::util::cbox(-520., y, -190., y + 170.)
-}
-
-fn draw_dec_nand3_gate_contact(idx: Int) -> Rect {
-    let y = 205. + 480. * idx as Float;
-    lib::columns::util::draw_box("poly.drawing", lib::columns::util::cbox(-520., y - 50., -190., y + 220.));
-    lib::columns::util::draw_box("licon1.drawing", lib::columns::util::cbox(-440., y, -270., y + 170.));
-    lib::columns::util::draw_box("npc.drawing", lib::columns::util::cbox(-540., y - 100., -170., y + 270.));
-    lib::columns::util::draw_box("li1.drawing", lib::columns::util::cbox(-520., y, -190., y + 170.))
-}
-
-cell dec_nand3_raw(nw: Int, pw: Int, draw: Int) {
-    let tx = dec_total_x(nw, pw);
-    let p0 = nw as Float + 520.;
-    let sd_0_0 = dec_sd_port_raw(0., nw as Float, 0);
-    let sd_0_3 = dec_sd_port_raw(0., nw as Float, 3);
-    let sd_1_0 = dec_sd_port_raw(p0, pw as Float, 0);
-    let sd_1_1 = dec_sd_port_raw(p0, pw as Float, 1);
-    let sd_1_2 = dec_sd_port_raw(p0, pw as Float, 2);
-    let sd_1_3 = dec_sd_port_raw(p0, pw as Float, 3);
-    pub let y_out = lib::columns::util::rect_union(sd_0_3, sd_1_3);
-    pub let vss = sd_0_0;
-    pub let vdd = sd_1_0;
-    pub let vdd1 = sd_1_2;
-    pub let a = dec_nand3_gate_contact_raw(0);
-    pub let b = dec_nand3_gate_contact_raw(1);
-    pub let c = dec_nand3_gate_contact_raw(2);
-    pub let nwell_bbox = lib::columns::util::cbox(p0 - 180., -180., p0 + pw as Float + 180., 1720.);
-    pub let nsdm_bbox = lib::columns::util::cbox(-125., -125., nw as Float + 125., 1665.);
-    pub let psdm_bbox = lib::columns::util::cbox(p0 - 125., -125., p0 + pw as Float + 125., 1665.);
-    pub let outline = dec_nand3_raw_bbox(nw, pw);
-    if draw == 1 {
-        lib::columns::util::draw_box("nsdm.drawing", nsdm_bbox);
-        lib::columns::util::draw_box("psdm.drawing", psdm_bbox);
-        lib::columns::util::draw_box("nwell.drawing", nwell_bbox);
-        lib::columns::util::draw_box("diff.drawing", lib::columns::util::cbox(0., 0., nw as Float, 1540.));
-        lib::columns::util::draw_box("diff.drawing", lib::columns::util::cbox(p0, 0., tx, 1540.));
-        for finger in std::range(3) {
-            let y = 265. + 430. * finger as Float;
-            lib::columns::util::draw_box("poly.drawing", lib::columns::util::cbox(-190., y, tx + 130., y + 150.));
-            draw_dec_nand3_gate_contact(finger);
-        }
-        lib::columns::util::draw_box("npc.drawing", lib::columns::util::cbox(-540., 105., -170., 1435.));
-        draw_dec_sd_contact(0., nw as Float, 0);
-        draw_dec_sd_contact(0., nw as Float, 3);
-        for row in std::range(4) {
-            draw_dec_sd_contact(p0, pw as Float, row);
-        }
-        lib::columns::util::draw_box("li1.drawing", y_out);
-        let space = (sd_0_3.x1, sd_1_1.x0,);
-        let hspan = lib::columns::util::center_span_gridded((((space.0 + space.1) as Int) / 2) as Float, lib::columns::util::rect_h(sd_0_3));
-        lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_from_spans(hspan, (sd_1_1.y0, sd_0_3.y1,)));
-        lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_from_spans((hspan.0, sd_1_1.x1,), lib::columns::util::rect_vspan(sd_1_1)));
-    } else {
-        crect(x0=0., y0=0., x1=0., y1=0.);
-    };
-}
-
-cell dec_inv_raw(nw: Int, pw: Int, draw: Int) {
-    let hn = dec_inv_half_nw(nw);
-    let hp = dec_inv_half_pw(pw);
-    let tx = dec_total_x(hn, hp);
-    let p0 = hn as Float + 520.;
-    let gate = lib::columns::util::cbox(-520., 470., -190., 640.);
-    let sd_0_0 = dec_sd_port_raw(0., hn as Float, 0);
-    let sd_0_1 = dec_sd_port_raw(0., hn as Float, 1);
-    let sd_0_2 = dec_sd_port_raw(0., hn as Float, 2);
-    let sd_1_0 = dec_sd_port_raw(p0, hp as Float, 0);
-    let sd_1_1 = dec_sd_port_raw(p0, hp as Float, 1);
-    let sd_1_2 = dec_sd_port_raw(p0, hp as Float, 2);
-    pub let y_out = lib::columns::util::rect_union(sd_0_1, sd_1_1);
-    pub let vss0 = sd_0_0;
-    pub let vss1 = sd_0_2;
-    pub let vdd0 = sd_1_0;
-    pub let vdd1 = sd_1_2;
-    pub let a = gate;
-    pub let nwell_bbox = dec_nwell(hn, hp);
-    pub let nsdm_bbox = dec_nsdm(hn);
-    pub let psdm_bbox = dec_psdm(hn, hp);
-    pub let outline = dec_raw_bbox(hn, hp);
-    if draw == 1 {
-        let bbox = draw_dec_base_diff_poly(hn, hp);
-        draw_dec_sd_contact(0., hn as Float, 0);
-        draw_dec_sd_contact(0., hn as Float, 1);
-        draw_dec_sd_contact(0., hn as Float, 2);
-        draw_dec_sd_contact(p0, hp as Float, 0);
-        draw_dec_sd_contact(p0, hp as Float, 1);
-        draw_dec_sd_contact(p0, hp as Float, 2);
-        lib::columns::util::draw_box("poly.drawing", lib::columns::util::cbox(-520., 265., -190., 845.));
-        lib::columns::util::draw_box("poly.drawing", lib::columns::util::cbox(-520., 420., -190., 690.));
-        lib::columns::util::draw_box("licon1.drawing", lib::columns::util::cbox(-440., 470., -270., 640.));
-        lib::columns::util::draw_box("li1.drawing", gate);
-        lib::columns::util::draw_box("npc.drawing", lib::columns::util::cbox(-540., 370., -170., 740.));
-        lib::columns::util::draw_box("li1.drawing", y_out);
-    } else {
-        crect(x0=0., y0=0., x1=0., y1=0.);
-    };
-}
-
-// MultiFingerInv uses one 700 nm-wide MOS per polarity and realizes drive
-// strength by changing the finger count.  Unlike FoldedInv, its two devices
-// are individually rotated before they are placed side by side.
-fn dec_mf_nf(width: Int) -> Int {
-    max_int((width + 350) / 700, 1)
-}
-
-fn dec_mf_diff_perp(nf: Int) -> Float {
-    // 265 nm diffusion edge, 150 nm gate, and 280 nm inter-finger space.
-    250. + 430. * nf as Float
-}
-
-fn dec_mf_last_even(nf: Int) -> Int {
-    if nf % 2 == 0 { nf } else { nf - 1 }
-}
-
-fn dec_mf_last_odd(nf: Int) -> Int {
-    if nf % 2 == 0 { nf - 1 } else { nf }
-}
-
-fn dec_mf_sd_bbox(nf: Int, odd: Bool) -> Rect {
-    let first = if odd { 1 } else { 0 };
-    let last = if odd { dec_mf_last_odd(nf) } else { dec_mf_last_even(nf) };
-    if last < first {
-        lib::columns::util::cbox(0., 0., 0., 0.)
-    } else {
-        lib::columns::util::rect_union(dec_sd_port_raw(0., 700., first), dec_sd_port_raw(0., 700., last))
+        crect(x0=a.x0, y0=a.y0, x1=a.x0, y1=a.y0)
     }
 }
 
-cell dec_mf_device_raw(nf: Int, pmos: Bool, draw: Int, pins: Int) {
-    let diff_top = dec_mf_diff_perp(nf);
-    let gate_top = -15. + 430. * nf as Float;
-    let gate_area = lib::columns::util::cbox(-520., 265., -190., gate_top);
-    let gate_cut_bbox = lib::columns::util::contact_cut_bbox_later(3, gate_area, gate_area, 0, 0, true);
-    pub let gate_contact = lib::columns::util::contact_top_bbox_later(3, gate_area, gate_area, 0, 0, true);
-    pub let sd_even = dec_mf_sd_bbox(nf, false);
-    pub let sd_odd = dec_mf_sd_bbox(nf, true);
-    if draw == 1 {
-        lib::columns::util::draw_box("diff.drawing", lib::columns::util::cbox(0., 0., 700., diff_top));
-        if pmos {
-            lib::columns::util::draw_box("psdm.drawing", lib::columns::util::cbox(-125., -125., 825., diff_top + 125.));
-            lib::columns::util::draw_box("nwell.drawing", lib::columns::util::cbox(-180., -180., 880., diff_top + 180.));
+// Draws supply straps across implant `r` in a `w`-wide slot, on met2 when
+// `m2`, each tied to all of `ports` unless `tie` is false.
+fn draw_straps(r: Rect, ports: [Rect], w: Float, tie: Bool, m2: Bool) -> [Rect] {
+    [for s in straps(r) {
+        let strap = if m2 {
+            util::met2_port(0., s.0, w, s.1)
         } else {
-            lib::columns::util::draw_box("nsdm.drawing", lib::columns::util::cbox(-125., -125., 825., diff_top + 125.));
+            util::met1_port(0., s.0, w, s.1)
         };
-        for finger in std::range(nf) {
-            let y0 = 265. + 430. * finger as Float;
-            lib::columns::util::draw_box("poly.drawing", lib::columns::util::cbox(-190., y0, 830., y0 + 150.));
+        if tie {
+            for port in ports {
+                let c = crossing(strap, port);
+                if m2 {
+                    util::contact(Via::Mcon, c, c, longer=true, later=true);
+                    util::contact(Via::Via1, c, c, longer=true, later=true);
+                } else {
+                    util::contact(Via::Mcon, c, c, top_dir=1, longer=true);
+                }
+            }
         }
-        lib::columns::util::draw_box("poly.drawing", gate_area);
-        lib::columns::util::draw_contact_full_later(3, "poly.drawing", "li1.drawing", gate_area, gate_area, 0, 0, true);
-        lib::columns::util::draw_box("npc.drawing", lib::columns::util::rect_expand_xy(gate_cut_bbox, 100., 100.));
-        for row in std::range(nf + 1) {
-            let sd = draw_dec_sd_contact(0., 700., row);
-            if pins == 1 {
-                lib::columns::util::draw_box("li1.pin", sd);
-            } else {
-                crect(x0=0., y0=0., x1=0., y1=0.);
-            };
+        strap
+    }]
+}
+
+fn across(layer: String, r: Rect, w: Float) -> Rect {
+    rect(layer, x0=0., y0=r.y0, x1=w, y1=r.y1)
+}
+
+// `c` turned to run up a `w`-wide slot and centered in it, construction-only
+// when `construction`.
+fn in_slot(c: Any, w: Float, construction: Bool) -> Any {
+    let g = inst(c, y=0., angle=90, construction=construction);
+    let b = bbox(g);
+    eq(b.x0 + b.x1, w);
+    g
+}
+
+// A decoder gate's devices in a `w`-wide slot. Gates and their taps share
+// this call, and so one evaluation of the devices.
+fn gate_devices(inputs: Int, nw: Int, pw: Int, w: Float, construction: Bool) -> Any {
+    in_slot(util::gate(inputs, nw, pw), w, construction)
+}
+
+// A gate (`util::gate`) centered in a `width` slot, with its well and
+// implants across the slot and supply straps tied to its sources, on met2
+// when `m2`. A filler has the well, implants, and straps but no devices.
+cell dec_gate(
+    inputs: Int,
+    nw: Int,
+    pw: Int,
+    width: Int = 1580,
+    filler: Bool = false,
+    signal_pins: Bool = false,
+    supply_pins: Bool = false,
+    boundary: Bool = true,
+    m2: Bool = false,
+) {
+    let w = width as Float;
+    let g = gate_devices(inputs, nw, pw, w, filler);
+    let b = bbox(g);
+    pub let nwell = across("nwell.drawing", shapes(g, "nwell.drawing")[0], w);
+    pub let nsdm = across("nsdm.drawing", shapes(g, "nsdm.drawing")[0], w);
+    pub let psdm = across("psdm.drawing", shapes(g, "psdm.drawing")[0], w);
+    pub let vss_straps = draw_straps(nsdm, g.vss, w, !filler, m2);
+    pub let vdd_straps = draw_straps(psdm, g.vdd, w, !filler, m2);
+    pub let gates = g.gates;
+    pub let a = g.a;
+    pub let out = g.out;
+    pub let vss = g.vss;
+    pub let vdd = g.vdd;
+    if !filler && signal_pins {
+        for r in cons(out, gates) {
+            util::draw_box("li1.pin", r);
         }
+    }
+    if !filler && supply_pins {
+        for r in std::concat(vss, vdd) {
+            util::draw_box("li1.pin", r);
+        }
+    }
+    pub let outline = if boundary {
+        rect("layout_boundary.boundary", x0=0., y0=b.y0, x1=w, y1=b.y1)
     } else {
-        crect(x0=0., y0=0., x1=0., y1=0.);
+        crect(x0=0., y0=b.y0, x1=w, y1=b.y1)
     };
 }
 
-fn dec_mf_pmos_dx(pnf: Int) -> Float {
-    // The PMOS nwell controls its left edge after R90 orientation.  It is
-    // placed 220 nm to the right of the NMOS implant's right edge (125 nm).
-    dec_mf_diff_perp(pnf) + 525.
+// A tap column `w` wide beside gates with well `nwell` and implants `nsdm`
+// and `psdm`: an n-tap in the PMOS implant, a p-tap in the NMOS implant, and
+// the gates' supply straps, on met2 when `m2`.
+fn draw_taps(w: Float, nwell: Rect, nsdm: Rect, psdm: Rect, m2: Bool, later: Bool, top_dir: Int) {
+    across("nwell.drawing", nwell, w);
+    for side in [(nsdm, "psdm.drawing"), (psdm, "nsdm.drawing")] {
+        let r = side.0;
+        rect(side.1, x0=170., y0=r.y0 + 110., x1=w - 170., y1=r.y1 - 110.);
+        let area = crect(x0=295., y0=r.y0 + 290., x1=w - 295., y1=r.y1 - 290.);
+        util::contact(Via::Tap, area, area, longer=true, later=true);
+        for s in straps(r) {
+            if m2 { util::met2_port(0., s.0, w, s.1); } else { util::met1_port(0., s.0, w, s.1); }
+            let c = crect(x0=295., y0=s.0, x1=w - 295., y1=s.1);
+            util::contact(Via::Mcon, c, c, top_dir=top_dir, longer=true, later=later);
+            if m2 {
+                util::contact(Via::Via1, c, c, longer=true, later=true);
+            }
+        }
+    }
 }
 
-cell dec_multifinger_inv_raw(nw: Int, pw: Int, draw: Int, pins: Int) {
-    let nnf = dec_mf_nf(nw);
-    let pnf = dec_mf_nf(pw);
-    let pdx = dec_mf_pmos_dx(pnf);
-    let nmos = inst(dec_mf_device_raw(nnf, false, draw, pins), x=0., y=0., angle=90);
-    let pmos = inst(dec_mf_device_raw(pnf, true, draw, pins), x=pdx, y=0., angle=90);
-    pub let a = lib::columns::util::rect_union(nmos.gate_contact, pmos.gate_contact);
-    pub let y_out = lib::columns::util::rect_union(nmos.sd_odd, pmos.sd_odd);
-    pub let vss = nmos.sd_even;
-    pub let vdd = pmos.sd_even;
-    if draw == 1 {
-        lib::columns::util::draw_box("li1.drawing", a);
-        if pins == 1 {
-            lib::columns::util::draw_box("li1.pin", a);
-        } else {
-            crect(x0=0., y0=0., x1=0., y1=0.);
-        };
-    } else {
-        crect(x0=0., y0=0., x1=0., y1=0.);
-    };
-}
-
-fn dec_mf_gate_contact_raw(nf: Int) -> Rect {
-    let area = lib::columns::util::cbox(-520., 265., -190., -15. + 430. * nf as Float);
-    lib::columns::util::contact_top_bbox_later(3, area, area, 0, 0, true)
-}
-
-fn dec_mf_raw_a(nw: Int, pw: Int) -> Rect {
-    let nnf = dec_mf_nf(nw);
-    let pnf = dec_mf_nf(pw);
-    lib::columns::util::rect_union(
-        lib::columns::mux::xf_q1(dec_mf_gate_contact_raw(nnf), 0., 0.),
-        lib::columns::mux::xf_q1(dec_mf_gate_contact_raw(pnf), dec_mf_pmos_dx(pnf), 0.),
-    )
-}
-
-fn dec_mf_decoder_dx(width: Int) -> Float {
-    // The raw MultiFingerInv bbox has horizontal center -170 nm after its
-    // internal device rotations.
-    width as Float / 2. + 170.
-}
-
-fn dec_mf_outer_xf(r: Rect, device_dx: Float, width: Int) -> Rect {
-    lib::columns::mux::xf_q1(
-        lib::columns::mux::xf_q1(r, device_dx, 0.),
-        dec_mf_decoder_dx(width),
-        0.,
-    )
-}
-
-fn dec_mf_sd_outer(row: Int, device_dx: Float, width: Int) -> Rect {
-    dec_mf_outer_xf(dec_sd_port_raw(0., 700., row), device_dx, width)
-}
-
-fn dec_mf_gate_port_a0(nw: Int, pw: Int, width: Int) -> Rect {
-    lib::columns::mux::xf_q1(dec_mf_raw_a(nw, pw), dec_mf_decoder_dx(width), 0.)
-}
-
-fn dec_mf_gate_port_y0(nw: Int, pw: Int, width: Int) -> Rect {
-    let nnf = dec_mf_nf(nw);
-    let pnf = dec_mf_nf(pw);
-    let pdx = dec_mf_pmos_dx(pnf);
-    let raw_y = lib::columns::util::rect_union(
-        lib::columns::mux::xf_q1(dec_mf_sd_bbox(nnf, true), 0., 0.),
-        lib::columns::mux::xf_q1(dec_mf_sd_bbox(pnf, true), pdx, 0.),
+// A tap `width` wide beside `dec_gate`s of the given kind and size.
+cell dec_tap(
+    inputs: Int,
+    nw: Int,
+    pw: Int,
+    width: Int = 1000,
+    boundary: Bool = true,
+    m2: Bool = false,
+    later: Bool = true,
+    top_dir: Int = 0,
+) {
+    let g = gate_devices(inputs, nw, pw, 1580., true);
+    let b = bbox(g);
+    draw_taps(
+        width as Float,
+        shapes(g, "nwell.drawing")[0],
+        shapes(g, "nsdm.drawing")[0],
+        shapes(g, "psdm.drawing")[0],
+        m2,
+        later,
+        top_dir,
     );
-    lib::columns::mux::xf_q1(raw_y, dec_mf_decoder_dx(width), 0.)
-}
-
-fn dec_mf_gate_power0(nw: Int, pw: Int, width: Int, vdd: Bool) -> Rect {
-    let nnf = dec_mf_nf(nw);
-    let pnf = dec_mf_nf(pw);
-    if vdd {
-        dec_mf_outer_xf(dec_mf_sd_bbox(pnf, false), dec_mf_pmos_dx(pnf), width)
+    pub let outline = if boundary {
+        rect("layout_boundary.boundary", x0=0., y0=b.y0, x1=width as Float, y1=b.y1)
     } else {
-        dec_mf_outer_xf(dec_mf_sd_bbox(nnf, false), 0., width)
-    }
-}
-
-fn dec_mf_gate_rail_vspan(nw: Int, pw: Int, width: Int) -> (Float, Float) {
-    let a = dec_mf_gate_port_a0(nw, pw, width);
-    let y = dec_mf_gate_port_y0(nw, pw, width);
-    let vss = dec_mf_gate_power0(nw, pw, width, false);
-    let vdd = dec_mf_gate_power0(nw, pw, width, true);
-    lib::columns::util::span_union(
-        lib::columns::util::rect_vspan(a),
-        lib::columns::util::span_union(
-            lib::columns::util::rect_vspan(y),
-            lib::columns::util::span_union(lib::columns::util::rect_vspan(vss), lib::columns::util::rect_vspan(vdd)),
-        ),
-    )
-}
-
-fn dec_mf_gate_a(nw: Int, pw: Int, width: Int) -> Rect {
-    lib::columns::util::rect_with_vspan(dec_mf_gate_port_a0(nw, pw, width), dec_mf_gate_rail_vspan(nw, pw, width))
-}
-
-fn dec_mf_gate_y(nw: Int, pw: Int, width: Int) -> Rect {
-    let y = dec_mf_gate_port_y0(nw, pw, width);
-    lib::columns::util::rect_from_spans((y.x1 - 240., y.x1,), dec_mf_gate_rail_vspan(nw, pw, width))
-}
-
-fn dec_mf_device_implant_outer(nf: Int, device_dx: Float, width: Int) -> Rect {
-    dec_mf_outer_xf(
-        lib::columns::util::cbox(-125., -125., 825., dec_mf_diff_perp(nf) + 125.),
-        device_dx,
-        width,
-    )
-}
-
-fn dec_mf_device_nwell_outer(nf: Int, device_dx: Float, width: Int) -> Rect {
-    dec_mf_outer_xf(
-        lib::columns::util::cbox(-180., -180., 880., dec_mf_diff_perp(nf) + 180.),
-        device_dx,
-        width,
-    )
-}
-
-fn dec_mf_draw_li_m1_vias(nf: Int, device_dx: Float, width: Int, odd: Bool, rail: Rect) -> Rect {
-    for row in std::range(nf + 1) {
-        if (row % 2 == 1) == odd {
-            let port = dec_mf_sd_outer(row, device_dx, width);
-            lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", port, rail, 0, 0, true);
-        } else {
-            crect(x0=0., y0=0., x1=0., y1=0.);
-        };
-    }
-    crect(x0=0., y0=0., x1=0., y1=0.)
-}
-
-fn dec_mf_draw_power_stripes(device_span: (Float, Float), width: Int, rail: Rect, enabled: Bool) -> Rect {
-    let count = dec_power_strap_count(device_span);
-    for index in std::range(count) {
-        let vspan = dec_power_strap_span(device_span, index);
-        let stripe = lib::columns::util::met2_port(0., vspan.0, width as Float, vspan.1);
-        if enabled {
-            lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", rail, stripe, 0, 0, true);
-        } else {
-            crect(x0=0., y0=0., x1=0., y1=0.);
-        };
-    }
-    crect(x0=0., y0=0., x1=0., y1=0.)
-}
-
-cell dec_multifinger_inv_gate(nw: Int, pw: Int, filler: Int, width: Int, pins: Int) {
-    let nnf = dec_mf_nf(nw);
-    let pnf = dec_mf_nf(pw);
-    let pdx = dec_mf_pmos_dx(pnf);
-    let gate_dx = dec_mf_decoder_dx(width);
-    let raw = inst(dec_multifinger_inv_raw(nw, pw, if filler == 1 { 0 } else { 1 }, 0), x=gate_dx, y=0., angle=90);
-
-    let n_implant = dec_mf_device_implant_outer(nnf, 0., width);
-    let p_implant = dec_mf_device_implant_outer(pnf, pdx, width);
-    let p_nwell = dec_mf_device_nwell_outer(pnf, pdx, width);
-    lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans((0., width as Float,), lib::columns::util::rect_vspan(p_nwell)));
-
-    let a0 = raw.a;
-    let y0 = raw.y_out;
-    let vss0 = raw.vss;
-    let vdd0 = raw.vdd;
-    let y_rail0 = lib::columns::util::rect_with_hspan(y0, (y0.x1 - 240., y0.x1,));
-    let vss_rail0 = lib::columns::util::rect_with_hspan(vss0, (vss0.x0, vss0.x0 + 240.,));
-    let vdd_rail0 = lib::columns::util::rect_with_hspan(vdd0, (vdd0.x0, vdd0.x0 + 240.,));
-    let rail_vspan = lib::columns::util::span_union(
-        lib::columns::util::rect_vspan(a0),
-        lib::columns::util::span_union(
-            lib::columns::util::rect_vspan(y_rail0),
-            lib::columns::util::span_union(lib::columns::util::rect_vspan(vss_rail0), lib::columns::util::rect_vspan(vdd_rail0)),
-        ),
-    );
-    let a = lib::columns::util::rect_with_vspan(a0, rail_vspan);
-    let y_out = lib::columns::util::rect_with_vspan(y_rail0, rail_vspan);
-    let vss = vss_rail0;
-    let vdd = vdd_rail0;
-
-    if filler == 0 {
-        lib::columns::util::draw_box("met1.drawing", vss);
-        dec_mf_draw_li_m1_vias(nnf, 0., width, false, vss);
-        lib::columns::util::draw_box("met1.drawing", vdd);
-        dec_mf_draw_li_m1_vias(pnf, pdx, width, false, vdd);
-        lib::columns::util::draw_box("met1.drawing", a);
-        lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", a0, a, 0, 0, true);
-        if pins == 1 {
-            lib::columns::util::draw_box("met1.pin", a);
-        } else {
-            crect(x0=0., y0=0., x1=0., y1=0.);
-        };
-        lib::columns::util::draw_box("met1.drawing", y_out);
-        dec_mf_draw_li_m1_vias(nnf, 0., width, true, y_out);
-        dec_mf_draw_li_m1_vias(pnf, pdx, width, true, y_out);
-        if pins == 1 {
-            lib::columns::util::draw_box("met1.pin", y_out);
-        } else {
-            crect(x0=0., y0=0., x1=0., y1=0.);
-        };
-    } else {
-        crect(x0=0., y0=0., x1=0., y1=0.);
+        crect(x0=0., y0=b.y0, x1=width as Float, y1=b.y1)
     };
-
-    dec_mf_draw_power_stripes(lib::columns::util::rect_vspan(n_implant), width, vss, filler == 0);
-    dec_mf_draw_power_stripes(lib::columns::util::rect_vspan(p_implant), width, vdd, filler == 0);
-    let outline_y0 = min_float(n_implant.y0, p_nwell.y0) - 200.;
-    let outline_y1 = max_float(n_implant.y1, p_nwell.y1) + 200.;
-    let outline = rect("layout_boundary.boundary", x0=0., y0=outline_y0, x1=width as Float, y1=outline_y1);
 }
 
-fn dec_mf_draw_tap_region(is_vdd_region: Bool, device_span: (Float, Float), tap_width: Int) -> Rect {
-    let implant_hspan = (170., tap_width as Float - 170.,);
-    let implant = lib::columns::util::rect_from_spans(implant_hspan, lib::columns::mux::span_shrink_all(device_span, 110.));
-    if is_vdd_region {
-        lib::columns::util::draw_box("nsdm.drawing", implant);
-    } else {
-        lib::columns::util::draw_box("psdm.drawing", implant);
-    };
-    let area = lib::columns::util::rect_from_spans(
-        lib::columns::mux::span_shrink_all(implant_hspan, 125.),
-        lib::columns::mux::span_shrink_all(device_span, 290.),
+// A multi-finger inverter: a 700 nm NMOS and PMOS with as many fingers as
+// their widths need, each turned on its side, the PMOS well 220 nm past the
+// NMOS implant. `nsd` and `psd` are their source/drain contacts by row.
+cell mf_inv(nw: Int, pw: Int, pins: Bool = false) {
+    let n = inst(
+        util::mos([util::nmos(700)], 150, max_int((nw + 350) / 700, 1), gates=util::Gates::Merged),
+        x=0.,
+        y=0.,
+        angle=90,
     );
-    lib::columns::util::draw_contact_full_later(2, "tap.drawing", "li1.drawing", area, area, 0, 0, true).2
-}
-
-fn dec_mf_draw_tap_power(device_span: (Float, Float), tap_width: Int) -> Rect {
-    let count = dec_power_strap_count(device_span);
-    for index in std::range(count) {
-        let vspan = dec_power_strap_span(device_span, index);
-        let stripe = lib::columns::util::met2_port(0., vspan.0, tap_width as Float, vspan.1);
-        let area = lib::columns::util::rect_from_spans((295., tap_width as Float - 295.,), vspan);
-        lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", area, area, 0, 0, true);
-        lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", area, area, 0, 0, true);
+    let p = inst(
+        util::mos([util::pmos(700)], 150, max_int((pw + 350) / 700, 1), gates=util::Gates::Merged),
+        y=0.,
+        angle=90,
+    );
+    eq(bbox(p).x0, bbox(n).x1 + 220.);
+    pub let nsd = n.sd[0];
+    pub let psd = p.sd[0];
+    pub let a = util::draw_box("li1.drawing", union(n.gate[0], p.gate[0]));
+    if pins {
+        for r in cons(a, std::concat(nsd, psd)) {
+            util::draw_box("li1.pin", r);
+        }
     }
-    crect(x0=0., y0=0., x1=0., y1=0.)
 }
 
-cell dec_multifinger_inv_tap(nw: Int, pw: Int, tap_width: Int, gate_width: Int) {
-    let nnf = dec_mf_nf(nw);
-    let pnf = dec_mf_nf(pw);
-    let pdx = dec_mf_pmos_dx(pnf);
-    let n_implant = dec_mf_device_implant_outer(nnf, 0., gate_width);
-    let p_implant = dec_mf_device_implant_outer(pnf, pdx, gate_width);
-    let p_nwell = dec_mf_device_nwell_outer(pnf, pdx, gate_width);
-    lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans((0., tap_width as Float,), lib::columns::util::rect_vspan(p_nwell)));
-    dec_mf_draw_tap_region(false, lib::columns::util::rect_vspan(n_implant), tap_width);
-    dec_mf_draw_tap_region(true, lib::columns::util::rect_vspan(p_implant), tap_width);
-    dec_mf_draw_tap_power(lib::columns::util::rect_vspan(n_implant), tap_width);
-    dec_mf_draw_tap_power(lib::columns::util::rect_vspan(p_implant), tap_width);
+// The stacked contact rows of `sd` with odd (or even) index, as one
+// rectangle.
+fn rows(sd: [Rect], odd: Bool) -> Rect {
+    let last = std::len(sd) - 1;
+    union(sd[if odd { 1 } else { 0 }], sd[if (last % 2 == 1) == odd { last } else { last - 1 }])
+}
+
+// A multi-finger inverter centered in a `width` slot, with met1 rails for its
+// input, output, and supplies, and met2 supply stripes across its implants.
+cell mf_gate(nw: Int, pw: Int, width: Int = 1580, filler: Bool = false, pins: Bool = false) {
+    let w = width as Float;
+    let g = mf_devices(nw, pw, w, filler);
+    pub let nsdm = shapes(g, "nsdm.drawing")[0];
+    pub let psdm = shapes(g, "psdm.drawing")[0];
+    pub let nwell = across("nwell.drawing", shapes(g, "nwell.drawing")[0], w);
+    let nsd = g.nsd;
+    let psd = g.psd;
+    let a0 = g.a;
+    let y_out = union(rows(nsd, true), rows(psd, true));
+    let vss0 = rows(nsd, false);
+    let vdd0 = rows(psd, false);
+    pub let vss = crect(x0=vss0.x0, y0=vss0.y0, x1=vss0.x0 + 240., y1=vss0.y1);
+    pub let vdd = crect(x0=vdd0.x0, y0=vdd0.y0, x1=vdd0.x0 + 240., y1=vdd0.y1);
+    let span = util::hull([
+        a0,
+        crect(x0=y_out.x1 - 240., y0=y_out.y0, x1=y_out.x1, y1=y_out.y1),
+        vss,
+        vdd,
+    ]);
+    pub let a = crect(x0=a0.x0, y0=span.y0, x1=a0.x1, y1=span.y1);
+    pub let out = crect(x0=y_out.x1 - 240., y0=span.y0, x1=y_out.x1, y1=span.y1);
+    if !filler {
+        for rail in [(vss, nsd, false), (vdd, psd, false), (out, nsd, true), (out, psd, true)] {
+            util::draw_box("met1.drawing", rail.0);
+            for i in std::range(std::len(rail.1)) if (i % 2 == 1) == rail.2 {
+                util::contact(Via::Mcon, rail.1[i], rail.0, longer=true, later=true);
+            }
+        }
+        util::draw_box("met1.drawing", a);
+        util::contact(Via::Mcon, a0, a, longer=true, later=true);
+        if pins {
+            util::draw_box("met1.pin", a);
+            util::draw_box("met1.pin", out);
+        }
+    }
+    pub let vss_stripes = [for s in straps(nsdm) {
+        tied(util::met2_port(0., s.0, w, s.1), vss, !filler)
+    }];
+    pub let vdd_stripes = [for s in straps(psdm) {
+        tied(util::met2_port(0., s.0, w, s.1), vdd, !filler)
+    }];
     pub let outline = rect(
         "layout_boundary.boundary",
         x0=0.,
-        y0=min_float(n_implant.y0, p_nwell.y0),
-        x1=tap_width as Float,
-        y1=max_float(n_implant.y1, p_nwell.y1),
+        y0=min_float(nsdm.y0, nwell.y0) - 200.,
+        x1=w,
+        y1=max_float(nsdm.y1, nwell.y1) + 200.,
     );
 }
 
-fn dec_span_center_i(span: (Float, Float)) -> Float {
-    (((span.0 + span.1) as Int) / 2) as Float
+// `stripe`, tied to `rail` below it when `tie`.
+fn tied(stripe: Rect, rail: Rect, tie: Bool) -> Rect {
+    if tie {
+        util::contact(Via::Via1, rail, stripe, longer=true, later=true);
+    }
+    stripe
 }
 
-fn dec_center_span_i(center: Float, width: Float) -> (Float, Float) {
-    let start = lib::columns::util::snap5(center - width / 2.);
-    (start, start + width,)
+// A multi-finger inverter in a `w`-wide slot, shared by gates and taps.
+fn mf_devices(nw: Int, pw: Int, w: Float, construction: Bool) -> Any {
+    in_slot(mf_inv(nw, pw), w, construction)
 }
 
-fn dec_power_strap_count(span: (Float, Float)) -> Int {
-    let len = span.1 - span.0;
-    if len > 3840. { (len / 3840.) as Int } else { 1 }
+// The height of an `mf_gate`: both devices' fingers at 430 nm plus their
+// diffusion ends, implant, well, and 200 nm margins. Cheaper than building
+// one just to measure it.
+fn mf_gate_height(nw: Int, pw: Int) -> Float {
+    (430 * (max_int((nw + 350) / 700, 1) + max_int((pw + 350) / 700, 1)) + 1730) as Float
 }
 
-fn dec_power_strap_span(span: (Float, Float), idx: Int) -> (Float, Float) {
-    let len = span.1 - span.0;
-    if len > 3840. {
-        let num = (len / 3840.) as Int;
-        let full = (1920. * (2 * num - 1) as Float / 5.) as Int * 5;
-        let all = dec_center_span_i(dec_span_center_i(span), full as Float);
-        let center = all.0 + 960. * (4 * idx + 1) as Float;
-        dec_center_span_i(center, 1920.)
-    } else {
-        let w0 = ((len / 20.) as Int * 10) as Float;
-        dec_center_span_i(dec_span_center_i(span), max_float(w0, 320.))
+// A tap `width` wide beside `mf_gate`s of the given size.
+cell mf_tap(nw: Int, pw: Int, width: Int = 1000) {
+    let g = mf_devices(nw, pw, 1580., true);
+    let nsdm = shapes(g, "nsdm.drawing")[0];
+    let nwell = shapes(g, "nwell.drawing")[0];
+    draw_taps(width as Float, nwell, nsdm, shapes(g, "psdm.drawing")[0], true, true, 0);
+    pub let outline = rect(
+        "layout_boundary.boundary",
+        x0=0.,
+        y0=min_float(nsdm.y0, nwell.y0),
+        x1=width as Float,
+        y1=max_float(nsdm.y1, nwell.y1),
+    );
+}
+
+// Jogs li1 from output `src` up 170 nm past its top and over to input `dst`,
+// then up to `dst` when `to_dst`.
+fn li_jog(src: Rect, dst: Rect, to_dst: Bool) {
+    let top = src.y1 + src.w + 170.;
+    rect("li1.drawing", x0=src.x0, y0=src.y0, x1=src.x1, y1=top);
+    rect(
+        "li1.drawing",
+        x0=min_float(src.x0, dst.x0),
+        y0=src.y1 + 170.,
+        x1=max_float(src.x1, dst.x0),
+        y1=top,
+    );
+    if to_dst {
+        rect("li1.drawing", x0=dst.x0, y0=src.y1 + 170., x1=dst.x1, y1=dst.y1);
     }
 }
 
-fn draw_dec_power_via(strap: Rect, port: Rect, enabled: Bool) -> Rect {
-    let inter = lib::columns::util::rect_intersection(strap, port);
-    if (enabled && lib::columns::util::rect_has_area(inter)) {
-        lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", inter, inter, 0, 1, true).2
-    } else {
-        crect(x0=0., y0=0., x1=0., y1=0.)
-    }
-}
-
-fn draw_dec_straps_1(span: (Float, Float), port0: Rect, enabled: Bool) -> Rect {
-    let count = dec_power_strap_count(span);
-    for i in std::range(count) {
-        let vspan = dec_power_strap_span(span, i);
-        let strap = lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans((0., 1580.,), vspan));
-        lib::columns::util::draw_box("met1.pin", strap);
-        draw_dec_power_via(strap, port0, enabled);
-    }
-    crect(x0=0., y0=0., x1=0., y1=0.)
-}
-
-fn draw_dec_straps_2(span: (Float, Float), port0: Rect, port1: Rect, enabled: Bool) -> Rect {
-    let count = dec_power_strap_count(span);
-    for i in std::range(count) {
-        let vspan = dec_power_strap_span(span, i);
-        let strap = lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans((0., 1580.,), vspan));
-        lib::columns::util::draw_box("met1.pin", strap);
-        draw_dec_power_via(strap, port0, enabled);
-        draw_dec_power_via(strap, port1, enabled);
-    }
-    crect(x0=0., y0=0., x1=0., y1=0.)
-}
-
-fn draw_dec_straps_1_w(span: (Float, Float), port0: Rect, enabled: Bool, width: Int) -> Rect {
-    let count = dec_power_strap_count(span);
-    for i in std::range(count) {
-        let vspan = dec_power_strap_span(span, i);
-        let strap = lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans((0., width as Float,), vspan));
-        lib::columns::util::draw_box("met1.pin", strap);
-        draw_dec_power_via(strap, port0, enabled);
-    }
-    crect(x0=0., y0=0., x1=0., y1=0.)
-}
-
-fn draw_dec_straps_2_w(span: (Float, Float), port0: Rect, port1: Rect, enabled: Bool, width: Int) -> Rect {
-    let count = dec_power_strap_count(span);
-    for i in std::range(count) {
-        let vspan = dec_power_strap_span(span, i);
-        let strap = lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans((0., width as Float,), vspan));
-        lib::columns::util::draw_box("met1.pin", strap);
-        draw_dec_power_via(strap, port0, enabled);
-        draw_dec_power_via(strap, port1, enabled);
-    }
-    crect(x0=0., y0=0., x1=0., y1=0.)
-}
-
-cell dec_nand2_gate_w(nw: Int, pw: Int, filler: Int, width: Int, signal_pins: Int, boundary: Int) {
-    let raw = inst(dec_nand2_raw(nw, pw, if filler == 1 { 0 } else { 1 }), x=dec_gate_dx_w(nw, pw, width), y=0., angle=90);
-    let nwell_bbox = lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans((0., width as Float,), lib::columns::util::rect_vspan(raw.nwell_bbox)));
-    let nsdm_bbox = lib::columns::util::draw_box("nsdm.drawing", lib::columns::util::rect_from_spans((0., width as Float,), lib::columns::util::rect_vspan(raw.nsdm_bbox)));
-    let psdm_bbox = lib::columns::util::draw_box("psdm.drawing", lib::columns::util::rect_from_spans((0., width as Float,), lib::columns::util::rect_vspan(raw.psdm_bbox)));
-    draw_dec_straps_1_w(lib::columns::util::rect_vspan(raw.nsdm_bbox), raw.vss, filler == 0, width);
-    draw_dec_straps_1_w(lib::columns::util::rect_vspan(raw.psdm_bbox), raw.vdd, filler == 0, width);
-    pub let vss_strap = lib::columns::util::rect_from_spans((0., width as Float,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
-    pub let vdd_strap = lib::columns::util::rect_from_spans((0., width as Float,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
-    let a = raw.a;
-    let b = raw.b;
-    let y_out = raw.y_out;
-    let vss = raw.vss;
-    let vdd = raw.vdd;
-    if (filler == 0 && signal_pins == 1) {
-        lib::columns::util::draw_box("li1.pin", a);
-        lib::columns::util::draw_box("li1.pin", b);
-        lib::columns::util::draw_box("li1.pin", y_out);
-    } else {
-        crect(x0=0., y0=0., x1=0., y1=0.);
-    };
-    if filler == 0 {
-        lib::columns::util::draw_box("li1.pin", vss);
-        lib::columns::util::draw_box("li1.pin", vdd);
-    } else {
-        crect(x0=0., y0=0., x1=0., y1=0.);
-    };
-    let outline = if boundary == 1 {
-        rect("layout_boundary.boundary", x0=0., y0=raw.outline.y0, x1=width as Float, y1=raw.outline.y1)
-    } else {
-        crect(x0=0., y0=raw.outline.y0, x1=width as Float, y1=raw.outline.y1)
-    };
-}
-
-fn dec_nand3_gate_dx_w(nw: Int, pw: Int, width: Int) -> Float {
-    let q1 = lib::columns::mux::xf_q1(dec_nand3_raw_bbox(nw, pw), 0., 0.);
-    width as Float / 2. - (((q1.x0 + q1.x1) as Int) / 2) as Float
-}
-
-fn dec_nand3_gate_xf_w(r: Rect, nw: Int, pw: Int, width: Int) -> Rect {
-    lib::columns::mux::xf_q1(r, dec_nand3_gate_dx_w(nw, pw, width), 0.)
-}
-
-// A NAND3 decoder gate in a `width` slot, with M1 power straps across it.
-cell dec_nand3_gate_w(nw: Int, pw: Int, filler: Int, width: Int, boundary: Int) {
-    let raw = inst(dec_nand3_raw(nw, pw, if filler == 1 { 0 } else { 1 }), x=dec_nand3_gate_dx_w(nw, pw, width), y=0., angle=90);
-    let nwell_bbox = lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans((0., width as Float,), lib::columns::util::rect_vspan(raw.nwell_bbox)));
-    let nsdm_bbox = lib::columns::util::draw_box("nsdm.drawing", lib::columns::util::rect_from_spans((0., width as Float,), lib::columns::util::rect_vspan(raw.nsdm_bbox)));
-    let psdm_bbox = lib::columns::util::draw_box("psdm.drawing", lib::columns::util::rect_from_spans((0., width as Float,), lib::columns::util::rect_vspan(raw.psdm_bbox)));
-    draw_dec_straps_1_w(lib::columns::util::rect_vspan(raw.nsdm_bbox), raw.vss, filler == 0, width);
-    draw_dec_straps_2_w(lib::columns::util::rect_vspan(raw.psdm_bbox), raw.vdd, raw.vdd1, filler == 0, width);
-    pub let vss_strap = lib::columns::util::rect_from_spans((0., width as Float,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
-    pub let vdd_strap = lib::columns::util::rect_from_spans((0., width as Float,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
-    let a = raw.a;
-    let b = raw.b;
-    let c = raw.c;
-    let y_out = raw.y_out;
-    let outline = if boundary == 1 {
-        rect("layout_boundary.boundary", x0=0., y0=raw.outline.y0, x1=width as Float, y1=raw.outline.y1)
-    } else {
-        crect(x0=0., y0=raw.outline.y0, x1=width as Float, y1=raw.outline.y1)
-    };
-}
-
-fn dec_inv_gate_dx_w(nw: Int, pw: Int, width: Int) -> Float {
-    let q1 = lib::columns::mux::xf_q1(dec_inv_raw_bbox(nw, pw), 0., 0.);
-    width as Float / 2. - (((q1.x0 + q1.x1) as Int) / 2) as Float
-}
-
-fn dec_inv_gate_xf_w(r: Rect, nw: Int, pw: Int, width: Int) -> Rect {
-    lib::columns::mux::xf_q1(r, dec_inv_gate_dx_w(nw, pw, width), 0.)
-}
-
-// A folded inverter decoder gate in a `width` slot.
-cell dec_inv_gate_w(nw: Int, pw: Int, filler: Int, width: Int, boundary: Int) {
-    let raw = inst(dec_inv_raw(nw, pw, if filler == 1 { 0 } else { 1 }), x=dec_inv_gate_dx_w(nw, pw, width), y=0., angle=90);
-    let nwell_bbox = lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans((0., width as Float,), lib::columns::util::rect_vspan(raw.nwell_bbox)));
-    let nsdm_bbox = lib::columns::util::draw_box("nsdm.drawing", lib::columns::util::rect_from_spans((0., width as Float,), lib::columns::util::rect_vspan(raw.nsdm_bbox)));
-    let psdm_bbox = lib::columns::util::draw_box("psdm.drawing", lib::columns::util::rect_from_spans((0., width as Float,), lib::columns::util::rect_vspan(raw.psdm_bbox)));
-    draw_dec_straps_2_w(lib::columns::util::rect_vspan(raw.nsdm_bbox), raw.vss0, raw.vss1, filler == 0, width);
-    draw_dec_straps_2_w(lib::columns::util::rect_vspan(raw.psdm_bbox), raw.vdd0, raw.vdd1, filler == 0, width);
-    let vss_strap = lib::columns::util::rect_from_spans((0., width as Float,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
-    let vdd_strap = lib::columns::util::rect_from_spans((0., width as Float,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
-    let a = raw.a;
-    let y_out = raw.y_out;
-    let outline = if boundary == 1 {
-        rect("layout_boundary.boundary", x0=0., y0=raw.outline.y0, x1=width as Float, y1=raw.outline.y1)
-    } else {
-        crect(x0=0., y0=raw.outline.y0, x1=width as Float, y1=raw.outline.y1)
-    };
-}
-
-cell dec_nand2_gate(nw: Int, pw: Int, filler: Int) {
-    let raw = inst(dec_nand2_raw(nw, pw, if filler == 1 { 0 } else { 1 }), x=dec_gate_dx(nw, pw), y=0., angle=90);
-    let nwell_bbox = lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans((0., 1580.,), lib::columns::util::rect_vspan(raw.nwell_bbox)));
-    let nsdm_bbox = lib::columns::util::draw_box("nsdm.drawing", lib::columns::util::rect_from_spans((0., 1580.,), lib::columns::util::rect_vspan(raw.nsdm_bbox)));
-    let psdm_bbox = lib::columns::util::draw_box("psdm.drawing", lib::columns::util::rect_from_spans((0., 1580.,), lib::columns::util::rect_vspan(raw.psdm_bbox)));
-    draw_dec_straps_1(lib::columns::util::rect_vspan(raw.nsdm_bbox), raw.vss, filler == 0);
-    draw_dec_straps_1(lib::columns::util::rect_vspan(raw.psdm_bbox), raw.vdd, filler == 0);
-    pub let vss_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
-    pub let vdd_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
-    pub let a = raw.a;
-    pub let b = raw.b;
-    pub let y_out = raw.y_out;
-    let vss = raw.vss;
-    let vdd = raw.vdd;
-    pub let outline = rect("layout_boundary.boundary", x0=0., y0=raw.outline.y0, x1=1580., y1=raw.outline.y1);
-}
-
-cell dec_inv_gate(nw: Int, pw: Int, filler: Int) {
-    let raw = inst(dec_inv_raw(nw, pw, if filler == 1 { 0 } else { 1 }), x=dec_inv_gate_dx(nw, pw), y=0., angle=90);
-    let nwell_bbox = lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans((0., 1580.,), lib::columns::util::rect_vspan(raw.nwell_bbox)));
-    let nsdm_bbox = lib::columns::util::draw_box("nsdm.drawing", lib::columns::util::rect_from_spans((0., 1580.,), lib::columns::util::rect_vspan(raw.nsdm_bbox)));
-    let psdm_bbox = lib::columns::util::draw_box("psdm.drawing", lib::columns::util::rect_from_spans((0., 1580.,), lib::columns::util::rect_vspan(raw.psdm_bbox)));
-    draw_dec_straps_2(lib::columns::util::rect_vspan(raw.nsdm_bbox), raw.vss0, raw.vss1, filler == 0);
-    draw_dec_straps_2(lib::columns::util::rect_vspan(raw.psdm_bbox), raw.vdd0, raw.vdd1, filler == 0);
-    pub let vss_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
-    pub let vdd_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
-    let a = raw.a;
-    pub let y_out = raw.y_out;
-    let vss0 = raw.vss0;
-    let vss1 = raw.vss1;
-    let vdd0 = raw.vdd0;
-    let vdd1 = raw.vdd1;
-    pub let outline = rect("layout_boundary.boundary", x0=0., y0=raw.outline.y0, x1=1580., y1=raw.outline.y1);
-}
-
-// The vertical driver style keeps device access on LI/M1, but moves the
-// stage's input and power stripes to M2.  DecoderVia therefore contributes
-// both the LI--M1 contact and the M1--M2 via at each power-port crossing.
-fn draw_dec_power_via_vertical(strap: Rect, port: Rect, enabled: Bool) -> Rect {
-    let inter = lib::columns::util::rect_intersection(strap, port);
-    if (enabled && lib::columns::util::rect_has_area(inter)) {
-        lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", inter, inter, 0, 0, true);
-        lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", inter, inter, 0, 0, true).2
-    } else {
-        crect(x0=0., y0=0., x1=0., y1=0.)
-    }
-}
-
-fn draw_dec_straps_2_vertical(span: (Float, Float), port0: Rect, port1: Rect, enabled: Bool) -> Rect {
-    let count = dec_power_strap_count(span);
-    for i in std::range(count) {
-        let vspan = dec_power_strap_span(span, i);
-        let strap = lib::columns::util::draw_box("met2.drawing", lib::columns::util::rect_from_spans((0., 1580.,), vspan));
-        lib::columns::util::draw_box("met2.pin", strap);
-        draw_dec_power_via_vertical(strap, port0, enabled);
-        draw_dec_power_via_vertical(strap, port1, enabled);
-    }
-    crect(x0=0., y0=0., x1=0., y1=0.)
-}
-
-cell dec_inv_gate_vertical(nw: Int, pw: Int, filler: Int) {
-    let raw = inst(dec_inv_raw(nw, pw, if filler == 1 { 0 } else { 1 }), x=dec_inv_gate_dx(nw, pw), y=0., angle=90);
-    let nwell_bbox = lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans((0., 1580.,), lib::columns::util::rect_vspan(raw.nwell_bbox)));
-    let nsdm_bbox = lib::columns::util::draw_box("nsdm.drawing", lib::columns::util::rect_from_spans((0., 1580.,), lib::columns::util::rect_vspan(raw.nsdm_bbox)));
-    let psdm_bbox = lib::columns::util::draw_box("psdm.drawing", lib::columns::util::rect_from_spans((0., 1580.,), lib::columns::util::rect_vspan(raw.psdm_bbox)));
-    draw_dec_straps_2_vertical(lib::columns::util::rect_vspan(raw.nsdm_bbox), raw.vss0, raw.vss1, filler == 0);
-    draw_dec_straps_2_vertical(lib::columns::util::rect_vspan(raw.psdm_bbox), raw.vdd0, raw.vdd1, filler == 0);
-    pub let vss_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.nsdm_bbox), 0));
-    pub let vdd_strap = lib::columns::util::rect_from_spans((0., 1580.,), dec_power_strap_span(lib::columns::util::rect_vspan(raw.psdm_bbox), 0));
-    let a = raw.a;
-    let y_out = raw.y_out;
-    let vss0 = raw.vss0;
-    let vss1 = raw.vss1;
-    let vdd0 = raw.vdd0;
-    let vdd1 = raw.vdd1;
-    let outline = rect("layout_boundary.boundary", x0=0., y0=raw.outline.y0, x1=1580., y1=raw.outline.y1);
-}
-
-fn dec_and2_inv_x(nand_nw: Int, nand_pw: Int) -> Float {
-    // FoldedInv is placed 300 nm to the right of the NAND. Both primitive
-    // bboxes begin at x=-540 nm.
-    dec_total_x(nand_nw, nand_pw) as Float + 1020.
-}
-
-fn dec_raw_translate(r: Rect, dx: Float) -> Rect {
-    lib::columns::util::rect_translate(r, dx, 0.)
-}
-
-fn dec_and2_connection(nand_nw: Int, nand_pw: Int, inv_nw: Int, inv_pw: Int) -> Rect {
-    let p0 = nand_nw as Float + 520.;
-    let src = lib::columns::util::rect_union(dec_sd_port_raw(0., nand_nw as Float, 2), dec_sd_port_raw(p0, nand_pw as Float, 2));
-    let dst = dec_raw_translate(lib::columns::util::cbox(-520., 470., -190., 640.), dec_and2_inv_x(nand_nw, nand_pw));
-    let line = lib::columns::util::rect_h(src);
-    let p1 = src.x1 + line + 170.;
-    let p2 = src.x1 + 170.;
-    let r1 = lib::columns::util::cbox(src.x0, src.y0, p1, src.y1);
-    let r2 = lib::columns::util::cbox(p2, min_float(src.y0, dst.y0), p1, max_float(src.y1, dst.y0));
-    let r3 = lib::columns::util::cbox(p2, dst.y0, dst.x1, dst.y1);
-    lib::columns::util::draw_box("li1.drawing", dec_gate_xf(r1, nand_nw, nand_pw));
-    lib::columns::util::draw_box("li1.drawing", dec_gate_xf(r2, nand_nw, nand_pw));
-    lib::columns::util::draw_box("li1.drawing", dec_gate_xf(r3, nand_nw, nand_pw))
-}
-
-cell dec_and2_gate(nand_nw: Int, nand_pw: Int, inv_nw: Int, inv_pw: Int, filler: Int, pins: Int, boundary: Int) {
-    let inv_x = dec_and2_inv_x(nand_nw, nand_pw);
-    let nand = inst(dec_nand2_gate(nand_nw, nand_pw, filler), x=0., y=0.);
-    let inv = inst(dec_inv_gate(inv_nw, inv_pw, filler), x=0., y=inv_x);
-    if filler == 0 {
-        dec_and2_connection(nand_nw, nand_pw, inv_nw, inv_pw);
-        if pins == 1 {
-            lib::columns::util::draw_box("li1.pin", nand.a);
-            lib::columns::util::draw_box("li1.pin", nand.b);
-            lib::columns::util::draw_box("li1.pin", nand.y_out);
-            lib::columns::util::draw_box("li1.pin", inv.y_out);
-        } else {
-            crect(x0=0., y0=0., x1=0., y1=0.);
-        };
-        // VDD/VSS are propagated by Decoder and remain ports after its final
-        // flatten, even when the stage's signal ports are internal.
-        let nand_p0 = nand_nw as Float + 520.;
-        lib::columns::util::draw_box("li1.pin", dec_gate_xf(dec_sd_port_raw(0., nand_nw as Float, 0), nand_nw, nand_pw));
-        lib::columns::util::draw_box("li1.pin", dec_gate_xf(dec_sd_port_raw(nand_p0, nand_pw as Float, 1), nand_nw, nand_pw));
-        let hn = dec_inv_half_nw(inv_nw);
-        let hp = dec_inv_half_pw(inv_pw);
-        let inv_p0 = hn as Float + 520.;
-        lib::columns::util::draw_box("li1.pin", lib::columns::util::rect_translate(dec_inv_gate_xf(dec_sd_port_raw(0., hn as Float, 0), inv_nw, inv_pw), 0., inv_x));
-        lib::columns::util::draw_box("li1.pin", lib::columns::util::rect_translate(dec_inv_gate_xf(dec_sd_port_raw(0., hn as Float, 2), inv_nw, inv_pw), 0., inv_x));
-        lib::columns::util::draw_box("li1.pin", lib::columns::util::rect_translate(dec_inv_gate_xf(dec_sd_port_raw(inv_p0, hp as Float, 0), inv_nw, inv_pw), 0., inv_x));
-        lib::columns::util::draw_box("li1.pin", lib::columns::util::rect_translate(dec_inv_gate_xf(dec_sd_port_raw(inv_p0, hp as Float, 2), inv_nw, inv_pw), 0., inv_x));
-    } else { crect(x0=0., y0=0., x1=0., y1=0.); };
-    let inv_right = dec_total_x(dec_inv_half_nw(inv_nw), dec_inv_half_pw(inv_pw)) as Float + 180.;
-    let outline = if boundary == 1 {
-        rect("layout_boundary.boundary", x0=0., y0=-540., x1=1580., y1=inv_x + inv_right)
-    } else {
-        crect(x0=0., y0=-540., x1=1580., y1=inv_x + inv_right)
-    };
-    let a = nand.a;
-    pub let b = nand.b;
-    let y_b = nand.y_out;
-    pub let y_out = inv.y_out;
-    let nand_vss = nand.vss_strap;
-    let nand_vdd = nand.vdd_strap;
-    pub let inv_vss = inv.vss_strap;
-    pub let inv_vdd = inv.vdd_strap;
-}
-
-// Rust performs logical-effort and transistor sizing. These accessors only
-// expose the concrete stage record to the geometry below.
-fn dec_num_stages(p: DecoderParams) -> Int { p.num_stages }
-
-fn dec_stage_ff(stage: Int, p: DecoderParams) -> Int { p.stages[stage].folds }
-
-fn dec_max_ff(p: DecoderParams) -> Int { p.max_folds }
-
-fn dec_tap_period() -> Int { 4 }
-
-fn dec_tap_groups(folding_factor: Int) -> Int {
-    (folding_factor + dec_tap_period() - 1) / dec_tap_period()
-}
-
-fn dec_stage_nw(stage: Int, p: DecoderParams) -> Int { p.stages[stage].nwidth }
-
-fn dec_stage_pw(stage: Int, p: DecoderParams) -> Int { p.stages[stage].pwidth }
-
-fn dec_gate_xf(r: Rect, nw: Int, pw: Int) -> Rect {
-    lib::columns::mux::xf_q1(r, dec_gate_dx(nw, pw), 0.)
-}
-
-fn dec_gate_xf_w(r: Rect, nw: Int, pw: Int, width: Int) -> Rect {
-    lib::columns::mux::xf_q1(r, dec_gate_dx_w(nw, pw, width), 0.)
-}
-
-fn dec_inv_gate_xf(r: Rect, nw: Int, pw: Int) -> Rect {
-    lib::columns::mux::xf_q1(r, dec_inv_gate_dx(nw, pw), 0.)
-}
-
-fn dec_gate_span(stage: Int, p: DecoderParams) -> (Float, Float) {
-    let nw = dec_stage_nw(stage, p);
-    let pw = dec_stage_pw(stage, p);
-    let raw = if stage == 0 { dec_raw_bbox(nw, pw) } else { dec_inv_raw_bbox(nw, pw) };
-    lib::columns::util::rect_hspan(raw)
-}
-
-fn dec_tile_yoff(stage: Int, p: DecoderParams) -> Float {
-    let span = dec_gate_span(stage, p);
-    -dec_span_center_i(span)
-}
-
-fn dec_group_h(stage: Int, p: DecoderParams) -> Float {
-    let span = dec_gate_span(stage, p);
-    span.1 - span.0
-}
-
-fn dec_group_bot(stage: Int, p: DecoderParams) -> Float {
-    -dec_group_h(stage, p) / 2.
-}
-
-fn dec_group_top(stage: Int, p: DecoderParams) -> Float {
-    dec_group_h(stage, p) / 2.
-}
-
-fn dec_group_w(p: DecoderParams) -> Float {
-    let maxff = dec_max_ff(p);
-    (dec_tap_groups(maxff) + 1) as Float * 1000. + maxff as Float * 1580.
-}
-
-fn dec_group_xoff(p: DecoderParams) -> Float {
-    -dec_group_w(p) / 2.
-}
-
-fn dec_group_abs_bot(stage: Int, p: DecoderParams) -> Float {
-    if stage == 0 {
-        300.
-    } else {
-        dec_group_abs_bot(stage - 1, p) + dec_group_h(stage - 1, p) + 300.
-    }
-}
-
-fn dec_group_yoff(stage: Int, p: DecoderParams) -> Float {
-    dec_group_abs_bot(stage, p) - dec_group_bot(stage, p)
-}
-
-fn dec_tile_abs_x(stage: Int, p: DecoderParams, tile: Int) -> Float {
-    dec_group_xoff(p) + 1000. + tile as Float * 1580. + (tile / dec_tap_period()) as Float * 1000.
-}
-
-fn dec_tile_abs_y(stage: Int, p: DecoderParams) -> Float {
-    dec_group_yoff(stage, p) + dec_tile_yoff(stage, p)
-}
-
-fn dec_gate_port_a_local(stage: Int, p: DecoderParams) -> Rect {
-    let nw = dec_stage_nw(stage, p);
-    let pw = dec_stage_pw(stage, p);
-    if stage == 0 {
-        dec_gate_xf(dec_gate_contact_raw(0), nw, pw)
-    } else {
-        dec_inv_gate_xf(lib::columns::util::cbox(-520., 470., -190., 640.), nw, pw)
-    }
-}
-
-fn dec_gate_port_b_local(stage: Int, p: DecoderParams) -> Rect {
-    let nw = dec_stage_nw(stage, p);
-    let pw = dec_stage_pw(stage, p);
-    if stage == 0 {
-        dec_gate_xf(dec_gate_contact_raw(1), nw, pw)
-    } else {
-        lib::columns::util::cbox(0., 0., 0., 0.)
-    }
-}
-
-fn dec_gate_port_y_local(stage: Int, p: DecoderParams) -> Rect {
-    let nw = dec_stage_nw(stage, p);
-    let pw = dec_stage_pw(stage, p);
-    if stage == 0 {
-        let p0 = nw as Float + 520.;
-        dec_gate_xf(lib::columns::util::rect_union(dec_sd_port_raw(0., nw as Float, 2), dec_sd_port_raw(p0, pw as Float, 2)), nw, pw)
-    } else {
-        let hn = dec_inv_half_nw(nw);
-        let hp = dec_inv_half_pw(pw);
-        let p0 = hn as Float + 520.;
-        dec_inv_gate_xf(lib::columns::util::rect_union(dec_sd_port_raw(0., hn as Float, 1), dec_sd_port_raw(p0, hp as Float, 1)), nw, pw)
-    }
-}
-
-fn dec_region_nwell_span(stage: Int, p: DecoderParams) -> (Float, Float) {
-    let nw = dec_stage_nw(stage, p);
-    let pw = dec_stage_pw(stage, p);
-    if stage == 0 {
-        lib::columns::util::rect_vspan(dec_gate_xf(dec_nwell(nw, pw), nw, pw))
-    } else {
-        let hn = dec_inv_half_nw(nw);
-        let hp = dec_inv_half_pw(pw);
-        lib::columns::util::rect_vspan(dec_inv_gate_xf(dec_nwell(hn, hp), nw, pw))
-    }
-}
-
-fn dec_region_nsdm_span(stage: Int, p: DecoderParams) -> (Float, Float) {
-    let nw = dec_stage_nw(stage, p);
-    let pw = dec_stage_pw(stage, p);
-    if stage == 0 {
-        lib::columns::util::rect_vspan(dec_gate_xf(dec_nsdm(nw), nw, pw))
-    } else {
-        let hn = dec_inv_half_nw(nw);
-        lib::columns::util::rect_vspan(dec_inv_gate_xf(dec_nsdm(hn), nw, pw))
-    }
-}
-
-fn dec_region_psdm_span(stage: Int, p: DecoderParams) -> (Float, Float) {
-    let nw = dec_stage_nw(stage, p);
-    let pw = dec_stage_pw(stage, p);
-    if stage == 0 {
-        lib::columns::util::rect_vspan(dec_gate_xf(dec_psdm(nw, pw), nw, pw))
-    } else {
-        let hn = dec_inv_half_nw(nw);
-        let hp = dec_inv_half_pw(pw);
-        lib::columns::util::rect_vspan(dec_inv_gate_xf(dec_psdm(hn, hp), nw, pw))
-    }
-}
-
-fn dec_stage_port_a(stage: Int, p: DecoderParams, tile: Int) -> Rect {
-    lib::columns::util::rect_translate(dec_gate_port_a_local(stage, p), dec_tile_abs_x(stage, p, tile), dec_tile_abs_y(stage, p))
-}
-
-fn dec_stage_port_b(stage: Int, p: DecoderParams, tile: Int) -> Rect {
-    lib::columns::util::rect_translate(dec_gate_port_b_local(stage, p), dec_tile_abs_x(stage, p, tile), dec_tile_abs_y(stage, p))
-}
-
-fn dec_stage_port_y(stage: Int, p: DecoderParams, tile: Int) -> Rect {
-    lib::columns::util::rect_translate(dec_gate_port_y_local(stage, p), dec_tile_abs_x(stage, p, tile), dec_tile_abs_y(stage, p))
-}
-
-fn dec_gate_sd_local(stage: Int, p: DecoderParams, dev: Int, row: Int) -> Rect {
-    let nw = dec_stage_nw(stage, p);
-    let pw = dec_stage_pw(stage, p);
-    if stage == 0 {
-        let p0 = nw as Float + 520.;
-        if dev == 0 {
-            dec_gate_xf(dec_sd_port_raw(0., nw as Float, row), nw, pw)
-        } else {
-            dec_gate_xf(dec_sd_port_raw(p0, pw as Float, row), nw, pw)
+// An AND2: a NAND2 with a folded inverter 300 nm above it, the NAND's output
+// jogged to the inverter's input.
+cell and2_gate(
+    nand: PrimitiveGateParams,
+    inv: PrimitiveGateParams,
+    filler: Bool = false,
+    pins: Bool = false,
+    boundary: Bool = true,
+) {
+    let n = inst(dec_gate(2, nand.nwidth, nand.pwidth, filler=filler), x=0., y=0.);
+    let i = inst(dec_gate(1, inv.nwidth, inv.pwidth, filler=filler), x=0.);
+    eq(i.outline.y0, n.outline.y1 + 300.);
+    if !filler {
+        li_jog(n.out, i.a, true);
+        if pins {
+            for r in [n.gates[0], n.gates[1], n.out, i.out] {
+                util::draw_box("li1.pin", r);
+            }
         }
-    } else {
-        let hn = dec_inv_half_nw(nw);
-        let hp = dec_inv_half_pw(pw);
-        let p0 = hn as Float + 520.;
-        if dev == 0 {
-            dec_inv_gate_xf(dec_sd_port_raw(0., hn as Float, row), nw, pw)
-        } else {
-            dec_inv_gate_xf(dec_sd_port_raw(p0, hp as Float, row), nw, pw)
+        for r in std::concat(std::concat(n.vss, n.vdd), std::concat(i.vss, i.vdd)) {
+            util::draw_box("li1.pin", r);
         }
     }
-}
-
-fn dec_stage_sd(stage: Int, p: DecoderParams, tile: Int, dev: Int, row: Int) -> Rect {
-    lib::columns::util::rect_translate(dec_gate_sd_local(stage, p, dev, row), dec_tile_abs_x(stage, p, tile), dec_tile_abs_y(stage, p))
-}
-
-fn draw_dec_stage_li_pins(stage: Int, p: DecoderParams, tile: Int) -> Rect {
-    lib::columns::util::draw_box("li1.pin", dec_stage_port_a(stage, p, tile));
-    lib::columns::util::draw_box("li1.pin", dec_stage_port_y(stage, p, tile));
-    if stage == 0 {
-        lib::columns::util::draw_box("li1.pin", dec_stage_port_b(stage, p, tile));
-        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, p, tile, 0, 0));
-        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, p, tile, 1, 1))
+    pub let outline = if boundary {
+        rect("layout_boundary.boundary", x0=0., y0=n.outline.y0, x1=1580., y1=i.outline.y1)
     } else {
-        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, p, tile, 0, 0));
-        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, p, tile, 0, 2));
-        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, p, tile, 1, 0));
-        lib::columns::util::draw_box("li1.pin", dec_stage_sd(stage, p, tile, 1, 2))
-    }
-}
-
-fn dec_uniform_track(tracks_start: Float, index: Int) -> (Float, Float) {
-    let top = tracks_start - index as Float * 480.;
-    (top - 320., top,)
-}
-
-fn dec_stage_logic_top(p: DecoderParams) -> Float {
-    let final_stage = dec_num_stages(p) - 1;
-    let nominal = dec_group_abs_bot(final_stage, p) + dec_group_h(final_stage, p);
-    let final_ff = dec_stage_ff(final_stage, p);
-    if final_ff > 1 {
-        let port = dec_stage_port_y(final_stage, p, 0);
-        max_float(nominal, port.y1 + lib::columns::util::rect_w(port) + 170.)
-    } else {
-        nominal
-    }
-}
-
-fn dec_stage_left(p: DecoderParams) -> Float {
-    -dec_group_w(p) / 2.
-}
-
-fn dec_stage_right(p: DecoderParams) -> Float {
-    dec_group_w(p) / 2.
-}
-
-fn dec_stage_bbox(p: DecoderParams) -> Rect {
-    lib::columns::util::cbox(dec_stage_left(p), -640., dec_stage_right(p), dec_stage_logic_top(p))
-}
-
-fn dec_offset_jog_r1(src: Rect, dst: Float, space: Float) -> Rect {
-    let line = lib::columns::util::rect_w(src);
-    let p1 = src.y1 + line + space;
-    lib::columns::util::cbox(src.x0, min_float(src.y0, p1), src.x1, max_float(src.y1, p1))
-}
-
-fn dec_offset_jog_r2(src: Rect, dst: Float, space: Float) -> Rect {
-    let line = lib::columns::util::rect_w(src);
-    let p1 = src.y1 + line + space;
-    let p2 = src.y1 + space;
-    lib::columns::util::cbox(min_float(src.x0, dst), min_float(p1, p2), max_float(src.x1, dst), max_float(p1, p2))
-}
-
-fn draw_dec_li_jog(src: Rect, dst: Rect) -> Rect {
-    let r1 = dec_offset_jog_r1(src, dst.x0, 170.);
-    let r2 = dec_offset_jog_r2(src, dst.x0, 170.);
-    lib::columns::util::draw_box("li1.drawing", r1);
-    lib::columns::util::draw_box("li1.drawing", r2);
-    lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(dst), (r2.y0, dst.y1,)))
-}
-
-fn draw_dec_final_fold_jog(src: Rect, dst: Rect) -> Rect {
-    let r1 = dec_offset_jog_r1(src, dst.x0, 170.);
-    let r2 = dec_offset_jog_r2(src, dst.x0, 170.);
-    lib::columns::util::draw_box("li1.drawing", r1);
-    lib::columns::util::draw_box("li1.drawing", r2)
-}
-
-fn draw_dec_li_met1_contact(area: Rect) -> Rect {
-    lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", area, area, 0, 1, true).2
-}
-
-fn draw_dec_tap_for_span(is_vdd_region: Bool, vspan: (Float, Float)) -> Rect {
-    let tap_hspan = (170., 830.,);
-    let implant = lib::columns::util::rect_from_spans(tap_hspan, lib::columns::mux::span_shrink_all(vspan, 110.));
-    if is_vdd_region {
-        lib::columns::util::draw_box("nsdm.drawing", implant);
-    } else {
-        lib::columns::util::draw_box("psdm.drawing", implant);
+        crect(x0=0., y0=n.outline.y0, x1=1580., y1=i.outline.y1)
     };
-    let area = lib::columns::util::rect_from_spans(lib::columns::mux::span_shrink_all(tap_hspan, 125.), lib::columns::mux::span_shrink_all(vspan, 290.));
-    lib::columns::util::draw_contact_full_later(2, "tap.drawing", "li1.drawing", area, area, 0, 0, true).0
+    pub let a = n.gates[0];
+    pub let b = n.gates[1];
+    pub let out = i.out;
+    pub let vdd_straps = std::concat(n.vdd_straps, i.vdd_straps);
+    pub let vss_straps = std::concat(n.vss_straps, i.vss_straps);
 }
 
-fn draw_dec_tap_for_span_width(is_vdd_region: Bool, vspan: (Float, Float), tap_width: Float) -> Rect {
-    let tap_hspan = (170., tap_width - 170.,);
-    let implant = lib::columns::util::rect_from_spans(tap_hspan, lib::columns::mux::span_shrink_all(vspan, 110.));
-    if is_vdd_region {
-        lib::columns::util::draw_box("nsdm.drawing", implant);
-    } else {
-        lib::columns::util::draw_box("psdm.drawing", implant);
-    };
-    let area = lib::columns::util::rect_from_spans(lib::columns::mux::span_shrink_all(tap_hspan, 125.), lib::columns::mux::span_shrink_all(vspan, 290.));
-    // DecoderVia delegates this contact to the PDK's MaxViaArray.  Use its
-    // later-candidate tie policy; the preferred enclosure orientation varies
-    // with the transistor-region aspect ratio.
-    lib::columns::util::draw_contact_full_later(2, "tap.drawing", "li1.drawing", area, area, 0, 0, true).0
+// The taps beside an AND2.
+cell and2_tap(nand: PrimitiveGateParams, inv: PrimitiveGateParams, width: Int) {
+    let n = inst(dec_tap(2, nand.nwidth, nand.pwidth, width=width), x=0., y=0.);
+    let i = inst(dec_tap(1, inv.nwidth, inv.pwidth, width=width), x=0.);
+    eq(i.outline.y0, n.outline.y1 + 300.);
+    rect("layout_boundary.boundary", x0=0., y0=n.outline.y0, x1=width as Float, y1=i.outline.y1);
 }
 
-cell dec_primitive_tap(nw: Int, pw: Int, is_inv: Bool, tap_width: Int, gate_width: Int, boundary: Int) {
-    let hn = if is_inv { dec_inv_half_nw(nw) } else { nw };
-    let hp = if is_inv { dec_inv_half_pw(pw) } else { pw };
-    let xf_nwell = if is_inv { dec_inv_gate_xf(dec_nwell(hn, hp), nw, pw) } else { dec_gate_xf_w(dec_nwell(nw, pw), nw, pw, gate_width) };
-    let xf_nsdm = if is_inv { dec_inv_gate_xf(dec_nsdm(hn), nw, pw) } else { dec_gate_xf_w(dec_nsdm(nw), nw, pw, gate_width) };
-    let xf_psdm = if is_inv { dec_inv_gate_xf(dec_psdm(hn, hp), nw, pw) } else { dec_gate_xf_w(dec_psdm(nw, pw), nw, pw, gate_width) };
-    let raw_bbox = if is_inv { dec_inv_raw_bbox(nw, pw) } else { dec_raw_bbox(nw, pw) };
-    let nwell = lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans((0., tap_width as Float,), lib::columns::util::rect_vspan(xf_nwell)));
-    pub let outline = if boundary == 1 {
-        rect("layout_boundary.boundary", x0=0., y0=raw_bbox.x0, x1=tap_width as Float, y1=raw_bbox.x1)
-    } else {
-        crect(x0=0., y0=raw_bbox.x0, x1=tap_width as Float, y1=raw_bbox.x1)
-    };
-    let nsdm_span = lib::columns::util::rect_vspan(xf_nsdm);
-    let psdm_span = lib::columns::util::rect_vspan(xf_psdm);
-    draw_dec_tap_for_span_width(false, nsdm_span, tap_width as Float);
-    draw_dec_tap_for_span_width(true, psdm_span, tap_width as Float);
-    let inner_hspan = (295., tap_width as Float - 295.,);
-    let ncnt = dec_power_strap_count(nsdm_span);
-    for i in std::range(ncnt) {
-        let vspan = dec_power_strap_span(nsdm_span, i);
-        let vss = lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans((0., tap_width as Float,), vspan));
-        lib::columns::util::draw_box("met1.pin", vss);
-        let area = lib::columns::util::rect_from_spans(inner_hspan, vspan);
-        lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", area, area, 0, 0, true);
-    }
-    let pcnt = dec_power_strap_count(psdm_span);
-    for i in std::range(pcnt) {
-        let vspan = dec_power_strap_span(psdm_span, i);
-        let vdd = lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans((0., tap_width as Float,), vspan));
-        lib::columns::util::draw_box("met1.pin", vdd);
-        let area = lib::columns::util::rect_from_spans(inner_hspan, vspan);
-        lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", area, area, 0, 0, true);
+// Rises 340 nm on li1 from a gate output to an li1-met1 contact. Returns its
+// met1.
+fn li_up(port: Rect) -> Rect {
+    let li = rect("li1.drawing", x0=port.x0, y0=port.y0, x1=port.x1, y1=port.y1 + 340.);
+    let area = crect(x0=li.x0, y0=li.y1 - 240., x1=li.x1, y1=li.y1);
+    util::contact(Via::Mcon, area, area, top_dir=2, longer=true, later=true).top
+}
+
+// Joins a stage's output folds `outs` to the next stage's input folds `ins`
+// on a 240 nm met1 bus 400 nm below the first input. An li1 output (`li`)
+// rises from its first fold through `li_up`.
+fn join(outs: [Rect], ins: [Rect], li: Bool) {
+    let first = if li { li_up(outs[0]) } else { outs[0] };
+    let bus = util::centered(ins[0].y0 - 400., 240.);
+    let lasts = std::concat(
+        if std::len(outs) > 1 { [std::last(outs)] } else { [] },
+        if std::len(ins) > 1 { [std::last(ins)] } else { [] },
+    );
+    let span = util::hull(std::concat([first, ins[0]], lasts));
+    rect("met1.drawing", x0=span.x0, y0=bus.0, x1=span.x1, y1=bus.1);
+    for port in std::concat(if li { [first] } else { outs }, ins) {
+        rect(
+            "met1.drawing",
+            x0=port.x0,
+            y0=min_float(port.y0, bus.0),
+            x1=port.x1,
+            y1=max_float(port.y1, bus.1),
+        );
     }
 }
 
-cell dec_primitive_tap_vertical(nw: Int, pw: Int, tap_width: Int, gate_width: Int, boundary: Int) {
-    let hn = dec_inv_half_nw(nw);
-    let hp = dec_inv_half_pw(pw);
-    let xf_nwell = dec_inv_gate_xf(dec_nwell(hn, hp), nw, pw);
-    let xf_nsdm = dec_inv_gate_xf(dec_nsdm(hn), nw, pw);
-    let xf_psdm = dec_inv_gate_xf(dec_psdm(hn, hp), nw, pw);
-    let raw_bbox = dec_inv_raw_bbox(nw, pw);
-    let nwell = lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans((0., tap_width as Float,), lib::columns::util::rect_vspan(xf_nwell)));
-    pub let outline = if boundary == 1 {
-        rect("layout_boundary.boundary", x0=0., y0=raw_bbox.x0, x1=tap_width as Float, y1=raw_bbox.x1)
-    } else {
-        crect(x0=0., y0=raw_bbox.x0, x1=tap_width as Float, y1=raw_bbox.x1)
-    };
-    let nsdm_span = lib::columns::util::rect_vspan(xf_nsdm);
-    let psdm_span = lib::columns::util::rect_vspan(xf_psdm);
-    draw_dec_tap_for_span_width(false, nsdm_span, tap_width as Float);
-    draw_dec_tap_for_span_width(true, psdm_span, tap_width as Float);
-    let inner_hspan = (295., tap_width as Float - 295.,);
-    let ncnt = dec_power_strap_count(nsdm_span);
-    for i in std::range(ncnt) {
-        let vspan = dec_power_strap_span(nsdm_span, i);
-        let vss = lib::columns::util::draw_box("met2.drawing", lib::columns::util::rect_from_spans((0., tap_width as Float,), vspan));
-        lib::columns::util::draw_box("met2.pin", vss);
-        let area = lib::columns::util::rect_from_spans(inner_hspan, vspan);
-        lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", area, area, 0, 0, true);
-        lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", area, area, 0, 0, true);
-    }
-    let pcnt = dec_power_strap_count(psdm_span);
-    for i in std::range(pcnt) {
-        let vspan = dec_power_strap_span(psdm_span, i);
-        let vdd = lib::columns::util::draw_box("met2.drawing", lib::columns::util::rect_from_spans((0., tap_width as Float,), vspan));
-        lib::columns::util::draw_box("met2.pin", vdd);
-        let area = lib::columns::util::rect_from_spans(inner_hspan, vspan);
-        lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", area, area, 0, 0, true);
-        lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", area, area, 0, 0, true);
+// Ties gate input `port` to the met1 `track` it crosses.
+fn tie(port: Rect, track: Rect) {
+    let c = crect(x0=port.x0, y0=track.y0, x1=port.x1, y1=track.y1);
+    let via = util::contact(Via::Mcon, c, c, longer=true).bbox;
+    rect(
+        "li1.drawing",
+        x0=port.x0,
+        y0=min_float(port.y0, via.y0),
+        x1=port.x1,
+        y1=max_float(port.y1, via.y1),
+    );
+}
+
+// Ties a gate input to a far track: up to met2 at the gate, down to met1 at
+// the track, and across on met2.
+fn tie_m2(port: Rect, track: Rect) {
+    util::contact(Via::Mcon, port, port, longer=true);
+    util::contact(Via::Via1, port, port, longer=true);
+    let c = crect(x0=port.x0, y0=track.y0, x1=port.x1, y1=track.y1);
+    let via = util::contact(Via::Via1, c, c, longer=true);
+    rect(
+        "met2.drawing",
+        x0=via.top.x0,
+        y0=min_float(port.y0, via.bbox.y0),
+        x1=via.top.x1,
+        y1=max_float(port.y1, via.bbox.y1),
+    );
+}
+
+// Stacks rows of gates by their outlines, each 300 nm above the last.
+fn stack(outlines: [Rect]) {
+    for i in std::range(std::len(outlines) - 1) {
+        eq(outlines[i + 1].y0, outlines[i].y1 + 300.);
     }
 }
 
-cell dec_and2_tap(nand_nw: Int, nand_pw: Int, inv_nw: Int, inv_pw: Int, tap_width: Int, boundary: Int) {
-    let inv_x = dec_and2_inv_x(nand_nw, nand_pw);
-    // SRAM22's And2 tap is made from two primitive tap cells. Their own
-    // boundaries survive flattening even when the enclosing And2 boundary is
-    // suppressed by a recursive decoder.
-    let nand = inst(dec_primitive_tap(nand_nw, nand_pw, false, tap_width, 1580, 1), x=0., y=0.);
-    let inv = inst(dec_primitive_tap(inv_nw, inv_pw, true, tap_width, 1580, 1), x=0., y=inv_x);
-    let inv_right = dec_total_x(dec_inv_half_nw(inv_nw), dec_inv_half_pw(inv_pw)) as Float + 180.;
-    pub let outline = if boundary == 1 {
-        rect("layout_boundary.boundary", x0=0., y0=-540., x1=tap_width as Float, y1=inv_x + inv_right)
+// Met1 tracks across a stage from x = `left` to `-left`, 320 nm wide on a
+// 480 nm pitch, top down from y = 160.
+fn bus(left: Float, n: Int) -> [Rect] {
+    [for k in std::range(n) {
+        crect(x0=left, y0=-160. - 480. * k as Float, x1=-left, y1=160. - 480. * k as Float)
+    }]
+}
+
+// The rails `straps` extended across a stage from x = `left` to `-left`.
+fn rails(straps: [Rect], left: Float) -> [Rect] {
+    [for s in straps { crect(x0=left, y0=s.y0, x1=-left, y1=s.y1) }]
+}
+
+// One write-mask bit's decoder: a NAND2 of its mask and write-enable tracks,
+// then folded-inverter stages, each a row of folded gates with a tap before
+// every four.
+cell wmask_decoder_stage(p: DecoderParams) {
+    let maxff = p.max_folds;
+    let left = -((util::ceil_div(maxff, 4) + 1) as Float * 1000. + maxff as Float * 1580.) / 2.;
+    let sl = util::slots(left, maxff, 1580., 1000., 4);
+    let stages = [for s in std::range(p.num_stages) {
+        let g = p.stages[s];
+        let inputs = if s == 0 { 2 } else { 1 };
+        let row = [for t in std::range(maxff) {
+            inst(
+                dec_gate(
+                    inputs,
+                    g.nwidth,
+                    g.pwidth,
+                    filler=t >= g.folds,
+                    signal_pins=true,
+                    supply_pins=true,
+                ),
+                x=sl.gates[t],
+            )
+        }];
+        for gate in row {
+            eq(gate.y, row[0].y);
+        }
+        for x in sl.taps {
+            eq(inst(dec_tap(inputs, g.nwidth, g.pwidth, later=false, top_dir=1), x=x).y, row[0].y);
+        }
+        row
+    }];
+    eq(stages[0][0].outline.y0, 300.);
+    stack([for row in stages { row[0].outline }]);
+    for s in std::range(p.num_stages - 1) {
+        for t in std::range(p.stages[s].folds) {
+            li_jog(stages[s][t].out, stages[s + 1][0].a, true);
+        }
+        for t in std::range(p.stages[s + 1].folds) {
+            li_jog(stages[s][0].out, stages[s + 1][t].a, true);
+        }
+    }
+    let last = p.num_stages - 1;
+    if p.stages[last].folds > 1 {
+        for t in std::range(p.stages[last].folds) {
+            li_jog(stages[last][t].out, stages[last][0].out, false);
+        }
+    }
+    pub let inputs = [for t in bus(left, 2) { util::met1_port(t.x0, t.y0, t.x1, t.y1) }];
+    for t in std::range(p.stages[0].folds) {
+        for i in std::range(2) {
+            let port = stages[0][t].gates[i];
+            let c = crect(x0=port.x0, y0=inputs[i].y0, x1=port.x1, y1=inputs[i].y1);
+            let via = util::contact(Via::Mcon, c, c, top_dir=1, longer=true).bbox;
+            rect(
+                "li1.drawing",
+                x0=port.x0,
+                y0=min_float(port.y0, via.y0) - 30.,
+                x1=port.x1,
+                y1=max_float(port.y1, via.y1),
+            );
+        }
+    }
+    pub let outputs = [for t in std::range(p.stages[last].folds) { stages[last][t].out }];
+    pub let outputs_b = [for t in std::range(p.stages[last - 1].folds) { stages[last - 1][t].out }];
+    pub let vdd_straps = std::flatten([for row in stages { row[0].vdd_straps }]);
+    pub let vss_straps = std::flatten([for row in stages { row[0].vss_straps }]);
+    pub let nwells = [for row in stages { row[0].nwell }];
+}
+
+// The write-mask decoders and their DFFs, one per mask bit `unit_w` apart,
+// with the write enable track and supply straps across all of them.
+cell wmask_peripherals(cols: Int, mux: Int, gran: Int, p: DecoderParams) {
+    let bits = cols / mux / gran;
+    let unit_w = util::wmask_unit_w(cols, mux, gran);
+    let dff_x = 4715. + ((mux - 4) / 2) as Float * 1200.;
+    let st = bbox(wmask_decoder_stage(p));
+    let right = (bits - 1) as Float * unit_w + max_float(dff_x + 1385., st.w);
+    let stages = [for bit in std::range(bits) {
+        inst(wmask_decoder_stage(p), x=bit as Float * unit_w - st.x0, y=16840. - st.y0)
+    }];
+    let dffs = [for bit in std::range(bits) {
+        inst(lib::columns::dff::dff_column(4), x=bit as Float * unit_w + dff_x, y=1460.)
+    }];
+    for bit in std::range(bits) {
+        let q = dffs[bit].q;
+        let input = stages[bit].inputs[1];
+        let track = util::centered(util::cx_i(q), 280.);
+        let m1 = rect(
+            "met1.drawing",
+            x0=track.0,
+            y0=min_float(q.y0, input.y0),
+            x1=track.1,
+            y1=max_float(q.y1, input.y1),
+        );
+        rect(
+            "met1.drawing",
+            x0=min_float(input.x0, track.0),
+            y0=input.y0,
+            x1=max_float(input.x1, track.1),
+            y1=input.y1,
+        );
+        util::contact(Via::Mcon, q, m1, longer=true);
+    }
+    let s0 = stages[0];
+    pub let we = util::met1_port(0., s0.inputs[0].y0, right, s0.inputs[0].y1);
+    for s in std::concat(s0.vdd_straps, s0.vss_straps) {
+        util::met1_port(0., s.y0, right, s.y1);
+    }
+    pub let vdd = util::met2_port(0., 5650., right, 7450.);
+    pub let vss = util::met2_port(0., 9390., right, 11190.);
+    pub let clk = util::met2_port(0., 8175., right, 8495.);
+    pub let rstb = util::met2_port(0., 3940., right, 4260.);
+    for nw in s0.nwells {
+        rect("nwell.drawing", x0=0., y0=nw.y0, x1=(bits - 1) as Float * unit_w + st.w, y1=nw.y1);
+    }
+    pub let outputs = [for s in stages { s.outputs }];
+    pub let outputs_b = [for s in stages { s.outputs_b }];
+    pub let d = [for dff in dffs { dff.d }];
+    pub let vdd_straps = s0.vdd_straps;
+    pub let vss_straps = s0.vss_straps;
+}
+
+// Per-finger gate widths and fold counts of a fanout buffer: a folded
+// inverter followed by multi-finger inverters, each stage folded into
+// `folds` fingers.
+struct BufferLayout {
+    stages: [PrimitiveGateParams],
+    folds: [Int],
+    num_stages: Int,
+    max_folds: Int,
+    vertical: Bool,
+}
+
+fn max_of(values: [Int]) -> Int { max_of_from(values, 0) }
+
+fn max_of_from(values: [Int], best: Int) -> Int {
+    if values == [] { best } else { max_of_from(tail(values), max_int(head(values), best)) }
+}
+
+// The fold limit for a stage of `num` outputs within `max_width`.
+fn stage_fold_limit(max_width: Int, num: Int, width: Int, tap_width: Int) -> Int {
+    max_int(
+        (max_width - tap_width * (util::ceil_div(max_width, 4 * width + tap_width) + 1)) / num / width,
+        1,
+    )
+}
+
+// Fingers for one gate: one per 1.8 um of its narrower device, up to `limit`.
+fn gate_folds(g: PrimitiveGateParams, limit: Int) -> Int {
+    min_int(max_int(min_int(g.pwidth, g.nwidth) / 1800, 1), limit)
+}
+
+// A width split across `folds` fingers, rounded to 10 nm.
+fn fold_width(width: Int, folds: Int) -> Int {
+    ((width as Float * (1. / (folds as Float)) / 10. + 0.5) as Int) * 10
+}
+
+fn fold_gate(g: PrimitiveGateParams, folds: Int) -> PrimitiveGateParams {
+    PrimitiveGateParams {
+        nwidth: fold_width(g.nwidth, folds),
+        pwidth: fold_width(g.pwidth, folds),
+        length: g.length,
+    }
+}
+
+// Lays out a buffer chain within `max_width` (0 for no limit), in the
+// minimum decoder style: 1580 nm gates and 1000 nm taps.
+fn buffer_layout(sizing: BufferSizing, max_width: Int, vertical: Bool) -> BufferLayout {
+    let limit = if max_width > 0 { stage_fold_limit(max_width, 1, 1580, 1000) } else { 1 };
+    let folds = [for g in sizing.stages { gate_folds(g, limit) }];
+    BufferLayout {
+        stages: [for i in std::range(std::len(folds)) { fold_gate(sizing.stages[i], folds[i]) }],
+        folds,
+        num_stages: std::len(folds),
+        max_folds: max_of(folds),
+        vertical,
+    }
+}
+
+// A fanout buffer: a row of folded inverters, then rows of multi-finger
+// inverters, each 300 nm above the last with a tap before every four. Its
+// input is a track below the chain, on met2 when `vertical`.
+cell fanout_buffer(b: BufferLayout) {
+    let maxff = b.max_folds;
+    let left = -(1000. + maxff as Float * 1580. + ((maxff + 3) / 4) as Float * 1000.) / 2.;
+    let sl = util::slots(left, maxff, 1580., 1000., 4);
+    let g0 = b.stages[0];
+    let first = [for t in std::range(maxff) {
+        inst(
+            dec_gate(
+                1,
+                g0.nwidth,
+                g0.pwidth,
+                filler=t >= b.folds[0],
+                signal_pins=true,
+                supply_pins=true,
+                m2=b.vertical,
+            ),
+            x=sl.gates[t],
+        )
+    }];
+    for gate in first {
+        eq(gate.y, first[0].y);
+    }
+    for x in sl.taps {
+        eq(inst(dec_tap(1, g0.nwidth, g0.pwidth, m2=b.vertical), x=x).y, first[0].y);
+    }
+    let rest = [for s in std::range(b.num_stages - 1) {
+        let g = b.stages[s + 1];
+        let row = [for t in std::range(maxff) {
+            inst(mf_gate(g.nwidth, g.pwidth, filler=t >= b.folds[s + 1], pins=true), x=sl.gates[t])
+        }];
+        for gate in row {
+            eq(gate.y, row[0].y);
+        }
+        for x in sl.taps {
+            eq(inst(mf_tap(g.nwidth, g.pwidth), x=x).y, row[0].y);
+        }
+        row
+    }];
+    eq(first[0].outline.y0, 300.);
+    stack(cons(first[0].outline, [for row in rest { row[0].outline }]));
+    let ins = [for s in std::range(b.num_stages - 1) {
+        [for t in std::range(b.folds[s + 1]) { rest[s][t].a }]
+    }];
+    let outs = cons(
+        [for t in std::range(b.folds[0]) { first[t].out }],
+        [for s in std::range(b.num_stages - 1) {
+            [for t in std::range(b.folds[s + 1]) { rest[s][t].out }]
+        }],
+    );
+    for s in std::range(b.num_stages - 1) {
+        join(outs[s], ins[s], s == 0);
+    }
+    pub let outputs = std::last(outs);
+    if std::len(outputs) > 1 {
+        for port in outputs {
+            let top = port.y1 + port.w + 200.;
+            rect("met1.drawing", x0=port.x0, y0=port.y0, x1=port.x1, y1=top);
+            rect(
+                "met1.drawing",
+                x0=min_float(port.x0, outputs[0].x0),
+                y0=port.y1 + 200.,
+                x1=max_float(port.x1, outputs[0].x0),
+                y1=top,
+            );
+        }
+    }
+    pub let input = if b.vertical {
+        util::met2_port(left, -160., -left, 160.)
     } else {
-        crect(x0=0., y0=-540., x1=tap_width as Float, y1=inv_x + inv_right)
+        util::met1_port(left, -160., -left, 160.)
     };
+    let port = first[0].a;
+    if b.vertical {
+        let c = crect(x0=port.x0, y0=input.y0, x1=port.x1, y1=input.y1);
+        let via = union(
+            util::contact(Via::Mcon, c, c, longer=true, later=true).bbox,
+            util::contact(Via::Via1, c, c, longer=true, later=true).bbox,
+        );
+        rect(
+            "li1.drawing",
+            x0=port.x0,
+            y0=min_float(port.y0, via.y0),
+            x1=port.x1,
+            y1=max_float(port.y1, via.y1),
+        );
+    } else {
+        tie(port, input);
+    }
+    let stripes = [for vdd in [true, false] {
+        [for row in rest { if vdd { row[0].vdd_stripes } else { row[0].vss_stripes } }]
+    }];
+    pub let vdd = cons(
+        rails(first[0].vdd_straps, left)[0],
+        [for s in stripes[0] { rails(s, left)[0] }],
+    );
+    pub let vss = cons(
+        rails(first[0].vss_straps, left)[0],
+        [for s in stripes[1] { rails(s, left)[0] }],
+    );
+    // Supply port shapes: every strap and stripe of every stage.
+    let first_vdd = rails(first[0].vdd_straps, left);
+    let first_vss = rails(first[0].vss_straps, left);
+    pub let vdd_pins_m1 = util::coalesce_rects(if b.vertical { [] } else { first_vdd });
+    pub let vss_pins_m1 = util::coalesce_rects(if b.vertical { [] } else { first_vss });
+    pub let vdd_pins_m2 = util::coalesce_rects(std::concat(
+        if b.vertical { first_vdd } else { [] },
+        rails(std::flatten(stripes[0]), left),
+    ));
+    pub let vss_pins_m2 = util::coalesce_rects(std::concat(
+        if b.vertical { first_vss } else { [] },
+        rails(std::flatten(stripes[1]), left),
+    ));
 }
 
-fn address_gate_stage_left(num: Int) -> Float {
-    -(num as Float * 1580. + (ceil_div_dec(num, 4) + 1) as Float * 1000.) / 2.
+// Per-finger widths and folds of a column decoder: a NAND2 or NAND3 stage,
+// then the AND's inverter and the buffer inverters as multi-finger inverters.
+struct ColDecoderLayout {
+    inputs: Int,
+    nand: PrimitiveGateParams,
+    invs: [PrimitiveGateParams],
+    folds: [Int],
+    num_stages: Int,
+    max_folds: Int,
 }
 
-fn ceil_div_dec(a: Int, b: Int) -> Int { (a + b - 1) / b }
-
-fn address_gate_x(num: Int, index: Int) -> Float {
-    address_gate_stage_left(num) + 1000. + index as Float * 1580. + (index / 4) as Float * 1000.
+// Folds a column decoder into `max_width` in the relaxed decoder style:
+// 1900 nm gates and 1000 nm taps, one output per select value.
+fn col_decoder_layout(sizing: AndStageSizing, max_width: Int) -> ColDecoderLayout {
+    let limit = stage_fold_limit(max_width, col_outputs(sizing.inputs), 1900, 1000);
+    let gates = cons(sizing.nand, cons(sizing.inv, sizing.invs));
+    let folds = [for g in gates { gate_folds(g, limit) }];
+    let folded = [for i in std::range(std::len(gates)) { fold_gate(gates[i], folds[i]) }];
+    ColDecoderLayout {
+        inputs: sizing.inputs,
+        nand: head(folded),
+        invs: tail(folded),
+        folds,
+        num_stages: std::len(gates),
+        max_folds: max_of(folds),
+    }
 }
 
-fn address_gate_a(num: Int, index: Int) -> Rect {
-    let local = dec_gate_xf(dec_gate_contact_raw(0), 2000, 2500);
-    lib::columns::util::rect_translate(local, address_gate_x(num, index), 840.)
+fn col_outputs(inputs: Int) -> Int { if inputs == 3 { 8 } else { 4 } }
+
+// A column decoder's gates: a row of NAND2s or NAND3s, one group of `folds`
+// slots per output, then rows of multi-finger inverters, with predecode
+// tracks below. Input `i` of output `n` takes bit `i` of `n` from tracks 2i
+// and 2i + 1.
+cell column_decoder_stage(c: ColDecoderLayout, embedded: Bool) {
+    let num = col_outputs(c.inputs);
+    let n = num * c.max_folds;
+    let left = -(1000. * (1 + util::ceil_div(n, 4)) as Float + 1900. * n as Float) / 2.;
+    let sl = util::slots(left, n, 1900., 1000., 4);
+    let nands = [for k in std::range(n) {
+        inst(
+            dec_gate(
+                c.inputs,
+                c.nand.nwidth,
+                c.nand.pwidth,
+                width=1900,
+                filler=k % c.max_folds >= c.folds[0],
+                signal_pins=!embedded && c.inputs == 2,
+                supply_pins=true,
+            ),
+            x=sl.gates[k],
+        )
+    }];
+    for gate in nands {
+        eq(gate.y, nands[0].y);
+    }
+    for x in sl.taps {
+        eq(inst(dec_tap(2, c.nand.nwidth, c.nand.pwidth), x=x).y, nands[0].y);
+    }
+    let invs = [for s in std::range(c.num_stages - 1) {
+        let g = c.invs[s];
+        let pins = !embedded || s == c.num_stages - 2;
+        let row = [for k in std::range(n) {
+            inst(
+                mf_gate(
+                    g.nwidth,
+                    g.pwidth,
+                    width=1900,
+                    filler=k % c.max_folds >= c.folds[s + 1],
+                    pins=pins,
+                ),
+                x=sl.gates[k],
+            )
+        }];
+        for gate in row {
+            eq(gate.y, row[0].y);
+        }
+        for x in sl.taps {
+            eq(inst(mf_tap(g.nwidth, g.pwidth), x=x).y, row[0].y);
+        }
+        row
+    }];
+    eq(nands[0].outline.y0, 300.);
+    stack(cons(nands[0].outline, [for row in invs { row[0].outline }]));
+    let ins = [for s in std::range(c.num_stages - 1) {
+        [for o in std::range(num) {
+            [for f in std::range(c.folds[s + 1]) { invs[s][o * c.max_folds + f].a }]
+        }]
+    }];
+    let outs = cons(
+        [for o in std::range(num) {
+            [for f in std::range(c.folds[0]) { nands[o * c.max_folds + f].out }]
+        }],
+        [for s in std::range(c.num_stages - 1) {
+            [for o in std::range(num) {
+                [for f in std::range(c.folds[s + 1]) { invs[s][o * c.max_folds + f].out }]
+            }]
+        }],
+    );
+    for s in std::range(c.num_stages - 1) {
+        for o in std::range(num) {
+            join(outs[s][o], ins[s][o], s == 0);
+        }
+    }
+    pub let vdd = rails(nands[0].vdd_straps, left)[0];
+    pub let vss = rails(nands[0].vss_straps, left)[0];
+    pub let predecode = [for t in bus(left, 2 * c.inputs) {
+        util::met1_port(t.x0, t.y0, t.x1, t.y1)
+    }];
+    for o in std::range(num) {
+        for f in std::range(c.folds[0]) {
+            for i in std::range(c.inputs) {
+                tie(
+                    nands[o * c.max_folds + f].gates[i],
+                    predecode[2 * i + group_value(o, [2, 2, 2], i)],
+                );
+            }
+        }
+    }
+    pub let outputs = std::last(outs);
+    pub let outputs_b = std::last(ins);
+    pub let vdd_m1 = rails(nands[0].vdd_straps, left);
+    pub let vss_m1 = rails(nands[0].vss_straps, left);
+    pub let vdd_m2 = rails(std::flatten([for row in invs { row[0].vdd_stripes }]), left);
+    pub let vss_m2 = rails(std::flatten([for row in invs { row[0].vss_stripes }]), left);
 }
 
+// A two- or three-bit column decoder, placed by its lower-right corner at
+// the origin above its predecode tracks.
+cell column_decoder(c: ColDecoderLayout) {
+    let stage = inst(column_decoder_stage(c, true), y=(160 + 480 * (2 * c.inputs - 1)) as Float);
+    eq(stage.predecode[0].x1, 0.);
+    pub let outputs = stage.outputs;
+    pub let outputs_b = stage.outputs_b;
+    pub let predecode = stage.predecode;
+    pub let vdd = stage.vdd;
+    pub let vss = stage.vss;
+    // Supply port shapes: the NAND row's met1 straps and the inverter rows'
+    // met2 stripes.
+    pub let vdd_pins_m1 = util::coalesce_rects(stage.vdd_m1);
+    pub let vss_pins_m1 = util::coalesce_rects(stage.vss_m1);
+    pub let vdd_pins_m2 = util::coalesce_rects(stage.vdd_m2);
+    pub let vss_pins_m2 = util::coalesce_rects(stage.vss_m2);
+}
+
+// The address gates: AND2s of the address predecode lines, each driving a
+// row of the wordline decoder, with their inputs tied to the wordline enable.
 cell address_gate_stage(num: Int) {
-    let left = address_gate_stage_left(num);
-    let tap0 = inst(dec_and2_tap(2000, 2500, 4000, 10000, 1000, 1), x=left, y=840.);
-    for index in std::range(num) {
-        let gate = inst(dec_and2_gate(2000, 2500, 4000, 10000, 0, 1, 1), x=address_gate_x(num, index), y=840.);
-        if index % 4 == 3 {
-            let tap = inst(dec_and2_tap(2000, 2500, 4000, 10000, 1000, 1), x=address_gate_x(num, index) + 1580., y=840.);
-        } else { crect(x0=0., y0=0., x1=0., y1=0.); };
+    let nand = PrimitiveGateParams { nwidth: 2000, pwidth: 2500, length: 150 };
+    let inv = PrimitiveGateParams { nwidth: 4000, pwidth: 10000, length: 150 };
+    let left = -(num as Float * 1580. + (util::ceil_div(num, 4) + 1) as Float * 1000.) / 2.;
+    let sl = util::slots(left, num, 1580., 1000., 4);
+    for x in sl.taps {
+        inst(and2_tap(nand, inv, 1000), x=x, y=840.);
     }
-    if num % 4 != 0 {
-        let tap = inst(dec_and2_tap(2000, 2500, 4000, 10000, 1000, 1), x=address_gate_x(num, num - 1) + 1580., y=840.);
-    } else { crect(x0=0., y0=0., x1=0., y1=0.); };
-
-    let right = -left;
-    pub let wl_en = lib::columns::util::met1_port(left, -160., right, 160.);
-    let proto = inst(dec_and2_gate(2000, 2500, 4000, 10000, 0, 1, 1), x=0., y=840., construction=true);
-    pub let outputs = address_gate_ports(num, 0, proto.y_out);
-    pub let inputs = address_gate_ports(num, 0, proto.b);
-    let vdd = lib::columns::util::rect_with_hspan(proto.inv_vdd, (left, right,));
-    let vss = lib::columns::util::rect_with_hspan(proto.inv_vss, (left, right,));
-    for index in std::range(num) {
-        let port = address_gate_a(num, index);
-        let crossing = lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(port), lib::columns::util::rect_vspan(wl_en));
-        let via = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", crossing, crossing, 0, 0, true);
-        lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(port), lib::columns::util::span_union(lib::columns::util::rect_vspan(port), lib::columns::util::rect_vspan(via.2))));
+    let gates = [for x in sl.gates { inst(and2_gate(nand, inv, pins=true), x=x, y=840.) }];
+    pub let wl_en = util::met1_port(left, -160., -left, 160.);
+    pub let outputs = [for g in gates { g.out }];
+    pub let inputs = [for g in gates { g.b }];
+    // Supply port shapes: the AND2 row's met1 straps.
+    pub let vdd_pins_m1 = util::coalesce_rects(rails(gates[0].vdd_straps, left));
+    pub let vss_pins_m1 = util::coalesce_rects(rails(gates[0].vss_straps, left));
+    pub let vdd_pins_m2: [Rect] = [];
+    pub let vss_pins_m2: [Rect] = [];
+    for g in gates {
+        tie(g.a, wl_en);
     }
-}
-
-// An address gate's M1 power rails in its own coordinates.
-fn address_gate_rails(num: Int, vdd: Bool) -> [Rect] {
-    let left = address_gate_stage_left(num);
-    lib::columns::util::concat_rects(region_straps(nand_region(2000, 2500, vdd), 840., left, 0), region_straps(inv_region(4000, 10000, vdd), 840. + dec_and2_inv_x(2000, 2500), left, 0))
-}
-
-// A gate port repeated at each gate of an address gate stage.
-fn address_gate_ports(num: Int, index: Int, port: Rect) -> [Rect] {
-    [for i in range_full(index, num, 1) { lib::columns::util::rect_translate(port, address_gate_x(num, i), 0.) }]
-}
-
-fn draw_row_leaf_input(port: Rect, track: Rect) -> Rect {
-    let crossing = lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(port), lib::columns::util::rect_vspan(track));
-    let via = lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", crossing, crossing, 0, 0, true);
-    lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(port), lib::columns::util::span_union(lib::columns::util::rect_vspan(port), lib::columns::util::rect_vspan(via.2))))
-}
-
-// A gate input reaching a far predecode track: up to M2 at the gate, down to
-// M1 at the track, and across on M2.
-fn draw_row_input_m2(port: Rect, track: Rect) -> Rect {
-    lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", port, port, 0, 0, true);
-    lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", port, port, 0, 0, true);
-    let crossing = lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(port), lib::columns::util::rect_vspan(track));
-    let via = lib::columns::util::draw_contact_full(1, "met1.drawing", "met2.drawing", crossing, crossing, 0, 0, true);
-    lib::columns::util::draw_box("met2.drawing", lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(via.1), lib::columns::util::span_union(lib::columns::util::rect_vspan(port), lib::columns::util::rect_vspan(via.2))))
-}
-
-fn dec_and2_y_local(nand_nw: Int, nand_pw: Int, inv_nw: Int, inv_pw: Int) -> Rect {
-    let inv_x = dec_and2_inv_x(nand_nw, nand_pw);
-    let hn = dec_inv_half_nw(inv_nw);
-    let hp = dec_inv_half_pw(inv_pw);
-    let p0 = hn as Float + 520.;
-    let raw = lib::columns::util::rect_union(dec_sd_port_raw(0., hn as Float, 1), dec_sd_port_raw(p0, hp as Float, 1));
-    lib::columns::util::rect_translate(dec_inv_gate_xf(raw, inv_nw, inv_pw), 0., inv_x)
-}
-
-fn draw_row_root_li_m1(port: Rect, top: Bool) -> Rect {
-    let expanded = if top {
-        lib::columns::util::cbox(port.x0, port.y0, port.x1, port.y1 + 340.)
-    } else {
-        lib::columns::util::cbox(port.x0, port.y0 - 340., port.x1, port.y1)
-    };
-    lib::columns::util::draw_box("li1.drawing", expanded);
-    let contact_area = if top {
-        lib::columns::util::cbox(expanded.x0, expanded.y1 - 240., expanded.x1, expanded.y1)
-    } else {
-        lib::columns::util::cbox(expanded.x0, expanded.y0, expanded.x1, expanded.y0 + 240.)
-    };
-    lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", contact_area, contact_area, 0, 2, true).1
 }
 
 // The row decoder is a tree of AND stages. The root has unfolded AND2 gates
@@ -1416,14 +925,7 @@ struct NodeStage {
     groups: [Int],
 }
 
-fn log2_dec(n: Int) -> Int { if n <= 1 { 0 } else { 1 + log2_dec(n / 2) } }
-fn bit_pairs(k: Int) -> [Int] { if k == 0 { [] } else { cons(2, bit_pairs(k - 1)) } }
-
-fn child_nums(r: RowDecoderSizing, l: [Int]) -> [Int] { [for i in l { r.nodes[i].num }] }
-
-fn sum_ints(l: [Int]) -> Int { std::sum(l) }
-
-fn count_ints(l: [Int]) -> Int { std::len(l) }
+fn log2(n: Int) -> Int { if n <= 1 { 0 } else { 1 + log2(n / 2) } }
 
 // First track of group `i`.
 fn group_offset(groups: [Int], i: Int) -> Int {
@@ -1440,369 +942,251 @@ fn node_stage(r: RowDecoderSizing, index: Int, max_width: Int) -> NodeStage {
     let n = r.nodes[index];
     let width = if n.inputs == 3 { 3160 } else { 1580 };
     let period = if n.inputs == 3 { 2 } else { 4 };
-    let groups = if n.children == [] { bit_pairs(log2_dec(n.num)) } else { child_nums(r, n.children) };
-    if index == 0 {
-        NodeStage { root: true, leaf: n.children == [], inputs: n.inputs, num: n.num, width: width, period: period, nand: n.nand, inv: n.inv, invs: n.invs, nand_folds: 1, inv_folds: 1, max_folds: 1, groups: groups }
+    let groups = if n.children == [] {
+        [for i in std::range(log2(n.num)) { 2 }]
     } else {
-        let limit = max_int((max_width - 1580 * (ceil_div_dec(max_width, period * width + 1580) + 1)) / n.num / width, 1);
+        [for i in n.children { r.nodes[i].num }]
+    };
+    if index == 0 {
+        NodeStage {
+            root: true,
+            leaf: n.children == [],
+            inputs: n.inputs,
+            num: n.num,
+            width,
+            period,
+            nand: n.nand,
+            inv: n.inv,
+            invs: n.invs,
+            nand_folds: 1,
+            inv_folds: 1,
+            max_folds: 1,
+            groups,
+        }
+    } else {
+        let limit = max_int(
+            (max_width - 1580 * (util::ceil_div(max_width, period * width + 1580) + 1)) / n.num / width,
+            1,
+        );
         let nf = gate_folds(n.nand, limit);
         let inf = gate_folds(n.inv, limit);
         NodeStage {
-            root: false, leaf: n.children == [], inputs: n.inputs, num: n.num, width: width, period: period,
+            root: false, leaf: n.children == [], inputs: n.inputs, num: n.num, width, period,
             nand: fold_gate(n.nand, nf), inv: fold_gate(n.inv, inf), invs: [],
-            nand_folds: nf, inv_folds: inf, max_folds: max_int(nf, inf), groups: groups,
+            nand_folds: nf, inv_folds: inf, max_folds: max_int(nf, inf), groups,
         }
     }
 }
 
 fn node_slots(s: NodeStage) -> Int { s.num * s.max_folds }
-fn node_stage_w(s: NodeStage) -> Int { node_slots(s) * s.width + (ceil_div_dec(node_slots(s), s.period) + 1) * 1580 }
-fn node_left(s: NodeStage) -> Float { 0. - (node_stage_w(s) / 2) as Float }
-fn node_tracks(s: NodeStage) -> Int { sum_ints(s.groups) }
-
-fn node_slot_x(s: NodeStage, slot: Int) -> Float {
-    node_left(s) + 1580. + (slot * s.width) as Float + ((slot / s.period) * 1580) as Float
+fn node_stage_w(s: NodeStage) -> Int {
+    node_slots(s) * s.width + (util::ceil_div(node_slots(s), s.period) + 1) * 1580
 }
-
-// Tap `g`: the first at the left edge, then one after each group of slots.
-fn node_tap_x(s: NodeStage, g: Int) -> Float {
-    if g == 0 { node_left(s) } else { node_left(s) + 1580. + (min_int(g * s.period, node_slots(s)) * s.width) as Float + ((g - 1) * 1580) as Float }
-}
-
-fn node_track(s: NodeStage, k: Int) -> Rect {
-    let top = 160. - 480. * k as Float;
-    lib::columns::util::cbox(node_left(s), top - 320., 0. - node_left(s), top)
-}
+fn node_left(s: NodeStage) -> Float { -(node_stage_w(s) / 2) as Float }
 
 // The stage is placed by its lower-right corner, below the last track.
-fn node_dy(s: NodeStage) -> Float { (480 * node_tracks(s) - 320) as Float }
+fn node_dy(s: NodeStage) -> Float { (480 * std::sum(s.groups) - 320) as Float }
 
-// Root rows: the AND2 row, then one row per multi-finger inverter.
-fn root_rows(s: NodeStage) -> Int { 1 + gate_count(s.invs) }
-fn root_inv(s: NodeStage, row: Int) -> PrimitiveGateParams { s.invs[row - 1] }
-
-fn root_row_y(s: NodeStage, row: Int) -> Float {
-    if row == 0 {
-        840.
-    } else {
-        let prev_top = if row == 1 { and2_gate_top(s.nand, s.inv) } else { mf_gate_top(root_inv(s, row - 1).pwidth) };
-        root_row_y(s, row - 1) + prev_top - mf_gate_bottom(root_inv(s, row).nwidth) + 300.
-    }
-}
-
-fn root_port(s: NodeStage, row: Int, index: Int, output: Bool) -> Rect {
-    let local = if row == 0 {
-        if output { dec_and2_y_local(s.nand.nwidth, s.nand.pwidth, s.inv.nwidth, s.inv.pwidth) } else { dec_gate_xf(dec_gate_contact_raw(0), s.nand.nwidth, s.nand.pwidth) }
-    } else {
-        let g = root_inv(s, row);
-        if output { dec_mf_gate_y(g.nwidth, g.pwidth, 1580) } else { dec_mf_gate_a(g.nwidth, g.pwidth, 1580) }
-    };
-    lib::columns::util::rect_translate(local, node_slot_x(s, index), root_row_y(s, row))
-}
-
-fn draw_root_tap(s: NodeStage, row: Int, x: Float) -> Rect {
-    let y = root_row_y(s, row);
-    if row == 0 {
-        inst(dec_and2_tap(s.nand.nwidth, s.nand.pwidth, s.inv.nwidth, s.inv.pwidth, 1580, 1), x=x, y=y).outline
-    } else {
-        let g = root_inv(s, row);
-        inst(dec_multifinger_inv_tap(g.nwidth, g.pwidth, 1580, 1580), x=x, y=y).outline
-    }
-}
-
-fn draw_root_row(s: NodeStage, row: Int) -> Rect {
-    for g in std::range(ceil_div_dec(node_slots(s), s.period) + 1) {
-        draw_root_tap(s, row, node_tap_x(s, g));
-    }
-    let last = row == root_rows(s) - 1;
-    for index in std::range(s.num) {
-        let x = node_slot_x(s, index);
-        let y = root_row_y(s, row);
-        if row == 0 {
-            inst(dec_and2_gate(s.nand.nwidth, s.nand.pwidth, s.inv.nwidth, s.inv.pwidth, 0, 0, 1), x=x, y=y);
-        } else {
-            let g = root_inv(s, row);
-            inst(dec_multifinger_inv_gate(g.nwidth, g.pwidth, 0, 1580, if last { 1 } else { 0 }), x=x, y=y);
-        };
-    }
-    lib::columns::util::cbox(node_left(s), 0., 0. - node_left(s), 0.)
-}
-
-fn draw_root_connection(s: NodeStage, row: Int, index: Int) -> Rect {
-    let in0 = if row == 0 { draw_row_root_li_m1(root_port(s, row, index, true), true) } else { root_port(s, row, index, true) };
-    let out0 = root_port(s, row + 1, index, false);
-    let conn_vspan = lib::columns::util::center_span_gridded(out0.y0 - 400., 240.);
-    let conn_hspan = lib::columns::util::span_union(lib::columns::util::rect_hspan(in0), lib::columns::util::rect_hspan(out0));
-    let conn = lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(conn_hspan, conn_vspan));
-    lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(in0), lib::columns::util::span_union(lib::columns::util::rect_vspan(in0), conn_vspan)));
-    lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(out0), lib::columns::util::span_union(lib::columns::util::rect_vspan(out0), conn_vspan)));
-    conn
-}
-
-// Child rows: NAND gates, then folded inverters 300 nm above them.
-fn child_inv_y(s: NodeStage) -> Float { 840. + dec_total_x(s.nand.nwidth, s.nand.pwidth) + 1020. }
-
-fn child_nand_xf(s: NodeStage, r: Rect) -> Rect {
-    if s.inputs == 3 { dec_nand3_gate_xf_w(r, s.nand.nwidth, s.nand.pwidth, s.width) } else { dec_gate_xf_w(r, s.nand.nwidth, s.nand.pwidth, s.width) }
-}
-
-fn child_nand_input(s: NodeStage, slot: Int, input: Int) -> Rect {
-    let raw = if s.inputs == 3 { dec_nand3_gate_contact_raw(input) } else { dec_gate_contact_raw(input) };
-    lib::columns::util::rect_translate(child_nand_xf(s, raw), node_slot_x(s, slot), 840.)
-}
-
-fn child_nand_output(s: NodeStage, slot: Int) -> Rect {
-    let nw = s.nand.nwidth;
-    let p0 = nw as Float + 520.;
-    let row = if s.inputs == 3 { 3 } else { 2 };
-    let raw = lib::columns::util::rect_union(dec_sd_port_raw(0., nw as Float, row), dec_sd_port_raw(p0, s.nand.pwidth as Float, row));
-    lib::columns::util::rect_translate(child_nand_xf(s, raw), node_slot_x(s, slot), 840.)
-}
-
-fn child_inv_input(s: NodeStage, slot: Int) -> Rect {
-    let local = dec_inv_gate_xf_w(lib::columns::util::cbox(-520., 470., -190., 640.), s.inv.nwidth, s.inv.pwidth, s.width);
-    lib::columns::util::rect_translate(local, node_slot_x(s, slot), child_inv_y(s))
-}
-
-fn child_inv_output(s: NodeStage, slot: Int) -> Rect {
-    let hn = dec_inv_half_nw(s.inv.nwidth);
-    let hp = dec_inv_half_pw(s.inv.pwidth);
-    let raw = lib::columns::util::rect_union(dec_sd_port_raw(0., hn as Float, 1), dec_sd_port_raw(hn as Float + 520., hp as Float, 1));
-    lib::columns::util::rect_translate(dec_inv_gate_xf_w(raw, s.inv.nwidth, s.inv.pwidth, s.width), node_slot_x(s, slot), child_inv_y(s))
-}
-
-fn draw_child_rows(s: NodeStage) -> Rect {
-    let inv_y = child_inv_y(s);
-    for g in std::range(ceil_div_dec(node_slots(s), s.period) + 1) {
-        let x = node_tap_x(s, g);
-        inst(dec_primitive_tap(s.nand.nwidth, s.nand.pwidth, false, 1580, s.width, 1), x=x, y=840.);
-        inst(dec_primitive_tap(s.inv.nwidth, s.inv.pwidth, true, 1580, s.width, 1), x=x, y=inv_y);
-    }
-    for slot in std::range(node_slots(s)) {
-        let fold = slot % s.max_folds;
-        let x = node_slot_x(s, slot);
-        let nand_filler = if fold < s.nand_folds { 0 } else { 1 };
-        if s.inputs == 3 {
-            inst(dec_nand3_gate_w(s.nand.nwidth, s.nand.pwidth, nand_filler, s.width, 1), x=x, y=840.);
-        } else {
-            inst(dec_nand2_gate_w(s.nand.nwidth, s.nand.pwidth, nand_filler, s.width, 0, 1), x=x, y=840.);
-        };
-        inst(dec_inv_gate_w(s.inv.nwidth, s.inv.pwidth, if fold < s.inv_folds { 0 } else { 1 }, s.width, 1), x=x, y=inv_y);
-    }
-    // Each output's first NAND fold drives every inverter fold, and every
-    // NAND fold reaches the first inverter fold.
-    for n in std::range(s.num) {
-        let first = n * s.max_folds;
-        let inv_in = child_inv_input(s, first);
-        let gate_out = child_nand_output(s, first);
-        for j in std::range(s.nand_folds) {
-            draw_dec_li_jog(child_nand_output(s, first + j), inv_in);
-        }
-        for j in std::range(s.inv_folds) {
-            draw_dec_li_jog(gate_out, child_inv_input(s, first + j));
-        }
-    }
-    lib::columns::util::cbox(node_left(s), 0., 0. - node_left(s), 0.)
-}
-
-fn node_input(s: NodeStage, slot: Int, input: Int) -> Rect {
-    if s.root {
-        lib::columns::util::rect_translate(dec_gate_xf(dec_gate_contact_raw(input), s.nand.nwidth, s.nand.pwidth), node_slot_x(s, slot), 840.)
-    } else {
-        child_nand_input(s, slot, input)
-    }
-}
-
-// The output folds of output `n`: M1 at the root, li elsewhere.
-fn node_output_folds(s: NodeStage, n: Int, j: Int) -> [Rect] {
-    [for fold in range_full(j, s.inv_folds, 1) {
-        if s.root { root_port(s, root_rows(s) - 1, n, true) } else { child_inv_output(s, n * s.max_folds + fold) }
-    }]
-}
-
-fn node_outputs(s: NodeStage, n: Int) -> [[Rect]] { [for i in range_full(n, s.num, 1) { node_output_folds(s, i, 0) }] }
-
-fn node_track_list(s: NodeStage, k: Int) -> [Rect] { [for i in range_full(k, node_tracks(s), 1) { node_track(s, i) }] }
-
-// Power straps of a gate region, as rails across the stage at height y.
-fn region_straps(span: (Float, Float), y: Float, left: Float, i: Int) -> [Rect] {
-    [for k in range_full(i, dec_power_strap_count(span), 1) {
-        let v = dec_power_strap_span(span, k);
-        lib::columns::util::cbox(left, y + v.0, 0. - left, y + v.1)
-    }]
-}
-
-fn nand_region(nw: Int, pw: Int, vdd: Bool) -> (Float, Float) {
-    if vdd { lib::columns::util::rect_vspan(dec_gate_xf(dec_psdm(nw, pw), nw, pw)) } else { lib::columns::util::rect_vspan(dec_gate_xf(dec_nsdm(nw), nw, pw)) }
-}
-
-fn inv_region(nw: Int, pw: Int, vdd: Bool) -> (Float, Float) {
-    let hn = dec_inv_half_nw(nw);
-    let hp = dec_inv_half_pw(pw);
-    if vdd { lib::columns::util::rect_vspan(dec_inv_gate_xf(dec_psdm(hn, hp), nw, pw)) } else { lib::columns::util::rect_vspan(dec_inv_gate_xf(dec_nsdm(hn), nw, pw)) }
-}
-
-fn mf_region(nw: Int, pw: Int, vdd: Bool) -> (Float, Float) {
-    let pnf = dec_mf_nf(pw);
-    let implant = if vdd { dec_mf_device_implant_outer(pnf, dec_mf_pmos_dx(pnf), 1580) } else { dec_mf_device_implant_outer(dec_mf_nf(nw), 0., 1580) };
-    lib::columns::util::rect_vspan(implant)
-}
-
-// M1 rails of the stage: the AND2 row at the root, both rows elsewhere.
-fn node_m1_rails(s: NodeStage, vdd: Bool) -> [Rect] {
-    let left = node_left(s);
-    let nand = region_straps(nand_region(s.nand.nwidth, s.nand.pwidth, vdd), 840., left, 0);
-    let inv_y = if s.root { 840. + dec_and2_inv_x(s.nand.nwidth, s.nand.pwidth) } else { child_inv_y(s) };
-    lib::columns::util::concat_rects(nand, region_straps(inv_region(s.inv.nwidth, s.inv.pwidth, vdd), inv_y, left, 0))
-}
-
-// M2 stripes of the root's multi-finger inverter rows.
-fn node_m2_rails(s: NodeStage, row: Int, vdd: Bool) -> [Rect] {
-    if s.root == false {
-        []
-    } else {
-        std::flatten([for r in range_full(row, root_rows(s), 1) {
-            let g = root_inv(s, r);
-            region_straps(mf_region(g.nwidth, g.pwidth, vdd), root_row_y(s, r), node_left(s), 0)
-        }])
-    }
-}
-
-fn node_tap_columns(s: NodeStage, g: Int, top: Float) -> [Rect] {
-    [for k in range_full(g, ceil_div_dec(node_slots(s), s.period) + 1, 1) {
-        let x = node_tap_x(s, k);
-        lib::columns::util::cbox(x, 300., x + 1580., top)
-    }]
-}
-
-fn node_top(s: NodeStage) -> Float {
-    if s.root {
-        if s.invs == [] { 840. + and2_gate_top(s.nand, s.inv) } else { root_row_y(s, root_rows(s) - 1) + mf_gate_top(root_inv(s, root_rows(s) - 1).pwidth) }
-    } else {
-        child_inv_y(s) + inv_gate_top(s.inv.nwidth, s.inv.pwidth)
-    }
-}
-
-// One stage of the row decoder tree, with its predecode tracks.
+// One stage of the row decoder tree, with its predecode tracks. The root is
+// a row of AND2s then rows of multi-finger inverters; other stages are a row
+// of NANDs under a row of folded inverters, each output's first NAND fold
+// driving every inverter fold and every NAND fold the first inverter fold.
 cell row_decoder_stage(s: NodeStage) {
-    if s.root {
-        for row in std::range(root_rows(s)) {
-            draw_root_row(s, row);
+    let left = node_left(s);
+    let sl = util::slots(left, node_slots(s), s.width as Float, 1580., s.period);
+    pub let tracks = bus(left, std::sum(s.groups));
+    for t in tracks {
+        util::draw_box("met1.drawing", t);
+        if s.leaf {
+            util::draw_box("met1.pin", t);
         }
-        for row in std::range(root_rows(s) - 1) {
-            for index in std::range(s.num) {
-                draw_root_connection(s, row, index);
+    }
+    // Gate inputs (by slot) and outputs (by output and fold), and the met1
+    // straps of the first two rows and the met2 stripes of the rest.
+    let ports = if s.root {
+        for x in sl.taps {
+            inst(and2_tap(s.nand, s.inv, 1580), x=x, y=840.);
+        }
+        let ands = [for x in sl.gates { inst(and2_gate(s.nand, s.inv), x=x, y=840.) }];
+        let invs = [for k in std::range(std::len(s.invs)) {
+            let g = s.invs[k];
+            let row = [for x in sl.gates {
+                inst(mf_gate(g.nwidth, g.pwidth, pins=k == std::len(s.invs) - 1), x=x)
+            }];
+            for gate in row {
+                eq(gate.y, row[0].y);
+            }
+            for x in sl.taps {
+                eq(inst(mf_tap(g.nwidth, g.pwidth, width=1580), x=x).y, row[0].y);
+            }
+            row
+        }];
+        stack(cons(ands[0].outline, [for row in invs { row[0].outline }]));
+        let outs = cons([for g in ands { g.out }], [for row in invs { [for g in row { g.out }] }]);
+        for k in std::range(std::len(s.invs)) {
+            for i in std::range(s.num) {
+                join([outs[k][i]], [invs[k][i].a], k == 0);
             }
         }
-    } else {
-        draw_child_rows(s);
-    }
-    pub let tracks = node_track_list(s, 0);
-    for t in tracks {
-        lib::columns::util::draw_box("met1.drawing", t);
-        if s.leaf {
-            lib::columns::util::draw_box("met1.pin", t);
+        StagePorts {
+            inputs: [for g in ands { [g.a, g.b] }],
+            outputs: [for o in std::last(outs) { [o] }],
+            vdd: ands[0].vdd_straps,
+            vss: ands[0].vss_straps,
+            vdd_m2: std::flatten([for row in invs { row[0].vdd_stripes }]),
+            vss_m2: std::flatten([for row in invs { row[0].vss_stripes }]),
         }
-    }
+    } else {
+        let nands = [for k in std::range(node_slots(s)) {
+            inst(
+                dec_gate(
+                    s.inputs,
+                    s.nand.nwidth,
+                    s.nand.pwidth,
+                    width=s.width,
+                    filler=k % s.max_folds >= s.nand_folds,
+                    supply_pins=true,
+                ),
+                x=sl.gates[k],
+                y=840.,
+            )
+        }];
+        let invs = [for k in std::range(node_slots(s)) {
+            inst(
+                dec_gate(
+                    1,
+                    s.inv.nwidth,
+                    s.inv.pwidth,
+                    width=s.width,
+                    filler=k % s.max_folds >= s.inv_folds,
+                    supply_pins=true,
+                ),
+                x=sl.gates[k],
+            )
+        }];
+        for gate in invs {
+            eq(gate.y, invs[0].y);
+        }
+        for x in sl.taps {
+            inst(dec_tap(2, s.nand.nwidth, s.nand.pwidth, width=1580), x=x, y=840.);
+            eq(inst(dec_tap(1, s.inv.nwidth, s.inv.pwidth, width=1580), x=x).y, invs[0].y);
+        }
+        eq(invs[0].outline.y0, nands[0].outline.y1 + 300.);
+        for n in std::range(s.num) {
+            let first = n * s.max_folds;
+            for j in std::range(s.nand_folds) {
+                li_jog(nands[first + j].out, invs[first].a, true);
+            }
+            for j in std::range(s.inv_folds) {
+                li_jog(nands[first].out, invs[first + j].a, true);
+            }
+        }
+        StagePorts {
+            inputs: [for g in nands { g.gates }],
+            outputs: [for n in std::range(s.num) {
+                [for j in std::range(s.inv_folds) { invs[n * s.max_folds + j].out }]
+            }],
+            vdd: std::concat(nands[0].vdd_straps, invs[0].vdd_straps),
+            vss: std::concat(nands[0].vss_straps, invs[0].vss_straps),
+            vdd_m2: [],
+            vss_m2: [],
+        }
+    };
     for n in std::range(s.num) {
         for k in std::range(s.nand_folds) {
             for i in std::range(s.inputs) {
-                let port = node_input(s, n * s.max_folds + k, i);
-                let track = node_track(s, group_offset(s.groups, i) + group_value(n, s.groups, i));
-                if s.groups[i] > 6 {
-                    draw_row_input_m2(port, track);
-                } else {
-                    draw_row_leaf_input(port, track);
-                };
+                let port = ports.inputs[n * s.max_folds + k][i];
+                let track = tracks[group_offset(s.groups, i) + group_value(n, s.groups, i)];
+                if s.groups[i] > 6 { tie_m2(port, track); } else { tie(port, track); }
             }
         }
     }
-    pub let outputs = node_outputs(s, 0);
-    pub let vdd = node_m1_rails(s, true);
-    pub let vss = node_m1_rails(s, false);
-    pub let taps = node_tap_columns(s, 0, node_top(s));
+    pub let outputs = ports.outputs;
+    pub let vdd = rails(ports.vdd, left);
+    pub let vss = rails(ports.vss, left);
+    pub let vdd_m2 = rails(ports.vdd_m2, left);
+    pub let vss_m2 = rails(ports.vss_m2, left);
 }
 
-// Lowest rail of a list.
-fn lowest(l: [Rect]) -> Rect { lowest_from(tail(l), head(l)) }
-
-// The lowest of `best` and the rails of `l`, the later one on ties.
-fn lowest_from(l: [Rect], best: Rect) -> Rect {
-    if l == [] { best } else { lowest_from(tail(l), if head(l).y0 <= best.y0 { head(l) } else { best }) }
+// A decoder stage's gate inputs by slot, its outputs by output and fold, and
+// its supply straps.
+struct StagePorts {
+    inputs: [[Rect]],
+    outputs: [[Rect]],
+    vdd: [Rect],
+    vss: [Rect],
+    vdd_m2: [Rect],
+    vss_m2: [Rect],
 }
 
-fn draw_tie_vias(tie: Rect, rails: [Rect]) -> Rect {
-    for r in rails {
-        let crossing = lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(tie), lib::columns::util::rect_vspan(r));
-        lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", crossing, crossing, 0, 0, true);
-    }
-    tie
+// Jogs a child's output up to the parent's predecode track `dst` on met2.
+fn child_route(src: Rect, dst: Rect, final_width: Int) {
+    let li = rect("li1.drawing", x0=src.x0, y0=src.y0, x1=src.x1, y1=src.y1 + 340.);
+    let area = crect(x0=li.x0, y0=li.y1 - 170., x1=li.x1, y1=li.y1);
+    util::contact(Via::Mcon, area, area, longer=true, later=true);
+    let m2 = util::contact(Via::Via1, area, area, longer=true, later=true).top;
+    let space = (final_width / 2) as Float - m2.h;
+    rect("met2.drawing", x0=m2.x0 - m2.h - space, y0=m2.y0, x1=m2.x1, y1=m2.y1);
+    let r2 = rect(
+        "met2.drawing",
+        x0=m2.x0 - m2.h - space,
+        y0=min_float(m2.y0, dst.y1),
+        x1=m2.x0 - space,
+        y1=max_float(m2.y1, dst.y1),
+    );
+    util::contact(Via::Via1, dst, r2, longer=true, later=true);
 }
 
-// Supply (0 for VDD) of the tie at tap `k` onward whose column is centered
-// at c, or -1 if none is.
-fn tap_supply(taps: [Rect], c: Int, k: Int) -> Int {
-    if taps == [] { -1 } else if ((head(taps).x0 + head(taps).x1) as Int / 2) == c { k % 2 } else { tap_supply(tail(taps), c, k + 1) }
-}
-
-// Ties a child stage's rails to its parent's lowest rail of each supply with
-// M2 at the child's tap columns, which line up with the parent's. Taps
-// alternate between the two supplies, except that a column the parent ties
-// upward keeps the parent's supply.
-fn draw_child_ties(taps: [Rect], vdd: [Rect], vss: [Rect], parent_vdd: [Rect], parent_vss: [Rect], parent_taps: [Rect], g: Int) -> Rect {
-    for k in range_full(0, std::len(taps), 1) {
-        let t = taps[k];
-        let center = (t.x0 + t.x1) as Int / 2;
-        let above = tap_supply(parent_taps, center, 0);
-        let supply = if above >= 0 { above } else { (g + k) % 2 };
-        let rails = if supply == 0 { vdd } else { vss };
-        let target = lowest(if supply == 0 { parent_vdd } else { parent_vss });
-        let c = center as Float;
-        let tie = lib::columns::util::draw_box("met2.drawing", lib::columns::util::cbox(c - 160., lowest(rails).y0, c + 160., target.y1));
-        draw_tie_vias(tie, cons(target, rails));
-    }
-    lib::columns::util::cbox(0., 0., 0., 0.)
-}
-
-// A child output jogged up to the parent's predecode track on M2.
-fn draw_child_output_route(src: Rect, dst: Rect, final_width: Int) -> Rect {
-    let li = lib::columns::util::draw_box("li1.drawing", lib::columns::util::cbox(src.x0, src.y0, src.x1, src.y1 + 340.));
-    let contact_area = lib::columns::util::cbox(li.x0, li.y1 - 170., li.x1, li.y1);
-    lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", contact_area, contact_area, 0, 0, true);
-    let m2_via = lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", contact_area, contact_area, 0, 0, true).1;
-    let line = lib::columns::util::rect_h(m2_via);
-    let space = (final_width / 2) as Float - line;
-    let p1 = m2_via.x0 - line - space;
-    let p2 = m2_via.x0 - space;
-    lib::columns::util::draw_box("met2.drawing", lib::columns::util::cbox(p1, m2_via.y0, m2_via.x1, m2_via.y1));
-    let r2 = lib::columns::util::draw_box("met2.drawing", lib::columns::util::cbox(p1, min_float(m2_via.y0, dst.y1), p2, max_float(m2_via.y1, dst.y1)));
-    lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", dst, r2, 0, 0, true).2
-}
-
-fn draw_child_routes(outputs: [[Rect]], s: NodeStage, group: Int, final_width: Int) -> Rect {
-    for j in std::range(s.groups[group]) {
-        let dst = lib::columns::util::rect_translate(node_track(s, group_offset(s.groups, group) + j), node_left(s), node_dy(s));
-        for src in outputs[j] {
-            draw_child_output_route(src, dst, final_width);
-        }
-    }
-    lib::columns::util::cbox(0., 0., 0., 0.)
+// The predecode tracks of a node's children and the met1 rails of every
+// stage below it.
+struct ChildrenPorts {
+    predecode: [Rect],
+    vdd_m1: [Rect],
+    vss_m1: [Rect],
 }
 
 // Places children `k` onward with the next one's right edge at x, joins
-// their outputs to this stage's tracks, and returns their predecode tracks.
-fn place_children(r: RowDecoderSizing, n: DecoderNodeSizing, s: NodeStage, k: Int, x: Float, max_width: Int, parent_vdd: [Rect], parent_vss: [Rect], parent_taps: [Rect]) -> [Rect] {
-    if k == count_ints(n.children) {
-        []
+// their outputs to this stage's tracks, and returns their ports.
+fn place_children(
+    r: RowDecoderSizing,
+    n: DecoderNodeSizing,
+    s: NodeStage,
+    tracks: [Rect],
+    k: Int,
+    x: Float,
+    max_width: Int,
+) -> ChildrenPorts {
+    if k == std::len(n.children) {
+        ChildrenPorts { predecode: [], vdd_m1: [], vss_m1: [] }
     } else {
         let index = n.children[k];
         let sub = row_decoder_node(r, index, max_width);
         let b = bbox(sub);
         let child = inst(sub, x=x - b.x1, y=-340. - b.y1);
-        draw_child_routes(child.outputs, s, k, if r.nodes[index].inputs == 3 { 3160 } else { 1580 });
-        draw_child_ties(child.taps, child.vdd, child.vss, parent_vdd, parent_vss, parent_taps, 0);
-        let step = (ceil_div_dec((b.x1 - b.x0) as Int, 7900) * 7900) as Float;
-        lib::columns::util::concat_rects(child.predecode, place_children(r, n, s, k + 1, x - step, max_width, parent_vdd, parent_vss, parent_taps))
+        let outputs = child.outputs;
+        for j in std::range(s.groups[k]) {
+            for src in outputs[j] {
+                child_route(
+                    src,
+                    tracks[group_offset(s.groups, k) + j],
+                    if r.nodes[index].inputs == 3 { 3160 } else { 1580 },
+                );
+            }
+        }
+        let rest = place_children(
+            r,
+            n,
+            s,
+            tracks,
+            k + 1,
+            x - (util::ceil_div((b.x1 - b.x0) as Int, 7900) * 7900) as Float,
+            max_width,
+        );
+        ChildrenPorts {
+            predecode: std::concat(child.predecode, rest.predecode),
+            vdd_m1: std::concat(child.vdd_m1_tree, rest.vdd_m1),
+            vss_m1: std::concat(child.vss_m1_tree, rest.vss_m1),
+        }
     }
 }
 
@@ -1812,811 +1196,25 @@ cell row_decoder_node(r: RowDecoderSizing, index: Int, max_width: Int) {
     let s = node_stage(r, index, max_width);
     let stage = inst(row_decoder_stage(s), x=node_left(s), y=node_dy(s));
     let total = if index == 0 { node_stage_w(s) } else { max_width };
-    let share = total / (count_ints(n.children) + 1);
-    // The root's own taps carry no ties.
-    let tied = if index == 0 { [] } else { stage.taps };
-    let below = place_children(r, n, s, 0, 0., share, stage.vdd, stage.vss, tied);
+    let below = place_children(r, n, s, stage.tracks, 0, 0., total / (std::len(n.children) + 1));
     pub let outputs = stage.outputs;
-    pub let predecode = if n.children == [] { stage.tracks } else { below };
-    pub let vdd = stage.vdd;
-    pub let vss = stage.vss;
-    pub let taps = stage.taps;
+    pub let predecode = if n.children == [] { stage.tracks } else { below.predecode };
+    // The met1 rails of every stage in the subtree.
+    pub let vdd_m1_tree = std::concat(stage.vdd, below.vdd_m1);
+    pub let vss_m1_tree = std::concat(stage.vss, below.vss_m1);
+    pub let vdd_m2 = stage.vdd_m2;
+    pub let vss_m2 = stage.vss_m2;
 }
 
 // The row decoder, placed by its root stage's lower-right corner.
 cell row_decoder(r: RowDecoderSizing) {
     let tree = inst(row_decoder_node(r, 0, 0), x=0., y=0.);
-    pub let outputs = first_folds(tree.outputs);
+    pub let outputs = [for folds in tree.outputs { head(folds) }];
     pub let predecode = tree.predecode;
-    let vdd = tree.vdd;
-    let vss = tree.vss;
-}
-
-// The root stage's rails in the row decoder's coordinates: its AND2 row's M1
-// straps and its multi-finger rows' M2 stripes.
-fn row_decoder_m1_rails(r: RowDecoderSizing, vdd: Bool) -> [Rect] {
-    let s = node_stage(r, 0, 0);
-    lib::columns::util::shift_rects(node_m1_rails(s, vdd), node_left(s), node_dy(s))
-}
-
-fn row_decoder_m2_rails(r: RowDecoderSizing, vdd: Bool) -> [Rect] {
-    let s = node_stage(r, 0, 0);
-    lib::columns::util::shift_rects(node_m2_rails(s, 1, vdd), node_left(s), node_dy(s))
-}
-
-fn first_folds(l: [[Rect]]) -> [Rect] { [for folds in l { head(folds) }] }
-
-// Vertical extents of the decoder gate cells, from their outlines.
-fn inv_gate_top(nw: Int, pw: Int) -> Float { dec_total_x(dec_inv_half_nw(nw), dec_inv_half_pw(pw)) + 180. }
-fn nand2_gate_top(nw: Int, pw: Int) -> Float { dec_total_x(nw, pw) + 180. }
-fn and2_gate_top(nand: PrimitiveGateParams, inv: PrimitiveGateParams) -> Float {
-    dec_and2_inv_x(nand.nwidth, nand.pwidth) + inv_gate_top(inv.nwidth, inv.pwidth)
-}
-fn mf_gate_bottom(nw: Int) -> Float { -dec_mf_diff_perp(dec_mf_nf(nw)) - 325. }
-fn mf_gate_top(pw: Int) -> Float { dec_mf_diff_perp(dec_mf_nf(pw)) + 905. }
-
-// Per-finger widths and folds of a column decoder: a NAND2 or NAND3 stage,
-// then the AND's inverter and the buffer inverters as multi-finger inverters.
-struct ColDecoderLayout {
-    inputs: Int,
-    nand: PrimitiveGateParams,
-    invs: [PrimitiveGateParams],
-    folds: [Int],
-    num_stages: Int,
-    max_folds: Int,
-}
-
-// Folds a column decoder into `max_width` in the relaxed decoder style:
-// 1900 nm gates and 1000 nm taps, one output per select value.
-fn col_decoder_layout(sizing: AndStageSizing, max_width: Int) -> ColDecoderLayout {
-    let limit = stage_fold_limit(max_width, col_outputs(sizing.inputs), 1900, 1000);
-    let gates = cons(sizing.nand, cons(sizing.inv, sizing.invs));
-    let folds = gate_fold_list(gates, limit);
-    let folded = fold_gate_list(gates, folds);
-    ColDecoderLayout {
-        inputs: sizing.inputs,
-        nand: head(folded),
-        invs: tail(folded),
-        folds: folds,
-        num_stages: gate_count(gates),
-        max_folds: max_of(folds),
-    }
-}
-
-fn col_outputs(inputs: Int) -> Int { if inputs == 3 { 8 } else { 4 } }
-fn col_stage_num(c: ColDecoderLayout) -> Int { col_outputs(c.inputs) }
-fn col_stage_max_ff(c: ColDecoderLayout) -> Int { c.max_folds }
-fn col_stage_ff(c: ColDecoderLayout, stage: Int) -> Int { c.folds[stage] }
-fn col_stage_nw(c: ColDecoderLayout, stage: Int) -> Int { if stage == 0 { c.nand.nwidth } else { c.invs[stage - 1].nwidth } }
-fn col_stage_pw(c: ColDecoderLayout, stage: Int) -> Int { if stage == 0 { c.nand.pwidth } else { c.invs[stage - 1].pwidth } }
-fn col_stage_slots(c: ColDecoderLayout) -> Int { col_stage_num(c) * col_stage_max_ff(c) }
-
-fn col_nand_xf(c: ColDecoderLayout, r: Rect) -> Rect {
-    if c.inputs == 3 { dec_nand3_gate_xf_w(r, c.nand.nwidth, c.nand.pwidth, 1900) } else { dec_gate_xf_w(r, c.nand.nwidth, c.nand.pwidth, 1900) }
-}
-
-fn col_stage_left(c: ColDecoderLayout) -> Float {
-    -(1000. * (1 + ceil_div_dec(col_stage_slots(c), 4)) as Float + 1900. * col_stage_slots(c) as Float) / 2.
-}
-
-fn col_stage_bottom(c: ColDecoderLayout, stage: Int) -> Float {
-    if stage == 0 { -540. } else { mf_gate_bottom(col_stage_nw(c, stage)) }
-}
-
-fn col_stage_top(c: ColDecoderLayout, stage: Int) -> Float {
-    if stage == 0 { nand2_gate_top(col_stage_nw(c, 0), col_stage_pw(c, 0)) } else { mf_gate_top(col_stage_pw(c, stage)) }
-}
-
-fn col_stage_y(c: ColDecoderLayout, stage: Int) -> Float {
-    if stage == 0 {
-        840.
-    } else {
-        col_stage_y(c, stage - 1) + col_stage_top(c, stage - 1) - col_stage_bottom(c, stage) + 300.
-    }
-}
-
-fn col_stage_gate_x(c: ColDecoderLayout, output: Int, fold: Int) -> Float {
-    let slot = output * col_stage_max_ff(c) + fold;
-    col_stage_left(c) + 1000. + slot as Float * 1900. + (slot / 4) as Float * 1000.
-}
-
-fn col_stage_multi_a(c: ColDecoderLayout, stage: Int, output: Int, fold: Int) -> Rect {
-    lib::columns::util::rect_translate(
-        dec_mf_gate_a(col_stage_nw(c, stage), col_stage_pw(c, stage), 1900),
-        col_stage_gate_x(c, output, fold),
-        col_stage_y(c, stage),
-    )
-}
-
-fn col_stage_output(c: ColDecoderLayout, stage: Int, output: Int, fold: Int) -> Rect {
-    let local = if stage == 0 {
-        let nw = col_stage_nw(c, 0);
-        let pw = col_stage_pw(c, 0);
-        let p0 = nw as Float + 520.;
-        let row = if c.inputs == 3 { 3 } else { 2 };
-        col_nand_xf(c, lib::columns::util::rect_union(dec_sd_port_raw(0., nw as Float, row), dec_sd_port_raw(p0, pw as Float, row)))
-    } else {
-        dec_mf_gate_y(col_stage_nw(c, stage), col_stage_pw(c, stage), 1900)
-    };
-    lib::columns::util::rect_translate(local, col_stage_gate_x(c, output, fold), col_stage_y(c, stage))
-}
-
-fn draw_col_stage_tap(c: ColDecoderLayout, stage: Int, x: Float) -> Rect {
-    let nw = col_stage_nw(c, stage);
-    let pw = col_stage_pw(c, stage);
-    if stage == 0 {
-        inst(dec_primitive_tap(nw, pw, false, 1000, 1900, 1), x=x, y=col_stage_y(c, stage)).outline
-    } else {
-        inst(dec_multifinger_inv_tap(nw, pw, 1000, 1900), x=x, y=col_stage_y(c, stage)).outline
-    }
-}
-
-fn draw_col_stage_taps(c: ColDecoderLayout, stage: Int) -> Rect {
-    let tap0 = draw_col_stage_tap(c, stage, col_stage_left(c));
-    let slots = col_stage_slots(c);
-    for group in std::range(ceil_div_dec(slots, 4)) {
-        let before = min_int((group + 1) * 4, slots);
-        draw_col_stage_tap(c, stage, col_stage_left(c) + 1000. + before as Float * 1900. + group as Float * 1000.);
-    }
-    tap0
-}
-
-fn draw_col_stage_group(c: ColDecoderLayout, stage: Int, embedded: Int) -> Rect {
-    draw_col_stage_taps(c, stage);
-    let ff = col_stage_ff(c, stage);
-    let nw = col_stage_nw(c, stage);
-    let pw = col_stage_pw(c, stage);
-    for output in std::range(col_stage_num(c)) {
-        for fold in std::range(col_stage_max_ff(c)) {
-            let filler = if fold < ff { 0 } else { 1 };
-            if (stage == 0 && c.inputs == 3) {
-                inst(dec_nand3_gate_w(nw, pw, filler, 1900, 1), x=col_stage_gate_x(c, output, fold), y=col_stage_y(c, stage));
-            } else if stage == 0 {
-                inst(dec_nand2_gate_w(nw, pw, filler, 1900, if embedded == 1 { 0 } else { 1 }, 1), x=col_stage_gate_x(c, output, fold), y=col_stage_y(c, stage));
-            } else {
-                let signal_pins = if embedded == 1 { if stage == c.num_stages - 1 { 1 } else { 0 } } else { 1 };
-                inst(dec_multifinger_inv_gate(nw, pw, filler, 1900, signal_pins), x=col_stage_gate_x(c, output, fold), y=col_stage_y(c, stage));
-            };
-        }
-    }
-    lib::columns::util::cbox(col_stage_left(c), 0., -col_stage_left(c), 0.)
-}
-
-fn draw_col_stage_connection(c: ColDecoderLayout, stage: Int, output: Int) -> Rect {
-    let ff = col_stage_ff(c, stage);
-    let next_ff = col_stage_ff(c, stage + 1);
-    let first_in = if stage == 0 {
-        draw_row_root_li_m1(col_stage_output(c, stage, output, 0), true)
-    } else {
-        col_stage_output(c, stage, output, 0)
-    };
-    let first_out = col_stage_multi_a(c, stage + 1, output, 0);
-    let conn_vspan = lib::columns::util::center_span_gridded(first_out.y0 - 400., 240.);
-    let mut_hspan = lib::columns::util::span_union(lib::columns::util::rect_hspan(first_in), lib::columns::util::rect_hspan(first_out));
-    let hspan1 = if ff > 1 { lib::columns::util::span_union(mut_hspan, lib::columns::util::rect_hspan(col_stage_output(c, stage, output, ff - 1))) } else { mut_hspan };
-    let hspan = if next_ff > 1 { lib::columns::util::span_union(hspan1, lib::columns::util::rect_hspan(col_stage_multi_a(c, stage + 1, output, next_ff - 1))) } else { hspan1 };
-    let conn = lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(hspan, conn_vspan));
-    for fold in std::range(ff) {
-        let port = if stage == 0 { first_in } else { col_stage_output(c, stage, output, fold) };
-        lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(port), lib::columns::util::span_union(lib::columns::util::rect_vspan(port), conn_vspan)));
-    }
-    for fold in std::range(next_ff) {
-        let port = col_stage_multi_a(c, stage + 1, output, fold);
-        lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(port), lib::columns::util::span_union(lib::columns::util::rect_vspan(port), conn_vspan)));
-    }
-    conn
-}
-
-// Height of the stage's origin above the bottom of its lowest predecode track.
-fn col_stage_dy(c: ColDecoderLayout) -> Float { (160 + 480 * (2 * c.inputs - 1)) as Float }
-
-fn col_stage_track(c: ColDecoderLayout, index: Int) -> Rect {
-    let top = 160. - index as Float * 480.;
-    lib::columns::util::cbox(col_stage_left(c), top - 320., -col_stage_left(c), top)
-}
-
-// The VDD and VSS straps of a NAND row at height y.
-fn nand2_straps(nw: Int, pw: Int, y: Float) -> (Rect, Rect) {
-    let proto = inst(dec_nand2_gate_w(nw, pw, 0, 1900, 0, 1), x=0., y=y, construction=true);
-    (proto.vdd_strap, proto.vss_strap,)
-}
-
-fn nand3_straps(nw: Int, pw: Int, y: Float) -> (Rect, Rect) {
-    let proto = inst(dec_nand3_gate_w(nw, pw, 0, 1900, 1), x=0., y=y, construction=true);
-    (proto.vdd_strap, proto.vss_strap,)
-}
-
-cell column_decoder_stage(c: ColDecoderLayout, embedded: Int) {
-    for stage in std::range(c.num_stages) {
-        draw_col_stage_group(c, stage, embedded);
-    }
-    for stage in std::range(c.num_stages - 1) {
-        for output in std::range(col_stage_num(c)) {
-            draw_col_stage_connection(c, stage, output);
-        }
-    }
-    let nw0 = col_stage_nw(c, 0);
-    let pw0 = col_stage_pw(c, 0);
-    let straps = if c.inputs == 3 { nand3_straps(nw0, pw0, col_stage_y(c, 0)) } else { nand2_straps(nw0, pw0, col_stage_y(c, 0)) };
-    pub let vdd = lib::columns::util::rect_with_hspan(straps.0, (col_stage_left(c), -col_stage_left(c),));
-    pub let vss = lib::columns::util::rect_with_hspan(straps.1, (col_stage_left(c), -col_stage_left(c),));
-    for track in std::range(2 * c.inputs) {
-        let predecode = col_stage_track(c, track);
-        lib::columns::util::draw_box("met1.drawing", predecode);
-        lib::columns::util::draw_box("met1.pin", predecode);
-    }
-    // Input `i` of output `n` takes bit `i` of `n` from tracks 2i and 2i + 1.
-    for output in std::range(col_stage_num(c)) {
-        for fold in std::range(col_stage_ff(c, 0)) {
-            for i in std::range(c.inputs) {
-                let raw = if c.inputs == 3 { dec_nand3_gate_contact_raw(i) } else { dec_gate_contact_raw(i) };
-                let port = lib::columns::util::rect_translate(col_nand_xf(c, raw), col_stage_gate_x(c, output, fold), col_stage_y(c, 0));
-                draw_row_leaf_input(port, col_stage_track(c, 2 * i + group_value(output, [2, 2, 2], i)));
-            }
-        }
-    }
-}
-
-// A two- or three-bit column decoder: one stage placed by its lower-right
-// corner at the origin, above its predecode tracks.
-cell column_decoder(c: ColDecoderLayout) {
-    let stage = inst(column_decoder_stage(c, 1), x=col_stage_left(c), y=col_stage_dy(c));
-    pub let outputs = col_decoder_outputs(c, 0, false);
-    pub let outputs_b = col_decoder_outputs(c, 0, true);
-    pub let predecode = col_decoder_predecodes(c, 0);
-    pub let vdd = stage.vdd;
-    pub let vss = stage.vss;
-}
-
-// A column decoder's power rails in its own coordinates: the NAND row's M1
-// straps, then the multi-finger rows' M2 stripes.
-fn col_decoder_m1_rails(c: ColDecoderLayout, vdd: Bool) -> [Rect] {
-    let straps = region_straps(nand_region(col_stage_nw(c, 0), col_stage_pw(c, 0), vdd), col_stage_y(c, 0), col_stage_left(c), 0);
-    lib::columns::util::shift_rects(straps, col_stage_left(c), col_stage_dy(c))
-}
-
-fn col_decoder_m2_rails(c: ColDecoderLayout, vdd: Bool) -> [Rect] {
-    lib::columns::util::shift_rects(col_all_stripes(c, 1, vdd), col_stage_left(c), col_stage_dy(c))
-}
-
-fn col_all_stripes(c: ColDecoderLayout, stage: Int, vdd: Bool) -> [Rect] {
-    std::flatten([for st in range_full(stage, c.num_stages, 1) {
-        region_straps(mf_region(col_stage_nw(c, st), col_stage_pw(c, st), vdd), col_stage_y(c, st), col_stage_left(c), 0)
-    }])
-}
-
-// The last stage's output folds, or its input folds for the complement.
-fn col_decoder_folds(c: ColDecoderLayout, output: Int, fold: Int, complement: Bool) -> [Rect] {
-    let last = c.num_stages - 1;
-    [for f in range_full(fold, col_stage_ff(c, last), 1) {
-        let local = if complement { col_stage_multi_a(c, last, output, f) } else { col_stage_output(c, last, output, f) };
-        lib::columns::util::rect_translate(local, col_stage_left(c), col_stage_dy(c))
-    }]
-}
-
-fn col_decoder_outputs(c: ColDecoderLayout, output: Int, complement: Bool) -> [[Rect]] {
-    [for o in range_full(output, col_stage_num(c), 1) { col_decoder_folds(c, o, 0, complement) }]
-}
-
-// Predecode bus `2 * bit + complement`.
-fn col_decoder_predecodes(c: ColDecoderLayout, index: Int) -> [Rect] {
-    [for i in range_full(index, 2 * c.inputs, 1) { lib::columns::util::rect_translate(col_stage_track(c, i), col_stage_left(c), col_stage_dy(c)) }]
-}
-
-// Per-finger gate widths and fold counts of a fanout buffer: an inverter
-// followed by multi-finger inverters, each stage folded into `folds` fingers.
-struct BufferLayout {
-    stages: [PrimitiveGateParams],
-    folds: [Int],
-    num_stages: Int,
-    max_folds: Int,
-    vertical: Bool,
-}
-
-fn gate_count(gates: [PrimitiveGateParams]) -> Int { std::len(gates) }
-
-fn max_of(values: [Int]) -> Int { max_of_from(values, 0) }
-
-fn max_of_from(values: [Int], best: Int) -> Int {
-    if values == [] { best } else { max_of_from(tail(values), max_int(head(values), best)) }
-}
-
-// The fold limit for a stage of `num` outputs within `max_width`.
-fn stage_fold_limit(max_width: Int, num: Int, width: Int, tap_width: Int) -> Int {
-    max_int((max_width - tap_width * (ceil_div_dec(max_width, 4 * width + tap_width) + 1)) / num / width, 1)
-}
-
-// Fingers for one gate: one per 1.8 um of its narrower device, up to `limit`.
-fn gate_folds(g: PrimitiveGateParams, limit: Int) -> Int {
-    min_int(max_int(min_int(g.pwidth, g.nwidth) / 1800, 1), limit)
-}
-
-// A width split across `folds` fingers, rounded to 10 nm.
-fn fold_width(width: Int, folds: Int) -> Int {
-    ((width as Float * (1. / (folds as Float)) / 10. + 0.5) as Int) * 10
-}
-
-fn fold_gate(g: PrimitiveGateParams, folds: Int) -> PrimitiveGateParams {
-    PrimitiveGateParams { nwidth: fold_width(g.nwidth, folds), pwidth: fold_width(g.pwidth, folds), length: g.length }
-}
-
-fn gate_fold_list(gates: [PrimitiveGateParams], limit: Int) -> [Int] { [for g in gates { gate_folds(g, limit) }] }
-
-fn fold_gate_list(gates: [PrimitiveGateParams], folds: [Int]) -> [PrimitiveGateParams] {
-    [for i in range_full(0, std::len(gates), 1) { fold_gate(gates[i], folds[i]) }]
-}
-
-// Lays out a buffer chain within `max_width` (0 for no limit), in the
-// minimum decoder style: 1580 nm gates and 1000 nm taps.
-fn buffer_layout(sizing: BufferSizing, max_width: Int, vertical: Bool) -> BufferLayout {
-    let limit = if max_width > 0 { stage_fold_limit(max_width, 1, 1580, 1000) } else { 1 };
-    let folds = gate_fold_list(sizing.stages, limit);
-    BufferLayout {
-        stages: fold_gate_list(sizing.stages, folds),
-        folds: folds,
-        num_stages: gate_count(sizing.stages),
-        max_folds: max_of(folds),
-        vertical: vertical,
-    }
-}
-
-fn buffer_num_stages(b: BufferLayout) -> Int { b.num_stages }
-fn buffer_max_ff(b: BufferLayout) -> Int { b.max_folds }
-fn buffer_stage_ff(b: BufferLayout, stage: Int) -> Int { b.folds[stage] }
-fn buffer_stage_nw(b: BufferLayout, stage: Int) -> Int { b.stages[stage].nwidth }
-fn buffer_stage_pw(b: BufferLayout, stage: Int) -> Int { b.stages[stage].pwidth }
-
-fn buffer_stage_bottom(b: BufferLayout, stage: Int) -> Float {
-    if stage == 0 {
-        -540.
-    } else {
-        let nf = dec_mf_nf(buffer_stage_nw(b, stage));
-        -dec_mf_diff_perp(nf) - 325.
-    }
-}
-
-fn buffer_stage_top(b: BufferLayout, stage: Int) -> Float {
-    if stage == 0 {
-        2450.
-    } else {
-        let nf = dec_mf_nf(buffer_stage_pw(b, stage));
-        dec_mf_diff_perp(nf) + 905.
-    }
-}
-
-fn buffer_stage_y(b: BufferLayout, stage: Int) -> Float {
-    if stage == 0 {
-        840.
-    } else {
-        buffer_stage_y(b, stage - 1) + buffer_stage_top(b, stage - 1) - buffer_stage_bottom(b, stage) + 300.
-    }
-}
-
-fn buffer_group_w(b: BufferLayout) -> Float {
-    1000. + buffer_max_ff(b) as Float * 1580. + ((buffer_max_ff(b) + 3) / 4) as Float * 1000.
-}
-
-fn buffer_left(b: BufferLayout) -> Float { -buffer_group_w(b) / 2. }
-
-fn buffer_gate_x(b: BufferLayout, fold: Int) -> Float {
-    buffer_left(b) + 1000. + fold as Float * 1580. + (fold / 4) as Float * 1000.
-}
-
-fn buffer_multi_a(b: BufferLayout, stage: Int, fold: Int) -> Rect {
-    lib::columns::util::rect_translate(
-        dec_mf_gate_a(buffer_stage_nw(b, stage), buffer_stage_pw(b, stage), 1580),
-        buffer_gate_x(b, fold),
-        buffer_stage_y(b, stage),
-    )
-}
-
-fn buffer_output(b: BufferLayout, stage: Int, fold: Int) -> Rect {
-    let local = if stage == 0 {
-        let hn = dec_inv_half_nw(buffer_stage_nw(b, 0));
-        let hp = dec_inv_half_pw(buffer_stage_pw(b, 0));
-        dec_inv_gate_xf(lib::columns::util::rect_union(dec_sd_port_raw(0., hn as Float, 1), dec_sd_port_raw(hn as Float + 520., hp as Float, 1)), buffer_stage_nw(b, 0), buffer_stage_pw(b, 0))
-    } else {
-        dec_mf_gate_y(buffer_stage_nw(b, stage), buffer_stage_pw(b, stage), 1580)
-    };
-    lib::columns::util::rect_translate(local, buffer_gate_x(b, fold), buffer_stage_y(b, stage))
-}
-
-fn draw_buffer_tap(b: BufferLayout, stage: Int, x: Float) -> Rect {
-    let nw = buffer_stage_nw(b, stage);
-    let pw = buffer_stage_pw(b, stage);
-    let y = buffer_stage_y(b, stage);
-    if stage == 0 {
-        if b.vertical {
-            inst(dec_primitive_tap_vertical(nw, pw, 1000, 1580, 1), x=x, y=y).outline
-        } else {
-            inst(dec_primitive_tap(nw, pw, true, 1000, 1580, 1), x=x, y=y).outline
-        }
-    } else {
-        inst(dec_multifinger_inv_tap(nw, pw, 1000, 1580), x=x, y=y).outline
-    }
-}
-
-fn draw_buffer_taps(b: BufferLayout, stage: Int) -> Rect {
-    let tap0 = draw_buffer_tap(b, stage, buffer_left(b));
-    let groups = (buffer_max_ff(b) + 3) / 4;
-    for group in std::range(groups) {
-        let before = min_int((group + 1) * 4, buffer_max_ff(b));
-        draw_buffer_tap(b, stage, buffer_left(b) + 1000. + before as Float * 1580. + group as Float * 1000.);
-    }
-    tap0
-}
-
-fn draw_buffer_stage(b: BufferLayout, stage: Int) -> Rect {
-    draw_buffer_taps(b, stage);
-    let ff = buffer_stage_ff(b, stage);
-    let nw = buffer_stage_nw(b, stage);
-    let pw = buffer_stage_pw(b, stage);
-    for fold in std::range(buffer_max_ff(b)) {
-        let filler = if fold < ff { 0 } else { 1 };
-        if stage == 0 {
-            if b.vertical {
-                inst(dec_inv_gate_vertical(nw, pw, filler), x=buffer_gate_x(b, fold), y=buffer_stage_y(b, stage));
-            } else {
-                inst(dec_inv_gate(nw, pw, filler), x=buffer_gate_x(b, fold), y=buffer_stage_y(b, stage));
-            };
-            if fold < ff {
-                let hn = dec_inv_half_nw(nw);
-                let hp = dec_inv_half_pw(pw);
-                let p0 = hn as Float + 520.;
-                let dx = buffer_gate_x(b, fold);
-                let dy = buffer_stage_y(b, stage);
-                lib::columns::util::draw_box("li1.pin", lib::columns::util::rect_translate(dec_inv_gate_xf(lib::columns::util::cbox(-520., 470., -190., 640.), nw, pw), dx, dy));
-                lib::columns::util::draw_box("li1.pin", buffer_output(b, stage, fold));
-                lib::columns::util::draw_box("li1.pin", lib::columns::util::rect_translate(dec_inv_gate_xf(dec_sd_port_raw(0., hn as Float, 0), nw, pw), dx, dy));
-                lib::columns::util::draw_box("li1.pin", lib::columns::util::rect_translate(dec_inv_gate_xf(dec_sd_port_raw(0., hn as Float, 2), nw, pw), dx, dy));
-                lib::columns::util::draw_box("li1.pin", lib::columns::util::rect_translate(dec_inv_gate_xf(dec_sd_port_raw(p0, hp as Float, 0), nw, pw), dx, dy));
-                lib::columns::util::draw_box("li1.pin", lib::columns::util::rect_translate(dec_inv_gate_xf(dec_sd_port_raw(p0, hp as Float, 2), nw, pw), dx, dy));
-            } else {
-                crect(x0=0., y0=0., x1=0., y1=0.);
-            };
-        } else {
-            inst(dec_multifinger_inv_gate(nw, pw, filler, 1580, 1), x=buffer_gate_x(b, fold), y=buffer_stage_y(b, stage));
-        };
-    }
-    lib::columns::util::cbox(buffer_left(b), 0., -buffer_left(b), 0.)
-}
-
-fn draw_buffer_connection(b: BufferLayout, stage: Int) -> Rect {
-    let ff = buffer_stage_ff(b, stage);
-    let next_ff = buffer_stage_ff(b, stage + 1);
-    let first_in = if stage == 0 { draw_row_root_li_m1(buffer_output(b, stage, 0), true) } else { buffer_output(b, stage, 0) };
-    let first_out = buffer_multi_a(b, stage + 1, 0);
-    let conn_vspan = lib::columns::util::center_span_gridded(first_out.y0 - 400., 240.);
-    let hspan0 = lib::columns::util::span_union(lib::columns::util::rect_hspan(first_in), lib::columns::util::rect_hspan(first_out));
-    let hspan1 = if ff > 1 { lib::columns::util::span_union(hspan0, lib::columns::util::rect_hspan(buffer_output(b, stage, ff - 1))) } else { hspan0 };
-    let hspan = if next_ff > 1 { lib::columns::util::span_union(hspan1, lib::columns::util::rect_hspan(buffer_multi_a(b, stage + 1, next_ff - 1))) } else { hspan1 };
-    let conn = lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(hspan, conn_vspan));
-    for fold in std::range(ff) {
-        let port = if stage == 0 { first_in } else { buffer_output(b, stage, fold) };
-        lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(port), lib::columns::util::span_union(lib::columns::util::rect_vspan(port), conn_vspan)));
-    }
-    for fold in std::range(next_ff) {
-        let port = buffer_multi_a(b, stage + 1, fold);
-        lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(port), lib::columns::util::span_union(lib::columns::util::rect_vspan(port), conn_vspan)));
-    }
-    conn
-}
-
-fn draw_buffer_final_folds(b: BufferLayout) -> Rect {
-    let stage = buffer_num_stages(b) - 1;
-    let ff = buffer_stage_ff(b, stage);
-    let left = buffer_output(b, stage, 0);
-    if ff > 1 {
-        for fold in std::range(ff) {
-            let port = buffer_output(b, stage, fold);
-            let line = lib::columns::util::rect_w(port);
-            let p1 = port.y1 + line + 200.;
-            let p2 = port.y1 + 200.;
-            lib::columns::util::draw_box("met1.drawing", lib::columns::util::cbox(port.x0, port.y0, port.x1, p1));
-            lib::columns::util::draw_box("met1.drawing", lib::columns::util::cbox(min_float(port.x0, left.x0), p2, max_float(port.x1, left.x0), p1));
-        }
-    } else {
-        crect(x0=0., y0=0., x1=0., y1=0.);
-    };
-    left
-}
-
-// The first stage's power strap: M1, or M2 in the vertical style.
-fn buffer_first_strap(b: BufferLayout, vdd: Bool) -> Rect {
-    let nw = buffer_stage_nw(b, 0);
-    let pw = buffer_stage_pw(b, 0);
-    let y = buffer_stage_y(b, 0);
-    if b.vertical {
-        let gate = inst(dec_inv_gate_vertical(nw, pw, 0), x=0., y=y, construction=true);
-        if vdd { gate.vdd_strap } else { gate.vss_strap }
-    } else {
-        let gate = inst(dec_inv_gate(nw, pw, 0), x=0., y=y, construction=true);
-        if vdd { gate.vdd_strap } else { gate.vss_strap }
-    }
-}
-
-fn buffer_outputs(b: BufferLayout, fold: Int) -> [Rect] {
-    let last = buffer_num_stages(b) - 1;
-    [for f in range_full(fold, buffer_stage_ff(b, last), 1) { buffer_output(b, last, f) }]
-}
-
-// A fanout buffer's power rails in its own coordinates: the first stage's
-// straps, on M1 or on M2 in the vertical style, then every multi-finger M2
-// stripe.
-fn buffer_first_rails(b: BufferLayout, vdd: Bool) -> [Rect] {
-    region_straps(inv_region(buffer_stage_nw(b, 0), buffer_stage_pw(b, 0), vdd), buffer_stage_y(b, 0), buffer_left(b), 0)
-}
-
-fn buffer_m1_rails(b: BufferLayout, vdd: Bool) -> [Rect] { if b.vertical { [] } else { buffer_first_rails(b, vdd) } }
-
-fn buffer_m2_rails(b: BufferLayout, vdd: Bool) -> [Rect] {
-    lib::columns::util::concat_rects(if b.vertical { buffer_first_rails(b, vdd) } else { [] }, buffer_all_stripes(b, 1, vdd))
-}
-
-// Every M2 power stripe of the multi-finger stages.
-fn buffer_all_stripes(b: BufferLayout, stage: Int, vdd: Bool) -> [Rect] {
-    std::flatten([for st in range_full(stage, buffer_num_stages(b), 1) {
-        region_straps(mf_region(buffer_stage_nw(b, st), buffer_stage_pw(b, st), vdd), buffer_stage_y(b, st), buffer_left(b), 0)
-    }])
-}
-
-// The M2 power stripes of the multi-finger stages, which span the buffer.
-fn buffer_stage_rails(b: BufferLayout, stage: Int, vdd: Bool) -> [Rect] {
-    [for st in range_full(stage, buffer_num_stages(b), 1) {
-        let nw = buffer_stage_nw(b, st);
-        let pw = buffer_stage_pw(b, st);
-        let pnf = dec_mf_nf(pw);
-        let implant = if vdd { dec_mf_device_implant_outer(pnf, dec_mf_pmos_dx(pnf), 1580) } else { dec_mf_device_implant_outer(dec_mf_nf(nw), 0., 1580) };
-        let span = dec_power_strap_span(lib::columns::util::rect_vspan(implant), 0);
-        lib::columns::util::cbox(buffer_left(b), buffer_stage_y(b, st) + span.0, -buffer_left(b), buffer_stage_y(b, st) + span.1)
-    }]
-}
-
-// A fanout buffer stage: one input track below the chain, M1 for a
-// horizontal buffer and M2 for a vertical one.
-cell fanout_buffer(b: BufferLayout) {
-    for stage in std::range(buffer_num_stages(b)) {
-        draw_buffer_stage(b, stage);
-    }
-    for stage in std::range(buffer_num_stages(b) - 1) {
-        draw_buffer_connection(b, stage);
-    }
-    draw_buffer_final_folds(b);
-    pub let input = lib::columns::util::cbox(buffer_left(b), -160., -buffer_left(b), 160.);
-    if b.vertical {
-        lib::columns::util::draw_box("met2.drawing", input);
-        lib::columns::util::draw_box("met2.pin", input);
-    } else {
-        lib::columns::util::draw_box("met1.drawing", input);
-        lib::columns::util::draw_box("met1.pin", input);
-    };
-    let port = lib::columns::util::rect_translate(dec_inv_gate_xf(lib::columns::util::cbox(-520., 470., -190., 640.), buffer_stage_nw(b, 0), buffer_stage_pw(b, 0)), buffer_gate_x(b, 0), buffer_stage_y(b, 0));
-    pub let outputs = buffer_outputs(b, 0);
-    let span = (buffer_left(b), -buffer_left(b),);
-    pub let vdd = cons(lib::columns::util::rect_with_hspan(buffer_first_strap(b, true), span), buffer_stage_rails(b, 1, true));
-    pub let vss = cons(lib::columns::util::rect_with_hspan(buffer_first_strap(b, false), span), buffer_stage_rails(b, 1, false));
-    if b.vertical {
-        let crossing = lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(port), lib::columns::util::rect_vspan(input));
-        let li_m1 = lib::columns::util::draw_contact_full_later(0, "li1.drawing", "met1.drawing", crossing, crossing, 0, 0, true);
-        let m1_m2 = lib::columns::util::draw_contact_full_later(1, "met1.drawing", "met2.drawing", crossing, crossing, 0, 0, true);
-        let via_bbox = lib::columns::util::rect_union(li_m1.2, m1_m2.2);
-        lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(port), lib::columns::util::span_union(lib::columns::util::rect_vspan(port), lib::columns::util::rect_vspan(via_bbox))));
-    } else {
-        draw_row_leaf_input(port, input);
-    };
-}
-
-cell dec_tap(stage: Int, p: DecoderParams) {
-    let span = dec_gate_span(stage, p);
-    let nwell = lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans((0., 1000.,), dec_region_nwell_span(stage, p)));
-    let outline = rect("layout_boundary.boundary", x0=0., y0=span.0, x1=1000., y1=span.1);
-    let nsdm_span = dec_region_nsdm_span(stage, p);
-    let psdm_span = dec_region_psdm_span(stage, p);
-    draw_dec_tap_for_span(false, nsdm_span);
-    draw_dec_tap_for_span(true, psdm_span);
-    let ncnt = dec_power_strap_count(nsdm_span);
-    for i in std::range(ncnt) {
-        let vspan = dec_power_strap_span(nsdm_span, i);
-        let vss = lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans((0., 1000.,), vspan));
-        lib::columns::util::draw_box("met1.pin", vss);
-        draw_dec_li_met1_contact(lib::columns::util::rect_from_spans((295., 705.,), vspan));
-    }
-    let pcnt = dec_power_strap_count(psdm_span);
-    for i in std::range(pcnt) {
-        let vspan = dec_power_strap_span(psdm_span, i);
-        let vdd = lib::columns::util::draw_box("met1.drawing", lib::columns::util::rect_from_spans((0., 1000.,), vspan));
-        lib::columns::util::draw_box("met1.pin", vdd);
-        draw_dec_li_met1_contact(lib::columns::util::rect_from_spans((295., 705.,), vspan));
-    }
-}
-
-fn draw_dec_stage_tile(stage: Int, p: DecoderParams, tile: Int, filler: Int) -> Rect {
-    let nw = dec_stage_nw(stage, p);
-    let pw = dec_stage_pw(stage, p);
-    let x = dec_tile_abs_x(stage, p, tile);
-    let yoff = dec_tile_abs_y(stage, p);
-    if stage == 0 {
-        let gate = inst(dec_nand2_gate(nw, pw, filler), x=x, y=yoff);
-        gate.outline
-    } else {
-        let gate = inst(dec_inv_gate(nw, pw, filler), x=x, y=yoff);
-        gate.outline
-    }
-}
-
-fn draw_dec_stage_group(stage: Int, p: DecoderParams) -> Rect {
-    let tap_y = dec_group_yoff(stage, p) + dec_tile_yoff(stage, p);
-    let tap0 = inst(dec_tap(stage, p), x=dec_group_xoff(p), y=tap_y);
-    let maxff = dec_max_ff(p);
-    let ff = dec_stage_ff(stage, p);
-    for tile in std::range(maxff) {
-        draw_dec_stage_tile(stage, p, tile, if tile < ff { 0 } else { 1 });
-    }
-    for group in std::range(dec_tap_groups(maxff)) {
-        let tiles_before_tap = min_int((group + 1) * dec_tap_period(), maxff);
-        let tap_x = dec_group_xoff(p) + 1000. + tiles_before_tap as Float * 1580. + group as Float * 1000.;
-        let tap = inst(dec_tap(stage, p), x=tap_x, y=tap_y);
-    }
-    lib::columns::util::cbox(dec_stage_left(p), dec_group_abs_bot(stage, p), dec_stage_right(p), dec_group_abs_bot(stage, p) + dec_group_h(stage, p))
-}
-
-fn draw_dec_input_to_track(port: Rect, track: Rect) -> Rect {
-    let bot = lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(port), lib::columns::util::rect_vspan(track));
-    let via = draw_dec_li_met1_contact(bot);
-    let li_vspan = lib::columns::util::span_union(lib::columns::util::rect_vspan(port), lib::columns::util::rect_vspan(via));
-    lib::columns::util::draw_box("li1.drawing", lib::columns::util::rect_from_spans(lib::columns::util::rect_hspan(port), (li_vspan.0 - 30., li_vspan.1,)))
-}
-
-cell wmask_decoder_stage(mux: Int, p: DecoderParams) {
-    let num_stages = dec_num_stages(p);
-    for stage in std::range(num_stages) {
-        draw_dec_stage_group(stage, p);
-        let ff = dec_stage_ff(stage, p);
-        for tile in std::range(ff) {
-            draw_dec_stage_li_pins(stage, p, tile);
-        }
-    }
-    for stage in std::range(num_stages - 1) {
-        let ff = dec_stage_ff(stage, p);
-        let next_ff = dec_stage_ff(stage + 1, p);
-        let first_dst = dec_stage_port_a(stage + 1, p, 0);
-        let gate_out = dec_stage_port_y(stage, p, 0);
-        for tile in std::range(ff) {
-            draw_dec_li_jog(dec_stage_port_y(stage, p, tile), first_dst);
-        }
-        for tile in std::range(next_ff) {
-            draw_dec_li_jog(gate_out, dec_stage_port_a(stage + 1, p, tile));
-        }
-    }
-    let final_stage = num_stages - 1;
-    let complement_stage = final_stage - 1;
-    let final_ff = dec_stage_ff(final_stage, p);
-    if final_ff > 1 {
-        let left_port = dec_stage_port_y(final_stage, p, 0);
-        for tile in std::range(final_ff) {
-            draw_dec_final_fold_jog(dec_stage_port_y(final_stage, p, tile), left_port);
-        }
-    } else {
-        crect(x0=0., y0=0., x1=0., y1=0.);
-    };
-
-    let pre_bbox = lib::columns::util::cbox(dec_stage_left(p), 300., dec_stage_right(p), dec_stage_logic_top(p));
-    let tracks_start = pre_bbox.y0 - 140.;
-    let predecode0 = lib::columns::util::met1_port(pre_bbox.x0, dec_uniform_track(tracks_start, 0).0, pre_bbox.x1, dec_uniform_track(tracks_start, 0).1);
-    let predecode1 = lib::columns::util::met1_port(pre_bbox.x0, dec_uniform_track(tracks_start, 1).0, pre_bbox.x1, dec_uniform_track(tracks_start, 1).1);
-    let ff0 = dec_stage_ff(0, p);
-    for tile in std::range(ff0) {
-        draw_dec_input_to_track(dec_stage_port_a(0, p, tile), predecode0);
-        draw_dec_input_to_track(dec_stage_port_b(0, p, tile), predecode1);
-    }
-    let y_port = dec_stage_port_y(final_stage, p, 0);
-    let y1 = if final_ff > 1 { dec_stage_port_y(final_stage, p, 1) } else { y_port };
-    let y2 = if final_ff > 2 { dec_stage_port_y(final_stage, p, 2) } else { y_port };
-    let y3 = if final_ff > 3 { dec_stage_port_y(final_stage, p, 3) } else { y_port };
-    let y_b_ff = dec_stage_ff(complement_stage, p);
-    let y_b = dec_stage_port_y(complement_stage, p, 0);
-    let y_b1 = if y_b_ff > 1 { dec_stage_port_y(complement_stage, p, 1) } else { y_b };
-    let y_b2 = if y_b_ff > 2 { dec_stage_port_y(complement_stage, p, 2) } else { y_b };
-    let y_b3 = if y_b_ff > 3 { dec_stage_port_y(complement_stage, p, 3) } else { y_b };
-    let vdd = lib::columns::util::cbox(0., 0., 0., 0.);
-    let vss = lib::columns::util::cbox(0., 0., 0., 0.);
-    let outline = crect(x0=dec_stage_left(p), y0=-640., x1=dec_stage_right(p), y1=dec_stage_logic_top(p));
-}
-
-fn wmask_dff_forced_left(mux: Int) -> Float {
-    -4715. - ((mux - 4) / 2) as Float * 1200.
-}
-
-fn wmask_dff_x(bit: Int, mux: Int, unit_w: Float) -> Float {
-    bit as Float * unit_w - wmask_dff_forced_left(mux)
-}
-
-fn wmask_dff_right(mux: Int) -> Float {
-    -wmask_dff_forced_left(mux) + 1385.
-}
-
-fn wmask_dff_y() -> Float {
-    1460.
-}
-
-fn wmask_full_right(bits: Int, mux: Int, p: DecoderParams, unit_w: Float) -> Float {
-    (bits - 1) as Float * unit_w + max_float(wmask_dff_right(mux), dec_group_w(p))
-}
-
-fn wmask_stage_x(bit: Int, p: DecoderParams, unit_w: Float) -> Float {
-    bit as Float * unit_w - dec_stage_left(p)
-}
-
-fn wmask_stage_y(p: DecoderParams) -> Float {
-    16840. - dec_stage_bbox(p).y0
-}
-
-fn wmask_stage_predecode(bit: Int, p: DecoderParams, unit_w: Float, index: Int) -> Rect {
-    let sx = wmask_stage_x(bit, p, unit_w);
-    let sy = wmask_stage_y(p);
-    lib::columns::util::rect_translate(lib::columns::util::rect_from_spans((dec_stage_left(p), dec_stage_right(p),), dec_uniform_track(160., index)), sx, sy)
-}
-
-fn wmask_stage_port_y(bit: Int, p: DecoderParams, unit_w: Float, stage: Int, tile: Int) -> Rect {
-    lib::columns::util::rect_translate(dec_stage_port_y(stage, p, tile), wmask_stage_x(bit, p, unit_w), wmask_stage_y(p))
-}
-
-fn draw_wmask_dff_to_stage(bit: Int, mux: Int, p: DecoderParams, unit_w: Float) -> Rect {
-    let dff_x = wmask_dff_x(bit, mux, unit_w);
-    let dff_y = wmask_dff_y();
-    let dff_out = lib::columns::util::cbox(dff_x - 2980., dff_y + 13135., dff_x - 330., dff_y + 13305.);
-    let wmask_in = wmask_stage_predecode(bit, p, unit_w, 1);
-    let m1_track = lib::columns::util::center_span_gridded(lib::columns::util::rect_cx_i(dff_out), 280.);
-    let m1_rect = lib::columns::util::rect_from_spans(m1_track, lib::columns::util::span_union(lib::columns::util::rect_vspan(dff_out), lib::columns::util::rect_vspan(wmask_in)));
-    let m1_to_input = lib::columns::util::rect_with_hspan(wmask_in, lib::columns::util::span_union(lib::columns::util::rect_hspan(wmask_in), m1_track));
-    lib::columns::util::draw_box("met1.drawing", m1_to_input);
-    lib::columns::util::draw_box("met1.drawing", m1_rect);
-    lib::columns::util::draw_contact_full(0, "li1.drawing", "met1.drawing", dff_out, m1_rect, 0, 0, true).2
-}
-
-fn draw_wmask_stage_power_full(bits: Int, mux: Int, p: DecoderParams, unit_w: Float, is_vdd: Bool) -> Rect {
-    let full_hspan = (0., wmask_full_right(bits, mux, p, unit_w),);
-    for stage in std::range(dec_num_stages(p)) {
-        let device_span = if is_vdd { dec_region_psdm_span(stage, p) } else { dec_region_nsdm_span(stage, p) };
-        let cnt = dec_power_strap_count(device_span);
-        for i in std::range(cnt) {
-            let local = dec_power_strap_span(device_span, i);
-            let shifted = (local.0 + dec_tile_abs_y(stage, p) + wmask_stage_y(p), local.1 + dec_tile_abs_y(stage, p) + wmask_stage_y(p),);
-            lib::columns::util::met1_port(full_hspan.0, shifted.0, full_hspan.1, shifted.1);
-        }
-    }
-    crect(x0=0., y0=0., x1=0., y1=0.)
-}
-
-fn draw_wmask_stage_nwell_full(bits: Int, mux: Int, p: DecoderParams, unit_w: Float) -> Rect {
-    let hspan = (0., (bits - 1) as Float * unit_w + dec_group_w(p),);
-    for stage in std::range(dec_num_stages(p)) {
-        let local = dec_region_nwell_span(stage, p);
-        let shifted = (local.0 + dec_tile_abs_y(stage, p) + wmask_stage_y(p), local.1 + dec_tile_abs_y(stage, p) + wmask_stage_y(p),);
-        lib::columns::util::draw_box("nwell.drawing", lib::columns::util::rect_from_spans(hspan, shifted));
-    }
-    crect(x0=0., y0=0., x1=0., y1=0.)
-}
-
-cell wmask_peripherals_exact(cols: Int, mux: Int, gran: Int, p: DecoderParams) {
-    let words = cols / mux;
-    let bits = words / gran;
-    let unit_w = lib::columns::util::wmask_unit_w(cols, mux, gran);
-    let full_right = wmask_full_right(bits, mux, p, unit_w);
-    let full_hspan = (0., full_right,);
-    for bit in std::range(bits) {
-        let stage = inst(wmask_decoder_stage(mux, p), x=wmask_stage_x(bit, p, unit_w), y=wmask_stage_y(p));
-        let dff = inst(lib::columns::dff::dff_column(4), x=wmask_dff_x(bit, mux, unit_w), y=wmask_dff_y());
-        draw_wmask_dff_to_stage(bit, mux, p, unit_w);
-    }
-    let we_span = lib::columns::util::rect_vspan(wmask_stage_predecode(0, p, unit_w, 0));
-    let we = lib::columns::util::met1_port(full_hspan.0, we_span.0, full_hspan.1, we_span.1);
-    draw_wmask_stage_power_full(bits, mux, p, unit_w, true);
-    draw_wmask_stage_power_full(bits, mux, p, unit_w, false);
-    let vdd = lib::columns::util::met2_port(full_hspan.0, 5650., full_hspan.1, 7450.);
-    let vss = lib::columns::util::met2_port(full_hspan.0, 9390., full_hspan.1, 11190.);
-    let clk = lib::columns::util::met2_port(full_hspan.0, 8175., full_hspan.1, 8495.);
-    let rstb = lib::columns::util::met2_port(full_hspan.0, 3940., full_hspan.1, 4260.);
-    draw_wmask_stage_nwell_full(bits, mux, p, unit_w);
-    let outline = crect(x0=0., y0=0., x1=full_right, y1=wmask_stage_y(p) + dec_stage_bbox(p).y1);
+    // Supply port shapes: every stage's met1 straps and the root's met2
+    // stripes.
+    pub let vdd_pins_m1 = util::coalesce_rects(tree.vdd_m1_tree);
+    pub let vss_pins_m1 = util::coalesce_rects(tree.vss_m1_tree);
+    pub let vdd_pins_m2 = util::coalesce_rects(tree.vdd_m2);
+    pub let vss_pins_m2 = util::coalesce_rects(tree.vss_m2);
 }

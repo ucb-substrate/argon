@@ -264,7 +264,6 @@ pub(super) fn field(base: &Value, field: &str) -> OpResult {
         // The base may have arrived as `Any`, so the field was never checked
         // against the struct.
         Value::Struct(value) => value
-            .fields
             .get(field)
             .cloned()
             .ok_or_else(|| error(ExecErrorKind::InvalidType)),
@@ -301,6 +300,7 @@ pub(super) fn index(base: &Value, index: &Value) -> OpResult {
 /// gives the value of each field the literal names; the rest come from `base`.
 pub(super) fn struct_lit<'v>(
     defs: &TypeDefs,
+    layouts: &StructLayouts,
     target: &StructLitTarget,
     explicit: impl Fn(&str) -> Option<&'v Value>,
     base: Option<&Value>,
@@ -309,47 +309,52 @@ pub(super) fn struct_lit<'v>(
     // `Any`. A variant literal has no base.
     let base = match (base, target) {
         (None, _) => None,
-        (Some(Value::Struct(value)), StructLitTarget::Struct(ty)) if value.name == ty.name => {
-            Some(&value.fields)
+        (Some(Value::Struct(value)), StructLitTarget::Struct(ty)) if value.name() == ty.name => {
+            Some(value)
         }
         (Some(_), _) => return Err(OpFailure::Error(ExecErrorKind::InvalidType, ErrorAt::Base)),
     };
     // Declaration order, whatever order the literal used: `CellArg::Struct`
     // fields are matched pairwise against the type's.
-    let declared = match target {
-        StructLitTarget::Struct(ty) => defs
-            .get(&ty.def)
-            .and_then(AdtDef::as_struct)
-            .map(|def| Either::Left(def.fields.keys())),
-        StructLitTarget::Variant { ty, variant } => defs
-            .get(&ty.def)
-            .and_then(AdtDef::as_enum)
-            .and_then(|def| def.variants.get(variant))
-            .and_then(|variant| match &variant.payload {
-                VariantTys::Struct(fields) => Some(Either::Right(fields.keys())),
-                VariantTys::Tuple(_) => None,
-            }),
-    }
-    .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
-    let fields = Iterator::map(declared, |name| {
-        let value = match explicit(name) {
-            Some(value) => Some(value.clone()),
-            None => base.and_then(|base| base.get(name).cloned()),
-        };
-        value.map(|value| (name.clone(), value))
-    })
-    .collect::<Option<FxIndexMap<_, _>>>()
-    .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
-    Ok(match target {
-        StructLitTarget::Struct(ty) => Value::Struct(Arc::new(StructValue {
-            name: ty.name.clone(),
-            fields,
-        })),
-        StructLitTarget::Variant { variant, .. } => Value::Enum(Arc::new(EnumValue {
-            variant: variant.clone(),
-            payload: VariantValues::Struct(fields),
-        })),
-    })
+    let (ty, variant) = match target {
+        StructLitTarget::Struct(ty) => {
+            let layout = layouts
+                .get(defs, ty)
+                .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
+            let values = layout
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, name)| match explicit(name) {
+                    Some(value) => Some(value.clone()),
+                    None => base.and_then(|base| match Arc::ptr_eq(&base.layout, &layout) {
+                        true => Some(base.values[index].clone()),
+                        false => base.get(name).cloned(),
+                    }),
+                })
+                .collect::<Option<SmallVec<_>>>()
+                .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
+            return Ok(Value::Struct(Arc::new(StructValue::new(layout, values))));
+        }
+        StructLitTarget::Variant { ty, variant } => (ty, variant),
+    };
+    let declared = defs
+        .get(&ty.def)
+        .and_then(AdtDef::as_enum)
+        .and_then(|def| def.variants.get(variant))
+        .and_then(|variant| match &variant.payload {
+            VariantTys::Struct(fields) => Some(fields.keys()),
+            VariantTys::Tuple(_) => None,
+        })
+        .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
+    let fields = declared
+        .map(|name| explicit(name).map(|value| (name.clone(), value.clone())))
+        .collect::<Option<FxIndexMap<_, _>>>()
+        .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
+    Ok(Value::Enum(Arc::new(EnumValue {
+        variant: variant.clone(),
+        payload: VariantValues::Struct(fields),
+    })))
 }
 
 pub(super) fn cons(head: &Value, tail: &Value) -> OpResult {
