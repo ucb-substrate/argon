@@ -698,7 +698,7 @@ dependencies = [
 [[package]]
 name = "atoll"
 version = "0.1.4"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "arcstr",
  "cache",
@@ -1094,7 +1094,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "cache"
 version = "0.7.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "backoff",
  "clap",
@@ -1391,7 +1391,7 @@ dependencies = [
 [[package]]
 name = "codegen"
 version = "0.10.3"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "convert_case 0.11.0",
  "darling 0.23.0",
@@ -1449,7 +1449,7 @@ dependencies = [
 [[package]]
 name = "config"
 version = "0.4.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "anyhow",
  "cache",
@@ -1499,9 +1499,9 @@ dependencies = [
 
 [[package]]
 name = "const_format"
-version = "0.2.36"
+version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4481a617ad9a412be3b97c5d403fef8ed023103368908b9c50af598ff467cc1e"
+checksum = "a3decb4d6965448659923544a634a0571ba44cede4e11ef15a5a317126840454"
 dependencies = [
  "const_format_proc_macros",
  "konst",
@@ -1509,9 +1509,9 @@ dependencies = [
 
 [[package]]
 name = "const_format_proc_macros"
-version = "0.2.34"
+version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d57c2eccfb16dbac1f4e61e206105db5820c9d26c3c472bc17c774259ef7744"
+checksum = "941b570269a642506f08cb5b688c04bfa6cfd41a26f8bcdc49db8fd00c0ab659"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1973,7 +1973,7 @@ checksum = "abd57806937c9cc163efc8ea3910e00a62e2aeb0b8119f1793a978088f8f6b04"
 [[package]]
 name = "diagnostics"
 version = "0.4.1"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "serde",
  "tracing",
@@ -2239,7 +2239,7 @@ dependencies = [
 [[package]]
 name = "enumify"
 version = "0.2.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "enumify_macros 0.3.2 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
 ]
@@ -2262,7 +2262,7 @@ dependencies = [
 [[package]]
 name = "enumify_macros"
 version = "0.3.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "convert_case 0.11.0",
  "darling 0.23.0",
@@ -2419,7 +2419,7 @@ dependencies = [
 [[package]]
 name = "examples"
 version = "0.2.1"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 
 [[package]]
 name = "exr"
@@ -2720,15 +2720,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fsevent-sys"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2845,7 +2836,7 @@ dependencies = [
 [[package]]
 name = "gds"
 version = "0.4.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "arcstr",
  "byteorder",
@@ -2865,7 +2856,7 @@ dependencies = [
 [[package]]
 name = "gdsconv"
 version = "0.2.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "arcstr",
  "gds",
@@ -3025,7 +3016,7 @@ dependencies = [
 [[package]]
 name = "geometry"
 version = "0.7.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "array_map",
  "geometry_macros 0.1.2 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
@@ -3050,7 +3041,7 @@ dependencies = [
 [[package]]
 name = "geometry_macros"
 version = "0.1.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "darling 0.23.0",
  "macrotools 0.2.1 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
@@ -4402,7 +4393,7 @@ dependencies = [
 [[package]]
 name = "layir"
 version = "0.2.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "aph_disjoint_set",
  "arcstr",
@@ -4692,7 +4683,7 @@ dependencies = [
 [[package]]
 name = "macrotools"
 version = "0.2.1"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -5039,7 +5030,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 [[package]]
 name = "ngspice"
 version = "0.5.3"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "arcstr",
  "cache",
@@ -5096,20 +5087,21 @@ checksum = "0676bb32a98c1a483ce53e500a81ad9c3d5b3f7c920c28c24e9cb0980d0b5bc8"
 
 [[package]]
 name = "notify"
-version = "8.2.0"
+version = "8.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d3d07927151ff8575b7087f245456e549fea62edf0ec4e565a5ee50c8402bc3"
+checksum = "c41a04a5f59df9322cc657286dd2d79f90816119b22c5f847607c850110205ab"
 dependencies = [
  "bitflags 2.13.2",
- "fsevent-sys",
  "inotify",
  "kqueue",
  "libc",
  "log",
  "mio",
  "notify-types",
+ "objc2-core-foundation",
+ "objc2-core-services",
  "walkdir",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5298,7 +5290,7 @@ dependencies = [
 [[package]]
 name = "nutlex"
 version = "0.4.3"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "enumify 0.2.2 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
  "nom",
@@ -5430,6 +5422,16 @@ dependencies = [
  "objc2 0.5.3",
  "objc2-foundation 0.2.2",
  "objc2-metal 0.2.2",
+]
+
+[[package]]
+name = "objc2-core-services"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "583300ad934cba24ff5292aee751ecc070f7ca6b39a574cc21b7b5e588e06a0b"
+dependencies = [
+ "libc",
+ "objc2-core-foundation",
 ]
 
 [[package]]
@@ -5808,7 +5810,7 @@ dependencies = [
 [[package]]
 name = "pathtree"
 version = "0.3.1"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 
 [[package]]
 name = "pbkdf2"
@@ -5823,7 +5825,7 @@ dependencies = [
 [[package]]
 name = "pegasus"
 version = "0.2.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "anyhow",
  "lazy_static",
@@ -6350,7 +6352,7 @@ dependencies = [
 [[package]]
 name = "psfparser"
 version = "0.1.5"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "anyhow",
  "enumify 0.2.2 (git+https://github.com/ucb-substrate/substrate2.git?branch=main)",
@@ -6867,9 +6869,9 @@ dependencies = [
 
 [[package]]
 name = "rust-embed"
-version = "8.13.0"
+version = "8.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19afa5b4b6a611de00bd1bdae6ae6f39084c9399f0679c3f52d8469cf335cc23"
+checksum = "e98f580cf7a2863aeb6827800283f52cbe6fb3f3bb7c1843783f903c16dcb8ad"
 dependencies = [
  "rust-embed-impl",
  "rust-embed-utils",
@@ -6878,9 +6880,9 @@ dependencies = [
 
 [[package]]
 name = "rust-embed-impl"
-version = "8.13.0"
+version = "8.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0d8afda6374eac59e066abee06d265247ebbaf3006cf878e2879e8356e34053"
+checksum = "a93e2f69cf224a6c7df7509aa5ba4a23f56828ee41b040e92ac8762371eb9ba7"
 dependencies = [
  "mime_guess",
  "proc-macro2",
@@ -6892,9 +6894,9 @@ dependencies = [
 
 [[package]]
 name = "rust-embed-utils"
-version = "8.13.0"
+version = "8.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d84e8ba78bd384263e5922f084cbe1b081c3b7e69add59c8fb097b879ba968a"
+checksum = "915e33dccbe7deb2b8a342dc4c517503fe85e0230ddbae40a4fb0220493dad9b"
 dependencies = [
  "sha2 0.11.1",
  "walkdir",
@@ -7102,7 +7104,7 @@ dependencies = [
 [[package]]
 name = "scir"
 version = "0.9.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "arcstr",
  "diagnostics",
@@ -7422,7 +7424,7 @@ dependencies = [
 [[package]]
 name = "sky130"
 version = "0.10.3"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "arcstr",
  "atoll",
@@ -7475,9 +7477,9 @@ dependencies = [
 
 [[package]]
 name = "smallvec"
-version = "1.16.3"
+version = "1.16.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
+checksum = "149309498a5f7334b12ddae0cad8aba81ce785fe91755068867e017cf98fee46"
 dependencies = [
  "serde",
 ]
@@ -7517,7 +7519,7 @@ dependencies = [
 [[package]]
 name = "snippets"
 version = "0.7.1"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "regex",
  "textwrap",
@@ -7544,7 +7546,7 @@ dependencies = [
 [[package]]
 name = "spectre"
 version = "0.11.3"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "arcstr",
  "cache",
@@ -7569,7 +7571,7 @@ dependencies = [
 [[package]]
 name = "spice"
 version = "0.9.3"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "arcstr",
  "ena",
@@ -7675,7 +7677,7 @@ dependencies = [
 [[package]]
 name = "substrate"
 version = "0.10.3"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "anyhow",
  "arcstr",
@@ -8600,7 +8602,7 @@ checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 [[package]]
 name = "type_dispatch"
 version = "0.5.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "duplicate",
  "type_dispatch_macros",
@@ -8609,7 +8611,7 @@ dependencies = [
 [[package]]
 name = "type_dispatch_macros"
 version = "0.4.2"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "itertools 0.14.0",
  "proc-macro-crate 3.5.0",
@@ -8732,7 +8734,7 @@ dependencies = [
 [[package]]
 name = "uniquify"
 version = "0.4.1"
-source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#01d9600f946437d3bc18806a6517e35001b68251"
+source = "git+https://github.com/ucb-substrate/substrate2.git?branch=main#c88780d5b87df8ee96723da73691d94e9f26bb74"
 dependencies = [
  "arcstr",
  "serde",
@@ -9364,7 +9366,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "12342cb4d8e3b046f3d80effd474a7a02447231330ef77d71daa6fbc40681143"
 dependencies = [
  "windows-core 0.57.0",
- "windows-targets 0.52.6",
+ "windows-targets",
 ]
 
 [[package]]
@@ -9432,7 +9434,7 @@ dependencies = [
  "windows-implement 0.57.0",
  "windows-interface 0.57.0",
  "windows-result 0.1.2",
- "windows-targets 0.52.6",
+ "windows-targets",
 ]
 
 [[package]]
@@ -9576,7 +9578,7 @@ version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e383302e8ec8515204254685643de10811af0ed97ea37210dc26fb0032647f8"
 dependencies = [
- "windows-targets 0.52.6",
+ "windows-targets",
 ]
 
 [[package]]
@@ -9621,7 +9623,7 @@ version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
 dependencies = [
- "windows-targets 0.52.6",
+ "windows-targets",
 ]
 
 [[package]]
@@ -9630,16 +9632,7 @@ version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.60.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2f500e4d28234f72040990ec9d39e3a6b950f9f22d3dba18416c35882612bcb"
-dependencies = [
- "windows-targets 0.53.5",
+ "windows-targets",
 ]
 
 [[package]]
@@ -9657,31 +9650,14 @@ version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b724f72796e036ab90c1021d4780d4d3d648aca59e491e6b98e725b84e99973"
 dependencies = [
- "windows_aarch64_gnullvm 0.52.6",
- "windows_aarch64_msvc 0.52.6",
- "windows_i686_gnu 0.52.6",
- "windows_i686_gnullvm 0.52.6",
- "windows_i686_msvc 0.52.6",
- "windows_x86_64_gnu 0.52.6",
- "windows_x86_64_gnullvm 0.52.6",
- "windows_x86_64_msvc 0.52.6",
-]
-
-[[package]]
-name = "windows-targets"
-version = "0.53.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4945f9f551b88e0d65f3db0bc25c33b8acea4d9e41163edf90dcd0b19f9069f3"
-dependencies = [
- "windows-link 0.2.1",
- "windows_aarch64_gnullvm 0.53.1",
- "windows_aarch64_msvc 0.53.1",
- "windows_i686_gnu 0.53.1",
- "windows_i686_gnullvm 0.53.1",
- "windows_i686_msvc 0.53.1",
- "windows_x86_64_gnu 0.53.1",
- "windows_x86_64_gnullvm 0.53.1",
- "windows_x86_64_msvc 0.53.1",
+ "windows_aarch64_gnullvm",
+ "windows_aarch64_msvc",
+ "windows_i686_gnu",
+ "windows_i686_gnullvm",
+ "windows_i686_msvc",
+ "windows_x86_64_gnu",
+ "windows_x86_64_gnullvm",
+ "windows_x86_64_msvc",
 ]
 
 [[package]]
@@ -9718,22 +9694,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a4622180e7a0ec044bb555404c800bc9fd9ec262ec147edd5989ccd0c02cd3"
 
 [[package]]
-name = "windows_aarch64_gnullvm"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9d8416fa8b42f5c947f8482c43e7d89e73a173cead56d044f6a56104a6d1b53"
-
-[[package]]
 name = "windows_aarch64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09ec2a7bb152e2252b53fa7803150007879548bc709c039df7627cabbd05d469"
-
-[[package]]
-name = "windows_aarch64_msvc"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9d782e804c2f632e395708e99a94275910eb9100b2114651e04744e9b125006"
 
 [[package]]
 name = "windows_i686_gnu"
@@ -9742,22 +9706,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e9b5ad5ab802e97eb8e295ac6720e509ee4c243f69d781394014ebfe8bbfa0b"
 
 [[package]]
-name = "windows_i686_gnu"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "960e6da069d81e09becb0ca57a65220ddff016ff2d6af6a223cf372a506593a3"
-
-[[package]]
 name = "windows_i686_gnullvm"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0eee52d38c090b3caa76c563b86c3a4bd71ef1a819287c19d586d7334ae8ed66"
-
-[[package]]
-name = "windows_i686_gnullvm"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa7359d10048f68ab8b09fa71c3daccfb0e9b559aed648a8f95469c27057180c"
 
 [[package]]
 name = "windows_i686_msvc"
@@ -9766,22 +9718,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "240948bc05c5e7c6dabba28bf89d89ffce3e303022809e73deaefe4f6ec56c66"
 
 [[package]]
-name = "windows_i686_msvc"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e7ac75179f18232fe9c285163565a57ef8d3c89254a30685b57d83a38d326c2"
-
-[[package]]
 name = "windows_x86_64_gnu"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "147a5c80aabfbf0c7d901cb5895d1de30ef2907eb21fbbab29ca94c5b08b1a78"
-
-[[package]]
-name = "windows_x86_64_gnu"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c3842cdd74a865a8066ab39c8a7a473c0778a3f29370b5fd6b4b9aa7df4a499"
 
 [[package]]
 name = "windows_x86_64_gnullvm"
@@ -9790,22 +9730,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "24d5b23dc417412679681396f2b49f3de8c1473deb516bd34410872eff51ed0d"
 
 [[package]]
-name = "windows_x86_64_gnullvm"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ffa179e2d07eee8ad8f57493436566c7cc30ac536a3379fdf008f47f6bb7ae1"
-
-[[package]]
 name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
-
-[[package]]
-name = "windows_x86_64_msvc"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "winnow"
@@ -10285,27 +10213,27 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zstd"
-version = "0.14.3"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
+checksum = "ad5020ab8f27bfc0024ad0a07aed6bf022a16208f479686fbed4fdd0c85eb0b3"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "8.2.0"
+version = "8.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
+checksum = "5a9ea9cc2576c2fcc104e9cec04f46e3ede564f4fbc206831e4ef7e859a4140d"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-sys"
-version = "2.1.2+zstd.1.5.7"
+version = "2.1.3+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
+checksum = "f729a06d0257428fd9d997ac8db7e1407bd0262ab016b085b36bc52957c0052d"
 dependencies = [
  "cc",
  "pkg-config",
