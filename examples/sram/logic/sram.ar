@@ -39,6 +39,15 @@ cell sram_routes(p: SramLayoutParams) {
     draw_signal_routes(p, floorplan::sram_grid(p, f), f, floorplan::place(p, f, true, true));
 }
 
+// The power straps and their vias, placed around construction copies of the
+// blocks and the signal `routes`. As its own cell, it is reused when the rest
+// of the core changes.
+cell sram_power(p: SramLayoutParams, with_control: Bool, routes: Shapes) {
+    let f = floorplan::sram_floorplan(p);
+    let b = floorplan::place(p, f, true, with_control);
+    pub let straps = lib::logic::power::draw_power(p, f, b, routes);
+}
+
 // The SRAM inside its guard ring: blocks, signal routes, and power, with the
 // bitcell array at the origin. Without control logic, the routes stop at its
 // pins.
@@ -46,7 +55,7 @@ cell sram_inner(p: SramLayoutParams, with_control: Bool) {
     let f = floorplan::sram_floorplan(p);
     let b = floorplan::place(p, f, false, with_control);
     let routes = draw_signal_routes(p, floorplan::sram_grid(p, f), f, b);
-    pub let straps = lib::logic::power::draw_power(p, f, b, routes);
+    pub let straps = inst(sram_power(p, with_control, routes), x=0., y=0.).straps;
 }
 
 // The guard ring's hole: the routing grid's metal extent with 1 um to spare.
