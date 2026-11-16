@@ -860,6 +860,11 @@ fn builtin_signature(name: &str) -> Option<SignatureInfo> {
             &[],
         ),
         "float" => signature("fn float() -> Float", &[], &[]),
+        "grid_floor" => signature(
+            "fn grid_floor(value: Float) -> Float",
+            &["value: Float"],
+            &[],
+        ),
         "eq" => signature(
             "fn eq(left: Float, right: Float)",
             &["left: Float", "right: Float"],

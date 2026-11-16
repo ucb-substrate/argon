@@ -6430,6 +6430,44 @@ cell top() {
     }
 
     #[test]
+    fn center_rects_rounds_down_to_the_grid() {
+        // Centering a 1-wide rectangle in a 1.5-wide one has no solution on
+        // the 0.1 grid; the inner rectangle sits half a grid step low and left.
+        let data = compile_top(
+            "use std::layout::{array, center_rects, crect, rect, text};
+             cell top() {
+                 let outer = rect(\"met1\", x0=0., y0=0., w=1.5, h=1.5);
+                 let cut = crect(layer=\"met2\", x0=0., y0=0., w=0.2, h=0.2);
+                 center_rects(outer, array(cut, 3, 0.4, 0.));
+                 text(\"t\", \"met1\", grid_floor((outer.x0 + outer.x1) / 2.), 0.);
+             }",
+        );
+        let cell = &data.cells[&data.top];
+        let mut cuts: Vec<_> = cell
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .filter(|rect| !rect.construction && rect.layer.as_deref() == Some("met2"))
+            .map(|rect| (rect.x0.0, rect.y0.0))
+            .collect();
+        cuts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // The array is 1 wide, so the slack is 0.5 in x and 1.3 in y.
+        for ((x0, y0), expected) in cuts.iter().zip([0.2, 0.6, 1.0]) {
+            assert_relative_eq!(*x0, expected, epsilon = EPSILON);
+            assert_relative_eq!(*y0, 0.6, epsilon = EPSILON);
+        }
+        let label = cell
+            .objects
+            .values()
+            .find_map(|object| match object {
+                SolvedValue::Text(text) => Some(text),
+                _ => None,
+            })
+            .expect("the cell emits one label");
+        assert_relative_eq!(label.x, 0.7, epsilon = EPSILON);
+    }
+
+    #[test]
     fn negative_path_dimensions_are_rejected() {
         // The width was silently absolutized and the extensions passed
         // straight through as a negative BGNEXTN/ENDEXTN.

@@ -32,6 +32,8 @@ let placed = std::layout::inst(inverter(1200., 2000., 4), x=100., y=50.);
 let bounds = std::layout::bbox(placed);
 ```
 
+Because `x` and `y` are the position, a cell can't have fields with those names; see [reserved names](/language/cells-functions#reserved-names). The `Inst` type can't be written in source, so annotate a parameter or result that holds an instance as `Any`.
+
 Only the fields the cell declares with [`pub let`](/language/cells-functions#public-fields) can be read this way. Reading another top-level `let` of the cell is an error. A field that holds a function, cell function, or variant constructor also can't be read through an instance.
 
 Imported GDS cells expose fields found in the file, including pin names when pin layers are configured.

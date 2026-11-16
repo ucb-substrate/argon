@@ -146,7 +146,7 @@ pub const RESERVED_CELL_FIELDS: [&str; 2] = ["x", "y"];
 pub const PLACEMENT_KEYWORDS: [&str; 4] = ["x", "y", "angle", "reflect"];
 
 /// Functions the compiler implements that every module calls by bare name.
-pub const BUILTINS: [&str; 17] = [
+pub const BUILTINS: [&str; 18] = [
     "cons",
     "head",
     "tail",
@@ -163,6 +163,7 @@ pub const BUILTINS: [&str; 17] = [
     "min_int",
     "max_via_array",
     "float",
+    "grid_floor",
     "eq",
 ];
 
@@ -203,6 +204,7 @@ enum Builtin {
     Path,
     Text,
     Float,
+    GridFloor,
     Eq,
     Dimension,
     Inst,
@@ -242,6 +244,7 @@ impl Builtin {
             "min_int" => Self::MinInt,
             "max_via_array" => Self::MaxViaArray,
             "float" => Self::Float,
+            "grid_floor" => Self::GridFloor,
             "eq" => Self::Eq,
             _ => return None,
         })
@@ -292,6 +295,7 @@ impl Builtin {
             | Self::MinInt
             | Self::MaxViaArray
             | Self::Float
+            | Self::GridFloor
             | Self::Eq => return None,
         })
     }
@@ -2741,6 +2745,8 @@ mod builtin_sig {
         LazyLock::new(|| Signature::positional([Ty::Int, Ty::Int, Ty::Int]));
     pub(super) static EQ: LazyLock<Signature> =
         LazyLock::new(|| Signature::positional([Ty::Float, Ty::Float]));
+    pub(super) static FLOAT: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::Float]));
     pub(super) static DIMENSION: LazyLock<Signature> = LazyLock::new(|| {
         Signature::positional([
             Ty::Float,
@@ -6425,6 +6431,10 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                 }
                 "float" => {
                     self.typecheck_args(input.span, args, &builtin_sig::NONE);
+                    (None, Ty::Float)
+                }
+                "grid_floor" => {
+                    self.typecheck_args(input.span, args, &builtin_sig::FLOAT);
                     (None, Ty::Float)
                 }
                 "eq" => {
@@ -14328,6 +14338,28 @@ impl<'a> ExecPass<'a> {
                         span: c.expr.span,
                     };
                     let var = state.new_solver_var(&span, VarObject::Float, VarRole::Value);
+                    self.values
+                        .insert(vid, Defer::Ready(Value::Linear(LinearExpr::from(var))));
+                    true
+                }
+                Some(Builtin::GridFloor) => {
+                    let Defer::Ready(value) = &self.values[&c.state.posargs[0]] else {
+                        self.add_value_dependent(c.state.posargs[0], vid);
+                        return Ok(false);
+                    };
+                    let Some(expr) = value.get_linear().cloned() else {
+                        let span = self.span(&vref.loc, c.expr.span);
+                        self.invalid_type(cell_id, &span);
+                        return self.poison(vid);
+                    };
+                    let state = self.cell_states.get_mut(&cell_id).unwrap();
+                    let span = Span {
+                        path: state.scope_span(vref.loc.scope).path.clone(),
+                        span: c.expr.span,
+                    };
+                    let var = state.new_solver_var(&span, VarObject::Float, VarRole::Value);
+                    let constraint = state.solver.constrain_floor(var, &expr);
+                    state.constraint_span_map.insert(constraint, span);
                     self.values
                         .insert(vid, Defer::Ready(Value::Linear(LinearExpr::from(var))));
                     true

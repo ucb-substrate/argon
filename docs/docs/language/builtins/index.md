@@ -9,7 +9,7 @@ Built-in functions are provided by the compiler, are in scope in every module, a
 
 | Page | Functions |
 | --- | --- |
-| [Constraints](/language/builtins/constraints) | `float`, `eq` |
+| [Constraints](/language/builtins/constraints) | `float`, `grid_floor`, `eq` |
 | [Collections](/language/builtins/collections) | `cons`, `head`, `tail`, `range_full`, `seq_len`, `seq_concat`, `seq_flatten`, `seq_sum`, `seq_any`, `seq_all` |
 | [Math](/language/builtins/math) | `max_float`, `min_float`, `max_int`, `min_int` |
 | [Vias](/language/builtins/vias) | `max_via_array` |

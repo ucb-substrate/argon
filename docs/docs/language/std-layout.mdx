@@ -336,7 +336,7 @@ If the rectangles don't overlap, the result is inverted rather than empty: this 
 
 ### `center_rects` {#center-rects}
 
-<ApiItem id="center-rects" name="std::layout::center_rects" signature={'center_rects(r1: Rect, r2: Rect) -> ()'} summary={<>Constrains two rectangles to share a center.</>}>
+<ApiItem id="center-rects" name="std::layout::center_rects" signature={'center_rects(r1: Rect, r2: Rect) -> ()'} summary={<>Constrains two rectangles to share a center, as closely as the grid allows.</>}>
 
 <ParameterTable rows={[
   {name: 'r1', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: 'First rectangle.'},
@@ -344,6 +344,8 @@ If the rectangles don't overlap, the result is inverted rather than empty: this 
 ]} />
 
 <Returns type="()">Nothing; two center constraints are added.</Returns>
+
+When the two widths or heights differ by an odd number of grid steps, `r2`'s center is half a step left of or below `r1`'s, so both stay on the grid. Either rectangle can be the one the constraints place.
 
 </ApiItem>
 

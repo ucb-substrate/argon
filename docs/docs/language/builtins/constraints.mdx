@@ -8,7 +8,7 @@ import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReferenc
 
 # Constraint built-ins
 
-Constraints relate [`Float`](/language/types/scalars#float) expressions; the solver finds geometry that satisfies them. For an equality constraint with a label the GUI draws, see [`std::layout::dimension`](/language/std-layout#dimension).
+Constraints relate [`Float`](/language/types/scalars#float) expressions; the solver finds geometry that satisfies them. See [constraints](/language/constraints) for how the solver determines values. For an equality constraint with a label the GUI draws, see [`std::layout::dimension`](/language/std-layout#dimension).
 
 ## `float`
 
@@ -19,8 +19,27 @@ Use it for a value you want to name now and constrain later.
 <Returns type="Float" href="/language/types/scalars#float">A variable with no constraints on it yet.</Returns>
 
 ```argon
-let center = float();
-eq(center, (bounds.x0 + bounds.x1) / 2.);
+let gap = float();
+eq(b.x0, a.x1 + gap);
+eq(c.x0, b.x1 + gap);
+```
+
+</ApiItem>
+
+## `grid_floor`
+
+<ApiItem id="grid-floor" name="grid_floor" signature={'grid_floor(value: Float) -> Float'} summary={<>Rounds a value down to the manufacturing grid.</>}>
+
+<ParameterTable rows={[
+  {name: 'value', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required, positional', description: 'A linear expression, which need not be solved yet.'},
+]} />
+
+<Returns type="Float" href="/language/types/scalars#float">A new variable equal to `value` rounded down to the grid.</Returns>
+
+It doesn't wait for `value`: the solver determines the result as soon as it can determine `value`, and before anything constrained to the result. Use it for midpoints and other values that can fall between grid points; see [staying on the grid](/language/constraints#staying-on-the-grid).
+
+```argon
+text("vdd", "li1.label", grid_floor((pin.x0 + pin.x1) / 2.), grid_floor((pin.y0 + pin.y1) / 2.));
 ```
 
 </ApiItem>

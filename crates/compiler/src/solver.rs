@@ -72,6 +72,17 @@ fn is_off_grid(value: f64, snapped: f64, grid: f64) -> bool {
     (value - snapped).abs() > tolerance
 }
 
+/// The largest grid point at or below `value`, treating floating-point noise
+/// as on the grid.
+fn floor_to_grid(value: f64, grid: f64) -> f64 {
+    let nearest = crate::tech::snap(value, grid);
+    if nearest > value && is_off_grid(value, nearest, grid) {
+        crate::tech::snap(nearest - grid, grid)
+    } else {
+        nearest
+    }
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize, Ord, PartialOrd)]
 pub struct Var(u64);
 
@@ -195,6 +206,11 @@ pub struct Solver {
     /// constraint that couples several of them, so the diagnostic needs the
     /// number, not just the fact that a miss happened.
     off_grid_vars: FxIndexMap<Var, f64>,
+    /// Constraints `var = expr` from [`Self::constrain_floor`], with their
+    /// `var`, which they round down to the grid.
+    floor_constraints: FxIndexMap<ConstraintId, Var>,
+    /// The variables of `floor_constraints`.
+    floor_vars: FxIndexSet<Var>,
     // Per-`solve()` scratch for the sparse elimination pre-pass (`eliminate_definitional`).
     // `elim_worklist` holds constraints to (re)examine for a small pivot; `substitutions`
     // records `var = expr` definitions for variables eliminated via a 2-variable
@@ -222,6 +238,8 @@ impl Default for Solver {
             back_substitute_stack: Vec::new(),
             inconsistent_constraints: FxIndexSet::default(),
             off_grid_vars: FxIndexMap::default(),
+            floor_constraints: FxIndexMap::default(),
+            floor_vars: FxIndexSet::default(),
             elim_worklist: VecDeque::new(),
             substitutions: Vec::new(),
             sparse_nullspace_cache: None,
@@ -421,6 +439,48 @@ impl Solver {
         }
     }
 
+    /// Constrains `var`, a new variable, to `expr` rounded down to the grid.
+    /// The solver solves `var` from this constraint before anything that
+    /// depends on it, so a centered shape lands on the grid.
+    pub fn constrain_floor(&mut self, var: Var, expr: &LinearExpr) -> ConstraintId {
+        let id = self.next_constraint;
+        self.next_constraint += 1;
+        self.floor_constraints.insert(id, var);
+        self.floor_vars.insert(var);
+        self.record_eq0(id, LinearExpr::difference(&LinearExpr::from(var), expr));
+        id
+    }
+
+    /// Whether the floor constraint `id` solves `var`.
+    fn floors(&self, id: ConstraintId, var: Var) -> bool {
+        self.floor_constraints.get(&id) == Some(&var)
+    }
+
+    /// Whether constraint `id`, with every variable solved, leaves `residual`
+    /// out of tolerance. A floor constraint's residual is its variable minus
+    /// its expression, which rounding down puts in `(-grid, 0]`.
+    fn violated(&self, id: ConstraintId, residual: f64) -> bool {
+        if self.floor_constraints.contains_key(&id) {
+            let tolerance = EPSILON * self.grid.max(1.);
+            residual > tolerance || residual <= tolerance - self.grid
+        } else {
+            relative_ne!(residual, 0., epsilon = EPSILON)
+        }
+    }
+
+    /// The value constraint `id` solves `var` to: `val` rounded down to the
+    /// grid if it is `var`'s floor constraint, and snapped otherwise.
+    fn settle(&mut self, id: ConstraintId, var: Var, val: f64) -> f64 {
+        if self.floors(id, var) {
+            return floor_to_grid(val, self.grid);
+        }
+        let rounded = crate::tech::snap(val, self.grid);
+        if is_off_grid(val, rounded, self.grid) {
+            self.off_grid_vars.insert(var, val);
+        }
+        rounded
+    }
+
     /// When back substitution would leave the constraint `lhs - rhs = 0` with
     /// one term, solves that term's variable as it would, and goes on to the
     /// constraints the variable is in; such a constraint is then dropped, so it
@@ -527,30 +587,34 @@ impl Solver {
             && let Some(constraint) = self.constraints.get_mut(&id)
         {
             constraint.simplify(&self.solved_vars);
-            if constraint.coeffs.is_empty()
-                && !relative_eq!(constraint.constant, 0., epsilon = EPSILON)
-            {
-                self.inconsistent_constraints.insert(id);
-                self.constraints.swap_remove(&id);
+            let constant = constraint.constant;
+            let term = match constraint.coeffs[..] {
+                [term] => Some(term),
+                [] => None,
+                _ => return,
+            };
+            let Some((coeff, var)) = term else {
+                if self.violated(id, constant) {
+                    self.inconsistent_constraints.insert(id);
+                    self.constraints.swap_remove(&id);
+                }
                 return;
-            }
-            if constraint.coeffs.len() != 1 {
-                return;
-            }
-            // If constraint solves a variable, insert it into the solved vars and traverse all
+            };
+            // The constraint solves a variable: insert it into the solved vars and traverse all
             // constraints involving the variable.
-            let (coeff, var) = constraint.coeffs[0];
-            let val = -constraint.constant / coeff;
-            if let Some(old_val) = self.solved_vars.get(&var) {
-                if relative_ne!(*old_val, val, epsilon = EPSILON) {
+            let val = -constant / coeff;
+            if let Some(&old_val) = self.solved_vars.get(&var) {
+                let val = if self.floors(id, var) {
+                    floor_to_grid(val, self.grid)
+                } else {
+                    val
+                };
+                if relative_ne!(old_val, val, epsilon = EPSILON) {
                     self.inconsistent_constraints.insert(id);
                 }
             } else {
-                let rounded_val = crate::tech::snap(val, self.grid);
-                if is_off_grid(val, rounded_val, self.grid) {
-                    self.off_grid_vars.insert(var, val);
-                }
-                self.solve_var(var, rounded_val);
+                let val = self.settle(id, var, val);
+                self.solve_var(var, val);
             }
             self.constraints.swap_remove(&id);
             if let Some(constraints) = self.var_to_constraints.get(&var) {
@@ -576,6 +640,19 @@ impl Solver {
         if !entered_body {
             return;
         }
+        self.solve_linear();
+        while self.solve_floors() {
+            self.solve_linear();
+        }
+    }
+
+    /// One pass of [`Self::solve`] that leaves aside floor constraints with
+    /// more than one unknown, since solving them jointly with the rest would
+    /// not round their variables first.
+    fn solve_linear(&mut self) {
+        if self.unsolved_vars.is_empty() || self.constraints.is_empty() {
+            return;
+        }
         // Sparsity-exploiting pre-pass: peel off variables that are uniquely defined
         // by a constraint of size <= 2 (generalizing 1-variable back-substitution),
         // shrinking the system before sparse analysis or the dense fallback. Variables eliminated via a
@@ -589,15 +666,32 @@ impl Solver {
         let substitutions_changed_coordinates = !self.substitutions.is_empty();
         self.sparse_nullspace_cache = Some(Vec::new());
 
+        self.floor_constraints
+            .retain(|id, _| self.constraints.contains_key(id));
+        let floors: Vec<_> = self
+            .floor_constraints
+            .keys()
+            .filter_map(|id| Some((*id, self.constraints.swap_remove(id)?)))
+            .collect();
+        if !floors.is_empty() {
+            // The components below leave out the floor constraints, so their
+            // null spaces are not the system's.
+            self.sparse_nullspace_cache = None;
+        }
         for component in self.constraint_components() {
             self.solve_component(&component.vars, &component.constraints);
         }
+        self.constraints.extend(floors);
+        let mut solved = Vec::new();
         for (id, constraint) in self.constraints.iter_mut() {
             constraint.simplify(&self.solved_vars);
-            if constraint.coeffs.is_empty()
-                && approx::relative_ne!(constraint.constant, 0., epsilon = EPSILON)
-            {
-                self.inconsistent_constraints.insert(*id);
+            if constraint.coeffs.is_empty() {
+                solved.push((*id, constraint.constant));
+            }
+        }
+        for (id, residual) in solved {
+            if self.violated(id, residual) {
+                self.inconsistent_constraints.insert(id);
             }
         }
         self.constraints
@@ -607,6 +701,38 @@ impl Solver {
         if substitutions_changed_coordinates {
             self.sparse_nullspace_cache = None;
         }
+    }
+
+    /// Solves each floor constraint whose only unknown is its own variable,
+    /// rounding down, and back-substitutes the result. Returns whether any was
+    /// solved.
+    fn solve_floors(&mut self) -> bool {
+        let floors: Vec<_> = self
+            .floor_constraints
+            .iter()
+            .map(|(id, var)| (*id, *var))
+            .collect();
+        let mut progress = false;
+        for (id, var) in floors {
+            let Some(constraint) = self.constraints.get_mut(&id) else {
+                continue;
+            };
+            constraint.simplify(&self.solved_vars);
+            if let [(coeff, only)] = constraint.coeffs[..]
+                && only == var
+            {
+                let val = floor_to_grid(-constraint.constant / coeff, self.grid);
+                self.remove_constraint(id);
+                self.solve_var(var, val);
+                self.back_substitute_stack
+                    .extend(self.var_to_constraints.get(&var).into_iter().flatten());
+                while !self.back_substitute_stack.is_empty() {
+                    self.try_back_substitute();
+                }
+                progress = true;
+            }
+        }
+        progress
     }
 
     /// Sparse elimination pre-pass. Repeatedly examines constraints with at most two
@@ -630,7 +756,7 @@ impl Solver {
             let constant = constraint.constant;
             match len {
                 0 => {
-                    if relative_ne!(constant, 0., epsilon = EPSILON) {
+                    if self.violated(id, constant) {
                         self.inconsistent_constraints.insert(id);
                     }
                     self.remove_constraint(id);
@@ -666,6 +792,11 @@ impl Solver {
     fn eliminate_unary(&mut self, id: ConstraintId) {
         let (coeff, var) = self.constraints[&id].coeffs[0];
         let val = -self.constraints[&id].constant / coeff;
+        let val = if self.floors(id, var) {
+            floor_to_grid(val, self.grid)
+        } else {
+            val
+        };
         self.remove_constraint(id);
         self.requeue_neighbors(var);
         self.assign_var(var, val);
@@ -675,11 +806,21 @@ impl Solver {
     /// it in terms of the other and substituting it out of every other constraint that
     /// mentions it. Records the definition in `substitutions` for later resolution.
     fn eliminate_binary(&mut self, id: ConstraintId) {
+        // A floor constraint waits until it can solve its own variable.
+        if self.floor_constraints.contains_key(&id) {
+            return;
+        }
         let (c0, v0) = self.constraints[&id].coeffs[0];
         let (c1, v1) = self.constraints[&id].coeffs[1];
         let constant = self.constraints[&id].constant;
-        // Pivot on the larger-magnitude coefficient (partial-pivoting analogue).
-        let ((a, v), (cw, w)) = if c0.abs() >= c1.abs() {
+        // Pivot on the larger-magnitude coefficient (partial-pivoting analogue), but keep
+        // a floor variable, so that its floor constraint solves it before what depends on it.
+        let pivot_first = match (self.floor_vars.contains(&v0), self.floor_vars.contains(&v1)) {
+            (true, false) => false,
+            (false, true) => true,
+            _ => c0.abs() >= c1.abs(),
+        };
+        let ((a, v), (cw, w)) = if pivot_first {
             ((c0, v0), (c1, v1))
         } else {
             ((c1, v1), (c0, v0))
@@ -1778,6 +1919,79 @@ mod tests {
         s.constrain_eq0(c(vec![(1., a), (1., b), (1., d)], -1.)); // a + b + c = 1  => 1/3 each
         s.solve();
         assert!(!s.off_grid_vars().is_empty());
+    }
+
+    /// Centers a 100-wide span in `[0, 155]` with a floor constraint, adding
+    /// the constraints in the given order, and returns the span's edges.
+    fn floor_centered(floor_first: bool) -> (Solver, f64, f64) {
+        let mut s = Solver::with_grid(5.);
+        let (x0, x1, d) = (s.new_var(), s.new_var(), s.new_var());
+        let floor = |s: &mut Solver| {
+            // d = floor((155 - (x1 - x0)) / 2)
+            s.constrain_floor(d, &c(vec![(-0.5, x1), (0.5, x0)], 77.5));
+        };
+        if floor_first {
+            floor(&mut s);
+        }
+        s.constrain_eq0(c(vec![(1., x1), (-1., x0)], -100.));
+        s.constrain_eq0(c(vec![(1., x0), (-1., d)], 0.));
+        if !floor_first {
+            floor(&mut s);
+        }
+        s.solve();
+        let (x0, x1) = (s.value_of(x0).unwrap(), s.value_of(x1).unwrap());
+        (s, x0, x1)
+    }
+
+    /// A floor constraint rounds its variable down before the variables that
+    /// depend on it are solved, whichever order the constraints come in.
+    #[test]
+    fn floor_constraint_rounds_down_before_dependents() {
+        for floor_first in [false, true] {
+            let (s, x0, x1) = floor_centered(floor_first);
+            assert_relative_eq!(x0, 25., epsilon = EPSILON);
+            assert_relative_eq!(x1, 125., epsilon = EPSILON);
+            assert!(s.off_grid_vars().is_empty());
+            assert!(s.inconsistent_constraints().is_empty());
+        }
+    }
+
+    /// A floor constraint whose expression only a dense system determines is
+    /// solved after that system, and its dependents after it.
+    #[test]
+    fn floor_constraint_after_dense_component() {
+        let mut s = Solver::with_grid(5.);
+        let (a, b, cc, d, x) = (
+            s.new_var(),
+            s.new_var(),
+            s.new_var(),
+            s.new_var(),
+            s.new_var(),
+        );
+        s.constrain_eq0(c(vec![(1., a), (1., b), (1., cc)], -30.));
+        s.constrain_eq0(c(vec![(1., a), (2., b), (1., cc)], -40.));
+        s.constrain_eq0(c(vec![(1., a), (1., b), (3., cc)], -50.));
+        s.constrain_eq0(c(vec![(1., x), (-1., d)], 0.));
+        s.constrain_floor(d, &c(vec![(0.5, a)], 2.5)); // floor(7.5)
+        s.solve();
+        assert_relative_eq!(s.value_of(d).unwrap(), 5., epsilon = EPSILON);
+        assert_relative_eq!(s.value_of(x).unwrap(), 5., epsilon = EPSILON);
+        assert!(s.off_grid_vars().is_empty());
+        assert!(s.inconsistent_constraints().is_empty());
+    }
+
+    /// A value other constraints give a floor variable must be its
+    /// expression rounded down.
+    #[test]
+    fn floor_constraint_checks_a_value_given_elsewhere() {
+        for (given, consistent) in [(5., true), (10., false)] {
+            let mut s = Solver::with_grid(5.);
+            let d = s.new_var();
+            s.constrain_eq0(c(vec![(1., d)], -given));
+            s.constrain_floor(d, &c(vec![], 7.5));
+            s.solve();
+            assert_eq!(s.inconsistent_constraints().is_empty(), consistent);
+        }
     }
 
     /// `VarSet` keeps the same order as an `IndexSet` under the same inserts

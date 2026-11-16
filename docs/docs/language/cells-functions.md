@@ -98,3 +98,16 @@ Here `p.metal` is readable, but `p.margin` is an error because `margin` is priva
 - `pub` applies only to a `let` at the top level of a cell body. A `pub let` in a function, loop, branch, or block is an error.
 - A `pub let` with a pattern, such as `pub let Size { w, h } = size;`, makes every name the pattern binds public.
 - If a name is bound more than once, the last binding is the field, and its `pub` decides whether the field is public.
+
+## Reserved names
+
+These names can't be used where noted:
+
+| Names | Not allowed as | Why |
+| --- | --- | --- |
+| `as`, `cell`, `const`, `else`, `enum`, `false`, `fn`, `for`, `if`, `in`, `let`, `match`, `mod`, `pub`, `struct`, `true`, `use` | Any name | Keywords. |
+| The [built-in functions](/language/builtins), such as `eq`, `float`, `grid_floor`, `head`, and `cons` | The name of a cell, function, or other module item, or a name bound with `use` | Every module calls them by bare name. A local `let` may shadow one. |
+| `x`, `y` | A `let` at the top level of a cell | They are an [instance's](/language/types/instance#instance-values) position, so they can't also be fields. Cell parameters, and `let`s in functions, loops, branches, and blocks, may use them. |
+| `x`, `y`, `angle`, `reflect`, in any case | A [device](/language/std-schematic#device) parameter | They place the device in the schematic; see [placement and routes](/language/schematic#placement-and-routes). |
+
+Simulators also reserve some net and subcircuit names, which netlists rename; see [reserved names in schematics](/language/schematic#reserved-names).

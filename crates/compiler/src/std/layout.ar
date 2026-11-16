@@ -102,8 +102,8 @@ fn eq_rect(r1: Rect, r2: Rect) {
 }
 
 fn center_rects(r1: Rect, r2: Rect) {
-    eq((r1.x0 + r1.x1)/2., (r2.x0 + r2.x1)/2.);
-    eq((r1.y0 + r1.y1)/2., (r2.y0 + r2.y1)/2.);
+    eq(r2.x0, r1.x0 + grid_floor((r1.w - r2.w) / 2.));
+    eq(r2.y0, r1.y0 + grid_floor((r1.h - r2.h) / 2.));
 }
 
 fn crect2rect(r: Rect) -> Rect {

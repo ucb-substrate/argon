@@ -1,0 +1,365 @@
+use sky130::{fet1v8, tap};
+use std::layout::{array, center_rects, crect, inst, max_array, rect, text};
+use std::schematic::{DeviceKind, Signal, device};
+
+/// A net that runs between the comparator's rows.
+enum Net {
+    Outp,
+    Outn,
+    Mp,
+    Mn,
+    Inp,
+    Inn,
+    Clk,
+    Tail,
+    Vdd,
+    Vss,
+}
+
+/// How a row connects one terminal of its devices: all four to one net, or
+/// the outer pair to one net and the inner pair to another.
+enum Strap {
+    Wide(Net),
+    Sides(Net, Net),
+}
+
+/// A row of four identical transistors, mirrored about x = 0, and how each
+/// of their terminals connects.
+struct Row {
+    nfet: Bool,
+    w: Float,
+    nf: Int,
+    g: Strap,
+    s: Strap,
+    d: Strap,
+}
+
+/// The comparator's signals.
+struct Nets {
+    clk: Signal,
+    inp: Signal,
+    inn: Signal,
+    outp: Signal,
+    outn: Signal,
+    mp: Signal,
+    mn: Signal,
+    tail: Signal,
+    vdd: Signal,
+    vss: Signal,
+}
+
+/// A StrongARM latch with an NMOS input pair, or a PMOS one if `pmos_input`.
+///
+/// Each transistor is split between two mirrored halves, so its `_w` and
+/// `_nf` give the finger width and finger count of each half; the tail has
+/// two such pairs. Finger widths are at least 420 nm.
+cell strong_arm(
+    half_tail_w: Float,
+    half_tail_nf: Int,
+    input_pair_w: Float,
+    input_pair_nf: Int,
+    inv_input_w: Float,
+    inv_input_nf: Int,
+    inv_precharge_w: Float,
+    inv_precharge_nf: Int,
+    precharge_w: Float,
+    precharge_nf: Int,
+    pmos_input: Bool,
+) {
+    pub let clk = Signal();
+    pub let inp = Signal();
+    pub let inn = Signal();
+    pub let outp = Signal();
+    pub let outn = Signal();
+    pub let vdd = Signal();
+    pub let vss = Signal();
+    let n = Nets { clk, inp, inn, outp, outn, mp: Signal(), mn: Signal(), tail: Signal(), vdd, vss };
+
+    // The reset devices hold the outputs and the input pair's drains at the
+    // reset rail until the tail switch connects the evaluation rail.
+    let input_type = !pmos_input;
+    let reset_rail = if pmos_input { Net::Vss } else { Net::Vdd };
+    let eval_rail = if pmos_input { Net::Vdd } else { Net::Vss };
+    let half_tail = Row {
+        nfet: input_type, w: half_tail_w, nf: half_tail_nf,
+        g: Strap::Wide(Net::Clk),
+        s: Strap::Wide(eval_rail),
+        d: Strap::Wide(Net::Tail),
+    };
+    let input_pair = Row {
+        nfet: input_type, w: input_pair_w, nf: input_pair_nf,
+        g: Strap::Sides(Net::Inp, Net::Inn),
+        s: Strap::Wide(Net::Tail),
+        d: Strap::Sides(Net::Mn, Net::Mp),
+    };
+    let inv_input = Row {
+        nfet: input_type, w: inv_input_w, nf: inv_input_nf,
+        g: Strap::Sides(Net::Outp, Net::Outn),
+        s: Strap::Sides(Net::Mn, Net::Mp),
+        d: Strap::Sides(Net::Outn, Net::Outp),
+    };
+    let inv_precharge = Row {
+        nfet: pmos_input, w: inv_precharge_w, nf: inv_precharge_nf,
+        g: Strap::Sides(Net::Outp, Net::Outn),
+        s: Strap::Wide(reset_rail),
+        d: Strap::Sides(Net::Outn, Net::Outp),
+    };
+    let precharge_mid = Row {
+        nfet: pmos_input, w: precharge_w, nf: precharge_nf,
+        g: Strap::Wide(Net::Clk),
+        s: Strap::Wide(reset_rail),
+        d: Strap::Sides(Net::Mn, Net::Mp),
+    };
+    let precharge_out = Row {
+        nfet: pmos_input, w: precharge_w, nf: precharge_nf,
+        g: Strap::Wide(Net::Clk),
+        s: Strap::Wide(reset_rail),
+        d: Strap::Sides(Net::Outn, Net::Outp),
+    };
+
+    // From the top: an n-tap, three PMOS rows, a p-tap, and three NMOS rows.
+    let rows = if pmos_input {
+        [half_tail, input_pair, inv_input, inv_precharge, precharge_mid, precharge_out]
+    } else {
+        [precharge_out, precharge_mid, inv_precharge, inv_input, input_pair, half_tail]
+    };
+    for r in rows {
+        devices(r, n);
+    }
+
+    // Rows hang below y = 0, 200 apart to keep their poly 210 apart. The
+    // p-tap's met1 is 420 tall, and its tap keeps clear of the gate contacts above it.
+    let r0 = place(rows[0], 0.);
+    let r1 = place(rows[1], r0[0].g.y0 - 200.);
+    let r2 = place(rows[2], r1[0].g.y0 - 200.);
+    let r3 = place(rows[3], r2[0].g.y0 - 810.);
+    let r4 = place(rows[4], r3[0].g.y0 - 200.);
+    let r5 = place(rows[5], r4[0].g.y0 - 200.);
+    let placed = [r0, r1, r2, r3, r4, r5];
+    let core = -2. * lowest([for p in placed { p[0].sdm.x0 }]) - 260.;
+    let ntap = inst(rail(1, core), x=0.);
+    eq(ntap.m1.y0, 170.);
+    let ptap = inst(rail(0, core), x=0.);
+    eq(ptap.m1.y1, r2[0].g.y0 - 220.);
+
+    rect("nwell.drawing", x0=ntap.sdm.x0 - 50., x1=ntap.sdm.x1 + 50., y0=r2[0].sdm.y0 - 50., y1=ntap.sdm.y1 + 50.);
+
+    // Outer devices reach tracks to their outside, inner ones tracks between them.
+    let edge = lowest([for p in placed { p[0].sdm.x1 }]) - 160.;
+    let bottom = r5[0].g.y0 - 20.;
+    for i in std::range(6) {
+        let p = placed[i];
+        let r = rows[i];
+        strap(r.g, [for d in p { d.g }], edge);
+        strap(r.s, [for d in p { d.s }], edge);
+        strap(r.d, [for d in p { d.d }], edge);
+    }
+    for net in [Net::Outn, Net::Outp, Net::Mn, Net::Inp] {
+        track(edge + outer(net), bottom, ntap.m1.y1);
+        track(-edge - outer(net), bottom, ntap.m1.y1);
+    }
+    for net in [Net::Outn, Net::Outp, Net::Mp, Net::Inn, Net::Clk, Net::Tail] {
+        track(inner(net), bottom, ntap.m1.y1);
+    }
+    let rails = inner(Net::Vdd);
+    track(rails, r2[0].g.y0, ntap.m1.y1);
+    track(rails, bottom, ptap.m1.y1);
+    via1(ntap.m1, rails);
+    via1(ptap.m1, rails);
+
+    // The outer tracks join the inner ones on met3.
+    let outn_m3 = cross(edge, Net::Outn, bottom + 200.);
+    let outp_m3 = cross(edge, Net::Outp, outn_m3.y1 + 300.);
+    let mn_m3 = cross(edge, Net::Mn, outp_m3.y1 + 300.);
+    let inp_m3 = cross(edge, Net::Inp, mn_m3.y1 + 300.);
+    via2(outn_m3, inner(Net::Outn));
+    via2(outp_m3, inner(Net::Outp));
+
+    pin("vdd", "met1.pin", "met1.label", ntap.m1);
+    pin("vss", "met1.pin", "met1.label", ptap.m1);
+    pin("outn", "met3.pin", "met3.label", outn_m3);
+    pin("outp", "met3.pin", "met3.label", outp_m3);
+    pin("inp", "met3.pin", "met3.label", inp_m3);
+    pin("inn", "met2.pin", "met2.label", crect(x0=inner(Net::Inn) - 140., w=280., y0=ptap.m1.y0, y1=ptap.m1.y1));
+    pin("clk", "met2.pin", "met2.label", crect(x0=inner(Net::Clk) - 140., w=280., y0=ptap.m1.y0, y1=ptap.m1.y1));
+}
+
+/// Places a row's devices, mirrored about x = 0, with their tops at `top`,
+/// and returns them from left to right.
+fn place(r: Row, top: Float) -> [Any] {
+    let m = mos(r.nfet, r.w, r.nf);
+    let bl = inst(m);
+    eq(bl.sdm.x1, -300.);
+    eq(bl.d.y1, top);
+    let al = inst(m, y=bl.y);
+    eq(al.sdm.x1, bl.sdm.x0 - 140.);
+    let br = inst(m, y=bl.y);
+    eq(br.sdm.x0, 300.);
+    let ar = inst(m, y=bl.y);
+    eq(ar.sdm.x0, br.sdm.x1 + 140.);
+    rect(if r.nfet { "nsdm.drawing" } else { "psdm.drawing" }, x0=al.sdm.x0, x1=ar.sdm.x1, y0=al.sdm.y0, y1=al.sdm.y1);
+    [al, bl, br, ar]
+}
+
+/// Ties together one terminal of a row, given each device's met1 bar for it
+/// from left to right.
+fn strap(s: Strap, bars: [Rect], edge: Float) {
+    match s {
+        Strap::Wide(net) => {
+            let bar = rect("met1.drawing", x0=bars[0].x0, x1=bars[3].x1, y0=bars[0].y0, y1=bars[0].y1);
+            via1(bar, inner(net));
+        },
+        Strap::Sides(a, b) => {
+            let x = edge + outer(a);
+            via1(rect("met1.drawing", x0=std::min(bars[0].x0, x - 160.), x1=bars[0].x1, y0=bars[0].y0, y1=bars[0].y1), x);
+            via1(rect("met1.drawing", x0=bars[3].x0, x1=std::max(bars[3].x1, 160. - x), y0=bars[3].y0, y1=bars[3].y1), -x);
+            via1(rect("met1.drawing", x0=bars[1].x0, x1=bars[2].x1, y0=bars[1].y0, y1=bars[1].y1), inner(b));
+        },
+    };
+}
+
+/// The x of a net's track between the inner devices.
+fn inner(net: Net) -> Float {
+    match net {
+        Net::Outn => -1260.,
+        Net::Mp => -840.,
+        Net::Inn => -420.,
+        Net::Clk => 0.,
+        Net::Tail => 420.,
+        Net::Vdd => 840.,
+        Net::Vss => 840.,
+        _ => 1260.,
+    }
+}
+
+/// How far a net's track lies outside the outer devices' innermost track.
+fn outer(net: Net) -> Float {
+    match net {
+        Net::Outn => 0.,
+        Net::Outp => -420.,
+        Net::Mn => -840.,
+        _ => -1260.,
+    }
+}
+
+/// A met3 strap across the comparator at `y0`, joining `net`'s two outer tracks.
+fn cross(edge: Float, net: Net, y0: Float) -> Rect {
+    let x = edge + outer(net);
+    let m3 = rect("met3.drawing", x0=x - 200., x1=200. - x, y0=y0, h=330.);
+    via2(m3, x);
+    via2(m3, -x);
+    m3
+}
+
+/// A vertical met2 track centered at `x`.
+fn track(x: Float, y0: Float, y1: Float) {
+    rect("met2.drawing", x0=x - 140., x1=x + 140., y0=y0, y1=y1);
+}
+
+/// A via from a met1 bar to the met2 track centered at `x`.
+fn via1(bar: Rect, x: Float) {
+    rect("via.drawing", x0=x - 75., w=150., y0=grid_floor((bar.y0 + bar.y1) / 2.) - 75., h=150.);
+}
+
+/// A via from a met2 track centered at `x` to a met3 strap.
+fn via2(strap: Rect, x: Float) {
+    rect("via2.drawing", x0=x - 100., w=200., y0=strap.y0 + 65., h=200.);
+}
+
+/// Labels a port with a pin at the center of a shape.
+fn pin(name: String, pin: String, label: String, r: Rect) {
+    let p = rect(pin, w=140., h=140.);
+    center_rects(r, p);
+    text(name, label, p.x0 + 70., p.y0 + 70.);
+}
+
+/// The smallest of a nonempty list of values.
+fn lowest(xs: [Float]) -> Float {
+    if tail(xs) == [] {
+        head(xs)
+    } else {
+        std::min(head(xs), lowest(tail(xs)))
+    }
+}
+
+/// A row's schematic: its outer pair of devices and its inner pair, each
+/// pair one transistor.
+fn devices(r: Row, n: Nets) {
+    fet(r, n, true);
+    fet(r, n, false);
+}
+
+fn fet(r: Row, n: Nets, outer: Bool) {
+    let d = signal(pick(r.d, outer), n);
+    let g = signal(pick(r.g, outer), n);
+    let s = signal(pick(r.s, outer), n);
+    let w = 2. * r.w * (r.nf as Float) / 1000.;
+    if r.nfet {
+        device(DeviceKind::Nmos, [d, g, s, n.vss], "sky130_fd_pr__nfet_01v8", w=w, l=0.15, nf=2 * r.nf);
+    } else {
+        device(DeviceKind::Pmos, [d, g, s, n.vdd], "sky130_fd_pr__pfet_01v8", w=w, l=0.15, nf=2 * r.nf);
+    }
+}
+
+/// The net a strap connects the outer or inner devices to.
+fn pick(s: Strap, outer: Bool) -> Net {
+    match s {
+        Strap::Wide(net) => net,
+        Strap::Sides(a, b) => if outer { a } else { b },
+    }
+}
+
+fn signal(net: Net, n: Nets) -> Signal {
+    match net {
+        Net::Outp => n.outp,
+        Net::Outn => n.outn,
+        Net::Mp => n.mp,
+        Net::Mn => n.mn,
+        Net::Inp => n.inp,
+        Net::Inn => n.inn,
+        Net::Clk => n.clk,
+        Net::Tail => n.tail,
+        Net::Vdd => n.vdd,
+        Net::Vss => n.vss,
+    }
+}
+
+/// A tap `w` wide, centered on x = 0 and strapped with met1.
+cell rail(ntap: Int, w: Float) {
+    let t = inst(tap(ntap, w, 500.), x=-w / 2., y=0.);
+    pub let sdm = t.sdm;
+    pub let m1 = rect("met1.drawing", x0=t.li1.x0, y0=t.li1.y0, x1=t.li1.x1, y1=t.li1.y1);
+    let mcon = crect(layer="mcon.drawing", x0=0., y0=0., w=170., h=170.);
+    center_rects(m1, max_array(mcon, m1.w - 120., 170., 360., 360.));
+}
+
+/// A `fet1v8` with met1 bars across it that tie together its gate fingers,
+/// its sources (even contact columns), and its drains (odd columns).
+cell mos(nfet: Bool, w: Float, nf: Int) {
+    let fet = inst(fet1v8(nfet, w, nf), x=0., y=0.);
+    let poly = fet.poly_bbox;
+    let cols = fet.li1_bbox;
+    pub let sdm = fet.sdm;
+    pub let s = rect("met1.drawing", x0=sdm.x0, x1=sdm.x1, y0=cols.y0 - 60., h=290.);
+    pub let d = rect("met1.drawing", x0=sdm.x0, x1=sdm.x1, y1=cols.y1 + 60., h=290.);
+    pub let g = rect("met1.drawing", x0=sdm.x0, x1=sdm.x1, y1=s.y0 - 140., h=290.);
+    contacts(cols.x0, s.y0 + 60., nf / 2 + 1);
+    contacts(cols.x0 + 430., d.y0 + 60., (nf + 1) / 2);
+
+    // The gate fingers join a poly bar below the diffusion, contacted along its length.
+    let li = rect("li1.drawing", x0=poly.x0 - 90., x1=poly.x1 + 90., y0=g.y0 + 60., h=170.);
+    let bar = rect("poly.drawing", x0=poly.x0 - 60., x1=poly.x1 + 60., y0=li.y0 - 80., y1=poly.y0);
+    let licon = crect(layer="licon1.drawing", x0=0., y0=0., w=170., h=170.);
+    center_rects(li, max_array(licon, bar.w - 100., 170., 340., 340.));
+    let mcon = crect(layer="mcon.drawing", x0=0., y0=0., w=170., h=170.);
+    center_rects(li, max_array(mcon, li.w, 170., 360., 360.));
+    rect("npc.drawing", x0=bar.x0 - 50., x1=bar.x1 + 50., y0=li.y0 - 100., y1=li.y1 + 100.);
+}
+
+/// Draws `n` mcons on every other contact column, starting at `x0`.
+fn contacts(x0: Float, y0: Float, n: Int) {
+    let mcon = crect(layer="mcon.drawing", x0=0., y0=0., w=170., h=170.);
+    let cuts = array(mcon, n, 860., 0.);
+    eq(cuts.x0, x0);
+    eq(cuts.y0, y0);
+}
