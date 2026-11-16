@@ -21,7 +21,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 pub const TOKEN_ENV: &str = "ARGON_SESSION_TOKEN";
 
 /// Version of the handshake and of the RPC services behind it.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// How long a peer may take to complete the handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);

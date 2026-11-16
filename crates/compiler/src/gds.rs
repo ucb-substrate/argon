@@ -1,4 +1,4 @@
-use std::{ops::Deref, path::Path};
+use std::{collections::HashSet, ops::Deref, path::Path};
 
 use ::gds::{
     GdsArrayRef, GdsBoundary, GdsElement, GdsError, GdsLayerSpec, GdsLibrary, GdsPath, GdsPoint,
@@ -28,12 +28,15 @@ pub struct GdsMap {
 struct GdsExporter {
     lib: GdsLibrary,
     map: GdsMap,
-    names: Names<CellId>,
+    /// Each exported cell's structure name, from [`CompiledData::gds_struct_names`].
+    names: IndexMap<CellId, ArcStr>,
+    /// The cells whose structures have been written.
+    exported: HashSet<CellId>,
     display_unit: f64,
 }
 
 impl GdsExporter {
-    fn new(name: impl Into<ArcStr>, tech: &Technology) -> Self {
+    fn new(name: impl Into<ArcStr>, tech: &Technology, names: IndexMap<CellId, ArcStr>) -> Self {
         let mut lib = GdsLibrary::new(name);
         // The first GDS unit is the DBU size in display (user) units; the
         // second is the DBU size in meters.
@@ -41,7 +44,8 @@ impl GdsExporter {
         Self {
             lib,
             map: GdsMap::from_technology(tech),
-            names: Names::new(),
+            names,
+            exported: HashSet::new(),
             display_unit: tech.display_unit as f64,
         }
     }
@@ -707,7 +711,7 @@ impl CompileOutput {
             output: Some(output),
         }) = self
         {
-            let mut exporter = GdsExporter::new("TOP", &output.tech);
+            let mut exporter = GdsExporter::new("TOP", &output.tech, output.gds_struct_names());
             output.cell_to_gds(&mut exporter, output.top)?;
             // `GdsLibrary::save` streams records, so a write that fails partway
             // -- an over-long record, a full disk -- would otherwise leave a
@@ -722,8 +726,22 @@ impl CompileOutput {
 }
 
 impl CompiledData {
-    fn cell_to_gds(&self, exporter: &mut GdsExporter, id: CellId) -> Result<()> {
-        trace!("Exporting cell {id}");
+    /// The GDS structure name [`CompileOutput::to_gds`] gives each cell it
+    /// exports, in the order it names them.
+    pub fn gds_struct_names(&self) -> IndexMap<CellId, ArcStr> {
+        let mut names = Names::new();
+        let mut assigned = IndexMap::new();
+        self.name_structs(&mut names, &mut assigned, self.top);
+        assigned
+    }
+
+    /// Names `id`, then each cell it instantiates that has no name yet.
+    fn name_structs(
+        &self,
+        names: &mut Names<CellId>,
+        assigned: &mut IndexMap<CellId, ArcStr>,
+        id: CellId,
+    ) {
         let cell = &self.cells[&id];
         let name = gds_struct_name(&cell.name);
         if name != cell.name {
@@ -731,8 +749,22 @@ impl CompiledData {
             // to its source cell if the rewrite is recorded somewhere.
             trace!("Cell `{}` exported as GDS struct `{name}`", cell.name);
         }
-        let name = exporter.names.assign_name(id, &name);
-        let mut ocell = GdsStruct::new(name.to_string());
+        assigned.insert(id, names.assign_name(id, &name));
+        for obj in cell.objects.values() {
+            if let SolvedValue::Instance(i) = obj
+                && obj.is_layout()
+                && !assigned.contains_key(&i.cell)
+            {
+                self.name_structs(names, assigned, i.cell);
+            }
+        }
+    }
+
+    fn cell_to_gds(&self, exporter: &mut GdsExporter, id: CellId) -> Result<()> {
+        trace!("Exporting cell {id}");
+        exporter.exported.insert(id);
+        let cell = &self.cells[&id];
+        let mut ocell = GdsStruct::new(exporter.names[&id].to_string());
         for (_, obj) in &cell.objects {
             // Shared with `bbox`, so the two cannot disagree about which
             // geometry exists.
@@ -843,11 +875,11 @@ impl CompiledData {
                     }));
                 }
                 SolvedValue::Instance(i) => {
-                    if exporter.names.name(&i.cell).is_none() {
+                    if !exporter.exported.contains(&i.cell) {
                         self.cell_to_gds(exporter, i.cell)?;
                     }
                     ocell.elems.push(GdsElement::GdsStructRef(GdsStructRef {
-                        name: exporter.names.name(&i.cell).unwrap().clone(),
+                        name: exporter.names[&i.cell].clone(),
                         xy: GdsPoint::new(exporter.coord_to_gds(i.x)?, exporter.coord_to_gds(i.y)?),
                         strans: Some(GdsStrans {
                             reflected: i.reflect,
@@ -1048,7 +1080,7 @@ mod tests {
             "##,
         )
         .unwrap();
-        let exporter = GdsExporter::new("test", &tech);
+        let exporter = GdsExporter::new("test", &tech, IndexMap::new());
         assert_eq!(exporter.coord_to_gds(1.25).unwrap(), 1250);
         assert_eq!(exporter.lib.units.db_unit(), 1e-9);
 

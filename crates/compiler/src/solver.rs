@@ -201,6 +201,8 @@ pub struct Solver {
     updated_vars: Vec<Var>,
     back_substitute_stack: Vec<ConstraintId>,
     inconsistent_constraints: FxIndexSet<ConstraintId>,
+    /// How each of `inconsistent_constraints` conflicts with the others.
+    conflicts: FxIndexMap<ConstraintId, Conflict>,
     /// Variables whose solved value missed the grid, with the value the
     /// solver computed. Rounding each variable in isolation can break a
     /// constraint that couples several of them, so the diagnostic needs the
@@ -224,6 +226,16 @@ pub struct Solver {
     sparse_nullspace_cache: Option<Vec<Vec<(f64, Var)>>>,
 }
 
+/// How an inconsistent constraint conflicts with the rest of the system.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Conflict {
+    /// It would set a value that is already `has` to `asks`.
+    Value { has: f64, asks: f64 },
+    /// Every value in it is already determined, which leaves its two sides
+    /// this far apart.
+    Residual(f64),
+}
+
 impl Default for Solver {
     fn default() -> Self {
         Self {
@@ -237,6 +249,7 @@ impl Default for Solver {
             updated_vars: Vec::new(),
             back_substitute_stack: Vec::new(),
             inconsistent_constraints: FxIndexSet::default(),
+            conflicts: FxIndexMap::default(),
             off_grid_vars: FxIndexMap::default(),
             floor_constraints: FxIndexMap::default(),
             floor_vars: FxIndexSet::default(),
@@ -378,6 +391,16 @@ impl Solver {
     #[inline]
     pub fn inconsistent_constraints(&self) -> &FxIndexSet<ConstraintId> {
         &self.inconsistent_constraints
+    }
+
+    /// How the inconsistent constraint `id` conflicts with the others.
+    pub fn conflict(&self, id: ConstraintId) -> Option<Conflict> {
+        self.conflicts.get(&id).copied()
+    }
+
+    fn mark_inconsistent(&mut self, id: ConstraintId, conflict: Conflict) {
+        self.inconsistent_constraints.insert(id);
+        self.conflicts.insert(id, conflict);
     }
 
     #[inline]
@@ -595,7 +618,7 @@ impl Solver {
             };
             let Some((coeff, var)) = term else {
                 if self.violated(id, constant) {
-                    self.inconsistent_constraints.insert(id);
+                    self.mark_inconsistent(id, Conflict::Residual(constant));
                     self.constraints.swap_remove(&id);
                 }
                 return;
@@ -610,7 +633,13 @@ impl Solver {
                     val
                 };
                 if relative_ne!(old_val, val, epsilon = EPSILON) {
-                    self.inconsistent_constraints.insert(id);
+                    self.mark_inconsistent(
+                        id,
+                        Conflict::Value {
+                            has: old_val,
+                            asks: val,
+                        },
+                    );
                 }
             } else {
                 let val = self.settle(id, var, val);
@@ -691,7 +720,7 @@ impl Solver {
         }
         for (id, residual) in solved {
             if self.violated(id, residual) {
-                self.inconsistent_constraints.insert(id);
+                self.mark_inconsistent(id, Conflict::Residual(residual));
             }
         }
         self.constraints
@@ -757,7 +786,7 @@ impl Solver {
             match len {
                 0 => {
                     if self.violated(id, constant) {
-                        self.inconsistent_constraints.insert(id);
+                        self.mark_inconsistent(id, Conflict::Residual(constant));
                     }
                     self.remove_constraint(id);
                 }

@@ -33,6 +33,9 @@ enum Command {
         /// session in first, instead of the working directory.
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Compile the libraries on disk instead, with no editor or session.
+        #[arg(long)]
+        headless: bool,
     },
     /// Run as a Claude Code `PreToolUse` hook that redirects `.ar` file
     /// tools to the analyzer while a session is running.
@@ -49,9 +52,9 @@ pub async fn run() {
                 std::process::exit(1);
             }
         }
-        Some(Command::Mcp { root }) => {
+        Some(Command::Mcp { root, headless }) => {
             crate::init_logging();
-            if let Err(error) = crate::mcp::run(root).await {
+            if let Err(error) = crate::mcp::run(root, headless).await {
                 eprintln!("argon-analyzer mcp: {error}");
                 std::process::exit(1);
             }

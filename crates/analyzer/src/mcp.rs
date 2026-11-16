@@ -1,9 +1,11 @@
-//! A Model Context Protocol server that lets agents work through running
-//! analyzers, so their edits land in the user's editor buffers.
+//! A Model Context Protocol server for agents, speaking newline-delimited
+//! JSON-RPC on stdin and stdout.
 //!
-//! It speaks newline-delimited JSON-RPC on stdin and stdout. Each tool call
-//! goes to the session whose workspace contains the file it names, or to the
-//! session chosen with `workspace`, the one used last, or the only one running.
+//! By default it works through running analyzers, so agents' edits land in
+//! the user's editor buffers. Each tool call goes to the session whose
+//! workspace contains the file it names, or to the session chosen with
+//! `workspace`, the one used last, or the only one running. With `--headless`
+//! it serves [`crate::headless`]'s tools instead, which need no editor.
 
 use std::{
     collections::HashMap,
@@ -146,6 +148,60 @@ impl PathView<'_> {
             .display()
             .to_string()
     }
+}
+
+/// The tools an MCP server offers.
+pub trait Tools: Send + Sync + 'static {
+    /// How to use the tools, sent to the client on initialization.
+    fn instructions(&self) -> &'static str;
+
+    /// The `tools/list` definitions.
+    fn definitions(&self) -> Value;
+
+    /// Runs one tool, returning its text or an error message.
+    fn run_tool(
+        &self,
+        name: &str,
+        arguments: &Value,
+    ) -> impl Future<Output = Result<String, String>> + Send;
+}
+
+/// The response to one JSON-RPC message, or `None` for a notification.
+pub async fn handle(tools: &impl Tools, message: Value) -> Option<Value> {
+    let id = message.get("id").cloned()?;
+    let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let result = match method {
+        "initialize" => Ok(initialize_result(&params, tools.instructions())),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({ "tools": tools.definitions() })),
+        "tools/call" => Ok(call_tool(tools, &params).await),
+        _ => Err((-32601, format!("method not found: {method}"))),
+    };
+    Some(match result {
+        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+        Err((code, message)) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": code, "message": message },
+        }),
+    })
+}
+
+async fn call_tool(tools: &impl Tools, params: &Value) -> Value {
+    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let (text, is_error) = match tools.run_tool(name, &arguments).await {
+        Ok(text) => (text, false),
+        Err(text) => (text, true),
+    };
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": is_error,
+    })
 }
 
 /// Answers MCP messages, routing each tool call to one of the user's
@@ -313,43 +369,15 @@ impl Bridge {
             .and_then(Value::as_str)
             .map(|workspace| self.absolute(workspace))
     }
+}
 
-    /// The response to one JSON-RPC message, or `None` for a notification.
-    pub async fn handle(&self, message: Value) -> Option<Value> {
-        let id = message.get("id").cloned()?;
-        let method = message.get("method").and_then(Value::as_str).unwrap_or("");
-        let params = message.get("params").cloned().unwrap_or(Value::Null);
-        let result = match method {
-            "initialize" => Ok(initialize_result(&params)),
-            "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tool_definitions() })),
-            "tools/call" => Ok(self.call_tool(&params).await),
-            _ => Err((-32601, format!("method not found: {method}"))),
-        };
-        Some(match result {
-            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-            Err((code, message)) => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": code, "message": message },
-            }),
-        })
+impl Tools for Bridge {
+    fn instructions(&self) -> &'static str {
+        INSTRUCTIONS
     }
 
-    async fn call_tool(&self, params: &Value) -> Value {
-        let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-        let arguments = params
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
-        let outcome = match self.run_tool(name, &arguments).await {
-            Ok(text) => (text, false),
-            Err(text) => (text, true),
-        };
-        json!({
-            "content": [{ "type": "text", "text": outcome.0 }],
-            "isError": outcome.1,
-        })
+    fn definitions(&self) -> Value {
+        tool_definitions()
     }
 
     async fn run_tool(&self, name: &str, arguments: &Value) -> Result<String, String> {
@@ -483,7 +511,7 @@ impl Bridge {
     }
 }
 
-fn initialize_result(params: &Value) -> Value {
+fn initialize_result(params: &Value, instructions: &str) -> Value {
     // The tools use only features every protocol revision shares, so the
     // client's preferred revision is accepted as is.
     let version = params
@@ -494,11 +522,11 @@ fn initialize_result(params: &Value) -> Value {
         "protocolVersion": version,
         "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": { "name": "argon", "version": env!("CARGO_PKG_VERSION") },
-        "instructions": INSTRUCTIONS,
+        "instructions": instructions,
     })
 }
 
-fn string_argument<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
+pub(crate) fn string_argument<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, String> {
     arguments
         .get(name)
         .and_then(Value::as_str)
@@ -792,13 +820,21 @@ fn parse_error(error: serde_json::Error) -> Value {
     })
 }
 
-/// Serves MCP on stdin and stdout until stdin closes.
-pub async fn run(directory: Option<PathBuf>) -> io::Result<()> {
+/// Serves MCP on stdin and stdout until stdin closes: the headless tools,
+/// or the bridge to running analyzers.
+pub async fn run(directory: Option<PathBuf>, headless: bool) -> io::Result<()> {
     let directory = match directory {
         Some(directory) => directory,
         None => std::env::current_dir()?,
     };
-    let bridge = Arc::new(Bridge::new(directory));
+    if headless {
+        serve(Arc::new(crate::headless::Headless::new(directory))).await
+    } else {
+        serve(Arc::new(Bridge::new(directory))).await
+    }
+}
+
+async fn serve(tools: Arc<impl Tools>) -> io::Result<()> {
     let (responses, mut outgoing) = mpsc::unbounded_channel::<Value>();
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
@@ -824,11 +860,11 @@ pub async fn run(directory: Option<PathBuf>) -> io::Result<()> {
             }
         };
         // Requests run concurrently, so a call waiting on the user's
-        // approval does not hold up the others.
-        let bridge = bridge.clone();
+        // approval or on a long compile does not hold up the others.
+        let tools = tools.clone();
         let responses = responses.clone();
         tokio::spawn(async move {
-            if let Some(response) = bridge.handle(message).await {
+            if let Some(response) = handle(tools.as_ref(), message).await {
                 let _ = responses.send(response);
             }
         });
@@ -850,27 +886,33 @@ mod tests {
     async fn answers_the_handshake_and_lists_tools() {
         let directory = tempfile::tempdir().unwrap();
         let bridge = bridge(directory.path());
-        let response = bridge
-            .handle(json!({
+        let response = handle(
+            &bridge,
+            json!({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
                 "params": { "protocolVersion": "2025-03-26", "capabilities": {} }
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(response["result"]["protocolVersion"], "2025-03-26");
         assert!(response["result"]["capabilities"]["tools"].is_object());
 
         assert!(
-            bridge
-                .handle(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
-                .await
-                .is_none()
+            handle(
+                &bridge,
+                json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+            )
+            .await
+            .is_none()
         );
 
-        let tools = bridge
-            .handle(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
-            .await
-            .unwrap();
+        let tools = handle(
+            &bridge,
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+        )
+        .await
+        .unwrap();
         let names = tools["result"]["tools"]
             .as_array()
             .unwrap()
@@ -890,10 +932,12 @@ mod tests {
             ]
         );
 
-        let unknown = bridge
-            .handle(json!({ "jsonrpc": "2.0", "id": 3, "method": "resources/list" }))
-            .await
-            .unwrap();
+        let unknown = handle(
+            &bridge,
+            json!({ "jsonrpc": "2.0", "id": 3, "method": "resources/list" }),
+        )
+        .await
+        .unwrap();
         assert_eq!(unknown["error"]["code"], -32601);
     }
 
@@ -901,13 +945,15 @@ mod tests {
     async fn tool_calls_report_errors_as_tool_results() {
         let directory = tempfile::tempdir().unwrap();
         let bridge = bridge(directory.path());
-        let missing = bridge
-            .handle(json!({
+        let missing = handle(
+            &bridge,
+            json!({
                 "jsonrpc": "2.0", "id": 1, "method": "tools/call",
                 "params": { "name": "edit_file", "arguments": { "path": "lib.ar" } }
-            }))
-            .await
-            .unwrap();
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(missing["result"]["isError"], true);
         assert!(
             missing["result"]["content"][0]["text"]

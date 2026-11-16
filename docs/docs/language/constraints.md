@@ -58,11 +58,11 @@ cell pair() {
 
 ### Inconsistent
 
-An equation that disagrees with values already determined is reported as an `inconsistent constraint`, at that equation:
+An equation that disagrees with values already determined is reported as an `inconsistent constraint`, at that equation, with how far apart it finds the two sides:
 
 ```argon
 let r = rect("met1", x0=0., y0=0., w=100., h=100.);
-eq(r.x1, 200.); // error: inconsistent constraint
+eq(r.x1, 200.); // error: inconsistent constraint: ... leave its two sides 100 apart
 ```
 
 Repeating a fact the system already implies is fine as long as it agrees: `rect("met1", x0=0., x1=100., w=100., y0=0., h=100.)` compiles. The usual cause is giving a shape both ends and its size where the size depends on parameters, so that the three agree for some parameters and not others. Give each shape exactly two equations per axis, and derive everything else from them.

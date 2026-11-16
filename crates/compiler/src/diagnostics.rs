@@ -1,7 +1,8 @@
 use std::{
+    borrow::Cow,
     fs,
     io::{self, IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -43,6 +44,28 @@ pub struct Diagnostic {
     /// renderer on the far side of the JSON boundary can still show the line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// The call in the top cell's body that led to the failing line, when
+    /// that line is inside a function or another cell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub called_at: Option<SourceRange>,
+}
+
+/// A byte range in a source file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct SourceRange {
+    pub path: PathBuf,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl From<&Span> for SourceRange {
+    fn from(span: &Span) -> Self {
+        Self {
+            path: span.path.to_path_buf(),
+            start: span.span.start(),
+            end: span.span.end(),
+        }
+    }
 }
 
 impl Diagnostic {
@@ -54,6 +77,7 @@ impl Diagnostic {
             start: None,
             end: None,
             source: None,
+            called_at: None,
         }
     }
 
@@ -65,6 +89,7 @@ impl Diagnostic {
             start: Some(span.span.start()),
             end: Some(span.span.end()),
             source: None,
+            called_at: None,
         }
     }
 }
@@ -133,6 +158,7 @@ pub fn condense(diagnostics: &mut Vec<Diagnostic>) {
                     diagnostic.start,
                     diagnostic.end,
                     diagnostic.message.as_str(),
+                    diagnostic.called_at.as_ref(),
                 ))
             })
             .collect()
@@ -247,9 +273,13 @@ pub fn from_compile_output(output: &CompileOutput) -> Vec<Diagnostic> {
             .collect(),
         CompileOutput::ExecErrors(ExecErrorCompileOutput { errors, .. }) => errors
             .iter()
-            .map(|error| match &error.span {
-                Some(span) => Diagnostic::at(Level::Error, error.kind.to_string(), span),
-                None => Diagnostic::error(error.kind.to_string()),
+            .map(|error| {
+                let mut diagnostic = match &error.span {
+                    Some(span) => Diagnostic::at(Level::Error, error.kind.to_string(), span),
+                    None => Diagnostic::error(error.kind.to_string()),
+                };
+                diagnostic.called_at = error.origin.as_ref().map(SourceRange::from);
+                diagnostic
             })
             .collect(),
         CompileOutput::Valid(_) => Vec::new(),
@@ -282,24 +312,49 @@ pub fn render(writer: &mut impl Write, diagnostic: &Diagnostic, color: bool) -> 
         diagnostic.level.label(),
         diagnostic.message
     )?;
+    if let (Some(path), Some(start)) = (&diagnostic.path, diagnostic.start) {
+        let source = source_text(path, diagnostic.source.as_deref());
+        let end = diagnostic.end.unwrap_or(start);
+        excerpt(writer, path, source.as_deref(), start, end, (open, close))?;
+    }
+    if let Some(call) = &diagnostic.called_at {
+        writeln!(writer, "note: in this call")?;
+        let source = source_text(&call.path, None);
+        excerpt(
+            writer,
+            &call.path,
+            source.as_deref(),
+            call.start,
+            call.end,
+            (open, close),
+        )?;
+    }
+    Ok(())
+}
 
-    let (Some(path), Some(start)) = (&diagnostic.path, diagnostic.start) else {
-        return Ok(());
-    };
-    // Read the file only in the arm that uses it: a diagnostic carrying its
-    // own source (every spliced `--cell` invocation) or one with a virtual
-    // source would otherwise pay a full read per diagnostic and discard it.
-    let virtual_source = crate::parse::virtual_source(path);
-    let file_source = match (&diagnostic.source, virtual_source) {
-        (Some(_), _) | (None, Some(_)) => None,
-        (None, None) => fs::read_to_string(path).ok(),
-    };
-    let source = match &diagnostic.source {
-        Some(source) => Some(source.as_str()),
-        None => virtual_source.or(file_source.as_deref()),
-    };
+/// The text of the file at `path`: `source` if given, the embedded text of a
+/// virtual file, or the file on disk.
+fn source_text<'a>(path: &Path, source: Option<&'a str>) -> Option<Cow<'a, str>> {
+    if let Some(source) = source {
+        return Some(Cow::Borrowed(source));
+    }
+    if let Some(source) = crate::parse::virtual_source(path) {
+        return Some(Cow::Borrowed(source));
+    }
+    fs::read_to_string(path).ok().map(Cow::Owned)
+}
+
+/// Writes the location of `start..end` in `path`, and the line it is on.
+fn excerpt(
+    writer: &mut impl Write,
+    path: &Path,
+    source: Option<&str>,
+    start: usize,
+    end: usize,
+    (open, close): (&str, &str),
+) -> io::Result<()> {
     let (line, column, line_text, underline) = source
-        .map(|source| source_location(source, start, diagnostic.end.unwrap_or(start)))
+        .map(|source| source_location(source, start, end))
         .unwrap_or((1, 1, None, 1));
     writeln!(writer, "  --> {}:{line}:{column}", path.display())?;
     if let Some(line_text) = line_text {

@@ -2316,7 +2316,7 @@ cell top() {
                 });
                 let bridge = &bridge;
                 async move {
-                    let response = bridge.handle(request).await.unwrap();
+                    let response = analyzer::mcp::handle(bridge, request).await.unwrap();
                     let result = &response["result"];
                     (
                         result["content"][0]["text"].as_str().unwrap().to_owned(),
@@ -2408,7 +2408,7 @@ cell top() {
                 });
                 let bridge = &bridge;
                 async move {
-                    let response = bridge.handle(request).await.unwrap();
+                    let response = analyzer::mcp::handle(bridge, request).await.unwrap();
                     let result = &response["result"];
                     (
                         result["content"][0]["text"].as_str().unwrap().to_owned(),

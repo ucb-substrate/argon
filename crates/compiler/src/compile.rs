@@ -746,6 +746,7 @@ fn execute_invocation(
 fn missing_tech_output() -> CompileOutput {
     CompileOutput::ExecErrors(ExecErrorCompileOutput {
         errors: vec![ExecError {
+            origin: None,
             span: None,
             cell: 0,
             kind: ExecErrorKind::MissingTech,
@@ -1402,6 +1403,7 @@ fn check_object_layer(
                 && !layers.contains(layer)
             {
                 errs.push(ExecError {
+                    origin: None,
                     span: r.span.clone(),
                     cell: cell_id,
                     kind: ExecErrorKind::IllegalLayer {
@@ -1413,6 +1415,7 @@ fn check_object_layer(
         }
         SolvedValue::Polygon(polygon) if !layers.contains(&polygon.layer) => {
             errs.push(ExecError {
+                origin: None,
                 span: polygon.span.clone(),
                 cell: cell_id,
                 kind: ExecErrorKind::IllegalLayer {
@@ -1423,6 +1426,7 @@ fn check_object_layer(
         }
         SolvedValue::Path(path) if !layers.contains(&path.layer) => {
             errs.push(ExecError {
+                origin: None,
                 span: path.span.clone(),
                 cell: cell_id,
                 kind: ExecErrorKind::IllegalLayer {
@@ -1433,6 +1437,7 @@ fn check_object_layer(
         }
         SolvedValue::Text(text) if !layers.contains(&text.layer) => {
             errs.push(ExecError {
+                origin: None,
                 span: text.span.clone(),
                 cell: cell_id,
                 kind: ExecErrorKind::IllegalTextLayer {
@@ -1529,6 +1534,7 @@ fn check_coordinate(
 ) {
     if !value.is_finite() {
         errs.push(ExecError {
+            origin: None,
             span: span.clone(),
             cell,
             kind: ExecErrorKind::NonFiniteValue,
@@ -1538,6 +1544,7 @@ fn check_coordinate(
     let dbu = value * tech.display_unit as f64;
     if dbu < f64::from(i32::MIN) || dbu > f64::from(i32::MAX) {
         errs.push(ExecError {
+            origin: None,
             span: span.clone(),
             cell,
             kind: ExecErrorKind::CoordinateOutOfRange {
@@ -1558,6 +1565,7 @@ fn check_coordinate(
 fn check_path_dimensions(path: &Path<(f64, LinearExpr)>, cell: CellId, errs: &mut Vec<ExecError>) {
     if path.width.0 < 0. {
         errs.push(ExecError {
+            origin: None,
             span: path.span.clone(),
             cell,
             kind: ExecErrorKind::NegativePathWidth(path.width.0),
@@ -1569,6 +1577,7 @@ fn check_path_dimensions(path: &Path<(f64, LinearExpr)>, cell: CellId, errs: &mu
     ] {
         if value < 0. {
             errs.push(ExecError {
+                origin: None,
                 span: path.span.clone(),
                 cell,
                 kind: ExecErrorKind::NegativePathExtension {
@@ -1589,6 +1598,7 @@ fn check_path_dimensions(path: &Path<(f64, LinearExpr)>, cell: CellId, errs: &mu
 fn check_text(text: &Text<f64>, cell: CellId, errs: &mut Vec<ExecError>) {
     if let Some(character) = text.text.chars().find(|c| !c.is_ascii()) {
         errs.push(ExecError {
+            origin: None,
             span: text.span.clone(),
             cell,
             kind: ExecErrorKind::NonAsciiText { character },
@@ -1596,6 +1606,7 @@ fn check_text(text: &Text<f64>, cell: CellId, errs: &mut Vec<ExecError>) {
     }
     if text.text.len() > MAX_TEXT_LEN {
         errs.push(ExecError {
+            origin: None,
             span: text.span.clone(),
             cell,
             kind: ExecErrorKind::TextTooLong {
@@ -4295,10 +4306,15 @@ impl<'a> VarIdTyPass<'a> {
                     self.check_ty_arg_arity(name.span, &ty.to_string(), 0, args.len());
                     return ty;
                 }
+                let unknown = if name.name.as_str() == "Inst" {
+                    StaticErrorKind::InstType
+                } else {
+                    StaticErrorKind::UnknownType
+                };
                 let Some((_, ty)) = self.lookup(name.name.as_str()) else {
                     self.errors.push(StaticError {
                         span: self.span(name.span),
-                        kind: StaticErrorKind::UnknownType,
+                        kind: unknown,
                     });
                     return Ty::Unknown;
                 };
@@ -4316,7 +4332,7 @@ impl<'a> VarIdTyPass<'a> {
                     Ty::Native(_) => {
                         self.errors.push(StaticError {
                             span: self.span(name.span),
-                            kind: StaticErrorKind::UnknownType,
+                            kind: unknown,
                         });
                         return Ty::Unknown;
                     }
@@ -7934,6 +7950,9 @@ pub type ConstraintVarId = u64;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompiledEmit {
     pub span: Span,
+    /// The call in the cell's body that the object was made under, when it
+    /// was made inside a function.
+    pub origin: Option<Span>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -9047,6 +9066,8 @@ struct CellState {
     sse_basis: SseBasis,
     unsolved_vars: Option<IndexSet<Var>>,
     constraint_span_map: FxIndexMap<ConstraintId, Span>,
+    /// The scope each constraint in `constraint_span_map` was made in, when known.
+    constraint_scopes: FxIndexMap<ConstraintId, ScopeId>,
     /// Where each variable that may be reported came from.
     var_origins: FxIndexMap<Var, VarOrigin>,
     var_dependents: FxIndexMap<Var, FxIndexSet<ValueId>>,
@@ -9085,12 +9106,41 @@ impl CellState {
         &self.scope_metadata[self.scopes[&scope].metadata.0 as usize].span
     }
 
-    fn new_solver_var(&mut self, span: &Span, object: VarObject, value: VarRole) -> Var {
+    /// Records that `constraint` was made at `span` in `scope`.
+    fn record_constraint(&mut self, constraint: ConstraintId, span: Span, scope: ScopeId) {
+        self.constraint_span_map.insert(constraint, span);
+        self.constraint_scopes.insert(constraint, scope);
+    }
+
+    /// The call in the cell's body that `scope` ran under, when it is inside
+    /// a function.
+    fn origin(&self, scope: ScopeId) -> Option<Span> {
+        let mut scope = &self.scopes[&scope];
+        let mut origin = None;
+        loop {
+            if let ScopeKind::Fn { call } = &self.scope_kinds[scope.kind.0 as usize] {
+                origin = Some(call.clone());
+            }
+            match scope.parent {
+                Some(parent) => scope = &self.scopes[&parent],
+                None => return origin,
+            }
+        }
+    }
+
+    fn new_solver_var(
+        &mut self,
+        span: &Span,
+        scope: ScopeId,
+        object: VarObject,
+        value: VarRole,
+    ) -> Var {
         let var = self.solver.new_var();
         self.var_origins.insert(
             var,
             VarOrigin {
                 span: span.clone(),
+                scope,
                 object,
                 value,
             },
@@ -9103,6 +9153,8 @@ impl CellState {
 #[derive(Clone, Debug)]
 struct VarOrigin {
     span: Span,
+    /// The scope the variable was made in.
+    scope: ScopeId,
     object: VarObject,
     value: VarRole,
 }
@@ -9438,6 +9490,7 @@ impl<'a> ExecPass<'a> {
     /// unwrapping: the static checker cannot have proven the type.
     fn invalid_type(&mut self, cell_id: CellId, span: &Span) {
         self.errors.push(ExecError {
+            origin: None,
             span: Some(span.clone()),
             cell: cell_id,
             kind: ExecErrorKind::InvalidType,
@@ -9606,6 +9659,7 @@ impl<'a> ExecPass<'a> {
                 _ => {
                     let (kwarg, _) = find_kwarg(call, "angle").expect("the angle was read");
                     self.errors.push(ExecError {
+                        origin: None,
                         span: Some(self.span(loc, kwarg.value.span())),
                         cell: loc.cell,
                         kind: ExecErrorKind::InvalidRotation,
@@ -9682,6 +9736,7 @@ impl<'a> ExecPass<'a> {
             Some(value) if value.is_finite() => Typed::Ready(value),
             Some(_) => {
                 self.errors.push(ExecError {
+                    origin: None,
                     span: Some(span.clone()),
                     cell: cell_id,
                     kind: ExecErrorKind::InvalidSymbol("the value is not a finite number".into()),
@@ -9759,6 +9814,7 @@ impl<'a> ExecPass<'a> {
                     Some(value) if value.is_finite() => *coord = value,
                     Some(_) => {
                         self.errors.push(ExecError {
+                            origin: None,
                             span: Some(span.clone()),
                             cell: cell_id,
                             kind: ExecErrorKind::InvalidSymbol(
@@ -9843,18 +9899,7 @@ impl<'a> ExecPass<'a> {
     /// The call in the cell's body that a call at `loc` ran under, when it
     /// ran inside a function.
     fn origin(&self, loc: &DynLoc) -> Option<Span> {
-        let state = self.cell_state(loc.cell);
-        let mut scope = &state.scopes[&loc.scope];
-        let mut origin = None;
-        loop {
-            if let ScopeKind::Fn { call } = &state.scope_kinds[scope.kind.0 as usize] {
-                origin = Some(call.clone());
-            }
-            match scope.parent {
-                Some(parent) => scope = &state.scopes[&parent],
-                None => return origin,
-            }
-        }
+        self.cell_state(loc.cell).origin(loc.scope)
     }
 
     /// Whether the GUI may rewrite the call `call` of `native` at `loc`: it
@@ -9901,6 +9946,7 @@ impl<'a> ExecPass<'a> {
         what: &str,
     ) -> Result<bool, ()> {
         self.errors.push(ExecError {
+            origin: None,
             span: Some(self.span(loc, call.expr.span)),
             cell: cell_id,
             kind: ExecErrorKind::InvalidSymbol(what.to_owned()),
@@ -9923,6 +9969,7 @@ impl<'a> ExecPass<'a> {
         if input.cell.is_empty() {
             return CompileOutput::ExecErrors(ExecErrorCompileOutput {
                 errors: vec![ExecError {
+                    origin: None,
                     span: None,
                     cell: 0,
                     kind: ExecErrorKind::InvalidCell("<empty>".to_string()),
@@ -9969,6 +10016,7 @@ impl<'a> ExecPass<'a> {
         } else {
             CompileOutput::ExecErrors(ExecErrorCompileOutput {
                 errors: vec![ExecError {
+                    origin: None,
                     span: None,
                     cell: 0, // TODO: don't use dummy cell ID
                     kind: ExecErrorKind::InvalidCell(input.cell.join("::")),
@@ -10038,7 +10086,7 @@ impl<'a> ExecPass<'a> {
                 && matches!(
                     error.kind,
                     ExecErrorKind::Underconstrained { .. }
-                        | ExecErrorKind::InconsistentConstraint(_)
+                        | ExecErrorKind::InconsistentConstraint(..)
                 )
             {
                 error.kind = ExecErrorKind::UnevaluatedCellArgument;
@@ -10048,6 +10096,7 @@ impl<'a> ExecPass<'a> {
         let value_id = self.cell_states[&entry_id].fields[&invocation.binding];
         let Some(DeferValue::Ready(Value::Cell(top))) = self.values.get(&value_id) else {
             self.errors.push(ExecError {
+                origin: None,
                 span: Some(invocation.span()),
                 cell: entry_id,
                 kind: ExecErrorKind::NotACell,
@@ -10221,17 +10270,17 @@ impl<'a> ExecPass<'a> {
             .iter()
             .copied()
             .collect::<FxIndexSet<_>>();
-        // One report per source expression, naming each free value once, in
-        // the order the values were declared.
+        // One report per source expression and call site, naming each free
+        // value once, in the order the values were declared.
         let mut origins = unsolved_vars
             .iter()
             .filter_map(|var| Some((*var, state.var_origins.get(var)?)))
             .collect::<Vec<_>>();
         origins.sort_by_key(|(var, _)| *var);
-        let mut reports = FxIndexMap::<Span, (VarObject, Vec<VarRole>)>::default();
+        let mut reports = FxIndexMap::<(Span, Option<Span>), (VarObject, Vec<VarRole>)>::default();
         for (_, origin) in origins {
             let (_, free) = reports
-                .entry(origin.span.clone())
+                .entry((origin.span.clone(), state.origin(origin.scope)))
                 .or_insert_with(|| (origin.object, Vec::new()));
             if !free.contains(&origin.value) {
                 free.push(origin.value);
@@ -10253,6 +10302,7 @@ impl<'a> ExecPass<'a> {
         }
         if reports.is_empty() {
             self.errors.push(ExecError {
+                origin: None,
                 span: None,
                 cell: cell_id,
                 kind: ExecErrorKind::Underconstrained {
@@ -10262,15 +10312,19 @@ impl<'a> ExecPass<'a> {
             });
             return;
         }
-        self.errors
-            .extend(reports.into_iter().map(|(span, (object, free))| ExecError {
-                span: Some(span),
-                cell: cell_id,
-                kind: ExecErrorKind::Underconstrained {
-                    object: Some(object),
-                    free,
-                },
-            }));
+        self.errors.extend(
+            reports
+                .into_iter()
+                .map(|((span, origin), (object, free))| ExecError {
+                    origin,
+                    span: Some(span),
+                    cell: cell_id,
+                    kind: ExecErrorKind::Underconstrained {
+                        object: Some(object),
+                        free,
+                    },
+                }),
+        );
     }
 
     pub(crate) fn execute_cell(
@@ -10297,6 +10351,7 @@ impl<'a> ExecPass<'a> {
         if self.eval_depth > MAX_EVAL_DEPTH {
             self.eval_depth -= 1;
             self.errors.push(ExecError {
+                origin: None,
                 span: None,
                 cell: 0,
                 kind: ExecErrorKind::RecursionLimitExceeded {
@@ -10328,6 +10383,7 @@ impl<'a> ExecPass<'a> {
         if let Some((declared_name, path)) = self.gds_imports.get(&cell).cloned() {
             if !args.is_empty() {
                 self.errors.push(ExecError {
+                    origin: None,
                     span: None,
                     cell: 0,
                     kind: ExecErrorKind::InvalidCellArity {
@@ -10355,6 +10411,7 @@ impl<'a> ExecPass<'a> {
             .0 as usize];
         if args.len() != cell_decl.args.len() {
             self.errors.push(ExecError {
+                origin: None,
                 span: None,
                 cell: 0,
                 kind: ExecErrorKind::InvalidCellArity {
@@ -10371,6 +10428,7 @@ impl<'a> ExecPass<'a> {
             .find(|(_, (arg, decl))| !arg.matches_ty(&decl.metadata.1, self.defs))
         {
             self.errors.push(ExecError {
+                origin: None,
                 span: None,
                 cell: 0,
                 kind: ExecErrorKind::InvalidCellArgumentType {
@@ -10415,6 +10473,7 @@ impl<'a> ExecPass<'a> {
         // only report it later, with a less specific message.
         if self.cell_states.contains_key(&cell_id) {
             self.errors.push(ExecError {
+                origin: None,
                 span: None,
                 cell: cell_id,
                 kind: ExecErrorKind::RecursiveInstantiation { cell: cell_name },
@@ -10449,6 +10508,7 @@ impl<'a> ExecPass<'a> {
                         unsolved_vars: Default::default(),
                         objects: Vec::new(),
                         constraint_span_map: FxIndexMap::default(),
+                        constraint_scopes: FxIndexMap::default(),
                         var_origins: FxIndexMap::default(),
                         var_dependents: FxIndexMap::default(),
                         proxy_objects: FxIndexSet::default(),
@@ -10518,6 +10578,7 @@ impl<'a> ExecPass<'a> {
             // Re-borrowed below: recording the diagnostic needs `self`.
             if state.solve_iters > MAX_SOLVE_ITERS {
                 self.errors.push(ExecError {
+                    origin: None,
                     span: None,
                     cell: cell_id,
                     kind: ExecErrorKind::LimitExceeded {
@@ -10583,25 +10644,28 @@ impl<'a> ExecPass<'a> {
 
         let state = self.cell_state_mut(cell_id);
         for constraint in state.solver.inconsistent_constraints().clone() {
-            let span = self
-                .cell_state(cell_id)
-                .constraint_span_map
+            let state = self.cell_state(cell_id);
+            let span = state.constraint_span_map.get(&constraint).cloned();
+            let origin = state
+                .constraint_scopes
                 .get(&constraint)
-                .cloned();
+                .and_then(|scope| state.origin(*scope));
+            let conflict = state.solver.conflict(constraint);
             self.errors.push(ExecError {
+                origin,
                 span,
                 cell: cell_id,
-                kind: ExecErrorKind::InconsistentConstraint(constraint),
+                kind: ExecErrorKind::InconsistentConstraint(constraint, conflict),
             });
         }
         let grid = self.cell_state(cell_id).solver.grid();
         for (var, value) in self.cell_state(cell_id).solver.off_grid_vars().clone() {
-            let span = self
-                .cell_state(cell_id)
-                .var_origins
-                .get(&var)
-                .map(|origin| origin.span.clone());
+            let state = self.cell_state(cell_id);
+            let var_origin = state.var_origins.get(&var);
+            let span = var_origin.map(|origin| origin.span.clone());
+            let origin = var_origin.and_then(|origin| state.origin(origin.scope));
             self.errors.push(ExecError {
+                origin,
                 span,
                 cell: cell_id,
                 kind: ExecErrorKind::OffGrid {
@@ -10695,6 +10759,7 @@ impl<'a> ExecPass<'a> {
         if !invalid.is_empty() {
             for (span, kind) in invalid {
                 self.errors.push(ExecError {
+                    origin: None,
                     span: Some(span),
                     cell: cell_id,
                     kind,
@@ -10917,6 +10982,7 @@ impl<'a> ExecPass<'a> {
             Ok(imported) => imported,
             Err(error) => {
                 self.errors.push(ExecError {
+                    origin: None,
                     span: None,
                     cell: 0,
                     // `{:#}` walks the whole `anyhow` chain. `to_string()`
@@ -11061,7 +11127,13 @@ impl<'a> ExecPass<'a> {
                     ),
                 };
                 objects.insert(id, value);
-                emit.push((id, CompiledEmit { span: span.clone() }));
+                emit.push((
+                    id,
+                    CompiledEmit {
+                        span: span.clone(),
+                        origin: None,
+                    },
+                ));
                 if let Some(field_name) = field_name {
                     named_objects.entry(field_name).or_default().push(id);
                 }
@@ -11162,6 +11234,7 @@ impl<'a> ExecPass<'a> {
                         .expect("rect y1 not solved");
                     if x0 > x1 {
                         self.errors.push(ExecError {
+                            origin: None,
                             span: rect.span.clone(),
                             cell,
                             kind: ExecErrorKind::FlippedRect("x0 > x1".to_string()),
@@ -11169,6 +11242,7 @@ impl<'a> ExecPass<'a> {
                     }
                     if y0 > y1 {
                         self.errors.push(ExecError {
+                            origin: None,
                             span: rect.span.clone(),
                             cell,
                             kind: ExecErrorKind::FlippedRect("y0 > y1".to_string()),
@@ -11265,6 +11339,7 @@ impl<'a> ExecPass<'a> {
                         let snapped = crate::tech::snap(exact, grid);
                         if snapped != exact {
                             self.errors.push(ExecError {
+                                origin: None,
                                 span: text.span.clone(),
                                 cell,
                                 kind: ExecErrorKind::OffGrid {
@@ -11428,6 +11503,7 @@ impl<'a> ExecPass<'a> {
                         obj_id,
                         CompiledEmit {
                             span: emit.span.clone(),
+                            origin: state.origin(emit.scope),
                         },
                     ));
             }
@@ -11445,6 +11521,7 @@ impl<'a> ExecPass<'a> {
                         emit.object,
                         CompiledEmit {
                             span: emit.span.clone(),
+                            origin: state.origin(emit.scope),
                         },
                     ));
             }
@@ -12451,6 +12528,7 @@ impl<'a> ExecPass<'a> {
                             if self.eval_depth > MAX_EVAL_DEPTH {
                                 self.eval_depth -= 1;
                                 self.errors.push(ExecError {
+                                    origin: None,
                                     span: Some(self.span(&loc, c.span)),
                                     cell: loc.cell,
                                     kind: ExecErrorKind::RecursionLimitExceeded {
@@ -12519,6 +12597,7 @@ impl<'a> ExecPass<'a> {
                         }
                         _ => {
                             self.errors.push(ExecError {
+                                origin: None,
                                 span: Some(self.span(&loc, c.span)),
                                 cell: loc.cell,
                                 kind: ExecErrorKind::InvalidType,
@@ -13054,6 +13133,7 @@ impl<'a> ExecPass<'a> {
             // rejects unless the value arrived as `Any`.
             Value::Signal(_) | Value::SchematicInst(_) | Value::Device(_) => {
                 self.errors.push(ExecError {
+                    origin: None,
                     span: Some(span.clone()),
                     cell: cell_id,
                     kind: ExecErrorKind::SignalCellArgument {
@@ -13068,6 +13148,7 @@ impl<'a> ExecPass<'a> {
             }
             v => {
                 self.errors.push(ExecError {
+                    origin: None,
                     span: None,
                     cell: cell_id,
                     kind: ExecErrorKind::UnsupportedCellArgument(v.kind_name().to_owned()),
@@ -13099,7 +13180,7 @@ impl<'a> ExecPass<'a> {
             if fallback {
                 let expr = LinearExpr::difference(lhs, value);
                 self.add_constraint(
-                    loc.cell,
+                    &loc,
                     expr,
                     true,
                     priority,
@@ -13117,8 +13198,7 @@ impl<'a> ExecPass<'a> {
             {
                 let span = self.span(&loc, span);
                 self.cell_state_mut(loc.cell)
-                    .constraint_span_map
-                    .insert(constraint, span);
+                    .record_constraint(constraint, span, loc.scope);
             }
             return false;
         }
@@ -13141,7 +13221,7 @@ impl<'a> ExecPass<'a> {
     /// determines its variables. `span` locates it for diagnostics.
     fn add_constraint(
         &mut self,
-        cell_id: CellId,
+        loc: &DynLoc,
         expr: LinearExpr,
         fallback: bool,
         priority: i32,
@@ -13150,7 +13230,7 @@ impl<'a> ExecPass<'a> {
     ) {
         if fallback {
             let span = span(self);
-            self.cell_state_mut(cell_id)
+            self.cell_state_mut(loc.cell)
                 .fallback_constraints
                 .push(FallbackConstraint {
                     priority,
@@ -13160,15 +13240,14 @@ impl<'a> ExecPass<'a> {
                 });
             return;
         }
-        let solver = &mut self.cell_state_mut(cell_id).solver;
+        let solver = &mut self.cell_state_mut(loc.cell).solver;
         let constraint = solver.constrain_eq0(expr);
         // Only a constraint the solver keeps, or finds inconsistent, is ever
         // reported.
         if solver.is_live(constraint) || solver.inconsistent_constraints().contains(&constraint) {
             let span = span(self);
-            self.cell_state_mut(cell_id)
-                .constraint_span_map
-                .insert(constraint, span);
+            self.cell_state_mut(loc.cell)
+                .record_constraint(constraint, span, loc.scope);
         }
     }
 
@@ -13196,6 +13275,7 @@ impl<'a> ExecPass<'a> {
             Err(OpFailure::Error(kind, at)) => {
                 let span = self.span(loc, span(at));
                 self.errors.push(ExecError {
+                    origin: None,
                     span: Some(span),
                     cell: loc.cell,
                     kind,
@@ -13229,6 +13309,7 @@ impl<'a> ExecPass<'a> {
     /// Reports a use of the detached value `detached` at `span`.
     fn detached_value(&mut self, cell_id: CellId, span: Span, detached: Arc<Detached>) {
         self.errors.push(ExecError {
+            origin: None,
             span: Some(span),
             cell: cell_id,
             kind: ExecErrorKind::DetachedValue(detached),
@@ -13340,6 +13421,7 @@ impl<'a> ExecPass<'a> {
         let span = self.span(loc, call.expr.span);
         if let Err(reason) = kind.check_terminals(attached.len()) {
             self.errors.push(ExecError {
+                origin: None,
                 span: Some(span),
                 cell: cell_id,
                 kind: ExecErrorKind::InvalidDevice {
@@ -13436,6 +13518,7 @@ impl<'a> ExecPass<'a> {
         };
         if model.chars().any(|c| c.is_whitespace() || c.is_control()) {
             self.errors.push(ExecError {
+                origin: None,
                 span: Some(model_span),
                 cell: cell_id,
                 kind: ExecErrorKind::InvalidDeviceModel { model },
@@ -13454,6 +13537,7 @@ impl<'a> ExecPass<'a> {
             }
             let invalid = |this: &mut Self, reason: String| {
                 this.errors.push(ExecError {
+                    origin: None,
                     span: Some(this.span(loc, kwarg.value.span())),
                     cell: cell_id,
                     kind: ExecErrorKind::InvalidDeviceParam {
@@ -13509,6 +13593,7 @@ impl<'a> ExecPass<'a> {
         let kind = self.cell_state(cell_id).schematic.device(device).kind;
         if let Err(reason) = kind.check_model(model.is_some(), value.is_some()) {
             self.errors.push(ExecError {
+                origin: None,
                 span: Some(self.span(loc, call.expr.span)),
                 cell: cell_id,
                 kind: ExecErrorKind::InvalidDevice {
@@ -13791,6 +13876,7 @@ impl<'a> ExecPass<'a> {
                                     var,
                                     VarOrigin {
                                         span: rect.span.clone().unwrap(),
+                                        scope: vref.loc.scope,
                                         object: VarObject::Rect,
                                         value,
                                     },
@@ -13842,6 +13928,7 @@ impl<'a> ExecPass<'a> {
                             Value::Int(count) => {
                                 let Ok(count) = usize::try_from(count) else {
                                     self.errors.push(ExecError {
+                                        origin: None,
                                         span: Some(self.span(&vref.loc, c.expr.span)),
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidPolygon,
@@ -13850,6 +13937,7 @@ impl<'a> ExecPass<'a> {
                                 };
                                 if count < 3 {
                                     self.errors.push(ExecError {
+                                        origin: None,
                                         span: Some(self.span(&vref.loc, c.expr.span)),
                                         cell: cell_id,
                                         kind: ExecErrorKind::InvalidPolygon,
@@ -13858,6 +13946,7 @@ impl<'a> ExecPass<'a> {
                                 }
                                 if count > MAX_SHAPE_POINTS {
                                     self.errors.push(ExecError {
+                                        origin: None,
                                         span: Some(self.span(&vref.loc, c.expr.span)),
                                         cell: cell_id,
                                         kind: ExecErrorKind::LimitExceeded {
@@ -13874,6 +13963,7 @@ impl<'a> ExecPass<'a> {
                                             state
                                                 .new_solver_var(
                                                     &span,
+                                                    vref.loc.scope,
                                                     VarObject::Polygon,
                                                     VarRole::X(Some(i)),
                                                 )
@@ -13881,6 +13971,7 @@ impl<'a> ExecPass<'a> {
                                             state
                                                 .new_solver_var(
                                                     &span,
+                                                    vref.loc.scope,
                                                     VarObject::Polygon,
                                                     VarRole::Y(Some(i)),
                                                 )
@@ -13891,6 +13982,7 @@ impl<'a> ExecPass<'a> {
                             }
                             _ => {
                                 self.errors.push(ExecError {
+                                    origin: None,
                                     span: Some(self.span(&vref.loc, c.expr.span)),
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
@@ -13900,6 +13992,7 @@ impl<'a> ExecPass<'a> {
                         };
                         if points.len() < 3 {
                             self.errors.push(ExecError {
+                                origin: None,
                                 span: Some(self.span(&vref.loc, c.expr.span)),
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidPolygon,
@@ -13911,6 +14004,7 @@ impl<'a> ExecPass<'a> {
                                 .expect("polygon kwargs were statically validated");
                             if coordinate.index >= points.len() {
                                 self.errors.push(ExecError {
+                                    origin: None,
                                     span: Some(self.span(&vref.loc, kwarg.name.span)),
                                     cell: cell_id,
                                     kind: ExecErrorKind::IndexOutOfBounds,
@@ -13998,6 +14092,7 @@ impl<'a> ExecPass<'a> {
                             ValueRef::Int(count) => usize::try_from(*count).ok(),
                             _ => {
                                 self.errors.push(ExecError {
+                                    origin: None,
                                     span: Some(self.span(&vref.loc, c.expr.span)),
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
@@ -14007,6 +14102,7 @@ impl<'a> ExecPass<'a> {
                         };
                         let Some(count) = count.filter(|count| *count >= 2) else {
                             self.errors.push(ExecError {
+                                origin: None,
                                 span: Some(self.span(&vref.loc, c.expr.span)),
                                 cell: cell_id,
                                 kind: ExecErrorKind::InvalidPath,
@@ -14015,6 +14111,7 @@ impl<'a> ExecPass<'a> {
                         };
                         if count > MAX_SHAPE_POINTS {
                             self.errors.push(ExecError {
+                                origin: None,
                                 span: Some(self.span(&vref.loc, c.expr.span)),
                                 cell: cell_id,
                                 kind: ExecErrorKind::LimitExceeded {
@@ -14030,6 +14127,7 @@ impl<'a> ExecPass<'a> {
                                 && coordinate.index >= count
                             {
                                 self.errors.push(ExecError {
+                                    origin: None,
                                     span: Some(self.span(&vref.loc, kwarg.name.span)),
                                     cell: cell_id,
                                     kind: ExecErrorKind::IndexOutOfBounds,
@@ -14051,7 +14149,7 @@ impl<'a> ExecPass<'a> {
                         });
                         let state = self.cell_state_mut(cell_id);
                         let width = state
-                            .new_solver_var(&span, VarObject::Path, VarRole::Width)
+                            .new_solver_var(&span, vref.loc.scope, VarObject::Path, VarRole::Width)
                             .into();
                         // Extensions are free variables even when no kwarg
                         // names them, exactly as `width` always is. Making
@@ -14065,7 +14163,8 @@ impl<'a> ExecPass<'a> {
                         // path that ignores extensions still solves to zero,
                         // and one that constrains them now works.
                         let extension = |state: &mut CellState, named: bool, value| {
-                            let var = state.new_solver_var(&span, VarObject::Path, value);
+                            let var =
+                                state.new_solver_var(&span, vref.loc.scope, VarObject::Path, value);
                             if !named {
                                 state
                                     .compiler_defaults
@@ -14081,10 +14180,20 @@ impl<'a> ExecPass<'a> {
                             .map(|i| {
                                 (
                                     state
-                                        .new_solver_var(&span, VarObject::Path, VarRole::X(Some(i)))
+                                        .new_solver_var(
+                                            &span,
+                                            vref.loc.scope,
+                                            VarObject::Path,
+                                            VarRole::X(Some(i)),
+                                        )
                                         .into(),
                                     state
-                                        .new_solver_var(&span, VarObject::Path, VarRole::Y(Some(i)))
+                                        .new_solver_var(
+                                            &span,
+                                            vref.loc.scope,
+                                            VarObject::Path,
+                                            VarRole::Y(Some(i)),
+                                        )
                                         .into(),
                                 )
                             })
@@ -14270,6 +14379,7 @@ impl<'a> ExecPass<'a> {
                             })),
                             _ => {
                                 self.errors.push(ExecError {
+                                    origin: None,
                                     span: Some(span.clone()),
                                     cell: cell_id,
                                     kind: ExecErrorKind::InvalidType,
@@ -14303,6 +14413,7 @@ impl<'a> ExecPass<'a> {
                             } else {
                                 // default to a zero rectangle
                                 self.errors.push(ExecError {
+                                    origin: None,
                                     span: Some(span.clone()),
                                     cell: cell_id,
                                     kind: ExecErrorKind::EmptyBbox,
@@ -14337,7 +14448,12 @@ impl<'a> ExecPass<'a> {
                         path: state.scope_span(vref.loc.scope).path.clone(),
                         span: c.expr.span,
                     };
-                    let var = state.new_solver_var(&span, VarObject::Float, VarRole::Value);
+                    let var = state.new_solver_var(
+                        &span,
+                        vref.loc.scope,
+                        VarObject::Float,
+                        VarRole::Value,
+                    );
                     self.values
                         .insert(vid, Defer::Ready(Value::Linear(LinearExpr::from(var))));
                     true
@@ -14357,9 +14473,14 @@ impl<'a> ExecPass<'a> {
                         path: state.scope_span(vref.loc.scope).path.clone(),
                         span: c.expr.span,
                     };
-                    let var = state.new_solver_var(&span, VarObject::Float, VarRole::Value);
+                    let var = state.new_solver_var(
+                        &span,
+                        vref.loc.scope,
+                        VarObject::Float,
+                        VarRole::Value,
+                    );
                     let constraint = state.solver.constrain_floor(var, &expr);
-                    state.constraint_span_map.insert(constraint, span);
+                    state.record_constraint(constraint, span, vref.loc.scope);
                     self.values
                         .insert(vid, Defer::Ready(Value::Linear(LinearExpr::from(var))));
                     true
@@ -14380,13 +14501,11 @@ impl<'a> ExecPass<'a> {
                         let state = self.cell_states.get_mut(&cell_id).unwrap();
                         let constraint = state.solver.constrain_eq0(expr);
 
-                        state.constraint_span_map.insert(
-                            constraint,
-                            Span {
-                                path: state.scope_span(vref.loc.scope).path.clone(),
-                                span: c.expr.span,
-                            },
-                        );
+                        let span = Span {
+                            path: state.scope_span(vref.loc.scope).path.clone(),
+                            span: c.expr.span,
+                        };
+                        state.record_constraint(constraint, span, vref.loc.scope);
                         self.values.insert(vid, Defer::Ready(Value::Nil));
                         true
                     } else {
@@ -14568,7 +14687,7 @@ impl<'a> ExecPass<'a> {
                             constraint,
                             span: Some(span.clone()),
                         };
-                        state.constraint_span_map.insert(constraint, span.clone());
+                        state.record_constraint(constraint, span.clone(), vref.loc.scope);
                         state.object_emit.push(ObjectEmit {
                             scope: vref.loc.scope,
                             object: dim.id,
@@ -14643,6 +14762,7 @@ impl<'a> ExecPass<'a> {
                                         270 => Rotation::R270,
                                         _ => {
                                             self.errors.push(ExecError {
+                                                origin: None,
                                                 span: Some(span),
                                                 cell: cell_id,
                                                 kind: ExecErrorKind::InvalidRotation,
@@ -14666,10 +14786,20 @@ impl<'a> ExecPass<'a> {
                         let inst = Instance {
                             id,
                             x: state
-                                .new_solver_var(&span, VarObject::Instance, VarRole::X(None))
+                                .new_solver_var(
+                                    &span,
+                                    vref.loc.scope,
+                                    VarObject::Instance,
+                                    VarRole::X(None),
+                                )
                                 .into(),
                             y: state
-                                .new_solver_var(&span, VarObject::Instance, VarRole::Y(None))
+                                .new_solver_var(
+                                    &span,
+                                    vref.loc.scope,
+                                    VarObject::Instance,
+                                    VarRole::Y(None),
+                                )
                                 .into(),
                             cell: *c.state.posargs.first().unwrap(),
                             reflect: refl.unwrap_or_default(),
@@ -15199,6 +15329,7 @@ impl<'a> ExecPass<'a> {
                                             Err(None) => return self.poison(vid),
                                             Err(Some(kind)) => {
                                                 self.errors.push(ExecError {
+                                                    origin: None,
                                                     span: Some(span),
                                                     cell: cell_id,
                                                     kind,
@@ -15246,6 +15377,7 @@ impl<'a> ExecPass<'a> {
                                 Err(None) => return self.poison(vid),
                                 Err(Some(kind)) => {
                                     self.errors.push(ExecError {
+                                        origin: None,
                                         span: Some(span),
                                         cell: cell_id,
                                         kind,
@@ -15274,6 +15406,7 @@ impl<'a> ExecPass<'a> {
                             let Some(value) = value else {
                                 let span = self.span(&vref.loc, field_access_expr.expr.span);
                                 self.errors.push(ExecError {
+                                    origin: None,
                                     span: Some(span),
                                     cell: cell_id,
                                     kind: ExecErrorKind::NoDeviceTerminal {
@@ -15344,7 +15477,7 @@ impl<'a> ExecPass<'a> {
                     let expr = LinearExpr::difference(lhs, rhs);
                     let span = &c.span;
                     self.add_constraint(
-                        cell_id,
+                        &vref.loc,
                         expr,
                         c.fallback,
                         c.priority,
@@ -15535,7 +15668,19 @@ impl<'a> ExecPass<'a> {
                         c.expr.func.path.iter().map(|ident| &ident.name).join("::")
                     )
                 });
-                let cell = self.execute_cell(c.expr.metadata.0.unwrap(), arg_vals, scope_name)?;
+                let errors = self.errors.len();
+                let cell = self.execute_cell(c.expr.metadata.0.unwrap(), arg_vals, scope_name);
+                // Errors in the called cell point back to this call, so that
+                // the outermost one names the call in the top cell's body.
+                if self.entry_cell != Some(cell_id) {
+                    let call = self.origin(&vref.loc).unwrap_or_else(|| span.clone());
+                    for error in &mut self.errors[errors..] {
+                        if error.cell != cell_id {
+                            error.origin = Some(call.clone());
+                        }
+                    }
+                }
+                let cell = cell?;
                 self.values.insert(vid, Defer::Ready(Value::Cell(cell)));
                 self.cell_values.insert(cell, vid);
                 true
@@ -15849,6 +15994,7 @@ impl<'a> ExecPass<'a> {
                     _ => {
                         let span = self.span(&vref.loc, f.for_loop.seq.span());
                         self.errors.push(ExecError {
+                            origin: None,
                             span: Some(span),
                             cell: cell_id,
                             kind: ExecErrorKind::InvalidType,
@@ -17517,6 +17663,9 @@ impl CompiledCell {
         for scope in self.scopes.values() {
             for (_, emit) in &scope.emit {
                 paths.insert(&emit.span.path);
+                if let Some(origin) = &emit.origin {
+                    paths.insert(&origin.path);
+                }
             }
         }
         for object in self.objects.values() {
@@ -17681,8 +17830,9 @@ impl CompiledCell {
                 metadata: _,
                 emit,
             } = scope;
-            for (_, CompiledEmit { span }) in emit.iter_mut() {
+            for (_, CompiledEmit { span, origin }) in emit.iter_mut() {
                 rebase.rebase(span)?;
+                rebase.rebase_opt(origin)?;
             }
         }
 
@@ -17835,8 +17985,11 @@ impl CompiledCell {
                 metadata: _,
                 emit,
             } = scope;
-            for (_, CompiledEmit { span }) in emit.iter() {
+            for (_, CompiledEmit { span, origin }) in emit.iter() {
                 check(span)?;
+                if let Some(origin) = origin {
+                    check(origin)?;
+                }
             }
         }
 

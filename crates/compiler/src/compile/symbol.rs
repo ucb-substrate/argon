@@ -563,7 +563,12 @@ impl SymbolState {
             editable: site.editable && unique.contains(&site.span),
         };
         let mut error = |span: Option<Span>, kind: ExecErrorKind| {
-            errors.push(ExecError { span, cell, kind });
+            errors.push(ExecError {
+                span,
+                origin: None,
+                cell,
+                kind,
+            });
         };
 
         let mut items = self.items.iter().collect::<Vec<_>>();

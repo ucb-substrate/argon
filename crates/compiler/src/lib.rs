@@ -3,6 +3,7 @@ pub mod ast;
 pub mod cellcache;
 pub mod compile;
 pub mod diagnostics;
+pub mod driver;
 pub mod fingerprint;
 pub mod gds;
 pub mod gdscache;
@@ -1303,7 +1304,7 @@ mod tests {
         let error = errors
             .errors
             .iter()
-            .find(|error| matches!(error.kind, ExecErrorKind::InconsistentConstraint(_)))
+            .find(|error| matches!(error.kind, ExecErrorKind::InconsistentConstraint(..)))
             .expect("expected an inconsistent constraint");
         let span = error
             .span

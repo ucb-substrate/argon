@@ -7,10 +7,9 @@ use std::{
 
 use crate::{
     WorkspaceConfig, artifact,
-    compile::{self, CompileOutput},
     diagnostics::{self, Diagnostic},
+    driver,
     netlist::{NetlistFormat, NetlistOptions},
-    parse::{self, CellInvocation, parse_workspace_with_config},
 };
 use clap::{ArgGroup, Parser, ValueEnum};
 
@@ -159,70 +158,26 @@ fn execute(args: Args) -> Result<(), Failed> {
         .with_dependencies(args.dependencies.clone())
         .with_tech(args.tech.clone())
         .with_gds_imports(args.gds_imports.clone());
-    // The invocation is spliced into the workspace before analysis so that its
-    // arguments are resolved, type-checked, and evaluated like any source
-    // expression, which means the entry point must be resolved before parsing.
-    let entry = if args.check {
-        None
-    } else {
-        let Some(cell) = args.cell.as_deref() else {
-            return Err(fail(format, "either --check or --cell is required"));
+    let sources = driver::Sources::new();
+    if args.check {
+        let diagnostics = driver::check(&workspace, &sources);
+        return if diagnostics.is_empty() {
+            Ok(())
+        } else {
+            Err(Failed(format, diagnostics))
         };
-        let Some(tech) = args.tech.as_deref() else {
-            return Err(fail(
-                format,
-                "--tech is required when compiling a cell; pass the path to an Argon TOML technology file",
-            ));
-        };
-        crate::tech::read_tech(tech).map_err(|error| fail(format, error.to_string()))?;
-        Some(cell)
+    }
+    let Some(cell) = args.cell.as_deref() else {
+        return Err(fail(format, "either --check or --cell is required"));
     };
-
-    let mut parse_output = parse_workspace_with_config(&workspace);
-    let entry = match entry {
-        Some(cell) => Some(
-            parse::add_cell_invocation(&mut parse_output, cell)
-                .map_err(|error| fail(format, format!("invalid cell invocation: {error}")))?,
-        ),
-        None => None,
-    };
-    let analysis = compile::analyze_workspace(parse_output);
-    let Some(typed_ast) = analysis.typed_ast else {
+    if args.tech.is_none() {
         return Err(fail(
             format,
-            format!("could not parse library root `{}`", root.display()),
-        ));
-    };
-    if !analysis.errors.is_empty() {
-        return Err(compile_failed(
-            format,
-            CompileOutput::StaticErrors(compile::StaticErrorCompileOutput {
-                errors: analysis.errors,
-            }),
-            entry.as_ref(),
+            "--tech is required when compiling a cell; pass the path to an Argon TOML technology file",
         ));
     }
-    // Nothing left to do for a `--check` run.
-    let Some(invocation) = entry else {
-        return Ok(());
-    };
-
-    // Evaluation reads only the typed AST.
-    drop(analysis.ast);
-    let output = if args.gds_only {
-        let output = compile::execute_cell_invocation_without_debug_info(
-            &typed_ast,
-            &invocation,
-            &workspace,
-        );
-        drop(typed_ast);
-        output
-    } else {
-        compile::execute_cell_invocation(&typed_ast, &invocation, &workspace)
-    };
-    if !matches!(output, CompileOutput::Valid(_)) {
-        return Err(compile_failed(format, output, Some(&invocation)));
-    }
+    let output = driver::compile_cell(&workspace, &sources, cell, !args.gds_only)
+        .map_err(|diagnostics| Failed(format, diagnostics))?;
     if !args.gds_only {
         let output_path = args.output.unwrap_or_else(|| root.with_extension("bin"));
         artifact::write(&output, &output_path).map_err(|error| {
@@ -303,21 +258,6 @@ fn is_identifier(name: &str) -> bool {
 
 fn fail(format: ErrorFormat, message: impl Into<String>) -> Failed {
     Failed(format, vec![Diagnostic::error(message)])
-}
-
-fn compile_failed(
-    format: ErrorFormat,
-    output: CompileOutput,
-    invocation: Option<&CellInvocation>,
-) -> Failed {
-    let mut diagnostics = diagnostics::from_compile_output(&output);
-    if let Some(invocation) = invocation {
-        diagnostics::remap_invocation(&mut diagnostics, invocation);
-    }
-    // After remapping, so that diagnostics the invocation splice moves onto a
-    // common span are deduplicated too.
-    diagnostics::condense(&mut diagnostics);
-    Failed(format, diagnostics)
 }
 
 #[cfg(test)]
@@ -1215,6 +1155,101 @@ cell top() {
             "{diagnostic}"
         );
         assert!(!diagnostic.contains("<argon-std>/layout.ar:1:1"));
+    }
+
+    #[test]
+    fn errors_name_the_call_in_the_top_cell_that_led_to_them() {
+        let source = temp_source(
+            "call-site",
+            "fn offset(x: Float) {\n    std::layout::rect(\"met1\", x0=x / 20., y0=0., w=1., h=1.);\n}\n\
+             fn free() {\n    std::layout::rect(\"met1\", x0=0., y0=0., w=1.);\n}\n\
+             cell inner(x: Float) {\n    offset(x);\n}\n\
+             cell top() {\n    offset(1.);\n    free();\n    std::layout::inst(inner(3.), x=0., y=0.);\n}\n",
+        );
+        let path = source.display().to_string();
+        let diagnostics = render_failed(failed(execution_args(source, "top()", basic_tech())));
+        for expected in [
+            // Off the grid in a function the top cell calls, and in one
+            // another cell calls.
+            format!("{path}:2:5\n"),
+            format!("note: in this call\n  --> {path}:11:5\n"),
+            format!("note: in this call\n  --> {path}:13:23\n"),
+            // Underconstrained in a function.
+            format!("{path}:5:5\n"),
+            format!("note: in this call\n  --> {path}:12:5\n"),
+        ] {
+            assert!(diagnostics.contains(&expected), "{expected}\n{diagnostics}");
+        }
+    }
+
+    #[test]
+    fn errors_say_how_to_fix_them() {
+        let inconsistent = temp_source(
+            "inconsistent",
+            "cell top() {\n    let r = std::layout::rect(\"met1\", x0=0., y0=0., x1=100., y1=10.);\n    eq(r.x1, 200.);\n}\n",
+        );
+        let diagnostics =
+            render_failed(failed(execution_args(inconsistent, "top()", basic_tech())));
+        assert!(
+            diagnostics.contains("leave its two sides 100 apart"),
+            "{diagnostics}"
+        );
+        let unwritable = temp_source(
+            "unwritable",
+            "cell other(a: Inst) {\n    if true { 1 } else { 2 }\n}\n",
+        );
+        let diagnostics = render_failed(failed(check_args(unwritable)));
+        assert!(
+            diagnostics.contains("an instance's type can't be written; use `Any`"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("end it with `;`, even when it is an `if` or `match` block"),
+            "{diagnostics}"
+        );
+    }
+
+    #[test]
+    fn gds_struct_names_match_the_exported_structures() {
+        let source = temp_source(
+            "struct-names",
+            "cell inner(w: Float) {\n    std::layout::rect(\"met1\", x0=0., y0=0., w=w, h=1.);\n}\n\
+             cell top() {\n    std::layout::inst(inner(1.), x=0., y=0.);\n    std::layout::inst(inner(2.), x=5., y=0.);\n}\n",
+        );
+        let artifact_path = source.with_extension("bin");
+        let gds_path = source.with_extension("gds");
+        let mut args = execution_args(source, "top()", basic_tech());
+        args.gds = Some(gds_path.clone());
+        if let Err(error) = execute(args) {
+            panic!("`top()` should compile: {}", render_failed(error));
+        }
+        let CompileOutput::Valid(output) =
+            artifact::read(artifact_path).expect("artifact should decode")
+        else {
+            panic!("`top()` should compile successfully");
+        };
+        let library = GdsLibrary::load(&gds_path).expect("GDS should load");
+        let names = output.gds_struct_names();
+        assert_eq!(names.len(), library.structs.len());
+        for (id, name) in &names {
+            let structure = library
+                .structs
+                .iter()
+                .find(|structure| structure.name == *name)
+                .unwrap_or_else(|| panic!("no structure named {name}"));
+            let shapes = output.cells[id]
+                .objects
+                .values()
+                .filter(|object| object.is_layout())
+                .count();
+            assert_eq!(structure.elems.len(), shapes, "{name}");
+        }
+        // The two `inner` cells keep distinct names, in export order.
+        let inner = names
+            .values()
+            .filter(|name| name.starts_with("inner"))
+            .collect::<Vec<_>>();
+        assert_eq!(inner, ["inner", "inner_1"]);
     }
 
     #[test]

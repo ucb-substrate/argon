@@ -4,6 +4,7 @@ mod cell_list;
 mod command_completion;
 mod compiler_worker;
 pub mod document;
+pub mod headless;
 pub mod hook;
 pub mod mcp;
 mod navigation;

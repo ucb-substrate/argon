@@ -8,7 +8,7 @@ sidebar_label: Agents
 
 A coding agent can edit an Argon project while you have it open. Its edits go into your Neovim buffers or VS Code documents, the same way GUI edits do, so you watch each one land in the editor and in the GUI. Edits stay unsaved until you save them, and each one can be undone.
 
-Agents connect through `argon-analyzer mcp`, a [Model Context Protocol](https://modelcontextprotocol.io) server. It finds the Argon sessions you have running when the agent calls a tool, so you can start, stop, and switch Argon projects without restarting the agent.
+Agents connect through `argon-analyzer mcp`, a [Model Context Protocol](https://modelcontextprotocol.io) server. It finds the Argon sessions you have running when the agent calls a tool, so you can start, stop, and switch Argon projects without restarting the agent. An agent working without an editor, such as one in a sandbox, uses the server's [headless mode](#headless-mode) instead.
 
 ## Setup
 
@@ -92,6 +92,39 @@ For Claude Code, `argon-analyzer hook` is a `PreToolUse` hook that steers those 
     ]
   }
 }
+```
+
+## Headless mode
+
+`argon-analyzer mcp --headless` needs no editor or running session. Its tools compile the library on disk with the same compiler as `arc run`, so the agent edits files with its own tools and calls them after each edit:
+
+```json
+{
+  "mcpServers": {
+    "argon": {
+      "type": "stdio",
+      "command": "argon-analyzer",
+      "args": ["mcp", "--headless"]
+    }
+  }
+}
+```
+
+Each call uses the library whose `Argon.toml` is in the agent's working directory or above it, or the one an optional `workspace` argument names. Other paths, in arguments and in results, are relative to the library's directory. Coordinates are in the technology's units, nm for SKY130.
+
+| Tool | Arguments | Description |
+| --- | --- | --- |
+| `compile` | `cells`, `export`, `layers` | Compiles cell invocations in parallel and reports each one's size, bounding box, and errors. With `export`, writes each cell that compiles to `<export>/<name>/argon.gds` and `argon.spice`, exactly as `arc run --gds --spice` writes them, where `<name>` is the invocation's tokens joined by `-`; a cell that fails removes its old files there. With `layers`, adds each layer's drawn area. With no `cells`, only parses and type-checks the library. |
+| `inspect` | `cell`, `exprs` | Evaluates expressions at the end of the cell's body after it is solved, where its parameters and top-level `let`s are in scope, such as `out.x1 - out.x0`. |
+| `locate` | `cell`, `boxes`, `unit` | Finds the shapes that overlap or touch each box, such as a DRC violation, with the source line that drew each one, the call in its cell's body when that line is in a function, and the instances leading to it. A box takes optional `layers`, a `gds_cell` whose coordinates it is in (the cell a DRC report names for the violation), and a `label`. `unit` is `um`, the default, or `nm`. |
+
+An error names the line that failed and, when that line is in a function or another cell, the call in the top cell's body that led to it:
+
+```
+inv(1000., 1600., 4): 2.77 × 6.72 µm = 18.61 µm², (-665, -1160) to (2105, 5560); 25 shapes, 4 instances in the top cell → target/sweep/inv-1000-1600-4/
+inv(1001., 1600., 4): error
+  /path/to/pdks/sky130/lib.ar:11:16: solved value 1261 is off the 5 grid (nearest grid point is 1260)
+    called from lib.ar:5:38
 ```
 
 ## Security

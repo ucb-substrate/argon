@@ -4,7 +4,10 @@ use thiserror::Error;
 
 use std::sync::Arc;
 
-use crate::{ast::Span, solver::ConstraintId};
+use crate::{
+    ast::Span,
+    solver::{Conflict, ConstraintId},
+};
 
 use super::{CellId, CompiledData, Detached};
 
@@ -175,7 +178,9 @@ pub enum StaticErrorKind {
     #[error("unreachable match arm")]
     UnreachableMatchArm,
     /// A cell had an expression in tail position, which is not permitted.
-    #[error("cells may not have an expression in tail position")]
+    #[error(
+        "cells may not have an expression in tail position; end it with `;`, even when it is an `if` or `match` block"
+    )]
     CellWithTailExpr,
     /// If conditions must have type bool.
     #[error("if conditions must have type bool")]
@@ -235,6 +240,9 @@ pub enum StaticErrorKind {
     /// A referenced type has not been declared.
     #[error("unknown type")]
     UnknownType,
+    /// `Inst` was written as a type, which instances do not have.
+    #[error("an instance's type can't be written; use `Any`")]
+    InstType,
     /// The requested field does not exist on the given type.
     #[error("no field {field} on type {ty}")]
     NoFieldOnTy { field: String, ty: String },
@@ -320,6 +328,9 @@ pub enum StaticErrorKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecError {
     pub span: Option<Span>,
+    /// The call in the top cell's body that led to `span`, when `span` is
+    /// inside a function or another cell.
+    pub origin: Option<Span>,
     pub cell: CellId,
     pub kind: ExecErrorKind,
 }
@@ -374,9 +385,10 @@ pub enum ExecErrorKind {
     /// A text label uses a layer absent from the technology file.
     #[error("text uses layer `{layer}`, which is not defined in technology file `{tech}`")]
     IllegalTextLayer { layer: String, tech: String },
-    /// A constraint conflicts with the rest of the system.
-    #[error("inconsistent constraint")]
-    InconsistentConstraint(ConstraintId),
+    /// A constraint conflicts with the rest of the system, as the solver
+    /// found when it could tell how.
+    #[error("{}", inconsistent_message(.1))]
+    InconsistentConstraint(ConstraintId, Option<Conflict>),
     /// A solved value is not sufficiently close to the technology grid.
     ///
     /// Carries the value and where it would snap to: rounding each variable
@@ -543,6 +555,20 @@ fn signal_cell_param(
 
 /// How many free values an underconstrained message names before summarizing.
 const NAMED_FREE_VALUES: usize = 4;
+
+/// The message of [`ExecErrorKind::InconsistentConstraint`].
+fn inconsistent_message(conflict: &Option<Conflict>) -> String {
+    match conflict {
+        None => "inconsistent constraint".to_owned(),
+        Some(Conflict::Value { has, asks }) => format!(
+            "inconsistent constraint: it sets a value to {asks}, which other constraints already set to {has}"
+        ),
+        Some(Conflict::Residual(residual)) => format!(
+            "inconsistent constraint: other constraints already determine every value in it, and leave its two sides {} apart",
+            residual.abs()
+        ),
+    }
+}
 
 /// The message of [`ExecErrorKind::Underconstrained`].
 fn underconstrained_message(object: &Option<VarObject>, free: &[VarRole]) -> String {
