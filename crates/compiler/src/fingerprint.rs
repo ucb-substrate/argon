@@ -22,6 +22,7 @@
 //! has to make the fingerprint differ.
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     hash::Hasher,
     ops::Range,
@@ -30,6 +31,7 @@ use std::{
 };
 
 use indexmap::{IndexMap, IndexSet};
+use rustc_hash::FxHashMap;
 
 use crate::{
     ast::{
@@ -1324,9 +1326,33 @@ pub struct SpanRebase {
     /// per file and ordered by position, with the fingerprint that names each.
     from: HashMap<Arc<Path>, Vec<(Range<usize>, Fingerprint)>>,
     /// Where each of those declarations lives now.
-    to: HashMap<Fingerprint, (Arc<Path>, Range<usize>)>,
+    to: FxHashMap<Fingerprint, (Arc<Path>, Range<usize>)>,
     /// Files containing a declaration whose source extent moved or changed.
     moved_paths: HashSet<Arc<Path>>,
+    /// The declaration the last span was found in, where the next span most
+    /// likely is too.
+    last: Cell<Option<LastExtent>>,
+    /// Whether [`Self::rebase`] has changed a span since
+    /// [`Self::take_moved`] was last called.
+    moved: Cell<bool>,
+}
+
+/// The declaration a span starts in, and the file and offset shift that
+/// translate it.
+struct Located<'a> {
+    extent: Range<usize>,
+    fingerprint: Fingerprint,
+    path: &'a Arc<Path>,
+    shift: isize,
+}
+
+/// A declaration extent a span was found in, and its translation.
+struct LastExtent {
+    /// The spans' file, held so that its address cannot be reused.
+    path: Arc<Path>,
+    extent: Range<usize>,
+    fingerprint: Fingerprint,
+    shift: isize,
 }
 
 /// A span that could not be translated.
@@ -1347,7 +1373,7 @@ impl SpanRebase {
     pub fn new(from: &ItemIndex, to: &ItemIndex) -> Option<Self> {
         let mut moved = false;
         let mut moved_paths = HashSet::new();
-        let mut by_fingerprint = HashMap::with_capacity(to.len());
+        let mut by_fingerprint = FxHashMap::with_capacity_and_hasher(to.len(), Default::default());
         for (_, site) in to.iter() {
             by_fingerprint.insert(site.fingerprint, (site.path.clone(), site.span.clone()));
         }
@@ -1375,6 +1401,8 @@ impl SpanRebase {
             from: by_path,
             to: by_fingerprint,
             moved_paths,
+            last: Cell::new(None),
+            moved: Cell::new(false),
         })
     }
 
@@ -1392,10 +1420,23 @@ impl SpanRebase {
         let Some((path, shift)) = self.translation(span)? else {
             return Ok(());
         };
-        let shifted = |offset: usize| (offset as isize + shift) as usize;
-        span.path = path.clone();
-        span.span = cfgrammar::Span::new(shifted(span.span.start()), shifted(span.span.end()));
+        if !Arc::ptr_eq(&span.path, path) {
+            if span.path != *path {
+                self.moved.set(true);
+            }
+            span.path = path.clone();
+        }
+        if shift != 0 {
+            let shifted = |offset: usize| (offset as isize + shift) as usize;
+            span.span = cfgrammar::Span::new(shifted(span.span.start()), shifted(span.span.end()));
+            self.moved.set(true);
+        }
         Ok(())
+    }
+
+    /// Whether [`Self::rebase`] changed a span since this was last called.
+    pub fn take_moved(&self) -> bool {
+        self.moved.replace(false)
     }
 
     /// Whether [`Self::rebase`] would change `span`, with the same errors.
@@ -1411,6 +1452,27 @@ impl SpanRebase {
         &self,
         span: &crate::ast::Span,
     ) -> Result<Option<(&Arc<Path>, isize)>, RebaseError> {
+        if let Some(last) = self.last.take()
+            && Arc::ptr_eq(&last.path, &span.path)
+            && last.extent.contains(&span.span.start())
+        {
+            let (path, _) = &self.to[&last.fingerprint];
+            let shift = last.shift;
+            self.last.set(Some(last));
+            return Ok(Some((path, shift)));
+        }
+        let located = self.locate(span)?;
+        self.last.set(located.as_ref().map(|located| LastExtent {
+            path: span.path.clone(),
+            extent: located.extent.clone(),
+            fingerprint: located.fingerprint,
+            shift: located.shift,
+        }));
+        Ok(located.map(|located| (located.path, located.shift)))
+    }
+
+    /// Where `span` is, without consulting `last`.
+    fn locate(&self, span: &crate::ast::Span) -> Result<Option<Located<'_>>, RebaseError> {
         // Spans mostly share their file's path with the index they were
         // recorded against, which finds them without hashing the path.
         let extents = self
@@ -1440,7 +1502,12 @@ impl SpanRebase {
         if moved.end - moved.start != extent.end - extent.start {
             return Err(RebaseError::LengthChanged);
         }
-        Ok(Some((path, moved.start as isize - extent.start as isize)))
+        Ok(Some(Located {
+            extent: extent.clone(),
+            fingerprint: *fingerprint,
+            path,
+            shift: moved.start as isize - extent.start as isize,
+        }))
     }
 
     /// Translates an optional span, leaving `None` alone.

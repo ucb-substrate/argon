@@ -26,6 +26,7 @@ type FxIndexSet<T> = IndexSet<T, BuildHasherDefault<FxHasher>>;
 mod direct;
 mod foreign;
 mod ops;
+mod plain;
 mod result;
 mod route;
 mod schematic;
@@ -8221,6 +8222,9 @@ pub enum CellArg {
     Point(f64, f64),
     /// A tuple, like [`Value::Tuple`]: its elements in order.
     Tuple(Vec<CellArg>),
+    /// A sequence, tuple, struct, or enum of integers, booleans, strings, and
+    /// constant floats, shared with the caller's value rather than copied.
+    Plain(Value),
 }
 
 /// The declared payload of `variant` of the enum `ty`, and the substitution
@@ -8236,11 +8240,21 @@ fn variant_payload<'a>(
 }
 
 impl CellArg {
+    /// The unshared form of a [`Self::Plain`] argument, or `None` for any
+    /// other.
+    pub(crate) fn unshared(&self) -> Option<CellArg> {
+        match self {
+            Self::Plain(value) => Some(plain::cell_arg(value)),
+            _ => None,
+        }
+    }
+
     /// Whether this argument inhabits `ty`. Struct and enum types are looked up
     /// in `defs`; a type parameter, like `Any`, admits anything.
     fn matches_ty(&self, ty: &Ty, defs: &TypeDefs) -> bool {
         match (self, ty) {
             (_, Ty::Any | Ty::Param(_)) => true,
+            (Self::Plain(value), ty) => plain::cell_arg(value).matches_ty(ty, defs),
             (Self::Float(_), Ty::Float)
             | (Self::Int(_), Ty::Int)
             | (Self::Bool(_), Ty::Bool)
@@ -8303,6 +8317,7 @@ impl CellArg {
 
     fn ty_name(&self) -> &'static str {
         match self {
+            Self::Plain(value) => plain::cell_arg(value).ty_name(),
             Self::Float(_) => "Float",
             Self::Int(_) => "Int",
             Self::Bool(_) => "Bool",
@@ -8349,6 +8364,8 @@ pub(crate) enum CellArgKey {
     Path(String, bool, [u64; 3], Vec<(u64, u64)>),
     Point(u64, u64),
     Tuple(Vec<CellArgKey>),
+    /// A plain argument, hashed and compared as the tree it stands for.
+    Plain(plain::PlainKey),
 }
 
 /// The bits of each coordinate pair.
@@ -8435,6 +8452,7 @@ impl From<&CellArg> for CellArgKey {
             ),
             CellArg::Point(x, y) => Self::Point(x.to_bits(), y.to_bits()),
             CellArg::Tuple(v) => Self::Tuple(v.iter().map(Self::from).collect()),
+            CellArg::Plain(value) => Self::Plain(plain::PlainKey(value.clone())),
         }
     }
 }
@@ -13432,6 +13450,7 @@ impl<'a> ExecPass<'a> {
             CellArg::Bool(b) => Value::Bool(*b),
             CellArg::Float(f) => Value::Linear(LinearExpr::from(*f)),
             CellArg::String(s) => Value::String(s.clone()),
+            CellArg::Plain(value) => value.clone(),
             CellArg::Enum { variant, payload } => Value::Enum(Arc::new(EnumValue {
                 variant: variant.clone(),
                 payload: VariantValues::Tuple(
@@ -13603,6 +13622,9 @@ impl<'a> ExecPass<'a> {
         val: &Value,
         span: &Span,
     ) -> Result<Option<CellArg>, ()> {
+        if plain::is_shared(val) {
+            return Ok(Some(CellArg::Plain(val.clone())));
+        }
         Ok(match val {
             Value::Linear(v) => {
                 // A scalar argument need not be a coordinate, so it is passed
@@ -17721,6 +17743,10 @@ pub enum FieldValue {
     /// A detached value, which reads back as itself through either kind of
     /// instance.
     Detached(Arc<Detached>),
+    /// A sequence, tuple, struct, or enum of integers, booleans, strings, and
+    /// constant floats, shared with the value the cell bound rather than
+    /// copied.
+    Plain(plain::PlainField),
     /// A field whose value was poisoned, which already reported why. Only ever
     /// a whole field.
     Poison,
@@ -17758,6 +17784,9 @@ impl FieldValue {
             }
             Ok(solved)
         };
+        if plain::is_shared(value) {
+            return Ok(Self::Plain(plain::PlainField(value.clone())));
+        }
         let exact =
             |expr: &LinearExpr| solver.eval_expr_exact(expr).expect("cell field not solved");
         Ok(match value {
@@ -17871,6 +17900,7 @@ impl FieldValue {
             }
             Self::Device { kind, terminals } => reader.device(*kind, terminals, path),
             Self::Detached(detached) => Value::Detached(detached.clone()),
+            Self::Plain(plain) => plain.0.clone(),
             Self::Poison | Self::Unreadable(_) => Value::Poison,
         }
     }
@@ -17903,6 +17933,7 @@ impl FieldValue {
             | Self::Cell(_)
             | Self::Nil
             | Self::Signal(_)
+            | Self::Plain(_)
             | Self::Poison
             | Self::Unreadable(_) => Ok(()),
         }
@@ -17933,6 +17964,7 @@ impl FieldValue {
             | Self::Cell(_)
             | Self::Nil
             | Self::Signal(_)
+            | Self::Plain(_)
             | Self::Poison
             | Self::Unreadable(_) => Ok(()),
         }
@@ -17963,6 +17995,7 @@ impl FieldValue {
             | Self::Nil
             | Self::Signal(_)
             | Self::Detached(_)
+            | Self::Plain(_)
             | Self::Poison
             | Self::Unreadable(_) => {}
         }
@@ -17991,6 +18024,7 @@ impl FieldValue {
             | Self::Nil
             | Self::Signal(_)
             | Self::Detached(_)
+            | Self::Plain(_)
             | Self::Poison
             | Self::Unreadable(_) => {}
         }

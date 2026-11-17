@@ -5,10 +5,8 @@ use std::layout::{crect, inst};
 use lib::params::SramLayoutParams;
 use lib::logic::floorplan::{Blocks, Grid, SramFloorplan};
 use lib::logic::routing::Shapes;
-use lib::logic::power::Straps;
 use lib::columns::{top, util};
-use lib::logic::{floorplan, guard_ring, routing};
-use lib::columns::util::Via;
+use lib::logic::{floorplan, guard_ring, power, routing};
 
 // All signal routes, returning the shapes they use outside the blocks.
 fn draw_signal_routes(p: SramLayoutParams, g: Grid, f: SramFloorplan, b: Blocks) -> Shapes {
@@ -34,18 +32,20 @@ fn draw_signal_routes(p: SramLayoutParams, g: Grid, f: SramFloorplan, b: Blocks)
 }
 
 // The signal routes alone, drawn against construction copies of the blocks.
-cell sram_routes(p: SramLayoutParams) {
-    let f = floorplan::sram_floorplan(p);
-    draw_signal_routes(p, floorplan::sram_grid(p, f), f, floorplan::place(p, f, true, true));
-}
-
-// The power straps and their vias, placed around construction copies of the
-// blocks and the signal `routes`. As its own cell, it is reused when the rest
-// of the core changes.
-cell sram_power(p: SramLayoutParams, with_control: Bool, routes: Shapes) {
+// Without control logic, the routes stop at its pins.
+cell sram_routes(p: SramLayoutParams, with_control: Bool) {
     let f = floorplan::sram_floorplan(p);
     let b = floorplan::place(p, f, true, with_control);
-    pub let straps = lib::logic::power::draw_power(p, f, b, routes);
+    pub let shapes = draw_signal_routes(p, floorplan::sram_grid(p, f), f, b);
+}
+
+// The signal routes, and the power straps and vias that avoid them, drawn
+// against construction copies of the blocks.
+cell sram_wiring(p: SramLayoutParams, with_control: Bool) {
+    let f = floorplan::sram_floorplan(p);
+    let routes = inst(sram_routes(p, with_control), x=0., y=0.).shapes;
+    let b = floorplan::place(p, f, true, with_control);
+    pub let straps = power::draw_power(p, f, b, routes);
 }
 
 // The SRAM inside its guard ring: blocks, signal routes, and power, with the
@@ -54,8 +54,7 @@ cell sram_power(p: SramLayoutParams, with_control: Bool, routes: Shapes) {
 cell sram_inner(p: SramLayoutParams, with_control: Bool) {
     let f = floorplan::sram_floorplan(p);
     let b = floorplan::place(p, f, false, with_control);
-    let routes = draw_signal_routes(p, floorplan::sram_grid(p, f), f, b);
-    pub let straps = inst(sram_power(p, with_control, routes), x=0., y=0.).straps;
+    pub let straps = inst(sram_wiring(p, with_control), x=0., y=0.).straps;
 }
 
 // The guard ring's hole: the routing grid's metal extent with 1 um to spare.
@@ -75,55 +74,6 @@ fn macro_bounds(g: Grid) -> Rect {
     util::grow(ring_hole(g), 4240., 4240.)
 }
 
-// Each strap that reaches the routing area's edge runs on to the outer edge
-// of its supply's ring, with vias onto the ring's crossing sides and, for
-// met1 straps, onto its tap. Met2 straps become supply pins.
-fn extend_straps(ring: Any, placed: Straps) {
-    // Each instance field read places its rects anew, so read the rings once.
-    let rings = [ring.vss_ring, ring.vdd_ring];
-    for s in placed.straps {
-        let r0 = lib::logic::router::from_box(s.rect);
-        let rg = rings[if s.vdd { 1 } else { 0 }];
-        let outer = rg.outer;
-        let vertical = s.layer == 0;
-        let lo = if s.lower_boundary {
-            if vertical { outer.y0 } else { outer.x0 }
-        } else {
-            if vertical { r0.y0 } else { r0.x0 }
-        };
-        let hi = if s.upper_boundary {
-            if vertical { outer.y1 } else { outer.x1 }
-        } else {
-            if vertical { r0.y1 } else { r0.x1 }
-        };
-        let r = if vertical {
-            crect(x0=r0.x0, y0=lo, x1=r0.x1, y1=hi)
-        } else {
-            crect(x0=lo, y0=r0.y0, x1=hi, y1=r0.y1)
-        };
-        // Sides in ring order: left, right, bottom, top.
-        let ends = std::concat(
-            if s.upper_boundary { [if vertical { 3 } else { 1 }] } else { [] },
-            if s.lower_boundary { [if vertical { 2 } else { 0 }] } else { [] },
-        );
-        for k in ends {
-            if vertical {
-                util::contact(Via::Via1, r, rg.sides[k], longer=true, later=true);
-            } else {
-                util::contact(Via::Via1, rg.sides[k], r, longer=true, later=true);
-            }
-        }
-        if vertical {
-            for k in ends {
-                util::contact(Via::Mcon, rg.mids[k], r, longer=true, later=true);
-            }
-            util::draw_box("met1.drawing", r);
-        } else {
-            util::met2_port(r.x0, r.y0, r.x1, r.y1);
-        }
-    }
-}
-
 // A pin from a signal's track down through the guard rings.
 fn pin_down(g: Grid, track: Rect) -> Rect {
     util::met1_port(track.x0, macro_bounds(g).y0, track.x1, g.y0 + 320.)
@@ -137,7 +87,7 @@ cell sram(p: SramLayoutParams, with_control: Bool) {
     let inner = inst(sram_inner(p, with_control), x=0., y=0.);
     let hole = ring_hole(g);
     let ring = inst(guard_ring::guard_ring(hole.x0, hole.y0, hole.x1, hole.y1), x=0., y=0.);
-    extend_straps(ring, inner.straps);
+    inst(power::strap_extensions(ring.vss_ring, ring.vdd_ring, inner.straps), x=0., y=0.);
     let dffs = inst(
         lib::logic::dff::dff_array(p.address_dff_count),
         x=f.dffs.0,
