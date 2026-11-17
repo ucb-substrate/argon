@@ -5027,7 +5027,8 @@ impl<'a> VarIdTyPass<'a> {
                 // must still be fetched fallibly, as the sibling natives do.
                 if let Some(arg) = args.posargs.first() {
                     let argty = self.shallow(&arg.ty());
-                    if !matches!(argty, Ty::Cell(_) | Ty::Inst(_)) {
+                    // An `Any` is checked when the call runs.
+                    if !matches!(argty, Ty::Cell(_) | Ty::Inst(_) | Ty::Any) {
                         self.errors.push(StaticError {
                             span: self.span(call_span),
                             kind: StaticErrorKind::IncorrectTyCategory {

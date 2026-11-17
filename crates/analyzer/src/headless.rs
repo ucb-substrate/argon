@@ -866,7 +866,12 @@ fn summary(data: &CompiledData) -> String {
             _ => {}
         }
     }
-    let counts = format!("{shapes} shapes, {instances} instances in the top cell");
+    let plural = |n: usize, noun: &str| format!("{n} {noun}{}", if n == 1 { "" } else { "s" });
+    let counts = format!(
+        "{}, {} in the top cell",
+        plural(shapes, "shape"),
+        plural(instances, "instance")
+    );
     let Some(bbox) = data.layout_bbox(data.top) else {
         return format!("empty; {counts}");
     };
@@ -1265,9 +1270,11 @@ fn format_object(data: &CompiledData, object: &SolvedValue) -> String {
         )
     };
     match object {
+        // Rects read through an instance are construction copies of drawn
+        // shapes, so only unlayered ones are labelled as construction.
         SolvedValue::Rect(rect) => format!(
             "{} {} {}",
-            if rect.construction {
+            if rect.construction && rect.layer.is_none() {
                 "construction Rect"
             } else {
                 "Rect"
@@ -1603,7 +1610,7 @@ mod tests {
         let (error, text) = call(
             &tools,
             "inspect",
-            json!({ "cell": INVERTER, "exprs": ["out_n.x1 - out_n.x0", "out", "out.bogus", "nf"] }),
+            json!({ "cell": INVERTER, "exprs": ["out_n.x1 - out_n.x0", "out", "out.bogus", "nf", "nmos.sdm", "std::layout::bbox(nmos)"] }),
         )
         .await;
         assert!(!error, "{text}");
@@ -1612,7 +1619,9 @@ mod tests {
             "out_n.x1 - out_n.x0 = 1665.\n\
              out = Rect li1.drawing (1700, 1400) to (1870, 2250), 170 × 850\n\
              out.bogus: error at column 5: no field bogus on type Rect\n\
-             nf = 4"
+             nf = 4\n\
+             nmos.sdm = Rect nsdm.drawing (-485, 0) to (1925, 1260), 2410 × 1260\n\
+             std::layout::bbox(nmos) = construction Rect (no layer) (-485, 0) to (1925, 1260), 2410 × 1260"
         );
         assert_eq!(
             fs::read_to_string(library.path().join("lib.ar")).unwrap(),

@@ -3425,6 +3425,34 @@ cell top() {
     }
 
     #[test]
+    fn argon_sky130_mos_wires_each_terminal_on_a_via_sized_bar() {
+        let o = parse_workspace_with_std(ARGON_SKY130_LIB);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        for nf in 1..=4 {
+            let data = compile_sky130(
+                &ast,
+                CompileInput {
+                    cell: &["mos"],
+                    args: vec![CellArg::Bool(true), CellArg::Float(420.), CellArg::Int(nf)],
+                },
+            )
+            .unwrap_valid();
+            let mut bars = top_rects_on(&data, "met1.drawing");
+            bars.sort_by(|a, b| a[1].partial_cmp(&b[1]).unwrap());
+            let [g, s, d] = bars[..] else {
+                panic!("mos draws three met1 bars: {bars:?}");
+            };
+            for bar in [g, s, d] {
+                assert_relative_eq!(bar[3] - bar[1], 320., epsilon = EPSILON);
+            }
+            // The bars keep met1's 140 spacing between them.
+            assert_relative_eq!(s[1] - g[3], 140., epsilon = EPSILON);
+            assert!(d[1] - s[3] >= 140., "{nf} fingers: {bars:?}");
+        }
+    }
+
+    #[test]
     fn argon_enumerations() {
         let o = parse_workspace_with_std(ARGON_ENUMERATIONS);
         assert!(o.static_errors().is_empty());
@@ -6466,6 +6494,70 @@ cell top() {
             })
             .expect("the cell emits one label");
         assert_relative_eq!(label.x, 0.7, epsilon = EPSILON);
+    }
+
+    /// The edges of every rect the top cell draws on `layer`, in creation order.
+    fn top_rects_on(data: &CompiledData, layer: &str) -> Vec<[f64; 4]> {
+        layout_objects(data, data.top)
+            .into_iter()
+            .filter_map(SolvedValue::get_rect)
+            .filter(|rect| rect.layer.as_deref() == Some(layer))
+            .map(|rect| [rect.x0.0, rect.y0.0, rect.x1.0, rect.y1.0])
+            .collect()
+    }
+
+    #[test]
+    fn symmetry_helpers_mirror_about_a_vertical_line() {
+        let data = compile_top(
+            "use std::layout::{bbox, eq_mirror, mirror_pair, rect};
+             cell half() {
+                 rect(\"met1\", x0=0., y0=0., w=100., h=50.);
+                 pub let tab = rect(\"met2\", x0=0., y0=40., w=30., h=10.);
+             }
+             cell top() {
+                 let pair = mirror_pair(half(), 500.);
+                 eq(pair[0].x, 100.);
+                 eq(pair[0].y, 20.);
+                 let right = pair[1];
+                 let b = bbox(right);
+                 rect(\"met3\", x0=b.x0, y0=b.y0, x1=b.x1, y1=b.y1);
+                 rect(\"via1\", x0=right.tab.x0, y0=right.tab.y0, x1=right.tab.x1, y1=right.tab.y1);
+                 let a = rect(\"met4\", x0=100., x1=250., y0=0., y1=40.);
+                 eq_mirror(a, rect(\"met4\"), 500.);
+             }",
+        );
+        assert_eq!(top_rects_on(&data, "met3"), [[800., 20., 900., 70.]]);
+        assert_eq!(top_rects_on(&data, "via1"), [[870., 60., 900., 70.]]);
+        assert_eq!(
+            top_rects_on(&data, "met4"),
+            [[100., 0., 250., 40.], [750., 0., 900., 40.]]
+        );
+    }
+
+    #[test]
+    fn unit_orders_interleave_two_devices() {
+        let data = compile_top(
+            "use std::layout::{common_centroid, interdigitated, rect};
+             fn mark(order: [Bool], layer: String) {
+                 for i in std::range(std::len(order)) {
+                     if order[i] {
+                         rect(layer, x0=(i as Float) * 10., y0=0., w=5., h=5.);
+                     }
+                 }
+             }
+             cell top() {
+                 mark(common_centroid(4), \"met1\");
+                 mark(interdigitated(3), \"met2\");
+             }",
+        );
+        let starts = |layer| {
+            top_rects_on(&data, layer)
+                .iter()
+                .map(|r| r[0])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(starts("met1"), [0., 30., 40., 70.]);
+        assert_eq!(starts("met2"), [0., 20., 40.]);
     }
 
     #[test]

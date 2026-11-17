@@ -1,4 +1,4 @@
-use std::layout::{crect, inst, rect};
+use std::layout::{array, center_rects, crect, inst, max_array, rect};
 
 /// A 1.8 V transistor with `nf` gate fingers over one diffusion, contacted
 /// with local interconnect between and beside the fingers.
@@ -44,6 +44,67 @@ cell tap(ntap: Int, w: Float, h: Float) {
     let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
     let cons = crect(x0=li1.x0, x1=li1.x1, y0=li1.y0+80., y1=li1.y1-80.);
     std::layout::center_rects(cons, std::layout::max_array(licon, cons.w, cons.h, 340., 340.));
+}
+
+/// A `fet1v8` wired on met1: its gate fingers join a poly bar below the
+/// diffusion, contacted under the met1 bar `g`, and the met1 bars `s` and `d`
+/// strap its sources (even contact columns, counting from 0 at the left) and
+/// its drains (odd columns). Each bar is 320 tall, so a via1 centered on it
+/// fits. Place it with `reflect=true` for its gate above, or use `fet1v8` to
+/// contact the gates some other way.
+///
+/// # Fields
+/// - `g`, `s`, `d`: the met1 bars.
+/// - `cols`: the bounds of the li1 contact columns, 170 wide on a 430 pitch.
+/// - `poly`: the bounds of the gate fingers.
+/// - `sdm`: the N+ or P+ implant.
+cell mos(nfet: Bool, w: Float, nf: Int) {
+    let fet = inst(fet1v8(nfet, w, nf), x=0., y=0.);
+    pub let sdm = fet.sdm;
+    pub let poly = fet.poly_bbox;
+    pub let cols = fet.li1_bbox;
+    pub let s = strap(cols.x0, cols.y0, nf / 2 + 1, 90.);
+    pub let d = strap(cols.x0 + 430., cols.y1 - 170., (nf + 1) / 2, 60.);
+
+    // The bar stays within the outer fingers, so abutted devices' bars keep
+    // apart, except that a lone finger's widens to fit a contact.
+    let ext = std::max(0., (270. - poly.w) / 2.);
+    let li_y0 = s.y0 - 385.;
+    let bar = rect("poly.drawing", x0=poly.x0 - ext, x1=poly.x1 + ext, y0=li_y0 - 80., y1=poly.y0);
+    let licon = crect(layer="licon1.drawing", x0=0., y0=0., w=170., h=170.);
+    let licons = max_array(licon, bar.w - 100., 170., 340., 340.);
+    center_rects(crect(x0=bar.x0, x1=bar.x1, y0=li_y0, h=170.), licons);
+    let li = rect("li1.drawing", x0=licons.x0 - 80., x1=licons.x1 + 80., y0=li_y0, h=170.);
+    let mcon = crect(layer="mcon.drawing", x0=0., y0=0., w=170., h=170.);
+    let mcons = max_array(mcon, li.w - 120., 170., 360., 360.);
+    center_rects(li, mcons);
+    pub let g = rect("met1.drawing", x0=mcons.x0 - 60., x1=mcons.x1 + 60., y0=li.y0 - 75., h=320.);
+    rect("npc.drawing", x0=poly.x0 - 140., x1=poly.x1 + 140., y0=li.y0 - 100., y1=li.y1 + 100.);
+}
+
+/// A met1 bar 320 tall over `n` mcons at `y`, on every other contact column
+/// from the one at `x0`, reaching `below` under them.
+fn strap(x0: Float, y: Float, n: Int, below: Float) -> Rect {
+    let mcon = crect(layer="mcon.drawing", x0=0., y0=0., w=170., h=170.);
+    let cuts = array(mcon, n, 860., 0.);
+    eq(cuts.x0, x0);
+    eq(cuts.y0, y);
+    rect("met1.drawing", x0=x0 - 60., x1=cuts.x1 + 60., y0=y - below, h=320.)
+}
+
+/// Places each `mos` instance of `devices` right of the one before, with its
+/// leftmost contact column on that one's rightmost, so their diffusions merge
+/// and the shared column is a terminal of both. Counting from column 0, which a
+/// mirrored copy has at its right, even columns are sources. Abutted devices
+/// need the same `w`; two with `nf = 1` and their gates on the same side can't
+/// abut.
+fn abut(devices: [Any]) {
+    for i in std::range(std::len(devices) - 1) {
+        let a = devices[i];
+        let b = devices[i + 1];
+        eq(b.cols.x0, a.cols.x1 - 170.);
+        eq(b.cols.y0, a.cols.y0);
+    }
 }
 
 cell inv(nw: Float, pw: Float, nf: Int) {

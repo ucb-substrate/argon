@@ -109,3 +109,26 @@ fn center_rects(r1: Rect, r2: Rect) {
 fn crect2rect(r: Rect) -> Rect {
     rect(r.layer, x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)
 }
+
+fn mirror_pair(c: Any, axis: Float) -> [Any] {
+    let a = inst(c);
+    let b = inst(c, reflect=true, angle=180);
+    eq(a.x + b.x, 2. * axis);
+    eq(a.y, b.y);
+    [a, b]
+}
+
+fn eq_mirror(a: Rect, b: Rect, axis: Float) {
+    eq(a.x0 + b.x1, 2. * axis);
+    eq(a.x1 + b.x0, 2. * axis);
+    eq(a.y0, b.y0);
+    eq(a.y1, b.y1);
+}
+
+fn common_centroid(n: Int) -> [Bool] {
+    [for i in std::range(2 * n) { (i + 1) / 2 % 2 == 0 }]
+}
+
+fn interdigitated(n: Int) -> [Bool] {
+    [for i in std::range(2 * n) { i % 2 == 0 }]
+}
