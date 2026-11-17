@@ -256,7 +256,16 @@ fn hash_cell_arg_key(hasher: &mut fnv::FnvHasher, arg: &CellArgKey) {
                 hash_cell_arg_key(hasher, value);
             }
         }
+        CellArgKey::Plain(key) => key.hash_expanded(hasher),
     }
+}
+
+/// The hash `source_cell_id` feeds for `arg` alone.
+#[cfg(test)]
+pub(crate) fn cell_arg_key_hash(arg: &CellArgKey) -> u64 {
+    let mut hasher = fnv::FnvHasher::default();
+    hash_cell_arg_key(&mut hasher, arg);
+    hasher.finish()
 }
 
 fn hash_points(hasher: &mut fnv::FnvHasher, points: &[(u64, u64)]) {

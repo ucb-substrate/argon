@@ -435,6 +435,7 @@ fn referenced_cells(cell: &compile::CompiledCell) -> Arc<[compile::CellId]> {
             | FieldValue::Nil
             | FieldValue::Signal(_)
             | FieldValue::Detached(_)
+            | FieldValue::Plain(_)
             | FieldValue::Poison
             | FieldValue::Unreadable(_) => {}
             FieldValue::Seq(items)

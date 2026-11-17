@@ -22,6 +22,7 @@ use lib::logic::router::{
 use lib::columns::util;
 use lib::logic::floorplan;
 use lib::columns::util::Via;
+use lib::logic::guard_ring::Ring;
 
 struct StrapTarget {
     layer: Int,
@@ -478,12 +479,9 @@ fn draw_power(p: SramLayoutParams, f: SramFloorplan, blocks: Blocks, routes: Sha
         util::contact(Via::Via1, from_box(v.bot), from_box(v.top), later=true);
     }
     for c in placed.crossings {
+        let via = strap_via(from_box(c.via.bot), from_box(c.via.top));
         for o in c.offsets {
-            let via = std::layout::inst(
-                strap_via(from_box(c.via.bot), from_box(c.via.top)),
-                x=o.0,
-                y=o.1,
-            );
+            std::layout::inst(via, x=o.0, y=o.1);
         }
     }
     placed
@@ -492,4 +490,52 @@ fn draw_power(p: SramLayoutParams, f: SramFloorplan, blocks: Blocks, routes: Sha
 // The via between two crossing straps, drawn once and placed at every crossing.
 cell strap_via(bot: Rect, top: Rect) {
     util::contact(Via::Via1, bot, top, later=true);
+}
+
+// Each strap that reaches the routing area's edge runs on to the outer edge
+// of its supply's ring, with vias onto the ring's crossing sides and, for
+// met1 straps, onto its tap. Met2 straps become supply pins.
+cell strap_extensions(vss_ring: Ring, vdd_ring: Ring, placed: Straps) {
+    let by_supply = [vss_ring, vdd_ring];
+    for s in placed.straps {
+        let r0 = from_box(s.rect);
+        let rg = by_supply[if s.vdd { 1 } else { 0 }];
+        let outer = rg.outer;
+        let vertical = s.layer == 0;
+        let lo = if s.lower_boundary {
+            if vertical { outer.y0 } else { outer.x0 }
+        } else {
+            if vertical { r0.y0 } else { r0.x0 }
+        };
+        let hi = if s.upper_boundary {
+            if vertical { outer.y1 } else { outer.x1 }
+        } else {
+            if vertical { r0.y1 } else { r0.x1 }
+        };
+        let r = if vertical {
+            crect(x0=r0.x0, y0=lo, x1=r0.x1, y1=hi)
+        } else {
+            crect(x0=lo, y0=r0.y0, x1=hi, y1=r0.y1)
+        };
+        // Sides in ring order: left, right, bottom, top.
+        let ends = std::concat(
+            if s.upper_boundary { [if vertical { 3 } else { 1 }] } else { [] },
+            if s.lower_boundary { [if vertical { 2 } else { 0 }] } else { [] },
+        );
+        for k in ends {
+            if vertical {
+                util::contact(Via::Via1, r, rg.sides[k], longer=true, later=true);
+            } else {
+                util::contact(Via::Via1, rg.sides[k], r, longer=true, later=true);
+            }
+        }
+        if vertical {
+            for k in ends {
+                util::contact(Via::Mcon, rg.mids[k], r, longer=true, later=true);
+            }
+            util::draw_box("met1.drawing", r);
+        } else {
+            util::met2_port(r.x0, r.y0, r.x1, r.y1);
+        }
+    }
 }

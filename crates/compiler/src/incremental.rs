@@ -976,7 +976,10 @@ fn execution_environment_key(
 fn hash_cell_args(args: &[CellArg], hasher: &mut impl Hasher) {
     args.len().hash(hasher);
     for arg in args {
-        match arg {
+        // A shared argument hashes as its unshared form.
+        let unshared = arg.unshared();
+        match unshared.as_ref().unwrap_or(arg) {
+            CellArg::Plain(_) => unreachable!("unshared above"),
             CellArg::Float(value) => {
                 0_u8.hash(hasher);
                 value.to_bits().hash(hasher);
@@ -2149,6 +2152,38 @@ cell parent() { let child = inst(sized(3.), x=1., y=2.); }
             &named(&first, "after"),
             &named(&second, "after")
         ));
+        let mut fresh = IncrementalCompiler::new();
+        fresh.set_source_text(root, edited);
+        let uncached = fresh.compile_cell(&config, &cell, Vec::new());
+        assert_eq!(spans_of(&second), spans_of(&uncached));
+    }
+
+    /// A reused cell that nothing else holds is translated in place, which
+    /// must still count only the cells whose spans moved and translate them as
+    /// a fresh compile places them.
+    #[test]
+    fn in_place_reuse_counts_and_translates_only_moved_cells() {
+        let source = "use std::layout::{inst, rect};\n\
+                      cell before() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+                      cell parent() {\n    let a = inst(before(), x = 0., y = 0.);\n    \
+                      let b = inst(after(), x = 10., y = 0.);\n}\n\
+                      cell after() { let r = rect(\"met1\", x0 = 2., y0 = 0., x1 = 3., y1 = 1.); }\n";
+        let (_dir, config) = scratch_workspace(source);
+        let root = config.root_lib().to_path_buf();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = config.with_tech(Some(tech));
+        let cell = vec!["parent".to_owned()];
+
+        let mut session = IncrementalCompiler::new();
+        session.set_source_text(root.clone(), source);
+        drop(session.compile_cell(&config, &cell, Vec::new()));
+        let edited = source.replace("x = 10., y = 0.", "x = 100., y = 0.");
+        session.set_source_text(root.clone(), edited.clone());
+        let second = session.compile_cell(&config, &cell, Vec::new());
+        assert_eq!(session.stats().cell_cache.hits, 2);
+        assert_eq!(session.stats().cell_cache.rebased, 1, "only `after` moved");
+
         let mut fresh = IncrementalCompiler::new();
         fresh.set_source_text(root, edited);
         let uncached = fresh.compile_cell(&config, &cell, Vec::new());

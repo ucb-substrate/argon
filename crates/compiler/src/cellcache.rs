@@ -118,7 +118,8 @@ impl CellCache {
         // Indices of the entries whose `items` moved on, which are the only
         // ones worth writing back.
         let mut translated = Vec::new();
-        for (index, (_, entry)) in closure.iter_mut().enumerate() {
+        let mut failed = false;
+        'entries: for (index, (id, entry)) in closure.iter_mut().enumerate() {
             if Arc::ptr_eq(&entry.items, items) {
                 continue;
             }
@@ -138,29 +139,41 @@ impl CellCache {
                 translated.push(index);
                 continue;
             }
-            // Sharing a file with a moved declaration does not mean this
-            // cell's own spans moved. Keeping the same `Arc` when they did not
-            // lets consumers recognize the cell as unchanged.
-            let cell_moved = match entry.cell.spans_moved_by(rebase) {
-                Ok(moved) => moved,
-                Err(_) => {
-                    self.stats.rebase_failures += 1;
-                    self.stats.misses += 1;
-                    return None;
+            // Without the cache's own reference, a cell nothing else holds is
+            // translated in place rather than copied. One that is shared keeps
+            // its `Arc` when its spans did not move, so that consumers
+            // recognize it as unchanged.
+            self.entries.remove(id);
+            let cell_moved = match Arc::get_mut(&mut entry.cell) {
+                Some(cell) => {
+                    rebase.take_moved();
+                    if cell.rebase_spans(rebase).is_err() {
+                        failed = true;
+                        break;
+                    }
+                    rebase.take_moved()
                 }
+                None => match entry.cell.spans_moved_by(rebase) {
+                    Ok(false) => false,
+                    Ok(true) => {
+                        if Arc::make_mut(&mut entry.cell).rebase_spans(rebase).is_err() {
+                            failed = true;
+                            break;
+                        }
+                        true
+                    }
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                },
             };
-            if cell_moved && Arc::make_mut(&mut entry.cell).rebase_spans(rebase).is_err() {
-                self.stats.rebase_failures += 1;
-                self.stats.misses += 1;
-                return None;
-            }
             let mut errors_moved = false;
             for error in &mut entry.errors {
                 let before = error.span.clone();
                 if rebase.rebase_opt(&mut error.span).is_err() {
-                    self.stats.rebase_failures += 1;
-                    self.stats.misses += 1;
-                    return None;
+                    failed = true;
+                    break 'entries;
                 }
                 errors_moved |= error.span != before;
             }
@@ -177,6 +190,13 @@ impl CellCache {
         for index in translated {
             let (id, entry) = &closure[index];
             self.entries.insert(*id, entry.clone());
+        }
+        // A span that cannot be translated means the closure is wrong. The
+        // entry it was in is dropped, half translated.
+        if failed {
+            self.stats.rebase_failures += 1;
+            self.stats.misses += 1;
+            return None;
         }
         self.stats.hits += 1;
         Some(closure)
