@@ -18,7 +18,7 @@ Used by the [geometry constructors](/language/std-layout#geometry), [constraints
 
 ## `Int` {#int}
 
-`Int` is for counts, indices, point counts, and rotation angles. Schematic [placement and routes](/language/schematic#placement-and-routes) are `Int` grid units, not `Float`.
+`Int` is for counts, indices, point counts, and rotation angles. Schematic [placement and routes](/language/schematic-drawing#placement-and-routes) are `Int` grid units, not `Float`.
 
 Cast to a float with `value as Float`.
 
@@ -33,6 +33,13 @@ Cast to a float with `value as Float`.
 ```argon
 std::layout::rect("met1");
 std::layout::text("VDD", "text.label", 0., 0.);
+```
+
+A string can only be written as a literal and passed along. Strings can't be compared, joined, or formatted, and numbers can't be converted to strings, so choose between literals with `if` or `match`, or pass them in:
+
+```argon
+let implant = if nfet { "nsdm.drawing" } else { "psdm.drawing" };
+let port = ["d0", "d1", "d2", "d3"][i];
 ```
 
 ## `Any` {#any}

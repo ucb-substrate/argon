@@ -7,13 +7,13 @@ description: "Viewing a cell's schematic in the GUI: symbols, wires, flylines, a
 
 The GUI shows three views of the open cell: its layout, its schematic, and its symbol. Press <kbd>V</kbd> to cycle through the layout, schematic, and symbol views, <kbd>Shift</kbd>+<kbd>V</kbd> to cycle back, or click a view in the control at the right end of the tool strip. Each view keeps its own camera and selection, and all three show the same cell.
 
-The schematic view draws exactly what the source stores, as [placement and routes](/language/schematic#placement-and-routes) on the calls that create each element and connection. It never routes a wire itself, and the source stays the only persistent state.
+The schematic view draws exactly what the source stores, as [placement and routes](/language/schematic-drawing#placement-and-routes) on the calls that create each element and connection. It never routes a wire itself, and the source stays the only persistent state.
 
 ## What is drawn
 
 | Item | Drawn as |
 | --- | --- |
-| Instance | Its cell's [symbol](/language/schematic#symbols), under the instance's placement. A cell that draws no symbol gets a generated box with its ports as pins. |
+| Instance | Its cell's [symbol](/language/schematic-drawing#symbols), under the instance's placement. A cell that draws no symbol gets a generated box with its ports as pins. |
 | Device | The symbol of its kind, with its key parameters beside it. A `Subckt` device is a box with numbered pins. |
 | Port | A pin glyph with the port's name, where a `pub` signal is placed. |
 | Net label | A tag with the net's name, where a private signal is placed. |

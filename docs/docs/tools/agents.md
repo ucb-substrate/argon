@@ -118,6 +118,8 @@ Each call uses the library whose `Argon.toml` is in the agent's working director
 | `inspect` | `cell`, `exprs` | Evaluates expressions at the end of the cell's body after it is solved, where its parameters and top-level `let`s are in scope, such as `out.x1 - out.x0`. |
 | `locate` | `cell`, `boxes`, `unit` | Finds the shapes that overlap or touch each box, such as a DRC violation, with the source line that drew each one, the call in its cell's body when that line is in a function, and the instances leading to it. A box takes optional `layers`, a `gds_cell` whose coordinates it is in (the cell a DRC report names for the violation), and a `label`. `unit` is `um`, the default, or `nm`. |
 
+The [quick reference](/language/reference) lists the language's rules and every function on one page, and [Writing a layout generator](/guides/layout-generator) builds and checks a generator with these tools.
+
 An error names the line that failed and, when that line is in a function or another cell, the call in the top cell's body that led to it:
 
 ```

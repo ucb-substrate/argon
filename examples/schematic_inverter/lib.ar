@@ -15,7 +15,8 @@ cell mos(nfet: Bool, w: Float, nf: Int) {
         "sky130_fd_pr__pfet_01v8"
     };
 
-    device(DeviceKind::Subckt, [d, g, s, b], model, l=0.15, w=w, nf=nf, x=0, y=0);
+    let kind = if nfet { DeviceKind::Nmos } else { DeviceKind::Pmos };
+    device(kind, [d, g, s, b], model, l=0.15, w=w, nf=nf, x=0, y=0);
 
     // Drawn as the transistor it wraps.
     if nfet {

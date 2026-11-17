@@ -321,6 +321,8 @@ If the rectangles don't overlap, the result is inverted rather than empty: this 
 
 <Returns type="Rect" href="/language/types/rect">The bounds from [`array2`](#array2), or a zero-size rectangle if nothing fits.</Returns>
 
+A width or height smaller than `r`'s draws nothing, so a via array between two shapes that overlap too little is silently missing. Make sure the overlap fits at least one cut with its enclosure.
+
 </ApiItem>
 
 ### `eq_rect` {#eq-rect}

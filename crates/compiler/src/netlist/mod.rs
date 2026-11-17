@@ -466,11 +466,11 @@ mod tests {
 * Top cell: inv
 
 .subckt mos d g s b
-X0 d g s b sky130_fd_pr__nfet_01v8 l=0.15 w=1 nf=2
+M0 d g s b sky130_fd_pr__nfet_01v8 l=0.15 w=1 nf=2
 .ends mos
 
 .subckt mos_1 d g s b
-X0 d g s b sky130_fd_pr__pfet_01v8 l=0.15 w=2 nf=2
+M0 d g s b sky130_fd_pr__pfet_01v8 l=0.15 w=2 nf=2
 .ends mos_1
 
 .subckt inv a out vdd vss
@@ -490,11 +490,11 @@ Xpmos out a vdd vdd mos_1
 simulator lang=spectre
 
 subckt mos d g s b
-    X0 (d g s b) sky130_fd_pr__nfet_01v8 l=0.15 w=1 nf=2
+    M0 (d g s b) sky130_fd_pr__nfet_01v8 l=0.15 w=1 nf=2
 ends mos
 
 subckt mos_1 d g s b
-    X0 (d g s b) sky130_fd_pr__pfet_01v8 l=0.15 w=2 nf=2
+    M0 (d g s b) sky130_fd_pr__pfet_01v8 l=0.15 w=2 nf=2
 ends mos_1
 
 subckt inv a out vdd vss
@@ -1187,14 +1187,9 @@ Xs a subckt
             format!(
                 "* inverter smoke test
 .include {}
-.subckt sky130_fd_pr__nfet_01v8 d g s b l=1 w=1 nf=1
-M0 d g s b nmos_stub l={{l*1e-6}} w={{w*nf*1e-6}}
-.ends
-.subckt sky130_fd_pr__pfet_01v8 d g s b l=1 w=1 nf=1
-M0 d g s b pmos_stub l={{l*1e-6}} w={{w*nf*1e-6}}
-.ends
-.model nmos_stub nmos level=1
-.model pmos_stub pmos level=1
+.option scale=1e-6
+.model sky130_fd_pr__nfet_01v8 nmos level=54
+.model sky130_fd_pr__pfet_01v8 pmos level=54
 Xdut in out vdd 0 inv
 Vdd vdd 0 1.8
 Vin in 0 0

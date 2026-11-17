@@ -42,13 +42,16 @@ fn half(value: Float) -> Float {
 }
 ```
 
-`let` bindings are immutable. Functions can be used before they're defined; cells are resolved in source order, so declare a cell before the cells that call it.
+`let` bindings are immutable. Items resolve across the whole module, so a cell or function can be used before it's declared.
 
 ## Chapters
 
+- [Quick reference](./reference): the rules and every function on one page
 - [Types and values](./types-values)
 - [Cells and functions](./cells-functions)
 - [Geometry](./geometry)
 - [Constraints](./constraints)
 - [Schematics](./schematic)
+- [Drawing schematics](./schematic-drawing)
 - [Modules and manifests](./modules-manifests)
+- [SKY130 library](./sky130)

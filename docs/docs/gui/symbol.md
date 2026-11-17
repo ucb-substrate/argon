@@ -5,7 +5,7 @@ description: Viewing and drawing a cell's symbol in the GUI.
 
 # Symbol view
 
-The symbol view shows the [symbol](/language/schematic#symbols) of the cell on screen, at its origin over the grid. Press <kbd>V</kbd> from the schematic view or <kbd>Shift</kbd>+<kbd>V</kbd> from the layout view, or click Symbol in the view control.
+The symbol view shows the [symbol](/language/schematic-drawing#symbols) of the cell on screen, at its origin over the grid. Press <kbd>V</kbd> from the schematic view or <kbd>Shift</kbd>+<kbd>V</kbd> from the layout view, or click Symbol in the view control.
 
 Every pin is drawn with its port's name, whether or not its `pin` call asked for a label, so a pin can always be identified. `inst_name` shows the instance name of the last descend step, or `X?` at the open cell, and `param` shows the value the cell was compiled with.
 

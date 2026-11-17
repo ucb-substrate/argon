@@ -50,12 +50,17 @@ Geometry and constraints use `Float`. Counts and indices use `Int`.
 
 ## Operators and casts
 
-Arithmetic: `+`, `-`, `*`, `/`, and `%`. Comparison: `==`, `!=`, `<`, `<=`, `>`, and `>=`.
+Arithmetic: `+`, `-`, `*`, `/`, and `%`. Comparison: `==`, `!=`, `<`, `<=`, `>`, and `>=`. Logic: `&&`, `||`, and `!`. There are no power or bitwise operators.
 
-Cast with `as`:
+- Both operands of arithmetic have the same type: `100. * n` with an `Int` `n` is an error. Cast with `as`.
+- `%` takes `Int`s. `Int` division and `%` truncate toward zero, so `-7 / 2` is `-3` and `-7 % 2` is `-1`.
+- `as Int` truncates toward zero too, so `-0.5 as Int` is `0`.
+- `==` and `!=` reject `Float`s, with the error `cannot compare equality or inequality of floating point numbers`. Compare floats with `<`, `<=`, `>`, and `>=`.
+- [`String`s](/language/types/scalars#string) can't be compared or joined.
 
 ```argon
 let offset = (index as Float) * pitch;
+let count = ((w - 170.) / 340.) as Int + 1;
 ```
 
 ## Sequences and tuples

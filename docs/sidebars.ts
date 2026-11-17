@@ -5,9 +5,9 @@ import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';
 // and the tools reference read as separate books. Doc IDs are paths relative
 // to docs/docs/.
 const sidebars: SidebarsConfig = {
-  // Each guide has a Neovim and a VS Code version, rendered from one partial in
-  // docs/docs/guides/_tutorial. Add new guides to both editors here and to
-  // docs/docs/guides/index.md.
+  // An editor guide has a Neovim and a VS Code version, rendered from one
+  // partial in docs/docs/guides/_tutorial; add it to both editors here and to
+  // docs/docs/guides/index.md. A guide that needs no editor goes after both.
   guides: [
     'guides/index',
     {
@@ -50,16 +50,19 @@ const sidebars: SidebarsConfig = {
         'guides/vscode/sky130-inverter',
       ],
     },
+    'guides/layout-generator',
   ],
 
   language: [
     'language/overview',
+    'language/reference',
     'language/types-values',
     'language/cells-functions',
     'language/control-flow',
     'language/geometry',
     'language/constraints',
     'language/schematic',
+    'language/schematic-drawing',
     'language/modules-manifests',
     'language/technology',
     {
@@ -81,6 +84,7 @@ const sidebars: SidebarsConfig = {
       link: {type: 'doc', id: 'language/std'},
       items: ['language/std-layout', 'language/std-schematic', 'language/std-symbol'],
     },
+    'language/sky130',
     {
       type: 'category',
       label: 'Types',

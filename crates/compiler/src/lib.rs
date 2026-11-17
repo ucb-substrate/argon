@@ -167,7 +167,6 @@ mod tests {
     use geometry::transform::Rotation;
     use indexmap::IndexMap;
     use itertools::Itertools;
-    use pegasus::drc::{DrcParams, run_drc};
 
     use crate::{
         WorkspaceConfig,
@@ -4883,41 +4882,6 @@ cell top() {
         );
     }
 
-    #[test]
-    #[ignore = "requires Pegasus"]
-    fn argon_sky130_vco() {
-        let o = parse_workspace_with_std(ARGON_SKY130_LIB);
-        assert!(o.static_errors().is_empty());
-        let ast = o.ast();
-        let cells = compile_sky130(
-            &ast,
-            CompileInput {
-                cell: &["diff_vco_top"],
-                args: vec![],
-            },
-        );
-        println!("cells: {cells:?}");
-
-        assert!(cells.is_valid());
-
-        let work_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("build/argon_sky130_vco");
-        let gds_path = work_dir.join("layout.gds");
-        cells.to_gds(&gds_path).expect("Failed to write to GDS");
-
-        use sky130::{sky130_drc, sky130_drc_rules_path};
-
-        let drc_dir = work_dir.join("drc");
-        let data = run_drc(&DrcParams {
-            work_dir: &drc_dir,
-            layout_path: &gds_path,
-            cell_name: "diff_vco_top",
-            rules_dir: &sky130_drc(),
-            rules_path: &sky130_drc_rules_path(),
-        })
-        .expect("failed to run drc");
-        assert!(data.rule_checks.is_empty());
-    }
-
     // -----------------------------------------------------------------------
     // Regression tests for inputs that used to abort the compiler.
     //
@@ -6558,6 +6522,26 @@ cell top() {
         };
         assert_eq!(starts("met1"), [0., 30., 40., 70.]);
         assert_eq!(starts("met2"), [0., 20., 40.]);
+    }
+
+    #[test]
+    fn max_array_draws_only_whole_cuts() {
+        let data = compile_top(
+            "use std::layout::{crect, max_array};
+             fn cuts(layer: String, w: Float) {
+                 let a = max_array(crect(layer=layer, x0=0., y0=0., w=20., h=20.), w, 20., 30., 30.);
+                 eq(a.x0, 0.);
+                 eq(a.y0, 0.);
+             }
+             cell top() {
+                 cuts(\"met1\", 85.);
+                 cuts(\"met2\", 20.);
+                 cuts(\"met3\", 15.);
+             }",
+        );
+        assert_eq!(top_rects_on(&data, "met1").len(), 3);
+        assert_eq!(top_rects_on(&data, "met2").len(), 1);
+        assert!(top_rects_on(&data, "met3").is_empty());
     }
 
     #[test]

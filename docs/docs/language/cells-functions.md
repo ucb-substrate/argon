@@ -56,6 +56,23 @@ fn inset_bounds(rect_: Rect, amount: Float) -> Rect {
 }
 ```
 
+## Keyword parameters
+
+A parameter with a default is a keyword parameter. A call passes it by name, in any order, or leaves it out to get the default, which may refer to the parameters before it. Keyword parameters come after the positional ones, and a positional parameter can't be passed by name.
+
+```argon
+use std::layout::{inst, rect};
+
+cell bar(w: Float, h: Float = w, layer: String = "met1") {
+    rect(layer, x0=0., y0=0., w=w, h=h);
+}
+
+cell top() {
+    let square = inst(bar(100.), x=0., y=0.);
+    let tall = inst(bar(100., layer="met2", h=300.), x=200., y=0.);
+}
+```
+
 ## Bindings and order
 
 `let` introduces an immutable binding:
@@ -73,7 +90,9 @@ let ViaParams { layer, .. } = params;
 
 At the top of a cell, each name a pattern binds is a field of the cell, like any other `let`.
 
-Top-level declarations are resolved across the whole module, so a cell can call a function declared further down the file.
+Top-level declarations are resolved across the whole module, so a cell can instantiate a cell or call a function declared further down the file.
+
+Module-level constants aren't implemented, so a `const` declaration is an error. Use a function without parameters instead, such as `fn pitch() -> Float { 430. }`.
 
 ## Public fields
 
@@ -98,6 +117,11 @@ Here `p.metal` is readable, but `p.margin` is an error because `margin` is priva
 - `pub` applies only to a `let` at the top level of a cell body. A `pub let` in a function, loop, branch, or block is an error.
 - A `pub let` with a pattern, such as `pub let Size { w, h } = size;`, makes every name the pattern binds public.
 - If a name is bound more than once, the last binding is the field, and its `pub` decides whether the field is public.
+- A public field that holds an instance can be read through as well: when `half` has `pub let n = inst(...)`, `h.n.g` reads `g` from it in the parent's coordinates.
+
+## Emission
+
+A postfix `!`, as in `let r = crect(x0=0., y0=0., w=10., h=10.)!;`, emits a value into its scope for the GUI, which lists it in the hierarchy. It doesn't add geometry to the exported layout or add a constraint.
 
 ## Reserved names
 
@@ -108,6 +132,6 @@ These names can't be used where noted:
 | `as`, `cell`, `const`, `else`, `enum`, `false`, `fn`, `for`, `if`, `in`, `let`, `match`, `mod`, `pub`, `struct`, `true`, `use` | Any name | Keywords. |
 | The [built-in functions](/language/builtins), such as `eq`, `float`, `grid_floor`, `head`, and `cons` | The name of a cell, function, or other module item, or a name bound with `use` | Every module calls them by bare name. A local `let` may shadow one. |
 | `x`, `y` | A `let` at the top level of a cell | They are an [instance's](/language/types/instance#instance-values) position, so they can't also be fields. Cell parameters, and `let`s in functions, loops, branches, and blocks, may use them. |
-| `x`, `y`, `angle`, `reflect`, in any case | A [device](/language/std-schematic#device) parameter | They place the device in the schematic; see [placement and routes](/language/schematic#placement-and-routes). |
+| `x`, `y`, `angle`, `reflect`, in any case | A [device](/language/std-schematic#device) parameter | They place the device in the schematic; see [placement and routes](/language/schematic-drawing#placement-and-routes). |
 
 Simulators also reserve some net and subcircuit names, which netlists rename; see [reserved names in schematics](/language/schematic#reserved-names).

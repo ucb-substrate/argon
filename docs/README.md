@@ -61,8 +61,8 @@ version links within itself. Partials shared across books, such as the VS Code
 extension's install steps, live in `docs/_partials/`. Docusaurus doesn't publish
 files or directories whose names start with `_`.
 
-`static/img/gui-light.png` and `static/img/gui.png` show `diff_vco_top()` from
-`pdks/sky130` in light and dark mode. The front page follows the site's theme.
+`static/img/gui-light.png` and `static/img/gui.png` show a differential ring
+oscillator in the GUI, in light and dark mode. The front page follows the site's theme.
 Retake both after visible GUI changes, keeping the same dimensions and framing
 and excluding the window title bar.
 

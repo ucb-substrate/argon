@@ -8,7 +8,7 @@ import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReferenc
 
 # `std::symbol`
 
-`std::symbol` is the standard library module that draws a cell's symbol: the shapes, text, and pins a parent's schematic draws each instance of the cell with. See [Symbols](/language/schematic#symbols) for how a symbol fits into a cell.
+`std::symbol` is the standard library module that draws a cell's symbol: the shapes, text, and pins a parent's schematic draws each instance of the cell with. See [Symbols](/language/schematic-drawing#symbols) for how a symbol fits into a cell.
 
 ## Importing
 
@@ -167,7 +167,7 @@ param("w", w, x=2., y=-2.);
 pin(vdd, x=0, y=4, label=true);
 ```
 
-Pins are checked once the body has run and the ports are known. See [pins](/language/schematic#pins) for the rules and where a label goes.
+Pins are checked once the body has run and the ports are known. See [pins](/language/schematic-drawing#pins) for the rules and where a label goes.
 
 </ApiItem>
 
@@ -202,7 +202,8 @@ cell mos(nfet: Bool, w: Float, nf: Int) {
     pub let g = Signal();
     pub let s = Signal();
     pub let b = Signal();
-    device(DeviceKind::Subckt, [d, g, s, b], model, l=0.15, w=w, nf=nf);
+    let kind = if nfet { DeviceKind::Nmos } else { DeviceKind::Pmos };
+    device(kind, [d, g, s, b], model, l=0.15, w=w, nf=nf);
 
     if nfet {
         std::symbol::nmos(d, g, s, b);

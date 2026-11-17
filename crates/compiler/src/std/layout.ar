@@ -81,8 +81,8 @@ fn array2(r: Rect, nx: Int, ny: Int, xpitch: Float, ypitch: Float) -> Rect {
 }
 
 fn max_array(r: Rect, w: Float, h: Float, xpitch: Float, ypitch: Float) -> Rect {
-    let nx = (((w - r.w) / xpitch) as Int + 1);
-    let ny = (((h - r.h) / ypitch) as Int + 1);
+    let nx = if w >= r.w { ((w - r.w) / xpitch) as Int + 1 } else { 0 };
+    let ny = if h >= r.h { ((h - r.h) / ypitch) as Int + 1 } else { 0 };
     if nx >= 1 {
         if ny >= 1 {
             array2(r, nx, ny, xpitch, ypitch)
