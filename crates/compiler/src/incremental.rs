@@ -2293,6 +2293,44 @@ cell parent() { let child = inst(sized(3.), x=1., y=2.); }
         );
     }
 
+    /// A reused cell brings along a cell it only measured, since a fresh
+    /// compile emits that cell too.
+    #[test]
+    fn reusing_a_cell_reinstates_the_cells_it_only_measured() {
+        let source = "use std::layout::{bbox, inst, rect};\n\
+                      cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+                      cell measured() {\n    let b = bbox(leaf());\n    \
+                      let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = b.x1, y1 = 1.);\n}\n\
+                      cell parent() {\n    let m = inst(measured(), x = 0., y = 0.);\n    \
+                      let r = rect(\"met2\", x0 = 0., y0 = 0., x1 = 10., y1 = 1.);\n}\n";
+        let (_dir, config) = scratch_workspace(source);
+        let root = config.root_lib().to_path_buf();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = config.with_tech(Some(tech));
+        let cell = vec!["parent".to_owned()];
+        let names = |out: &CompileOutput| match out {
+            CompileOutput::Valid(d) => d.cells.values().map(|c| c.name.clone()).collect::<Vec<_>>(),
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        let mut session = IncrementalCompiler::new();
+        session.set_source_text(root.clone(), source);
+        session.compile_cell(&config, &cell, Vec::new());
+
+        let edited = source.replace("x1 = 10.", "x1 = 20.");
+        assert_ne!(edited, source);
+        session.set_source_text(root.clone(), edited.clone());
+        let second = session.compile_cell(&config, &cell, Vec::new());
+        assert!(session.stats().cell_cache.hits > 0, "`measured` is reused");
+
+        let mut fresh = IncrementalCompiler::new();
+        fresh.set_source_text(root, edited);
+        let uncached = fresh.compile_cell(&config, &cell, Vec::new());
+        assert_eq!(names(&second), names(&uncached));
+        assert_eq!(geometry(&second), geometry(&uncached));
+    }
+
     /// A reused cell still tells a private field from a missing one, so a read
     /// through `Any` reports the same error whether or not the cell is reused.
     #[test]

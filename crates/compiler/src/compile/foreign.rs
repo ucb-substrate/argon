@@ -443,7 +443,7 @@ fn value_kind(value: &Value) -> &'static str {
 mod tests {
     use std::{
         path::{Path, PathBuf},
-        sync::{Arc, Mutex},
+        sync::mpsc,
         time::Duration,
     };
 
@@ -619,21 +619,22 @@ cell top() {
 
     #[test]
     fn a_running_call_reports_itself_and_stops_when_cancelled() {
-        let slow = Arc::new(Mutex::new(Vec::new()));
-        let reported = slow.clone();
-        let control = CallControl::new()
-            .on_slow_call(move |name| reported.lock().unwrap().push(name.to_owned()));
+        let (reported, slow) = mpsc::channel();
+        let control = CallControl::new().on_slow_call(move |name| {
+            let _ = reported.send(name.to_owned());
+        });
         let canceller = control.clone();
+        // Cancels only once the call has reported itself, so it is known to be running.
         let cancel = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
+            let report = slow.recv_timeout(Duration::from_secs(60));
             canceller.cancel();
+            report
         });
         let output = control
             .run(|| run("extern \"fixture\" fn spin() -> Int;\ncell top() { let r = spin(); }\n"));
-        cancel.join().unwrap();
+        assert_eq!(cancel.join().unwrap().as_deref(), Ok("spin"));
         assert!(output.was_cancelled());
         assert!(errors(&output).contains(&"extern function `spin` was cancelled".to_owned()));
-        assert_eq!(*slow.lock().unwrap(), ["spin"]);
     }
 
     #[test]

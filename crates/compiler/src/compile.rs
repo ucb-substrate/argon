@@ -9776,6 +9776,9 @@ struct ExecPass<'a> {
     /// Compiled cells retained across source edits.
     cell_cache: Option<&'a mut CellCache>,
     compiled_cell_cache: FxHashMap<CellExecKey, CellId>,
+    /// For each cell being executed, every cell its execution requested, in
+    /// request order.
+    requested_cells: Vec<FxIndexSet<CellId>>,
     /// Cell declaration generated for a compiler entry point's invocation, and
     /// the cell it executed as. A call made directly by that cell is the
     /// top-level invocation rather than a nested instantiation, so it is named
@@ -10014,6 +10017,7 @@ impl<'a> ExecPass<'a> {
             items_arc: None,
             cell_cache: None,
             compiled_cell_cache: FxHashMap::default(),
+            requested_cells: Vec::new(),
             entry_cell_var: None,
             entry_cell: None,
             appended_cell: None,
@@ -10898,6 +10902,19 @@ impl<'a> ExecPass<'a> {
         args: Vec<CellArg>,
         scope_name: Option<String>,
     ) -> Result<CellId, ()> {
+        let result = self.execute_cell_unrecorded(cell, args, scope_name);
+        if let (Ok(id), Some(requested)) = (result, self.requested_cells.last_mut()) {
+            requested.insert(id);
+        }
+        result
+    }
+
+    fn execute_cell_unrecorded(
+        &mut self,
+        cell: VarId,
+        args: Vec<CellArg>,
+        scope_name: Option<String>,
+    ) -> Result<CellId, ()> {
         let cache_key = CellExecKey {
             cell,
             args: args.iter().map(CellArgKey::from).collect(),
@@ -10925,7 +10942,9 @@ impl<'a> ExecPass<'a> {
             return Err(());
         }
         let cell_start = self.cell_start;
+        self.requested_cells.push(FxIndexSet::default());
         let result = self.execute_cell_inner(cache_key, cell, args, scope_name);
+        self.requested_cells.pop();
         self.cell_start = cell_start;
         self.eval_depth -= 1;
         result
@@ -11436,14 +11455,13 @@ impl<'a> ExecPass<'a> {
             return;
         };
         let span_paths = cell.span_paths();
-        let mut children = cell
-            .objects
-            .values()
-            .filter_map(|object| match object {
-                SolvedValue::Instance(inst) => Some(inst.cell),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        // A fresh execution emits every cell it requested, including cells used
+        // only for their bounding box, so reinstating this cell must as well.
+        let mut children = self.requested_cells.last().cloned().unwrap_or_default();
+        children.extend(cell.objects.values().filter_map(|object| match object {
+            SolvedValue::Instance(inst) => Some(inst.cell),
+            _ => None,
+        }));
         children.extend(
             cell.schematic
                 .instances
@@ -11452,8 +11470,11 @@ impl<'a> ExecPass<'a> {
         );
         // A field can name a cell that nothing here instantiates.
         for field in cell.fields.values() {
-            field.for_each_cell(&mut |child| children.push(child));
+            field.for_each_cell(&mut |child| {
+                children.insert(child);
+            });
         }
+        let children = children.into_iter().collect::<Vec<_>>();
         // Retaining a parent whose children are not retained would guarantee a
         // miss on every future lookup, since `reinstate` requires the whole
         // closure. GDS-imported children live in their own cache.

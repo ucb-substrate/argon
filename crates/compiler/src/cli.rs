@@ -734,9 +734,10 @@ cell device(enabled: Bool, w: Float, count: Int) {
 }
 "#,
         );
+        let output = source.with_extension("bin");
         let mut args = execution_args(source, "devices::device(true, 150., 5)", basic_tech());
         args.dependencies.push(("devices".to_owned(), dependency));
-        args.output = Some(std::env::temp_dir().join("argonc-bool.bin"));
+        args.output = Some(output);
         assert!(execute(args).is_ok());
     }
 
@@ -1150,9 +1151,10 @@ cell device(enabled: Bool, w: Float, count: Int) {
             "invalid-argument-dependency",
             "cell device(enabled: Bool, w: Float, count: Int) {}\n",
         );
+        let output = source.with_extension("bin");
         let mut args = execution_args(source, "devices::device(1, 150., 5)", basic_tech());
         args.dependencies.push(("devices".to_owned(), dependency));
-        args.output = Some(std::env::temp_dir().join("argonc-invalid-argument.bin"));
+        args.output = Some(output);
         let diagnostic = render_failed(failed(args));
         assert!(
             diagnostic.contains("expected type Bool, found Int"),
