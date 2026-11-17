@@ -1,93 +1,36 @@
 use std::layout::{crect, inst, rect};
+use lib::columns::util;
+use lib::columns::util::Via;
 
+// The fixed sense amp artwork and its ports.
 cell sense_amp_macro() {
-    let base = inst(lib::columns::sense_macro::macro_top(), x=0., y=0.);
-    let outp = lib::columns::util::cbox(520., 20850., 800., 25230.);
-    let outn = lib::columns::util::cbox(4000., 20850., 4280., 25230.);
-    pub let inp = lib::columns::util::cbox(100., 8400., 380., 25230.);
-    pub let inn = lib::columns::util::cbox(4420., 8400., 4700., 25230.);
-    let vdd = lib::columns::util::cbox(0., 22400., 4800., 22690.);
-    let vss = lib::columns::util::cbox(0., 9840., 4800., 10130.);
-    pub let clk = lib::columns::util::cbox(0., 8400., 4800., 8690.);
-    let outline = crect(x0=0., y0=8385., x1=4800., y1=25230.);
+    inst(lib::columns::sense_macro::macro_top(), x=0., y=0.);
+    pub let inp = crect(x0=100., y0=8400., x1=380., y1=25230.);
+    pub let inn = crect(x0=4420., y0=8400., x1=4700., y1=25230.);
+    pub let vdd = crect(x0=0., y0=22400., x1=4800., y1=22690.);
+    pub let vss = crect(x0=0., y0=9840., x1=4800., y1=10130.);
+    pub let clk = crect(x0=0., y0=8400., x1=4800., y1=8690.);
 }
 
-fn draw_sense_li_met1_min(area: Rect) -> Rect {
-    let choice = lib::columns::util::contact_choice(0, area, area, 0, 0, false);
-    let nx = choice.0;
-    let ny = choice.1;
-    let size = 170.;
-    let space = 190.;
-    let center = lib::columns::util::contact_center(area, area);
-    let aw = size * nx as Float + space * (nx - 1) as Float;
-    let ah = size * ny as Float + space * (ny - 1) as Float;
-    let ax0 = lib::columns::util::snap5(lib::columns::util::rect_cx_i(center) - aw / 2.);
-    let ay0 = lib::columns::util::snap5(lib::columns::util::rect_cy_i(center) - ah / 2.);
-    for ix in std::range(nx) {
-        for iy in std::range(ny) {
-            lib::columns::util::draw_box("mcon.drawing", lib::columns::util::cbox(ax0 + ix as Float * (size + space), ay0 + iy as Float * (size + space), ax0 + ix as Float * (size + space) + size, ay0 + iy as Float * (size + space) + size));
-        }
-    }
-    let cut_bbox = lib::columns::util::cbox(ax0, ay0, ax0 + aw, ay0 + ah);
-    let li_rect = lib::columns::util::rect_expand_xy(cut_bbox, choice.2, choice.3);
-    lib::columns::util::draw_box("li1.drawing", li_rect);
-    let met1_rect = lib::columns::util::rect_expand_xy(li_rect, 60., 30.);
-    lib::columns::util::draw_box("met1.drawing", met1_rect);
-    met1_rect
+// A tap and supply stack under the sense amp's stripe `power`, within the
+// span `span` of the tap column.
+fn center_pair(span: (Float, Float), power: (Float, Float), ntap: Bool) -> Rect {
+    let area = crect(x0=200., y0=span.0 + 200., x1=1100., y1=span.1 - 200.);
+    let tap = util::tap_contact(util::grow(area, 0., -170.), (0., 0.), (0., 120.), (0., 80.));
+    util::draw_box(
+        if ntap { "nsdm.drawing" } else { "psdm.drawing" },
+        util::grow(tap.bot, 130., 130.),
+    );
+    let stripe = util::met2_port(0., power.0, 1300., power.1);
+    let m1 = util::contact(Via::Mcon, area, area, top_dir=1).top;
+    util::contact(Via::Via1, m1, stripe, longer=true);
+    stripe
 }
 
-fn draw_sense_metvia(m1_rect: Rect, power_stripe: Rect) -> Rect {
-    let choice = lib::columns::util::contact_choice(1, m1_rect, power_stripe, 0, 0, true);
-    let nx = choice.0;
-    let ny = choice.1;
-    let size = 150.;
-    let space = 170.;
-    let center = lib::columns::util::contact_center(m1_rect, power_stripe);
-    let aw = size * nx as Float + space * (nx - 1) as Float;
-    let ah = size * ny as Float + space * (ny - 1) as Float;
-    let ax0 = lib::columns::util::snap5(lib::columns::util::rect_cx_i(center) - aw / 2.);
-    let ay0 = lib::columns::util::snap5(lib::columns::util::rect_cy_i(center) - ah / 2.);
-    for ix in std::range(nx) {
-        for iy in std::range(ny) {
-            lib::columns::util::draw_box("via.drawing", lib::columns::util::cbox(ax0 + ix as Float * (size + space), ay0 + iy as Float * (size + space), ax0 + ix as Float * (size + space) + size, ay0 + iy as Float * (size + space) + size));
-        }
-    }
-    let cut_bbox = lib::columns::util::cbox(ax0, ay0, ax0 + aw, ay0 + ah);
-    let met2_rect = lib::columns::util::rect_expand_xy(cut_bbox, choice.4, choice.5);
-    lib::columns::util::draw_box("met2.drawing", met2_rect);
-    lib::columns::util::draw_box("met1.drawing", met2_rect);
-    met2_rect
-}
-
-fn draw_sense_tap_li_contact(area: Rect) -> (Rect, Rect) {
-    let cut_bbox = lib::columns::mux::draw_centered_via_array("licon1.drawing", area, 170., 340., 0., 0.);
-    let tap_bbox = lib::columns::util::cbox(cut_bbox.x0, cut_bbox.y0 - 120., cut_bbox.x1, cut_bbox.y1 + 120.);
-    let li_bbox = lib::columns::util::cbox(cut_bbox.x0, cut_bbox.y0 - 80., cut_bbox.x1, cut_bbox.y1 + 80.);
-    lib::columns::util::draw_box("tap.drawing", tap_bbox);
-    lib::columns::util::draw_box("li1.drawing", li_bbox);
-    (tap_bbox, li_bbox,)
-}
-
-fn draw_sense_center_pair(span: (Float, Float), power: (Float, Float), is_vdd: Bool) -> Rect {
-    let via_area = lib::columns::mux::rect_expand_all(lib::columns::util::rect_from_spans((0., 1300.,), span), -200.);
-    let tap_area = lib::columns::util::cbox(via_area.x0, via_area.y0 + 170., via_area.x1, via_area.y1 - 170.);
-    let tap = draw_sense_tap_li_contact(tap_area);
-    if is_vdd {
-        lib::columns::util::draw_box("nsdm.drawing", lib::columns::mux::rect_expand_all(tap.0, 130.));
-    } else {
-        lib::columns::util::draw_box("psdm.drawing", lib::columns::mux::rect_expand_all(tap.0, 130.));
-    };
-    let power_stripe = lib::columns::util::rect_from_spans((0., 1300.,), power);
-    let met1_rect = draw_sense_li_met1_min(via_area);
-    draw_sense_metvia(met1_rect, power_stripe);
-    lib::columns::util::draw_box("met2.drawing", power_stripe);
-    lib::columns::util::draw_box("met2.pin", power_stripe);
-    power_stripe
-}
-
+// The 1.3 um tap between sense amps.
 cell sense_amp_cent() {
-    lib::columns::util::draw_box("nwell.drawing", lib::columns::util::cbox(0., 17335., 1300., 25230.));
-    let vdd = draw_sense_center_pair((17560., 25005.,), (22400., 22690.,), true);
-    let vss = draw_sense_center_pair((8855., 16735.,), (9840., 10130.,), false);
-    let outline = rect("layout_boundary.boundary", x0=0., y0=8385., x1=1300., y1=25230.);
+    rect("nwell.drawing", x0=0., y0=17335., x1=1300., y1=25230.);
+    center_pair((17560., 25005.), (22400., 22690.), true);
+    center_pair((8855., 16735.), (9840., 10130.), false);
+    rect("layout_boundary.boundary", x0=0., y0=8385., x1=1300., y1=25230.);
 }

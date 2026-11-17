@@ -31,16 +31,27 @@ pub struct ModDecl<S, T: AstMetadata> {
     pub span: cfgrammar::Span,
 }
 
-/// Imports the final item in `path` into the declaring module's namespace.
+/// Imports the final item or module in `path` into the declaring module's
+/// namespace.
 ///
 /// For example, `use lib::geometry::width;` makes `width` available as an
-/// unqualified name while retaining the full path here for module resolution.
+/// unqualified name while retaining the full path here for module resolution,
+/// and `use lib::geometry;` lets `geometry::width` name the same item.
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
 pub struct UseDecl<S, T: AstMetadata> {
     pub path: Vec<Ident<S, T>>,
     /// Optional local name from `use path::item as local;`.
     pub alias: Option<Ident<S, T>>,
     pub span: cfgrammar::Span,
+}
+
+impl<S, T: AstMetadata> UseDecl<S, T> {
+    /// The name the import binds: the alias, or the last path segment.
+    pub fn local_name(&self) -> &Ident<S, T> {
+        self.alias
+            .as_ref()
+            .unwrap_or_else(|| self.path.last().expect("use paths are non-empty"))
+    }
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -220,9 +231,19 @@ pub struct FnDecl<S, T: AstMetadata> {
     pub params: Vec<TyParam<S, T>>,
     pub args: Vec<ArgDecl<S, T>>,
     pub return_ty: Option<TySpec<S, T>>,
+    /// Empty for an `extern` function, which has no body.
     pub scope: Scope<S, T>,
+    /// The WASM module implementing an `extern` function.
+    pub foreign: Option<ForeignModule>,
     pub span: cfgrammar::Span,
     pub metadata: T::FnDecl,
+}
+
+/// The module named by `extern "module" fn`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignModule {
+    pub name: String,
+    pub span: cfgrammar::Span,
 }
 
 #[derive_where(Debug, Clone, Serialize, Deserialize; S)]
@@ -1107,6 +1128,7 @@ pub trait AstTransformer {
             args,
             return_ty,
             scope,
+            foreign: input.foreign.clone(),
             span: input.span,
             metadata,
         }

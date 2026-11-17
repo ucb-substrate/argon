@@ -713,7 +713,10 @@ impl CompileOutput {
             // -- an over-long record, a full disk -- would otherwise leave a
             // truncated `.gds` next to a `.bin` that looks perfectly valid.
             crate::write_atomically(out_path, ".argon-gds", |temp| {
-                exporter.lib.save(temp).map_err(describe_gds_error)
+                // Records are a few bytes each, so a large buffer saves most
+                // of the writes a small one would make.
+                let file = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(temp)?);
+                exporter.lib.write(file).map_err(describe_gds_error)
             })?;
         }
 

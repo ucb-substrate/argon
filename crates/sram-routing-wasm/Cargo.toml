@@ -1,0 +1,18 @@
+[package]
+name = "argon-sram-routing-wasm"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-3-Clause"
+publish = false
+description = "The greedy router as a WebAssembly module for examples/sram"
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+argon-greedy-router = { path = "../greedy-router" }
+argon-guest = { path = "../guest" }
+serde.workspace = true

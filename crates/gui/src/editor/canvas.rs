@@ -35,6 +35,7 @@ use protocol::rpc::{
     DimensionParams, DrawSegmentConstraint, InitialConditionEdit, InstancePreview, PathParams,
     PolygonParams, RectangleEditResult, ValueEdit, ValueEditResult, remap_span_after_value_edits,
 };
+use rustc_hash::FxHashMap;
 
 use crate::{
     actions::*,
@@ -1323,7 +1324,7 @@ pub struct LayoutCanvas {
     pending_rectangles: Vec<PendingRectangle>,
     /// Source-edit queue paths follow full snapshots only. A focused geometry
     /// preview has different cell IDs but must not retarget queued edits.
-    pending_scope_state: Option<Arc<imbl::HashMap<editor::ScopePath, editor::ScopeState>>>,
+    pending_scope_state: Option<Arc<editor::ScopeStates>>,
     next_rectangle_id: u64,
     #[cfg(test)]
     painted_complete_frame: bool,
@@ -1369,7 +1370,7 @@ pub struct LayoutCanvas {
     /// One prepared root per compiled cell, used to retain unchanged spatial
     /// indexes without keeping a second map containing every execution scope.
     raster_cell_roots: HashMap<CellId, Arc<editor::hierarchy::PreparedScope>>,
-    raster_scope_state: Option<Arc<imbl::HashMap<editor::ScopePath, editor::ScopeState>>>,
+    raster_scope_state: Option<Arc<editor::ScopeStates>>,
     /// See [`CompileOutputState::all_scopes_visible`]; true without a layout.
     raster_all_scopes_visible: bool,
     raster_selected_scope: Option<editor::ScopePath>,
@@ -1381,7 +1382,7 @@ pub struct LayoutCanvas {
     /// Conservative world-space bounds for everything the active presentation
     /// can draw. If retained tiles contain this box, zooming out may expose
     /// uncovered background but cannot expose missing geometry.
-    raster_layout_bbox: Option<Arc<compile::Rect<f64>>>,
+    raster_layout_bbox: Option<Arc<editor::hierarchy::ScopeBounds>>,
     raster_dark_mode: bool,
     cell_raster_tiles: Arc<Mutex<CellRasterTileCache>>,
     raster_spatial_index: Arc<RasterSpatialIndex>,
@@ -2062,7 +2063,7 @@ fn append_raster_bvh_item(
                 solved
                     .state
                     .get(&child_scope)
-                    .and_then(|scope| scope.bbox.as_ref())
+                    .and_then(|scope| scope.prepared.bbox.as_ref())
                     .map(|bbox| {
                         let mut instance_mat = TransformationMatrix::identity();
                         if instance.reflect {
@@ -3126,7 +3127,7 @@ fn build_cell_raster_tile(
     width: u16,
     height: u16,
 ) -> Option<CellRasterTile> {
-    let scope_state = &input.solved_cell.state[&address];
+    let scope_state = input.solved_cell.state.scope(&address);
     let bbox = scope_state.bbox.as_ref()?;
     let p0 = ifmatvec(orientation, (bbox.x0, bbox.y0));
     let p1 = ifmatvec(orientation, (bbox.x1, bbox.y1));
@@ -3149,7 +3150,7 @@ fn build_cell_raster_tile(
     let mut queue = VecDeque::from_iter([(address, orientation, (0., 0.))]);
 
     while let Some((address @ ScopeAddress { cell, scope }, mat, ofs)) = queue.pop_front() {
-        let scope_state = &input.solved_cell.state[&address];
+        let scope_state = input.solved_cell.state.scope(&address);
         if !scope_state.visible {
             continue;
         }
@@ -3965,6 +3966,13 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
         .map(|layer| layer.z)
         .max()
         .map_or(0, |z| z + 1);
+    // Shapes look up their layer by name; this hashes names faster than the
+    // layer map does.
+    let layer_named = input
+        .layers
+        .iter()
+        .map(|(name, layer)| (name.as_ref(), layer))
+        .collect::<FxHashMap<&str, &LayerState>>();
     let mut rect_primitives = (0..layer_count)
         .map(|_| Vec::<RasterRectPrimitive>::new())
         .collect::<Vec<_>>();
@@ -4019,7 +4027,7 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
         }
         let cell_info = &input.solved_cell.output.cells[&cell];
         let scope_info = &cell_info.scopes[&scope];
-        let scope_state = &input.solved_cell.state[&address];
+        let scope_state = input.solved_cell.state.scope(&address);
 
         if let Some(bbox) = &scope_state.bbox {
             let p0 = ifmatvec(mat, (bbox.x0, bbox.y0));
@@ -4064,8 +4072,10 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                         .layer_extents(&input.solved_cell, cell)
                         .iter()
                     {
-                        let Some(layer) =
-                            input.layers.get(layer_name).filter(|layer| layer.visible)
+                        let Some(layer) = layer_named
+                            .get(layer_name.as_ref())
+                            .copied()
+                            .filter(|layer| layer.visible)
                         else {
                             continue;
                         };
@@ -4163,7 +4173,11 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                 raster_offset,
             );
             for layer_name in occupancy.layers.iter() {
-                let Some(layer) = input.layers.get(layer_name).filter(|layer| layer.visible) else {
+                let Some(layer) = layer_named
+                    .get(layer_name.as_ref())
+                    .copied()
+                    .filter(|layer| layer.visible)
+                else {
                     continue;
                 };
                 mark_raster_occupancy(
@@ -4191,7 +4205,7 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                     let Some(layer) = rect
                         .layer
                         .as_ref()
-                        .and_then(|name| input.layers.get(name.as_str()))
+                        .and_then(|name| layer_named.get(name.as_str()).copied())
                         .filter(|layer| layer.visible)
                     else {
                         continue;
@@ -4243,9 +4257,9 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                     });
                 }
                 SolvedValue::Polygon(polygon) => {
-                    let Some(layer) = input
-                        .layers
+                    let Some(layer) = layer_named
                         .get(polygon.layer.as_str())
+                        .copied()
                         .filter(|layer| layer.visible)
                     else {
                         continue;
@@ -4312,9 +4326,9 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                     });
                 }
                 SolvedValue::Path(path) => {
-                    let Some(layer) = input
-                        .layers
+                    let Some(layer) = layer_named
                         .get(path.layer.as_str())
+                        .copied()
                         .filter(|layer| layer.visible)
                     else {
                         continue;
@@ -4397,9 +4411,9 @@ fn build_navigation_raster(input: NavigationRasterInput) -> Option<LayoutRasterC
                     if input.include_text
                         && layout_text_metrics(viewport.scale, TEXT_LAYOUT_SIZE).is_some() =>
                 {
-                    let Some(layer) = input
-                        .layers
+                    let Some(layer) = layer_named
                         .get(text.layer.as_str())
+                        .copied()
                         .filter(|layer| layer.visible)
                     else {
                         continue;
@@ -4870,7 +4884,7 @@ fn navigation_overview_layers(
         .collect()
 }
 
-fn navigation_overview_viewport(bbox: &compile::Rect<f64>) -> ViewportTransform {
+fn navigation_overview_viewport(bbox: &editor::hierarchy::ScopeBounds) -> ViewportTransform {
     navigation_overview_viewport_for_extents_in_size(
         bbox.x0,
         bbox.y0,
@@ -4904,7 +4918,7 @@ fn navigation_overview_viewport_for_extents_in_size(
 }
 
 fn navigation_overview_display_viewport(
-    bbox: &compile::Rect<f64>,
+    bbox: &editor::hierarchy::ScopeBounds,
     current: ViewportTransform,
     size: Size<Pixels>,
 ) -> ViewportTransform {
@@ -5684,9 +5698,9 @@ fn raster_presentation_change(
 }
 
 fn same_scope_name_path(
-    old_state: Option<&imbl::HashMap<editor::ScopePath, editor::ScopeState>>,
+    old_state: Option<&editor::ScopeStates>,
     old_scope: Option<editor::ScopePath>,
-    new_state: Option<&imbl::HashMap<editor::ScopePath, editor::ScopeState>>,
+    new_state: Option<&editor::ScopeStates>,
     new_scope: Option<editor::ScopePath>,
 ) -> bool {
     let (Some(old_state), Some(mut old_scope), Some(new_state), Some(mut new_scope)) =
@@ -5713,9 +5727,9 @@ fn same_scope_name_path(
 }
 
 fn remap_scope_name_path(
-    old_state: &imbl::HashMap<editor::ScopePath, editor::ScopeState>,
+    old_state: &editor::ScopeStates,
     old_scope: editor::ScopePath,
-    new_state: &imbl::HashMap<editor::ScopePath, editor::ScopeState>,
+    new_state: &editor::ScopeStates,
     new_selected: editor::ScopePath,
 ) -> Option<editor::ScopePath> {
     if new_state.contains_key(&old_scope) {
@@ -5725,7 +5739,7 @@ fn remap_scope_name_path(
     let mut current = Some(old_scope);
     while let Some(address) = current {
         let scope = old_state.get(&address)?;
-        names.push(scope.name.clone());
+        names.push(scope.prepared.name.clone());
         current = scope.parent;
     }
     let mut root = new_selected;
@@ -6006,6 +6020,7 @@ impl Element for CanvasElement {
         window: &mut gpui::Window,
         cx: &mut gpui::App,
     ) {
+        let bench_paint_start = crate::bench::FrameProbe::active(cx).then(Instant::now);
         let stale_images = self.inner.update(cx, |inner, _| {
             #[cfg(test)]
             {
@@ -6121,7 +6136,12 @@ impl Element for CanvasElement {
             // A new hierarchy is still being classified or rasterized. Keep
             // the window responsive (including the status spinner) instead of
             // flattening that hierarchy synchronously in this paint pass.
+            let bench_frame =
+                bench_paint_start.map(|start| inner.bench_frame(start, "blank", false, None, cx));
             inner.bg_style.clone().paint(bounds, window, cx, |_, _| {});
+            if let Some(frame) = bench_frame {
+                crate::bench::FrameProbe::report(frame, cx);
+            }
             return;
         }
         let layers = state.layers.read(cx);
@@ -6195,7 +6215,7 @@ impl Element for CanvasElement {
                     budget.spend(1)?;
                     let cell_info = &solved_cell.output.cells[&cell];
                     let scope_info = &cell_info.scopes[&scope];
-                    let scope_state = &solved_cell.state[&curr_address];
+                    let scope_state = solved_cell.state.scope(&curr_address);
                     if shallow && depth > 0 && scope == cell_info.root {
                         // Retained tiles already show every expanded instance and
                         // the outlines of collapsed ones. Only the editable cell's
@@ -6654,7 +6674,7 @@ impl Element for CanvasElement {
                                 };
                                 let new_mat = mat * inst_mat;
                                 let new_ofs = (inst_ofs.0 + ofs.0, inst_ofs.1 + ofs.1);
-                                let scope_state = &solved_cell.state[&inst_address];
+                                let scope_state = solved_cell.state.scope(&inst_address);
                                 let mut show = show;
                                 if object_depth + 1 >= state.hierarchy_depth || !scope_state.visible
                                 {
@@ -6847,6 +6867,13 @@ impl Element for CanvasElement {
                     }
                     cx.notify();
                 });
+                if let Some(start) = bench_paint_start {
+                    let frame = self
+                        .inner
+                        .read(cx)
+                        .bench_frame(start, "blank", false, None, cx);
+                    crate::bench::FrameProbe::report(frame, cx);
+                }
                 return;
             }
         }
@@ -6879,6 +6906,30 @@ impl Element for CanvasElement {
                 inner.last_presented_raster.set(None);
                 replay_direct.is_none()
             }
+        };
+        // A frame is complete when it draws the current content at the
+        // requested camera, not a retained image of another camera or revision.
+        let bench_presentation = bench_paint_start.map(|_| match &presentation {
+            Presentation::Raster { tiles, display } => (
+                "raster",
+                raster_display_matches_camera(*display, inner.scale, inner.offset)
+                    && tiles.scale == inner.scale
+                    && tiles.content_revision == inner.raster_content_revision,
+            ),
+            Presentation::Direct if replay_direct.is_some() => ("retained", false),
+            Presentation::Direct => ("direct", solved_cell.is_some()),
+        });
+        let bench_selected_rect = match (&bench_presentation, &tool) {
+            (
+                Some(_),
+                ToolState::Select(SelectToolState {
+                    selected_obj: Some(selected),
+                }),
+            ) => rects
+                .iter()
+                .find(|(rect, _)| rect.id.as_ref() == Some(selected))
+                .map(|(rect, _)| [rect.x0, rect.y0, rect.x1, rect.y1]),
+            _ => None,
         };
         // A scale-safe raster deliberately coalesces objects smaller than a
         // display pixel; highlighting one of them would flash below-LOD detail.
@@ -8605,6 +8656,13 @@ impl Element for CanvasElement {
             inner.sse_handles = sse_handles;
             inner.sse_bodies = sse_bodies;
         });
+        if let (Some(start), Some((kind, complete))) = (bench_paint_start, bench_presentation) {
+            let frame =
+                self.inner
+                    .read(cx)
+                    .bench_frame(start, kind, complete, bench_selected_rect, cx);
+            crate::bench::FrameProbe::report(frame, cx);
+        }
     }
 }
 
@@ -9082,7 +9140,7 @@ impl LayoutCanvas {
                         };
                         state
                             .get(&address)
-                            .map(|scope| (*cell, Arc::clone(&scope.prepared)))
+                            .map(|scope| (*cell, Arc::clone(scope.prepared)))
                     })
                     .collect()
             })
@@ -9898,8 +9956,82 @@ impl LayoutCanvas {
         self.is_sse_dragging
     }
 
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(dead_code, reason = "the benchmark driver is native only")
+    )]
+    pub(crate) fn screen_bounds(&self) -> Bounds<Pixels> {
+        self.screen_bounds
+    }
+
+    /// Moves the camera in one step, as a discrete zoom or pan gesture would.
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(dead_code, reason = "the benchmark driver is native only")
+    )]
+    pub(crate) fn set_camera(&mut self, scale: f32, offset: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.is_dragging || self.is_sse_dragging || self.is_sse_persisting {
+            return;
+        }
+        if scale != self.scale {
+            self.advance_raster_generation();
+            self.raster_navigation_direction = RasterTileIndex { x: 0, y: 0 };
+            let previous_raster_display = self.raster_display;
+            self.scale = scale;
+            self.offset = offset;
+            let has_compatible_retained_raster = self.update_raster_display_for_camera();
+            self.raster_display = raster_zoom_display_transform(
+                previous_raster_display,
+                Some(RasterDisplayTransform { scale, offset }),
+                has_compatible_retained_raster,
+            );
+            self.request_navigation_overview(cx);
+        } else {
+            self.begin_navigation();
+            let previous_offset = self.offset;
+            self.offset = offset;
+            if let Some(direction) = raster_navigation_direction(previous_offset, offset) {
+                self.raster_navigation_direction = direction;
+            }
+            self.hover_hit = None;
+            self.request_navigation_overview(cx);
+            self.update_raster_display_for_camera();
+        }
+        self.request_navigation_raster(cx);
+        self.request_visible_raster_decision(cx);
+        cx.notify();
+    }
+
     pub(crate) fn should_handle_pointer_move(&self, position: Point<Pixels>) -> bool {
         self.screen_bounds.contains(&position) || self.is_dragging || self.is_sse_dragging
+    }
+
+    /// A benchmark record of the frame being painted.
+    fn bench_frame(
+        &self,
+        paint_start: Instant,
+        presentation: &'static str,
+        complete: bool,
+        selected_rect: Option<[f32; 4]>,
+        cx: &App,
+    ) -> crate::bench::PaintedFrame {
+        let state = self.state.read(cx);
+        let now = Instant::now();
+        crate::bench::PaintedFrame {
+            paint_start,
+            paint_end: now,
+            presented: now,
+            presentation,
+            complete,
+            scale: self.scale,
+            offset: self.offset,
+            canvas: self.screen_bounds,
+            content_revision: self.raster_content_revision,
+            compilation_revision: state.compilation_revision,
+            has_layout: state.displayed_cell(cx).is_some(),
+            sse_preview: self.is_sse_dragging || self.is_sse_persisting,
+            selected_rect,
+        }
     }
 
     pub(crate) fn defer_snapshot(&mut self, snapshot: PreparedCompilationSnapshot) {
@@ -10183,15 +10315,23 @@ impl LayoutCanvas {
         self.set_rendering(has_solved_layout, cx);
         self.hover_hit = None;
         if let Some(cell) = self.state.read(cx).displayed_cell(cx)
-            && let Some(bbox) = &cell.state[&cell.selected_scope].bbox.as_ref().or_else(|| {
-                let scope_address = &cell.selected_scope;
-                cell.state[&ScopeAddress {
-                    cell: scope_address.cell,
-                    scope: cell.output.cells[&scope_address.cell].root,
-                }]
-                    .bbox
-                    .as_ref()
-            })
+            && let Some(bbox) = cell
+                .state
+                .scope(&cell.selected_scope)
+                .prepared
+                .bbox
+                .as_ref()
+                .or_else(|| {
+                    let scope_address = &cell.selected_scope;
+                    cell.state
+                        .scope(&ScopeAddress {
+                            cell: scope_address.cell,
+                            scope: cell.output.cells[&scope_address.cell].root,
+                        })
+                        .prepared
+                        .bbox
+                        .as_ref()
+                })
         {
             self.scale = fit_scale(
                 self.screen_bounds.size,
@@ -11089,7 +11229,7 @@ impl LayoutCanvas {
         }
     }
 
-    fn layout_to_px(&self, pt: Point<f32>) -> Point<Pixels> {
+    pub(crate) fn layout_to_px(&self, pt: Point<f32>) -> Point<Pixels> {
         Point::new(self.scale * px(pt.x), self.scale * px(-pt.y))
             + self.offset
             + self.screen_bounds.origin
@@ -12033,7 +12173,7 @@ fn exact_object_bounds(
                 };
 
                 if is_last {
-                    let bbox = cell.state.get(&current_scope)?.bbox.as_ref()?;
+                    let bbox = cell.state.get(&current_scope)?.prepared.bbox.as_ref()?;
                     return Some(ExactLayoutBounds::transformed(
                         bbox.x0, bbox.y0, bbox.x1, bbox.y1, mat, ofs,
                     ));
@@ -14054,7 +14194,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
             output: &CompiledData,
             address: ScopeAddress,
             parent: Option<ScopeAddress>,
-            state: &mut imbl::HashMap<editor::ScopePath, editor::ScopeState>,
+            state: &mut editor::ScopeStates,
         ) -> (editor::ScopePath, Option<compile::Rect<f64>>) {
             let cell = &output.cells[&address.cell];
             let scope_info = &cell.scopes[&address.scope];
@@ -14130,7 +14270,14 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                     parent,
                     prepared: Arc::new(editor::hierarchy::PreparedScope {
                         name: scope_name,
-                        bbox: bbox.clone().map(Arc::new),
+                        bbox: bbox.as_ref().map(|bbox| {
+                            Arc::new(editor::hierarchy::ScopeBounds {
+                                x0: bbox.x0,
+                                y0: bbox.y0,
+                                x1: bbox.x1,
+                                y1: bbox.y1,
+                            })
+                        }),
                         children: smallvec::SmallVec::new(),
                     }),
                 },
@@ -14143,7 +14290,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
             cell: output.top,
             scope: output.cells[&output.top].root,
         };
-        let mut state = imbl::HashMap::new();
+        let mut state = editor::ScopeStates::default();
         let (selected_scope, _) = visit_scope(&output, root, None, &mut state);
         let all_scopes_visible = state.values().all(|scope| scope.visible);
         CompileOutputState {
@@ -14239,14 +14386,20 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
     }
 
     #[test]
-    #[ignore = "SRAM raster timing benchmark; run in release with --nocapture"]
+    #[ignore = "SRAM raster timing benchmark; build argon-sram-routing-wasm for wasm32-unknown-unknown, then run in release with --nocapture"]
     fn bench_sram_parent_raster_after_bulk_delete() {
         let workspace =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/sram");
         let source = workspace.join("lib.ar");
         let original = std::fs::read_to_string(&source).unwrap();
         let config = argonc::WorkspaceConfig::new(&source)
-            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")));
+            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")))
+            .with_wasm_modules([(
+                "routing".to_owned(),
+                workspace.join(
+                    "../../target/wasm32-unknown-unknown/release/argon_sram_routing_wasm.wasm",
+                ),
+            )]);
         let base = format!(
             "{original}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); }}\n"
         );
@@ -14255,7 +14408,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                 let x0 = (i % 10) * 10;
                 let y0 = (i / 10) * 10;
                 format!(
-                    "let r{i} = rect(\"met1.drawing\", x0={x0}., y0={y0}., x1={}., y1={}.)!;",
+                    "let r{i} = std::layout::rect(\"met1.drawing\", x0={x0}., y0={y0}., x1={}., y1={}.)!;",
                     x0 + 100,
                     y0 + 100
                 )
@@ -14287,7 +14440,7 @@ cell reflected() { let child = inst(partial(), x=0., y=100., reflect=true); }
                 previous.as_ref(),
                 previous_layers.as_ref(),
             );
-            let bbox = state.state[&root].bbox.as_ref().unwrap().clone();
+            let bbox = state.state.scope(&root).bbox.as_ref().unwrap().clone();
             let viewport = navigation_overview_viewport(&bbox);
             let solved = CompileOutputState {
                 output: Arc::new(output),

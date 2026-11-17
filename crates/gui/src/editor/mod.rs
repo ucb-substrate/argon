@@ -36,6 +36,7 @@ use crate::{
 
 pub mod canvas;
 mod hierarchy;
+pub use hierarchy::{ScopeStates, ScopeView};
 pub mod input;
 pub mod schematic;
 pub(crate) mod start_screen;
@@ -105,10 +106,7 @@ impl RootStep {
 }
 
 /// The scope names from the root of `state` down to `address`.
-fn scope_name_path(
-    state: &imbl::HashMap<ScopePath, ScopeState>,
-    mut address: ScopeAddress,
-) -> Option<Vec<String>> {
+fn scope_name_path(state: &ScopeStates, mut address: ScopeAddress) -> Option<Vec<String>> {
     let mut names = Vec::new();
     loop {
         let scope = state.get(&address)?;
@@ -125,7 +123,7 @@ fn scope_name_path(
 /// The scope that `names`, starting with the name of `root`, reach in
 /// `state`.
 fn scope_at_name_path(
-    state: &imbl::HashMap<ScopePath, ScopeState>,
+    state: &ScopeStates,
     root: ScopeAddress,
     names: &[String],
 ) -> Option<ScopeAddress> {
@@ -193,19 +191,12 @@ pub struct LayerState {
     pub z: usize,
 }
 
+/// A scope to add to a [`ScopeStates`].
 #[derive(Clone, Debug)]
 pub struct ScopeState {
     pub visible: bool,
     pub parent: Option<ScopeAddress>,
     prepared: Arc<hierarchy::PreparedScope>,
-}
-
-impl std::ops::Deref for ScopeState {
-    type Target = hierarchy::PreparedScope;
-
-    fn deref(&self) -> &Self::Target {
-        &self.prepared
-    }
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq, Debug)]
@@ -222,7 +213,7 @@ pub type ScopePath = ScopeAddress;
 pub struct CompileOutputState {
     pub output: Arc<CompiledData>,
     pub selected_scope: ScopePath,
-    pub state: Arc<imbl::HashMap<ScopePath, ScopeState>>,
+    pub state: Arc<ScopeStates>,
     /// Whether every scope in `state` is visible. It may be false when they
     /// all are, but is never true when one is hidden.
     pub all_scopes_visible: bool,
@@ -243,7 +234,7 @@ impl CompileOutputState {
         self.state
             .get(&address)
             .zip(previous.state.get(&address))
-            .is_some_and(|(new, old)| Arc::ptr_eq(&new.prepared, &old.prepared))
+            .is_some_and(|(new, old)| Arc::ptr_eq(new.prepared, old.prepared))
     }
 }
 
@@ -379,21 +370,21 @@ fn shape_fill(
 #[derive(Default)]
 struct ProcessScopeState {
     layers: IndexMap<SharedString, LayerState>,
-    state: imbl::HashMap<ScopePath, ScopeState>,
+    state: ScopeStates,
 }
 
 #[derive(Default)]
 pub(crate) struct CompilationPreparationContext {
     layers: IndexMap<SharedString, LayerState>,
     selected_scope: Option<ScopePath>,
-    scope_state: Option<Arc<imbl::HashMap<ScopePath, ScopeState>>>,
+    scope_state: Option<Arc<ScopeStates>>,
     previous: Option<CompileOutputState>,
 }
 
 struct PreparedCompileOutput {
     layers: IndexMap<SharedString, LayerState>,
     selected_scope: ScopePath,
-    state: imbl::HashMap<ScopePath, ScopeState>,
+    state: ScopeStates,
     all_scopes_visible: bool,
 }
 
@@ -429,6 +420,17 @@ fn mark_layer_used(state: &mut ProcessScopeState, layer: &str) {
 }
 
 impl EditorState {
+    /// Whether a compilation, snapshot preparation, or render is in progress.
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(dead_code, reason = "the benchmark driver is native only")
+    )]
+    pub(crate) fn is_busy(&self) -> bool {
+        self.rendering
+            || !self.compilation_activities.is_empty()
+            || !self.snapshot_preparations.is_empty()
+    }
+
     pub(crate) fn displayed_cell(&self, cx: &App) -> Option<CompileOutputState> {
         self.displayed_cell_and_revision(cx).0
     }

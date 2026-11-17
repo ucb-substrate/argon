@@ -1,5 +1,6 @@
 // Native transcriptions of the fixed Sky130 SRAM bitcell macros used by SRAM22.
 // Coordinates are the foundry macro geometry; parameterized tiling lives in array.ar.
+// arc-fmt: no-wrap
 
 use std::layout::polygon;
 

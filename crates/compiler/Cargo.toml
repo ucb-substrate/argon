@@ -12,6 +12,7 @@ workspace = true
 derive-where = { version = "1", features = ["serde"] }
 nalgebra = { version = "0.35", features = ["sparse"] }
 sparse-linear-solver = { path = "../sparse-linear-solver" }
+argon-greedy-router = { path = "../greedy-router" }
 gds = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
 anyhow = { workspace = true }
 cfgrammar = { workspace = true }
@@ -36,8 +37,15 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 tempfile = { workspace = true }
 postcard = { workspace = true }
+ciborium = "0.2"
+ciborium-io = { version = "0.2", features = ["std"] }
+ciborium-ll = { version = "0.2", features = ["std"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+wasmtime = { version = "50", default-features = false, features = ["cranelift", "parallel-compilation", "runtime", "std"] }
 
 [dev-dependencies]
+wat = "1"
 const_format = "0.2"
 pegasus = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }
 sky130 = { git = "https://github.com/ucb-substrate/substrate2.git", branch = "main" }

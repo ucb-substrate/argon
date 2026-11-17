@@ -9,6 +9,9 @@ use serde::Deserialize;
 
 pub mod cli;
 pub mod doc;
+pub mod formatter;
+
+pub use formatter::format_source;
 
 const MANIFEST_FILE: &str = "Argon.toml";
 const SOURCE_FILE: &str = "lib.ar";
@@ -59,6 +62,9 @@ pub struct Manifest {
     /// GDS files imported as zero-argument cells.
     #[serde(default)]
     pub gds: IndexMap<String, PathBuf>,
+    /// WASM modules implementing `extern` functions, by module name.
+    #[serde(default)]
+    pub wasm: IndexMap<String, PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +75,7 @@ pub struct Library {
     pub tech: Option<PathBuf>,
     pub dependencies: IndexMap<String, PathBuf>,
     pub gds: IndexMap<String, PathBuf>,
+    pub wasm: IndexMap<String, PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -88,6 +95,11 @@ impl Library {
             .into_iter()
             .map(|(name, path)| Ok((validate_cell_path(name)?, resolve_path(directory, path))))
             .collect::<Result<_>>()?;
+        let wasm = manifest
+            .wasm
+            .into_iter()
+            .map(|(name, path)| (name, resolve_path(directory, path)))
+            .collect();
         Ok(Self {
             name: manifest.name,
             manifest_path: manifest_path.to_path_buf(),
@@ -95,6 +107,7 @@ impl Library {
             tech: manifest.tech.map(|path| resolve_path(directory, path)),
             dependencies,
             gds,
+            wasm,
         })
     }
 
@@ -211,45 +224,6 @@ fn format_files(mut files: Vec<PathBuf>, check: bool) -> Result<FormatReport> {
     Ok(FormatReport { files, changed })
 }
 
-pub fn format_source(source: &str) -> String {
-    let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
-    let mut output = Vec::new();
-    let mut delimiters = Vec::new();
-    let mut in_string = false;
-
-    for line in normalized.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            if output.last().is_some_and(|line: &String| !line.is_empty()) {
-                output.push(String::new());
-            }
-            continue;
-        }
-
-        let leading_closers = leading_closing_delimiters(trimmed, &delimiters, in_string);
-        let remaining = &delimiters[..delimiters.len().saturating_sub(leading_closers)];
-        let depth = if trimmed.starts_with('}') && !in_string {
-            remaining
-                .iter()
-                .filter(|delimiter| **delimiter == '{')
-                .count()
-        } else {
-            indentation_depth(remaining)
-        };
-        output.push(format!("{}{trimmed}", " ".repeat(depth * 4)));
-        update_delimiters(trimmed, &mut delimiters, &mut in_string);
-    }
-
-    while output.last().is_some_and(String::is_empty) {
-        output.pop();
-    }
-    if output.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", output.join("\n"))
-    }
-}
-
 fn collect_argon_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     let metadata =
         fs::metadata(path).with_context(|| format!("could not access '{}'", path.display()))?;
@@ -319,76 +293,6 @@ fn collect_workspace_argon_files(path: &Path, files: &mut Vec<PathBuf>) -> Resul
         }
     }
     Ok(())
-}
-
-fn indentation_depth(delimiters: &[char]) -> usize {
-    let brace_count = delimiters
-        .iter()
-        .filter(|delimiter| **delimiter == '{')
-        .count();
-    let continuation_count = delimiters
-        .iter()
-        .rposition(|delimiter| *delimiter == '{')
-        .map_or(delimiters.len(), |brace| delimiters.len() - brace - 1);
-    brace_count + continuation_count
-}
-
-fn leading_closing_delimiters(line: &str, delimiters: &[char], in_string: bool) -> usize {
-    if in_string {
-        return 0;
-    }
-    let mut stack_index = delimiters.len();
-    let mut closers = 0;
-    for ch in line.chars() {
-        if ch.is_whitespace() {
-            continue;
-        }
-        let Some(open) = stack_index
-            .checked_sub(1)
-            .and_then(|index| delimiters.get(index))
-        else {
-            break;
-        };
-        if closes(*open, ch) {
-            stack_index -= 1;
-            closers += 1;
-        } else {
-            break;
-        }
-    }
-    closers
-}
-
-fn update_delimiters(line: &str, delimiters: &mut Vec<char>, in_string: &mut bool) {
-    let mut chars = line.chars().peekable();
-    let mut escaped = false;
-    while let Some(ch) = chars.next() {
-        if *in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                *in_string = false;
-            }
-            continue;
-        }
-        if ch == '/' && chars.peek() == Some(&'/') {
-            break;
-        }
-        match ch {
-            '"' => *in_string = true,
-            '{' | '(' | '[' => delimiters.push(ch),
-            '}' | ')' | ']' if delimiters.last().is_some_and(|open| closes(*open, ch)) => {
-                delimiters.pop();
-            }
-            _ => {}
-        }
-    }
-}
-
-fn closes(open: char, close: char) -> bool {
-    matches!((open, close), ('{', '}') | ('(', ')') | ('[', ']'))
 }
 
 fn validate_workspace_name(name: &str) -> Result<()> {
@@ -612,6 +516,17 @@ fn width(s: Shape) -> Float {
     fn grouped_use_round_trips() {
         let source = "use a::{b, c as d};\nuse std::layout::{\n    crect,\n    rect as r,\n};\n";
         assert_eq!(format_source(source), source);
+    }
+
+    #[test]
+    fn module_imports_round_trip() {
+        let source = "use lib::columns::util;\nuse lib::columns::{decoder as dec, mux};\n\ncell top() {\n    let w = util::width(dec::rows());\n}\n";
+        assert_eq!(format_source(source), source);
+        let messy = "use lib::columns::util;\ncell top() {\nlet w = util::width(\n1.);\n}\n";
+        assert_eq!(
+            format_source(messy),
+            "use lib::columns::util;\ncell top() {\n    let w = util::width(\n        1.);\n}\n"
+        );
     }
 
     #[test]

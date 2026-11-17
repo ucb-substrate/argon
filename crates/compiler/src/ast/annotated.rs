@@ -30,16 +30,31 @@ pub struct AnnotatedAst<T: AstMetadata> {
     pub span2scope: IndexMap<Span, Scope<Substr, T>>,
     // TODO: merge span2 IndexMaps
     pub span2call: IndexMap<Span, CallExpr<Substr, T>>,
+    /// Whether `span2scope` and `span2call` index the AST.
+    span_indexes: bool,
 }
 
 impl<T: AstMetadata> AnnotatedAst<T> {
     pub fn new<S>(text: ArcStr, ast: &Ast<S, T>, path: impl Into<Arc<Path>>) -> Self {
-        let path: Arc<Path> = path.into();
+        Self::annotate(text, ast, path.into(), true)
+    }
+
+    /// Like [`Self::new`], without building `span2scope` and `span2call`.
+    pub(crate) fn new_without_span_indexes<S>(
+        text: ArcStr,
+        ast: &Ast<S, T>,
+        path: impl Into<Arc<Path>>,
+    ) -> Self {
+        Self::annotate(text, ast, path.into(), false)
+    }
+
+    fn annotate<S>(text: ArcStr, ast: &Ast<S, T>, path: Arc<Path>, span_indexes: bool) -> Self {
         let mut pass = AstAnnotationPass {
             text,
             path: path.clone(),
             span2scope: Default::default(),
             span2call: Default::default(),
+            span_indexes,
             phantom: Default::default(),
         };
 
@@ -82,7 +97,53 @@ impl<T: AstMetadata> AnnotatedAst<T> {
             path,
             span2scope: pass.span2scope,
             span2call: pass.span2call,
+            span_indexes,
         }
+    }
+
+    /// Like [`Self::new`] for an AST whose names are already substrings of
+    /// `text`, without building the span indexes.
+    pub(crate) fn without_span_indexes(text: ArcStr, ast: Ast<Substr, T>, path: Arc<Path>) -> Self {
+        Self {
+            source_text: text.clone(),
+            text,
+            generated_declarations: 0,
+            parsed: true,
+            ast,
+            path,
+            span2scope: IndexMap::new(),
+            span2call: IndexMap::new(),
+            span_indexes: false,
+        }
+    }
+
+    /// Whether `span2scope` and `span2call` index the AST.
+    pub fn has_span_indexes(&self) -> bool {
+        self.span_indexes
+    }
+
+    /// A copy without `span2scope` and `span2call`. See
+    /// [`Self::drop_span_indexes`].
+    pub fn clone_without_span_indexes(&self) -> Self {
+        Self {
+            text: self.text.clone(),
+            source_text: self.source_text.clone(),
+            generated_declarations: self.generated_declarations,
+            parsed: self.parsed,
+            ast: self.ast.clone(),
+            path: self.path.clone(),
+            span2scope: IndexMap::new(),
+            span2call: IndexMap::new(),
+            span_indexes: false,
+        }
+    }
+
+    /// Drops `span2scope` and `span2call`, which only editor tooling reads.
+    /// An AST typed from this one is built without them.
+    pub fn drop_span_indexes(&mut self) {
+        self.span2scope = IndexMap::new();
+        self.span2call = IndexMap::new();
+        self.span_indexes = false;
     }
 
     /// Moves declarations parsed from the end of the backing text to the
@@ -105,6 +166,8 @@ struct AstAnnotationPass<S, T: AstMetadata> {
     path: Arc<Path>,
     span2scope: IndexMap<Span, Scope<Substr, T>>,
     span2call: IndexMap<Span, CallExpr<Substr, T>>,
+    /// Whether to fill `span2scope` and `span2call`.
+    span_indexes: bool,
     phantom: PhantomData<S>,
 }
 
@@ -397,6 +460,9 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
         _input: &Scope<Self::InputS, Self::InputMetadata>,
         output: &Scope<Self::OutputS, Self::OutputMetadata>,
     ) {
+        if !self.span_indexes {
+            return;
+        }
         self.span2scope.insert(
             Span {
                 path: self.path.clone(),
@@ -421,6 +487,9 @@ impl<S, T: AstMetadata> AstTransformer for AstAnnotationPass<S, T> {
             span: input.span,
             metadata,
         };
+        if !self.span_indexes {
+            return o;
+        }
         self.span2call.insert(
             Span {
                 path: self.path.clone(),

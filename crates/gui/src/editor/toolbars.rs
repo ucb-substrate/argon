@@ -1542,7 +1542,7 @@ impl HierarchySideBar {
     ) {
         let mut stack = vec![(scope, count, depth)];
         while let Some((scope, count, depth)) = stack.pop() {
-            let scope_state = &solved_cell.state[&scope];
+            let scope_state = solved_cell.state.scope(&scope);
             if scope_state.name.to_lowercase().contains(filter) {
                 rows.push(HierarchyRow {
                     scope,
@@ -1605,7 +1605,7 @@ impl HierarchySideBar {
                 .child(div().flex_1())
         };
         let tool = self.tool.clone();
-        let scope_state = &solved_cell.state[&scope];
+        let scope_state = solved_cell.state.scope(&scope);
         let scope_path = scope;
         let expanded = self.state.read(cx).expanded_scopes.contains(&scope_path);
         let is_cell = solved_cell.output.cells[&scope.cell].root == scope.scope;
@@ -1720,14 +1720,12 @@ impl HierarchySideBar {
                         move |_event, _window, cx| {
                             solved_cell.update(cx, |state, cx| {
                                 if let Some(state) = state.as_mut() {
-                                    let visible = state.state[&scope_path].visible;
+                                    let visible = state.state.scope(&scope_path).visible;
                                     Arc::make_mut(&mut state.state)
-                                        .get_mut(&scope_path)
-                                        .unwrap()
-                                        .visible = !visible;
+                                        .set_visible(scope_path, !visible);
                                     // Showing one scope can leave others hidden.
                                     state.all_scopes_visible =
-                                        !visible && state.state.values().all(|scope| scope.visible);
+                                        !visible && state.state.all_visible();
                                     cx.notify();
                                 }
                             })
@@ -1768,7 +1766,7 @@ impl HierarchySideBar {
                 .iter()
                 .enumerate()
                 .max_by_key(|(_, row)| {
-                    let name = &solved_cell.state[&row.scope].name;
+                    let name = &solved_cell.state.scope(&row.scope).prepared.name;
                     let count_width = if row.count > 1 {
                         row.count.to_string().len() + 3
                     } else {
@@ -2147,11 +2145,7 @@ impl Render for HierarchySideBar {
                                 move |_event, _window, cx| {
                                     solved_cell.update(cx, |cell, cx| {
                                         if let Some(cell) = cell {
-                                            for (_, state) in
-                                                Arc::make_mut(&mut cell.state).iter_mut()
-                                            {
-                                                state.visible = true;
-                                            }
+                                            Arc::make_mut(&mut cell.state).set_all_visible(true);
                                             cell.all_scopes_visible = true;
                                         }
                                         cx.notify();
@@ -2175,11 +2169,7 @@ impl Render for HierarchySideBar {
                                 move |_event, _window, cx| {
                                     solved_cell.update(cx, |cell, cx| {
                                         if let Some(cell) = cell {
-                                            for (_, state) in
-                                                Arc::make_mut(&mut cell.state).iter_mut()
-                                            {
-                                                state.visible = false;
-                                            }
+                                            Arc::make_mut(&mut cell.state).set_all_visible(false);
                                             cell.all_scopes_visible = cell.state.is_empty();
                                         }
                                         cx.notify();
@@ -2204,8 +2194,8 @@ impl Render for HierarchySideBar {
                                 move |_event, _window, cx| {
                                     let mut scope_paths = IndexSet::new();
                                     if let Some(cell) = solved_cell.read(cx) {
-                                        for path in cell.state.keys() {
-                                            scope_paths.insert(*path);
+                                        for (path, _) in cell.state.iter() {
+                                            scope_paths.insert(path);
                                         }
                                     }
                                     self_entity.read(cx).state.clone().update(cx, |state, cx| {

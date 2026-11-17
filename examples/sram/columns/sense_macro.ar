@@ -1,4 +1,5 @@
 // Native rectangle transcription of the fixed Sky130 sense-amplifier macro.
+// arc-fmt: no-wrap
 
 use std::layout::rect;
 

@@ -15,6 +15,7 @@ pub mod cli;
 
 pub mod actions;
 pub mod assets;
+pub mod bench;
 pub mod editor;
 pub mod focus;
 #[cfg(not(target_family = "wasm"))]
@@ -150,8 +151,13 @@ fn init_app(cx: &mut App, embedded: bool) {
 }
 
 /// Runs the GUI on its own, connected to the analyzer at `lang_server_addr`.
+/// With `bench`, it runs that benchmark and exits.
 #[cfg(not(target_family = "wasm"))]
-pub fn run_gui(lang_server_addr: std::net::SocketAddr, token: analyzer::transport::SessionToken) {
+pub fn run_gui(
+    lang_server_addr: std::net::SocketAddr,
+    token: analyzer::transport::SessionToken,
+    bench: Option<bench::BenchConfig>,
+) {
     focus::initialize_target();
 
     analyzer::init_logging();
@@ -160,14 +166,23 @@ pub fn run_gui(lang_server_addr: std::net::SocketAddr, token: analyzer::transpor
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             init_app(cx, false);
-            cx.open_window(editor_window_options(), |window, cx| {
-                let main = cx.new(|cx| MainWindow::standalone(lang_server_addr, token, window, cx));
-                MainWindow::keep_standalone(&main, cx);
-                main
-            })
-            .unwrap();
+            let options = match &bench {
+                Some(config) => config.window_options(),
+                None => editor_window_options(),
+            };
+            let window = cx
+                .open_window(options, |window, cx| {
+                    let main =
+                        cx.new(|cx| MainWindow::standalone(lang_server_addr, token, window, cx));
+                    MainWindow::keep_standalone(&main, cx);
+                    main
+                })
+                .unwrap();
 
             focus::activate_gui(cx);
+            if let Some(config) = bench {
+                bench::start(config, window, cx);
+            }
         });
 }
 

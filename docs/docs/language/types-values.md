@@ -52,6 +52,8 @@ Geometry and constraints use `Float`. Counts and indices use `Int`.
 
 Arithmetic: `+`, `-`, `*`, `/`, and `%`. Comparison: `==`, `!=`, `<`, `<=`, `>`, and `>=`.
 
+A `Float` comparison uses exact values, not values snapped to the grid, and waits until the solver has fixed both sides. Values within floating-point noise of each other compare equal, so `0.1 + 0.2 >= 0.3` holds.
+
 Cast with `as`:
 
 ```argon

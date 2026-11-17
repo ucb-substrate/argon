@@ -13,6 +13,7 @@ use crate::{ColParams, PrimitiveGateParams, SramParams};
 
 /// Inverter counts of the control logic's delay chains.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ControlLogicParams {
     pub decoder_delay_invs: i32,
     pub wlen_pulse_invs: i32,
@@ -524,8 +525,8 @@ fn size_tree(plan: &PlanNode, load: f64) -> TreeNode {
     for (node, plan_node) in nodes.into_iter().zip(&path).rev() {
         let mut node = node;
         node.children.extend(child.take());
-        for i in 1..plan_node.children.len() {
-            let sub = size_tree(&plan_node.children[i], node.value_for_child(i));
+        for (i, sub_plan) in plan_node.children.iter().enumerate().skip(1) {
+            let sub = size_tree(sub_plan, node.value_for_child(i));
             node.children.push(sub);
         }
         child = Some(node);
@@ -676,6 +677,7 @@ pub fn control_logic_params(p: SramParams, col: &ColParams) -> ControlLogicParam
 /// Gate sizes of one decoder stage, from input to output: a NAND2 and its
 /// inverter, then the buffer inverters after them.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct AndStageSizing {
     /// 2 for an AND2 stage, 3 for an AND3 stage.
     pub inputs: i32,
@@ -686,6 +688,7 @@ pub struct AndStageSizing {
 
 /// Gate sizes of a buffer chain, from input to output.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct BufferSizing {
     pub stages: Vec<PrimitiveGateParams>,
 }
@@ -694,6 +697,7 @@ pub struct BufferSizing {
 /// buffer inverters, with `num` one-hot outputs. Its inputs come from the
 /// nodes listed in `children`, or from address bits when it has none.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct DecoderNodeSizing {
     pub inputs: i32,
     pub nand: PrimitiveGateParams,
@@ -705,12 +709,14 @@ pub struct DecoderNodeSizing {
 
 /// The row decoder tree as a node list, with the root first.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct RowDecoderSizing {
     pub nodes: Vec<DecoderNodeSizing>,
 }
 
 /// Sizes of the decoders and enable buffers around the array.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct PeripherySizing {
     pub row_decoder: RowDecoderSizing,
     pub col_decoder: AndStageSizing,

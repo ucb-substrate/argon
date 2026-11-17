@@ -754,6 +754,11 @@ impl State {
     }
 
     pub(crate) async fn nav_index(&self) -> Option<std::sync::Arc<NavIndex>> {
+        let ready = self.published_state.lock().await.nav_ready.clone();
+        if let Some(mut ready) = ready {
+            // A dropped sender means no newer index is coming.
+            let _ = ready.wait_for(|ready| *ready).await;
+        }
         self.published_state.lock().await.nav.clone()
     }
 
@@ -1210,6 +1215,45 @@ mod tests {
         assert_eq!(
             completion_context("let wid", "let wid".len()),
             CompletionContext::Plain
+        );
+    }
+
+    /// A path through a module import completes, navigates, and hovers as the
+    /// editor asks for each.
+    #[test]
+    fn a_module_import_completes_and_navigates() {
+        let source = "use std::layout as geo;\ncell top() {\n    let r = geo::rect(\"met1\");\n}\n";
+        let index = index_of(source);
+        let path = PathBuf::from(FILE);
+
+        let cursor = source.find("geo::rect").unwrap() + "geo::re".len();
+        let CompletionContext::Qualified { segments } = completion_context(source, cursor) else {
+            panic!("`geo::re` is a qualified path");
+        };
+        assert_eq!(segments, ["geo"]);
+        let labels = index
+            .qualified_completions(&path, &segments)
+            .into_iter()
+            .map(|candidate| candidate.label)
+            .collect::<Vec<_>>();
+        for expected in ["inst", "rect"] {
+            assert!(labels.iter().any(|label| label == expected), "{labels:?}");
+        }
+
+        let geo = source.rfind("geo").unwrap();
+        let definition = index.definition_at(&path, geo).expect("`geo` resolves");
+        let DefLocation::File(file) = &definition.location else {
+            panic!("expected the module's file, got {:?}", definition.location);
+        };
+        assert!(file.ends_with("layout.ar"), "{}", file.display());
+        assert_eq!(index.hover_at(&path, geo).unwrap().contents, "mod layout");
+        let rect = source.find("rect").unwrap();
+        assert!(
+            index
+                .hover_at(&path, rect)
+                .unwrap()
+                .contents
+                .starts_with("fn rect(")
         );
     }
 

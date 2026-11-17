@@ -45,3 +45,4 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", default-features = false, features = ["util"] }
+wat = "1"

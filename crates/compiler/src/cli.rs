@@ -10,7 +10,7 @@ use crate::{
     compile::{self, CompileOutput},
     diagnostics::{self, Diagnostic},
     netlist::{NetlistFormat, NetlistOptions},
-    parse::{self, CellInvocation, parse_workspace_with_config},
+    parse::{self, CellInvocation},
 };
 use clap::{ArgGroup, Parser, ValueEnum};
 
@@ -42,6 +42,10 @@ struct Args {
     /// GDS cell import in NAME=PATH form. NAME may be a module path.
     #[arg(long = "gds-import", value_parser = parse_gds_import)]
     gds_imports: Vec<(String, PathBuf)>,
+
+    /// WASM module for `extern` functions in NAME=PATH form.
+    #[arg(long = "wasm-module", value_parser = parse_dependency)]
+    wasm_modules: Vec<(String, PathBuf)>,
 
     /// Binary compiler-output path. Defaults to lib.bin beside the root lib.ar.
     #[arg(short, long, requires = "cell")]
@@ -154,11 +158,18 @@ fn execute(args: Args) -> Result<(), Failed> {
             return Err(fail(format, format!("duplicate GDS import `{name}`")));
         }
     }
+    names.clear();
+    for (name, _) in &args.wasm_modules {
+        if !names.insert(name) {
+            return Err(fail(format, format!("duplicate WASM module `{name}`")));
+        }
+    }
 
     let workspace = WorkspaceConfig::new(&root)
         .with_dependencies(args.dependencies.clone())
         .with_tech(args.tech.clone())
-        .with_gds_imports(args.gds_imports.clone());
+        .with_gds_imports(args.gds_imports.clone())
+        .with_wasm_modules(args.wasm_modules.clone());
     // The invocation is spliced into the workspace before analysis so that its
     // arguments are resolved, type-checked, and evaluated like any source
     // expression, which means the entry point must be resolved before parsing.
@@ -178,7 +189,17 @@ fn execute(args: Args) -> Result<(), Failed> {
         Some(cell)
     };
 
-    let mut parse_output = parse_workspace_with_config(&workspace);
+    if entry.is_some() {
+        // Compiled while the workspace is parsed and analyzed.
+        crate::wasm::precompile(
+            workspace
+                .wasm_modules
+                .iter()
+                .map(|(_, path)| path.clone())
+                .collect(),
+        );
+    }
+    let mut parse_output = parse::parse_workspace_without_span_indexes(&workspace);
     let entry = match entry {
         Some(cell) => Some(
             parse::add_cell_invocation(&mut parse_output, cell)
@@ -186,6 +207,12 @@ fn execute(args: Args) -> Result<(), Failed> {
         ),
         None => None,
     };
+    // Neither analysis nor evaluation reads the span indexes, so neither the
+    // parsed nor the typed AST keeps them, including the modules the
+    // invocation re-parsed.
+    for (ast, _) in parse_output.asts.values_mut() {
+        ast.drop_span_indexes();
+    }
     let analysis = compile::analyze_workspace(parse_output);
     let Some(typed_ast) = analysis.typed_ast else {
         return Err(fail(
@@ -437,6 +464,7 @@ mod tests {
             tech: None,
             dependencies: Vec::new(),
             gds_imports: Vec::new(),
+            wasm_modules: Vec::new(),
             output: None,
             gds: None,
             gds_only: false,
@@ -455,6 +483,7 @@ mod tests {
             tech: Some(tech),
             dependencies: Vec::new(),
             gds_imports: Vec::new(),
+            wasm_modules: Vec::new(),
             output: None,
             gds: None,
             gds_only: false,
@@ -705,9 +734,10 @@ cell device(enabled: Bool, w: Float, count: Int) {
 }
 "#,
         );
+        let output = source.with_extension("bin");
         let mut args = execution_args(source, "devices::device(true, 150., 5)", basic_tech());
         args.dependencies.push(("devices".to_owned(), dependency));
-        args.output = Some(std::env::temp_dir().join("argonc-bool.bin"));
+        args.output = Some(output);
         assert!(execute(args).is_ok());
     }
 
@@ -1121,9 +1151,10 @@ cell device(enabled: Bool, w: Float, count: Int) {
             "invalid-argument-dependency",
             "cell device(enabled: Bool, w: Float, count: Int) {}\n",
         );
+        let output = source.with_extension("bin");
         let mut args = execution_args(source, "devices::device(1, 150., 5)", basic_tech());
         args.dependencies.push(("devices".to_owned(), dependency));
-        args.output = Some(std::env::temp_dir().join("argonc-invalid-argument.bin"));
+        args.output = Some(output);
         let diagnostic = render_failed(failed(args));
         assert!(
             diagnostic.contains("expected type Bool, found Int"),

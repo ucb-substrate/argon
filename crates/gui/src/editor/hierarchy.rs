@@ -5,11 +5,12 @@ use std::{
     sync::Arc,
 };
 
-use argonc::compile::{CellId, SolvedValue, bbox_dim_union, bbox_text_union, bbox_union, ifmatvec};
+use argonc::compile::{CellId, ScopeId, SolvedValue, bbox_dim_union, bbox_text_union, ifmatvec};
 use geometry::transform::TransformationMatrix;
+use rustc_hash::FxHashMap;
 
 use super::{
-    CompileOutputState, CompiledData, LayerState, ProcessScopeState, Rect, ScopeAddress, ScopePath,
+    CompileOutputState, CompiledData, LayerState, ProcessScopeState, Rect, ScopeAddress,
     ScopeState, mark_layer_used,
 };
 use gpui::SharedString;
@@ -19,15 +20,289 @@ pub struct PreparedScope {
     pub name: Arc<str>,
     /// Shared because long chains of function/control-flow scopes commonly
     /// have exactly the same bounds as their only child.
-    pub bbox: Option<Arc<Rect<f64>>>,
+    pub bbox: Option<Arc<ScopeBounds>>,
     // Most generated execution scopes have zero or one child. Keep those
     // inline instead of performing a heap allocation per scope.
     pub children: smallvec::SmallVec<[ScopeAddress; 2]>,
 }
 
+/// The bounds of a scope's geometry, as [`argonc::compile::bbox_union`]
+/// combines them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScopeBounds {
+    pub x0: f64,
+    pub y0: f64,
+    pub x1: f64,
+    pub y1: f64,
+}
+
+impl ScopeBounds {
+    fn of(rect: &Rect<f64>) -> Self {
+        Self {
+            x0: rect.x0,
+            y0: rect.y0,
+            x1: rect.x1,
+            y1: rect.y1,
+        }
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+}
+
+/// A scope of a [`ScopeStates`].
+#[derive(Clone, Copy, Debug)]
+pub struct ScopeView<'a> {
+    pub visible: bool,
+    pub parent: Option<ScopeAddress>,
+    pub prepared: &'a Arc<PreparedScope>,
+}
+
+impl std::ops::Deref for ScopeView<'_> {
+    type Target = PreparedScope;
+
+    fn deref(&self) -> &Self::Target {
+        self.prepared
+    }
+}
+
+/// Every prepared scope, by address.
+type PreparedScopes = FxHashMap<ScopeAddress, Arc<PreparedScope>>;
+
+/// The scopes of one cell: each scope's parent within the cell, and its
+/// prepared data. The entry of the cell's root names the root itself.
+type CellScopeMap = FxHashMap<ScopeId, (ScopeId, Arc<PreparedScope>)>;
+
+#[derive(Clone, Debug, Default)]
+struct CellScopes {
+    /// The scope whose parent is in another cell, or which has none.
+    root: Option<ScopeId>,
+    root_parent: Option<ScopeAddress>,
+    scopes: Arc<CellScopeMap>,
+}
+
+/// Every scope of a prepared hierarchy, with its parent and visibility.
+///
+/// Scopes are grouped by cell, so a hierarchy prepared after an edit shares
+/// the scopes of each unchanged cell with the one before it.
+#[derive(Clone, Debug, Default)]
+pub struct ScopeStates {
+    cells: FxHashMap<CellId, CellScopes>,
+    /// The scopes the user hid.
+    hidden: HashSet<ScopeAddress>,
+    len: usize,
+    /// The distinct cells each cell of the compiled output instantiates.
+    instances: HashMap<CellId, Arc<[CellId]>>,
+}
+
+impl ScopeStates {
+    pub fn get(&self, address: &ScopeAddress) -> Option<ScopeView<'_>> {
+        let cell = self.cells.get(&address.cell)?;
+        let (parent, prepared) = cell.scopes.get(&address.scope)?;
+        Some(self.view(cell, address, *parent, prepared))
+    }
+
+    fn view<'a>(
+        &self,
+        cell: &CellScopes,
+        address: &ScopeAddress,
+        parent: ScopeId,
+        prepared: &'a Arc<PreparedScope>,
+    ) -> ScopeView<'a> {
+        ScopeView {
+            visible: self.hidden.is_empty() || !self.hidden.contains(address),
+            parent: if cell.root == Some(address.scope) {
+                cell.root_parent
+            } else {
+                Some(ScopeAddress {
+                    cell: address.cell,
+                    scope: parent,
+                })
+            },
+            prepared,
+        }
+    }
+
+    /// The scope at `address`, which must be in the hierarchy.
+    #[track_caller]
+    pub fn scope(&self, address: &ScopeAddress) -> ScopeView<'_> {
+        self.get(address)
+            .unwrap_or_else(|| panic!("scope {address:?} is not in the hierarchy"))
+    }
+
+    pub fn contains_key(&self, address: &ScopeAddress) -> bool {
+        self.cells
+            .get(&address.cell)
+            .is_some_and(|cell| cell.scopes.contains_key(&address.scope))
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (ScopeAddress, ScopeView<'_>)> {
+        self.cells.iter().flat_map(move |(cell_id, cell)| {
+            cell.scopes.iter().map(move |(scope, (parent, prepared))| {
+                let address = ScopeAddress {
+                    cell: *cell_id,
+                    scope: *scope,
+                };
+                (address, self.view(cell, &address, *parent, prepared))
+            })
+        })
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = ScopeView<'_>> {
+        self.iter().map(|(_, scope)| scope)
+    }
+
+    /// Whether every scope is visible.
+    pub fn all_visible(&self) -> bool {
+        self.hidden.is_empty()
+    }
+
+    /// Adds or replaces the scope at `address`. A parent in another cell, or
+    /// none, makes it its cell's root.
+    pub fn insert(&mut self, address: ScopeAddress, state: ScopeState) {
+        let ScopeState {
+            visible,
+            parent,
+            prepared,
+        } = state;
+        let cell = self.cells.entry(address.cell).or_default();
+        let parent_in_cell = parent
+            .filter(|parent| parent.cell == address.cell)
+            .map(|parent| parent.scope);
+        if parent_in_cell.is_none() {
+            cell.root = Some(address.scope);
+            cell.root_parent = parent;
+        } else if cell.root == Some(address.scope) {
+            cell.root = None;
+            cell.root_parent = None;
+        }
+        let entry = (parent_in_cell.unwrap_or(address.scope), prepared);
+        let unchanged = cell
+            .scopes
+            .get(&address.scope)
+            .is_some_and(|(parent, prepared)| {
+                *parent == entry.0 && Arc::ptr_eq(prepared, &entry.1)
+            });
+        if !unchanged
+            && Arc::make_mut(&mut cell.scopes)
+                .insert(address.scope, entry)
+                .is_none()
+        {
+            self.len += 1;
+        }
+        self.set_visible(address, visible);
+    }
+
+    pub fn remove(&mut self, address: &ScopeAddress) {
+        let Some(cell) = self.cells.get_mut(&address.cell) else {
+            return;
+        };
+        if !cell.scopes.contains_key(&address.scope) {
+            return;
+        }
+        self.len -= 1;
+        if cell.scopes.len() == 1 {
+            self.cells.remove(&address.cell);
+        } else {
+            Arc::make_mut(&mut cell.scopes).remove(&address.scope);
+            if cell.root == Some(address.scope) {
+                cell.root = None;
+                cell.root_parent = None;
+            }
+        }
+        if !self.hidden.is_empty() {
+            self.hidden.remove(address);
+        }
+    }
+
+    /// Removes every scope of `cell`.
+    fn remove_cell(&mut self, cell: CellId) {
+        if let Some(removed) = self.cells.remove(&cell) {
+            self.len -= removed.scopes.len();
+            if !self.hidden.is_empty() {
+                self.hidden.retain(|address| address.cell != cell);
+            }
+        }
+    }
+
+    pub fn set_visible(&mut self, address: ScopeAddress, visible: bool) {
+        if visible {
+            if !self.hidden.is_empty() {
+                self.hidden.remove(&address);
+            }
+        } else {
+            self.hidden.insert(address);
+        }
+    }
+
+    pub fn set_all_visible(&mut self, visible: bool) {
+        self.hidden = if visible {
+            HashSet::new()
+        } else {
+            self.iter().map(|(address, _)| address).collect()
+        };
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// The distinct cells `cell` instantiates.
+fn instantiated_cells(cell: &argonc::compile::CompiledCell) -> Arc<[CellId]> {
+    let mut cells = cell
+        .objects
+        .values()
+        .filter_map(|value| match value {
+            SolvedValue::Instance(instance) => Some(instance.cell),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    cells.sort_unstable();
+    cells.dedup();
+    cells.into()
+}
+
+/// The cells each cell of `output` instantiates, reusing the lists of the
+/// cells it shares with `previous`.
+fn cell_instances(
+    output: &CompiledData,
+    previous: Option<&CompileOutputState>,
+) -> HashMap<CellId, Arc<[CellId]>> {
+    output
+        .cells
+        .iter()
+        .map(|(id, cell)| {
+            let known = previous
+                .filter(|old| {
+                    old.output
+                        .cells
+                        .get(id)
+                        .is_some_and(|old| Arc::ptr_eq(old, cell))
+                })
+                .and_then(|old| old.state.instances.get(id).cloned());
+            (*id, known.unwrap_or_else(|| instantiated_cells(cell)))
+        })
+        .collect()
+}
+
 #[derive(Debug, Default)]
 pub(super) struct PreparedHierarchy {
-    scopes: HashMap<ScopeAddress, Arc<PreparedScope>>,
+    scopes: PreparedScopes,
     /// See [`CompileOutputState::all_scopes_visible`].
     pub(super) all_scopes_visible: bool,
 }
@@ -39,14 +314,14 @@ impl PreparedHierarchy {
     pub(super) fn remap_path(
         &self,
         root: ScopeAddress,
-        old_state: &imbl::HashMap<ScopePath, ScopeState>,
+        old_state: &ScopeStates,
         old_selected: ScopeAddress,
     ) -> Option<ScopeAddress> {
         let mut names = Vec::new();
         let mut current = Some(old_selected);
         while let Some(address) = current {
             let scope = old_state.get(&address)?;
-            names.push(scope.name.as_ref());
+            names.push(scope.prepared.name.as_ref());
             current = scope.parent;
         }
         let mut names = names.into_iter().rev();
@@ -81,7 +356,7 @@ enum GeometryPhase {
 struct GeometryFrame {
     address: ScopeAddress,
     phase: GeometryPhase,
-    bbox: Option<Arc<Rect<f64>>>,
+    bbox: Option<Arc<ScopeBounds>>,
     children: smallvec::SmallVec<[ScopeAddress; 2]>,
 }
 
@@ -90,7 +365,7 @@ struct GeometryFrame {
 fn prepare_geometry(
     output: &CompiledData,
     root: ScopeAddress,
-    scopes: &mut HashMap<ScopeAddress, Arc<PreparedScope>>,
+    scopes: &mut PreparedScopes,
     layers: &mut indexmap::IndexSet<String>,
     previous: Option<&CompileOutputState>,
     reusable: &HashSet<CellId>,
@@ -112,7 +387,7 @@ fn prepare_geometry(
         let source_scope = &cell.scopes[&address.scope];
         let cached = previous
             .and_then(|old| old.state.get(&address))
-            .map(|scope| &scope.prepared);
+            .map(|scope| scope.prepared);
         match top.phase {
             GeometryPhase::Start => {
                 if scopes.contains_key(&address) {
@@ -181,7 +456,7 @@ fn prepare_geometry(
                 if cached.children.iter().all(|child| {
                     old.state
                         .get(child)
-                        .is_some_and(|old| Arc::ptr_eq(&old.prepared, &scopes[child]))
+                        .is_some_and(|old| Arc::ptr_eq(old.prepared, &scopes[child]))
                 }) {
                     scopes.insert(address, cached.clone());
                 } else {
@@ -214,7 +489,9 @@ fn prepare_geometry(
                         );
                     }
                     value => {
-                        top.bbox = shared_bbox_union(top.bbox, object_bbox(value).map(Arc::new));
+                        let bounds =
+                            object_bbox(value).map(|rect| Arc::new(ScopeBounds::of(&rect)));
+                        top.bbox = shared_bbox_union(top.bbox, bounds);
                         if let Some(layer) = object_layer(value) {
                             layers.insert(layer.to_owned());
                         }
@@ -275,7 +552,7 @@ fn object_bbox(value: &SolvedValue) -> Option<Rect<f64>> {
 }
 
 /// The bounds of an instance whose cell's bounds are `rect`.
-fn instance_bbox(instance: &argonc::compile::SolvedInstance, rect: &Rect<f64>) -> Rect<f64> {
+fn instance_bbox(instance: &argonc::compile::SolvedInstance, rect: &ScopeBounds) -> ScopeBounds {
     let mut matrix = TransformationMatrix::identity();
     if instance.reflect {
         matrix = matrix.reflect_vert();
@@ -283,28 +560,22 @@ fn instance_bbox(instance: &argonc::compile::SolvedInstance, rect: &Rect<f64>) -
     matrix = matrix.rotate(instance.angle);
     let p0 = ifmatvec(matrix, (rect.x0, rect.y0));
     let p1 = ifmatvec(matrix, (rect.x1, rect.y1));
-    Rect {
-        layer: None,
+    ScopeBounds {
         x0: p0.0.min(p1.0) + instance.x,
         y0: p0.1.min(p1.1) + instance.y,
         x1: p0.0.max(p1.0) + instance.x,
         y1: p0.1.max(p1.1) + instance.y,
-        id: instance.id,
-        construction: true,
-        span: rect.span.clone(),
     }
 }
 
 fn shared_bbox_union(
-    left: Option<Arc<Rect<f64>>>,
-    right: Option<Arc<Rect<f64>>>,
-) -> Option<Arc<Rect<f64>>> {
+    left: Option<Arc<ScopeBounds>>,
+    right: Option<Arc<ScopeBounds>>,
+) -> Option<Arc<ScopeBounds>> {
     match (left, right) {
         (None, right) => right,
         (left, None) => left,
-        (Some(left), Some(right)) => Some(Arc::new(
-            bbox_union(Some((*left).clone()), Some((*right).clone())).unwrap(),
-        )),
+        (Some(left), Some(right)) => Some(Arc::new(left.union(*right))),
     }
 }
 
@@ -313,7 +584,7 @@ fn shared_bbox_union(
 fn prepare_paths(
     root: ScopeAddress,
     hidden_paths: &HashSet<Vec<String>>,
-    scopes: &HashMap<ScopeAddress, Arc<PreparedScope>>,
+    scopes: &PreparedScopes,
     state: &mut ProcessScopeState,
 ) {
     let mut path: Vec<String> = Vec::new();
@@ -347,7 +618,7 @@ fn prepare_paths(
 /// are needed only to remap the small set of user-hidden scopes across edits.
 fn prepare_visible_paths(
     root: ScopeAddress,
-    scopes: &HashMap<ScopeAddress, Arc<PreparedScope>>,
+    scopes: &PreparedScopes,
     state: &mut ProcessScopeState,
 ) {
     let mut stack = vec![(root, None)];
@@ -368,23 +639,22 @@ fn prepare_visible_paths(
     }
 }
 
-fn hidden_paths(old: Option<&imbl::HashMap<ScopePath, ScopeState>>) -> HashSet<Vec<String>> {
+fn hidden_paths(old: Option<&ScopeStates>) -> HashSet<Vec<String>> {
     old.into_iter()
         .flat_map(|state| {
-            state
-                .iter()
-                .filter(|(_, scope)| !scope.visible)
-                .map(|(address, _)| {
-                    let mut path = Vec::new();
-                    let mut current = Some(*address);
-                    while let Some(address) = current {
-                        let scope = &state[&address];
-                        path.push(scope.name.to_string());
-                        current = scope.parent;
-                    }
-                    path.reverse();
-                    path
-                })
+            state.hidden.iter().map(|address| {
+                let mut path = Vec::new();
+                let mut current = Some(*address);
+                while let Some(address) = current {
+                    let scope = state
+                        .get(&address)
+                        .expect("a hidden scope is in the hierarchy");
+                    path.push(scope.name.to_string());
+                    current = scope.parent;
+                }
+                path.reverse();
+                path
+            })
         })
         .collect()
 }
@@ -395,7 +665,7 @@ fn hidden_paths(old: Option<&imbl::HashMap<ScopePath, ScopeState>>) -> HashSet<V
 /// builder, which also handles removals and path collisions.
 fn reuse_paths(
     root: ScopeAddress,
-    scopes: &HashMap<ScopeAddress, Arc<PreparedScope>>,
+    scopes: &PreparedScopes,
     state: &mut ProcessScopeState,
     old: &CompileOutputState,
 ) -> bool {
@@ -416,7 +686,7 @@ fn reuse_paths(
         if inverse.insert(after, before).is_some() {
             return false;
         }
-        let Some(a) = old.state.get(&before).map(|scope| &scope.prepared) else {
+        let Some(a) = old.state.get(&before).map(|scope| scope.prepared) else {
             return false;
         };
         let b = &scopes[&after];
@@ -426,15 +696,20 @@ fn reuse_paths(
         remap.insert(before, after);
         pending.extend(a.children.iter().copied().zip(b.children.iter().copied()));
     }
+    let old_scope = |address: &ScopeAddress| {
+        old.state
+            .get(address)
+            .expect("a remapped scope is in the old hierarchy")
+    };
     let changed: HashSet<_> = remap
         .iter()
         .filter_map(|(before, after)| {
-            (!Arc::ptr_eq(&old.state[before].prepared, &scopes[after])).then_some(*before)
+            (!Arc::ptr_eq(old_scope(before).prepared, &scopes[after])).then_some(*before)
         })
         .collect();
     state.state = old.state.as_ref().clone();
     for (before, after) in &remap {
-        let scope = &old.state[before];
+        let scope = old_scope(before);
         let address = remap[before];
         let parent = scope.parent.map(|parent| remap[&parent]);
         if before != after {
@@ -445,8 +720,8 @@ fn reuse_paths(
                 *after,
                 ScopeState {
                     parent,
+                    visible: scope.visible,
                     prepared: Arc::clone(&scopes[&address]),
-                    ..scope.clone()
                 },
             );
         }
@@ -456,7 +731,11 @@ fn reuse_paths(
 
 /// A reused cell is safe to keep as an opaque prepared subtree only when its
 /// own data and every referenced cell are the same immutable allocations.
-fn reusable_cells(output: &CompiledData, old: &CompileOutputState) -> HashSet<CellId> {
+fn reusable_cells(
+    output: &CompiledData,
+    old: &CompileOutputState,
+    instances: &HashMap<CellId, Arc<[CellId]>>,
+) -> HashSet<CellId> {
     let same = |id: &CellId| {
         output.cells.get(id).is_some_and(|cell| {
             old.output
@@ -474,10 +753,9 @@ fn reusable_cells(output: &CompiledData, old: &CompileOutputState) -> HashSet<Ce
         let mut stack = vec![(*id, false)];
         while let Some((id, children_done)) = stack.pop() {
             if children_done {
-                let reusable = output.cells[&id].objects.values().all(|value| match value {
-                    SolvedValue::Instance(instance) => memo.get(&instance.cell) == Some(&true),
-                    _ => true,
-                });
+                let reusable = instances[&id]
+                    .iter()
+                    .all(|child| memo.get(child) == Some(&true));
                 memo.insert(id, reusable);
                 continue;
             }
@@ -489,11 +767,9 @@ fn reusable_cells(output: &CompiledData, old: &CompileOutputState) -> HashSet<Ce
                 continue;
             }
             stack.push((id, true));
-            for value in output.cells[&id].objects.values() {
-                if let SolvedValue::Instance(instance) = value
-                    && !memo.contains_key(&instance.cell)
-                {
-                    stack.push((instance.cell, false));
+            for child in instances[&id].iter() {
+                if !memo.contains_key(child) {
+                    stack.push((*child, false));
                 }
             }
         }
@@ -508,37 +784,26 @@ fn reusable_cells(output: &CompiledData, old: &CompileOutputState) -> HashSet<Ce
 /// millions of unchanged execution scopes; touching those again is unnecessary.
 fn reuse_unchanged_paths(
     root: ScopeAddress,
-    scopes: &HashMap<ScopeAddress, Arc<PreparedScope>>,
+    scopes: &PreparedScopes,
     state: &mut ProcessScopeState,
     old: &CompileOutputState,
     reusable: &HashSet<CellId>,
 ) -> bool {
     // Hidden scopes within a changed cell need name-path remapping. Let the
     // structural fallback handle that uncommon case without losing visibility.
-    for (id, cell) in &old.output.cells {
-        if reusable.contains(id) {
-            continue;
-        }
-        for scope in cell.scopes.keys() {
-            let address = ScopeAddress {
-                cell: *id,
-                scope: *scope,
-            };
-            if old.state.get(&address).is_some_and(|scope| !scope.visible) {
-                return false;
-            }
-        }
+    if old
+        .state
+        .hidden
+        .iter()
+        .any(|address| !reusable.contains(&address.cell))
+    {
+        return false;
     }
 
     state.state = old.state.as_ref().clone();
-    for (id, cell) in &old.output.cells {
+    for id in old.output.cells.keys() {
         if !reusable.contains(id) {
-            for scope in cell.scopes.keys() {
-                state.state.remove(&ScopeAddress {
-                    cell: *id,
-                    scope: *scope,
-                });
-            }
+            state.state.remove_cell(*id);
         }
     }
     let state = &mut state.state;
@@ -556,13 +821,12 @@ fn reuse_unchanged_paths(
                 return false;
             };
             if existing.parent != parent {
-                state.insert(
-                    address,
-                    ScopeState {
-                        parent,
-                        ..existing.clone()
-                    },
-                );
+                let existing = ScopeState {
+                    parent,
+                    visible: existing.visible,
+                    prepared: Arc::clone(existing.prepared),
+                };
+                state.insert(address, existing);
             }
             continue;
         }
@@ -617,15 +881,38 @@ pub(super) fn prepare(
     output: &CompiledData,
     root: ScopeAddress,
     state: &mut ProcessScopeState,
-    old: Option<&imbl::HashMap<ScopePath, ScopeState>>,
+    old: Option<&ScopeStates>,
     previous: Option<&CompileOutputState>,
     previous_layers: Option<&indexmap::IndexMap<SharedString, LayerState>>,
 ) -> PreparedHierarchy {
-    let mut scopes = HashMap::new();
+    let instances = cell_instances(output, previous);
+    let hierarchy = prepare_scopes(
+        output,
+        root,
+        state,
+        old,
+        previous,
+        previous_layers,
+        &instances,
+    );
+    state.state.instances = instances;
+    hierarchy
+}
+
+fn prepare_scopes(
+    output: &CompiledData,
+    root: ScopeAddress,
+    state: &mut ProcessScopeState,
+    old: Option<&ScopeStates>,
+    previous: Option<&CompileOutputState>,
+    previous_layers: Option<&indexmap::IndexMap<SharedString, LayerState>>,
+    instances: &HashMap<CellId, Arc<[CellId]>>,
+) -> PreparedHierarchy {
+    let mut scopes = PreparedScopes::default();
     let mut used_layers = indexmap::IndexSet::new();
     if let (Some(previous), Some(previous_layers)) = (previous, previous_layers) {
         let profile_start = web_time::Instant::now();
-        let reusable = reusable_cells(output, previous);
+        let reusable = reusable_cells(output, previous, instances);
         let reusable_elapsed = profile_start.elapsed();
         let old_changed_layers = changed_cell_layers(&previous.output, &reusable);
         let new_changed_layers = changed_cell_layers(output, &reusable);
@@ -711,7 +998,7 @@ pub(super) fn prepare(
             true
         } else {
             prepare_paths(root, &hidden_paths, &scopes, state);
-            state.state.values().all(|scope| scope.visible)
+            state.state.all_visible()
         }
     };
     PreparedHierarchy {
@@ -730,8 +1017,8 @@ pub(super) mod tests {
 
     fn assert_equivalent(actual: &ProcessScopeState, expected: &ProcessScopeState) {
         assert_eq!(actual.state.len(), expected.state.len());
-        for (path, expected) in &expected.state {
-            let actual = &actual.state[path];
+        for (path, expected) in expected.state.iter() {
+            let actual = actual.state.get(&path).unwrap();
             assert_eq!(actual.name, expected.name);
             assert_eq!(actual.parent, expected.parent);
             assert_eq!(actual.visible, expected.visible);
@@ -801,8 +1088,9 @@ cell top() {
         prepare(&output, root, &mut actual, None, None, None);
         assert_equivalent(&actual, &expected);
         let mut old = expected.state;
-        for (index, (_, scope)) in old.iter_mut().enumerate() {
-            scope.visible = index % 2 == 0;
+        let addresses = old.iter().map(|(address, _)| address).collect::<Vec<_>>();
+        for (index, address) in addresses.into_iter().enumerate() {
+            old.set_visible(address, index % 2 == 0);
         }
         let mut expected = ProcessScopeState::default();
         Reference::process_scope_reference(&output, root, &mut expected, None, Some(&old));
@@ -869,11 +1157,11 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             if previous.is_some() {
                 // The compact address changes when the top cell is rebuilt,
                 // while the original name path remains `top`.
-                expected.state.get_mut(&root).unwrap().visible = false;
+                expected.state.set_visible(root, false);
             }
             assert_equivalent(&actual, &expected);
             // A visibility override must survive every compatible path change.
-            actual.state.get_mut(&root).unwrap().visible = false;
+            actual.state.set_visible(root, false);
             previous_layers = Some(actual.layers.clone());
             previous = Some(CompileOutputState {
                 selected_scope: root,
@@ -885,14 +1173,20 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
     }
 
     #[test]
-    #[ignore = "SRAM hierarchy timing benchmark; run in release with --nocapture"]
+    #[ignore = "SRAM hierarchy timing benchmark; build argon-sram-routing-wasm for wasm32-unknown-unknown, then run in release with --nocapture"]
     fn bench_sram_parent_rectangle_preparation() {
         let workspace =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/sram");
         let source = workspace.join("lib.ar");
         let original = std::fs::read_to_string(&source).unwrap();
         let config = argonc::WorkspaceConfig::new(&source)
-            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")));
+            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")))
+            .with_wasm_modules([(
+                "routing".to_owned(),
+                workspace.join(
+                    "../../target/wasm32-unknown-unknown/release/argon_sram_routing_wasm.wasm",
+                ),
+            )]);
         let cell = vec!["benchmark_parent".to_owned()];
         let mut compiler = argonc::incremental::IncrementalCompiler::new();
         compiler.set_source_text(
@@ -920,7 +1214,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
         compiler.set_source_text(
             source,
             format!(
-                "{original}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); let r = rect(\"met1.drawing\", x0=0., y0=0., x1=100., y1=100.)!; }}\n"
+                "{original}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); let r = std::layout::rect(\"met1.drawing\", x0=0., y0=0., x1=100., y1=100.)!; }}\n"
             ),
         );
         let after = compiler.compile_cell(&config, &cell, vec![]).unwrap_valid();
@@ -953,7 +1247,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             .map(|i| {
                 let x0 = i * 100;
                 format!(
-                    "let r{i} = rect(\"met1.drawing\", x0={x0}., y0=0., x1={}., y1=100.)!;",
+                    "let r{i} = std::layout::rect(\"met1.drawing\", x0={x0}., y0=0., x1={}., y1=100.)!;",
                     x0 + 100
                 )
             })
@@ -1016,7 +1310,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
     }
 
     #[test]
-    #[ignore = "SRAM subcell hierarchy timing benchmark; run in release with --nocapture"]
+    #[ignore = "SRAM subcell hierarchy timing benchmark; build argon-sram-routing-wasm for wasm32-unknown-unknown, then run in release with --nocapture"]
     fn bench_sram_subcell_preparation() {
         let workspace =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/sram");
@@ -1025,11 +1319,17 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
         let original = std::fs::read_to_string(&macro_source).unwrap();
         let edited = original.replacen(
             "cell sp_cell() {",
-            "cell sp_cell() { let debug_rect = rect(\"met1.drawing\", x0=-100., y0=-100., x1=-90., y1=-90.);",
+            "cell sp_cell() { let debug_rect = std::layout::rect(\"met1.drawing\", x0=-100., y0=-100., x1=-90., y1=-90.);",
             1,
         );
         let config = argonc::WorkspaceConfig::new(&source)
-            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")));
+            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")))
+            .with_wasm_modules([(
+                "routing".to_owned(),
+                workspace.join(
+                    "../../target/wasm32-unknown-unknown/release/argon_sram_routing_wasm.wasm",
+                ),
+            )]);
         let cell = vec!["example_no_control_logic".to_owned()];
         let mut compiler = argonc::incremental::IncrementalCompiler::new();
         let before = compiler.compile_cell(&config, &cell, vec![]).unwrap_valid();
@@ -1071,6 +1371,17 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
         );
     }
 
+    fn union(left: Option<ScopeBounds>, right: Option<ScopeBounds>) -> Option<ScopeBounds> {
+        match (left, right) {
+            (Some(left), Some(right)) => Some(left.union(right)),
+            (left, right) => left.or(right),
+        }
+    }
+
+    fn add(bounds: Option<ScopeBounds>, rect: Option<Rect<f64>>) -> Option<ScopeBounds> {
+        union(bounds, rect.map(|rect| ScopeBounds::of(&rect)))
+    }
+
     struct Reference;
     impl Reference {
         fn process_scope_reference(
@@ -1078,7 +1389,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
             scope: ScopeAddress,
             state: &mut ProcessScopeState,
             parent: Option<ScopeAddress>,
-            old_scope_state: Option<&imbl::HashMap<ScopePath, ScopeState>>,
+            old_scope_state: Option<&ScopeStates>,
         ) {
             let cell = &solved_cell.cells[&scope.cell];
             let scope_info = &cell.scopes[&scope.scope];
@@ -1088,13 +1399,13 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
                 let value = &solved_cell.cells[&scope.cell].objects[obj];
                 match value {
                     SolvedValue::Rect(rect) => {
-                        bbox = bbox_union(bbox, Some(rect.to_float()));
+                        bbox = add(bbox, Some(rect.to_float()));
                         if let Some(layer) = &rect.layer {
                             mark_layer_used(state, layer);
                         }
                     }
                     SolvedValue::Polygon(polygon) => {
-                        bbox = bbox_union(bbox, polygon.bbox());
+                        bbox = add(bbox, polygon.bbox());
                         let layer = SharedString::from(&polygon.layer);
                         if let Some(layer_info) = state.layers.get_mut(&layer) {
                             layer_info.used = true;
@@ -1119,7 +1430,7 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
                         }
                     }
                     SolvedValue::Path(path) => {
-                        bbox = bbox_union(bbox, path.bbox());
+                        bbox = add(bbox, path.bbox());
                         let layer = SharedString::from(&path.layer);
                         if let Some(layer_info) = state.layers.get_mut(&layer) {
                             layer_info.used = true;
@@ -1155,9 +1466,16 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
                             Some(scope),
                             old_scope_state,
                         );
-                        bbox = bbox_union(
+                        let child = state
+                            .state
+                            .get(&inst_address)
+                            .unwrap()
+                            .bbox
+                            .as_deref()
+                            .copied();
+                        bbox = union(
                             bbox,
-                            state.state[&inst_address].bbox.as_ref().map(|rect| {
+                            child.map(|rect| {
                                 let mut inst_mat = TransformationMatrix::identity();
                                 if inst.reflect {
                                     inst_mat = inst_mat.reflect_vert()
@@ -1165,24 +1483,20 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
                                 inst_mat = inst_mat.rotate(inst.angle);
                                 let p0p = ifmatvec(inst_mat, (rect.x0, rect.y0));
                                 let p1p = ifmatvec(inst_mat, (rect.x1, rect.y1));
-                                Rect {
-                                    layer: None,
+                                ScopeBounds {
                                     x0: p0p.0.min(p1p.0) + inst.x,
                                     y0: p0p.1.min(p1p.1) + inst.y,
                                     x1: p0p.0.max(p1p.0) + inst.x,
                                     y1: p0p.1.max(p1p.1) + inst.y,
-                                    id: inst.id,
-                                    construction: true,
-                                    span: rect.span.clone(),
                                 }
                             }),
                         );
                     }
                     SolvedValue::Dimension(dim) => {
-                        bbox = bbox_dim_union(bbox, dim);
+                        bbox = add(bbox, bbox_dim_union(None, dim));
                     }
                     SolvedValue::Text(t) => {
-                        bbox = bbox_text_union(bbox, t);
+                        bbox = add(bbox, bbox_text_union(None, t));
                         mark_layer_used(state, &t.layer);
                     }
                 }
@@ -1200,7 +1514,14 @@ cell top() { let a = inst(branch(), x=0., y=0.); let b = inst(branch(), x=100., 
                     Some(scope),
                     old_scope_state,
                 );
-                bbox = bbox_union(bbox, state.state[&scope_address].bbox.as_deref().cloned());
+                let child = state
+                    .state
+                    .get(&scope_address)
+                    .unwrap()
+                    .bbox
+                    .as_deref()
+                    .copied();
+                bbox = union(bbox, child);
             }
 
             let visible = old_scope_state

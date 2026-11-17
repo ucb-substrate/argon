@@ -1,4 +1,6 @@
+use std::layout::rect;
+
 cell top() {
-    let val = float();
-    eq(val, 1.2345);
+    let r = rect("met1", x0=0., y0=0., y1=10.);
+    eq(r.x1, 1.2345);
 }

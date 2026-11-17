@@ -13,8 +13,9 @@ use argonc::{
     incremental::IncrementalCompiler,
     nav::NavIndex,
     parse::WorkspaceParseAst,
+    wasm::CallControl,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tracing::error;
 
 use crate::workspace_config;
@@ -50,13 +51,16 @@ pub(crate) struct CompileResult {
     pub(crate) identity: CompileIdentity,
     pub(crate) root_dir: PathBuf,
     pub(crate) config: WorkspaceConfig,
-    pub(crate) ast: WorkspaceParseAst,
+    /// Shared with the compiler session's analysis.
+    pub(crate) ast: Arc<WorkspaceParseAst>,
     /// Position-indexed definitions and references. `None` until the workspace
     /// has type-checked once — after that the session keeps serving the last
     /// index that had content — and on the paths that answer without reaching
     /// the compiler at all: a manifest that would not load, or an internal
     /// compiler error. None of those means "there is no index".
     pub(crate) nav: Option<Arc<NavIndex>>,
+    /// The navigation index, when the worker builds it after answering.
+    pub(crate) nav_later: Option<oneshot::Receiver<Option<Arc<NavIndex>>>>,
     pub(crate) output: Option<CompileOutput>,
     pub(crate) messages: Vec<String>,
 }
@@ -71,6 +75,8 @@ enum Command {
         request: CompileRequest,
         response: oneshot::Sender<CompileResult>,
         preview: Option<oneshot::Sender<CompilePreview>>,
+        /// Stops the compile's `extern` calls once a later compile replaces it.
+        control: CallControl,
     },
 }
 
@@ -84,12 +90,16 @@ enum Command {
 #[derive(Clone, Debug)]
 pub(crate) struct CompilerWorker {
     commands: Arc<Mutex<mpsc::Sender<Command>>>,
+    /// The control of the latest publishing compile, which the next one
+    /// cancels: its result could no longer be published.
+    latest: Arc<Mutex<CallControl>>,
 }
 
 impl CompilerWorker {
     pub(crate) fn new() -> Self {
         Self {
             commands: Arc::new(Mutex::new(spawn_worker())),
+            latest: Arc::default(),
         }
     }
 
@@ -116,13 +126,17 @@ impl CompilerWorker {
     }
 
     pub(crate) async fn compile(&self, request: CompileRequest) -> Option<CompileResult> {
-        let (_, result) = self.compile_streamed(request);
+        let (_, result) = self.compile_streamed(request, None);
         result.await.ok()
     }
 
+    /// Queues `request`. A publishing request cancels the `extern` calls of
+    /// the one before it, and reports to `slow_calls` each `extern` function
+    /// that runs long. A cancelled request gets no reply.
     pub(crate) fn compile_streamed(
         &self,
         request: CompileRequest,
+        slow_calls: Option<UnboundedSender<String>>,
     ) -> (
         Option<oneshot::Receiver<CompilePreview>>,
         oneshot::Receiver<CompileResult>,
@@ -134,10 +148,24 @@ impl CompilerWorker {
         } else {
             (None, None)
         };
+        let mut control = CallControl::new();
+        if let Some(slow_calls) = slow_calls {
+            control = control.on_slow_call(move |name| {
+                let _ = slow_calls.send(name.to_owned());
+            });
+        }
+        if request.publish {
+            let mut latest = self
+                .latest
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::replace(&mut *latest, control.clone()).cancel();
+        }
         self.send(Command::Compile {
             request,
             response,
             preview,
+            control,
         });
         (preview_result, result)
     }
@@ -181,6 +209,7 @@ fn run(commands: mpsc::Receiver<Command>) {
                 request,
                 response,
                 preview,
+                control,
             } => {
                 // GUI drawing can enqueue many source revisions faster than a
                 // large cell can compile. A publishing request with a later
@@ -192,11 +221,38 @@ fn run(commands: mpsc::Receiver<Command>) {
                         matches!(queued, Command::Compile { request, .. } if request.publish)
                     });
                 if !superseded {
-                    let _ = response.send(compile_catching_panics(&mut compiler, request, preview));
+                    let (mut result, nav_config) =
+                        control.run(|| compile_catching_panics(&mut compiler, request, preview));
+                    let nav = nav_config.map(|config| {
+                        let (sender, receiver) = oneshot::channel();
+                        result.nav_later = Some(receiver);
+                        (config, sender)
+                    });
+                    // The compile that cancelled this one answers instead.
+                    if !control.is_cancelled() {
+                        let _ = response.send(result);
+                    }
+                    // The index is built after answering, so that it does not
+                    // delay the layout.
+                    if let Some((config, sender)) = nav {
+                        let _ = sender.send(nav_catching_panics(&mut compiler, &config));
+                    }
                 }
             }
         }
     }
+}
+
+/// [`IncrementalCompiler::nav`], resetting the compiler if it panics.
+fn nav_catching_panics(
+    compiler: &mut IncrementalCompiler,
+    config: &WorkspaceConfig,
+) -> Option<Arc<NavIndex>> {
+    panic::catch_unwind(AssertUnwindSafe(|| compiler.nav(config))).unwrap_or_else(|_| {
+        error!("internal compiler error while building the navigation index");
+        compiler.reset();
+        None
+    })
 }
 
 /// [`compile`], turning an internal compiler error into a message on the
@@ -205,7 +261,7 @@ fn compile_catching_panics(
     compiler: &mut IncrementalCompiler,
     request: CompileRequest,
     preview: Option<oneshot::Sender<CompilePreview>>,
-) -> CompileResult {
+) -> (CompileResult, Option<WorkspaceConfig>) {
     let identity = request.identity.clone();
     let root_dir = request.root_dir.clone();
     panic::catch_unwind(AssertUnwindSafe(|| compile(compiler, request, preview))).unwrap_or_else(
@@ -213,18 +269,20 @@ fn compile_catching_panics(
             error!("internal compiler error while compiling {root_dir:?}");
             // The panic may have left the caches half-updated.
             compiler.reset();
-            CompileResult {
+            let result = CompileResult {
                 identity,
                 config: WorkspaceConfig::new(root_dir.join("lib.ar")),
                 root_dir,
-                ast: WorkspaceParseAst::default(),
+                ast: Arc::default(),
                 // The reset compiler has no index yet, and this request never
                 // got far enough to ask for one. Publishing treats that as
                 // "nothing to say" rather than as an index to clear.
                 nav: None,
+                nav_later: None,
                 output: None,
                 messages: vec![INTERNAL_COMPILER_ERROR_MESSAGE.to_owned()],
-            }
+            };
+            (result, None)
         },
     )
 }
@@ -233,7 +291,7 @@ fn compile(
     compiler: &mut IncrementalCompiler,
     request: CompileRequest,
     preview: Option<oneshot::Sender<CompilePreview>>,
-) -> CompileResult {
+) -> (CompileResult, Option<WorkspaceConfig>) {
     let CompileRequest {
         identity,
         root_dir,
@@ -245,15 +303,17 @@ fn compile(
         match Library::load(&manifest_path) {
             Ok(library) => Some(library),
             Err(error) => {
-                return CompileResult {
+                let result = CompileResult {
                     identity,
                     config: WorkspaceConfig::new(root_dir.join("lib.ar")),
                     root_dir,
-                    ast: WorkspaceParseAst::default(),
+                    ast: Arc::default(),
                     nav: None,
+                    nav_later: None,
                     output: None,
                     messages: vec![error.to_string()],
                 };
+                return (result, None);
             }
         }
     } else {
@@ -261,11 +321,13 @@ fn compile(
     };
     let workspace = workspace_config(root_dir.join("lib.ar"), library.as_ref());
     let analysis = compiler.analyze_workspace(&workspace);
-    let nav = compiler.nav(&workspace);
+    // The caller builds the navigation index once the result is answered.
+    let nav_config = Some(workspace.clone());
     let ast = analysis.ast;
     let mut messages = Vec::new();
+    let typed = analysis.typed_ast.is_some();
 
-    let output = if analysis.typed_ast.is_some() {
+    let output = if typed {
         if !analysis.errors.is_empty() {
             Some(CompileOutput::StaticErrors(StaticErrorCompileOutput {
                 errors: analysis.errors,
@@ -284,15 +346,17 @@ fn compile(
                     )
                 };
                 messages.push(format!("Could not open cell: {message}"));
-                return CompileResult {
+                let result = CompileResult {
                     identity,
                     root_dir,
                     config: workspace,
                     ast,
-                    nav,
+                    nav: None,
+                    nav_later: None,
                     output: None,
                     messages,
                 };
+                return (result, nav_config);
             }
             if let Some((previous_cell, sender)) = preview_cell.zip(preview)
                 && let Some(output) =
@@ -325,20 +389,84 @@ fn compile(
         Some(CompileOutput::FatalParseErrors)
     };
 
-    CompileResult {
+    let result = CompileResult {
         identity,
         root_dir,
         config: workspace,
         ast,
-        nav,
+        nav: None,
+        nav_later: None,
         output,
         messages,
-    }
+    };
+    (result, nav_config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A module whose `spin` function never returns.
+    const SPIN_MODULE: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "argon_abi_version") (result i32) (i32.const 0))
+  (func (export "argon_alloc") (param i32) (result i32) (i32.const 1024))
+  (func (export "argon_fn_spin") (param i32 i32) (result i64)
+    (loop $again (br $again))
+    (i64.const 0)))
+"#;
+
+    #[tokio::test]
+    async fn a_later_compile_cancels_a_running_extern_call() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("lib.ar"),
+            "extern \"fixture\" fn spin() -> Int;\ncell top() { let r = spin(); }\ncell other() {}\n",
+        )
+        .unwrap();
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
+            directory.path().join("tech.toml"),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("fixture.wasm"),
+            wat::parse_str(SPIN_MODULE).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("Argon.toml"),
+            "name = \"cancel-test\"\ntech = \"tech.toml\"\n[wasm]\nfixture = \"fixture.wasm\"\n",
+        )
+        .unwrap();
+        let request = |revision, cell: &str| CompileRequest {
+            identity: CompileIdentity {
+                revision,
+                cell: Some(cell.to_owned()),
+            },
+            root_dir: directory.path().to_path_buf(),
+            preview_cell: None,
+            publish: true,
+        };
+
+        let worker = CompilerWorker::new();
+        let (slow_calls, mut slow_call) = tokio::sync::mpsc::unbounded_channel();
+        let (_, spinning) = worker.compile_streamed(request(1, "top()"), Some(slow_calls));
+        let running = tokio::time::timeout(std::time::Duration::from_secs(30), slow_call.recv())
+            .await
+            .expect("the call is reported as running long");
+        assert_eq!(running.as_deref(), Some("spin"));
+
+        let (_, later) = worker.compile_streamed(request(2, "other()"), None);
+        assert!(
+            spinning.await.is_err(),
+            "a cancelled compile is not answered"
+        );
+        let later = later.await.unwrap();
+        assert_eq!(later.identity.revision, 2);
+        assert!(matches!(later.output, Some(CompileOutput::Valid(_))));
+    }
 
     #[tokio::test]
     async fn queued_burst_compiles_only_latest_source_revision() {
@@ -383,6 +511,7 @@ mod tests {
                     },
                     response: reply,
                     preview: None,
+                    control: CallControl::new(),
                 })
                 .unwrap();
             replies.push(result);
@@ -428,6 +557,7 @@ mod tests {
                     },
                     response: reply,
                     preview: None,
+                    control: CallControl::new(),
                 })
                 .unwrap();
             result
@@ -508,6 +638,7 @@ mod tests {
                 },
                 response: reply,
                 preview: None,
+                control: CallControl::new(),
             })
             .unwrap();
         sender
@@ -617,15 +748,18 @@ mod tests {
             root,
             original.replace("x1=w as Float", "x1=w as Float + 1."),
         );
-        let (preview, result) = worker.compile_streamed(CompileRequest {
-            identity: CompileIdentity {
-                revision: 2,
-                cell: Some("top()".to_owned()),
+        let (preview, result) = worker.compile_streamed(
+            CompileRequest {
+                identity: CompileIdentity {
+                    revision: 2,
+                    cell: Some("top()".to_owned()),
+                },
+                root_dir: directory.path().to_path_buf(),
+                preview_cell: Some(child),
+                publish: true,
             },
-            root_dir: directory.path().to_path_buf(),
-            preview_cell: Some(child),
-            publish: true,
-        });
+            None,
+        );
         let preview = preview.unwrap().await.unwrap();
         assert_eq!(preview.previous_cell, child);
         let CompileOutput::Valid(local) = &preview.output else {

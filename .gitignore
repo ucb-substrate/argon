@@ -1,5 +1,7 @@
 ### Argon ###
 *.gui
+# Compiler output, written beside lib.ar unless -o is given.
+*.bin
 
 ### Claude Code ###
 # Per-developer MCP server registration and local settings.

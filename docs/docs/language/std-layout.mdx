@@ -1,14 +1,14 @@
 ---
 title: "std::layout"
-description: Geometry constructors, instance placement, dimensions, and rectangle helpers.
+description: Geometry constructors, instance placement, routing, dimensions, and rectangle helpers.
 sidebar_label: "std::layout"
 ---
 
-import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReference';
+import {ApiItem, FieldTable, ParameterTable, Returns} from '@site/src/components/ApiReference';
 
 # `std::layout`
 
-`std::layout` is the standard library module that builds layout: geometry constructors, instance placement, bounding boxes, dimensions, and helpers for working with rectangles.
+`std::layout` is the standard library module that builds layout: geometry constructors, instance placement, bounding boxes, routing, dimensions, and helpers for working with rectangles.
 
 ## Importing
 
@@ -27,9 +27,9 @@ cell top() {
 }
 ```
 
-A `use` applies only to the file that declares it, so each module imports what it calls. You can also call an item by its full path, as in `std::layout::rect("met1")`, or import it under another name with `use std::layout::rect as r;`. A module may declare its own item named `rect` or `inst`; to use the `std::layout` one as well, import it under an alias or call it by full path. See [imports](/language/modules-manifests#imports) for the full `use` syntax.
+A `use` applies only to the file that declares it, so each module imports what it calls. You can also call an item by its full path, as in `std::layout::rect("met1")`, import it under another name with `use std::layout::rect as r;`, or import the module with `use std::layout;` and call `layout::rect("met1")`. A module may declare its own item named `rect` or `inst`; to use the `std::layout` one as well, import it under an alias or call it by full path. See [imports](/language/modules-manifests#imports) for the full `use` syntax.
 
-`rect`, `crect`, `polygon`, `path`, `text`, `inst`, `bbox`, and `dimension` are implemented by the compiler. They can only be called, so a reference that isn't a call, such as `let f = rect;`, is an error. The [rectangle helpers](#rectangle-helpers) are ordinary Argon functions.
+`rect`, `crect`, `polygon`, `path`, `text`, `inst`, `bbox`, `shapes`, `route_tracks`, and `dimension` are implemented by the compiler. They can only be called, so a reference that isn't a call, such as `let f = rect;`, is an error. [`autoroute`](#autoroute) and the [rectangle helpers](#rectangle-helpers) are ordinary Argon functions.
 
 The examples below assume the names they call are imported. Signatures use the [built-in notation](/language/builtins#signature-notation).
 
@@ -204,6 +204,166 @@ let transformed = bbox(placed);
 ```
 
 Construction-only geometry does not count toward the bounding box.
+
+</ApiItem>
+
+### `shapes` {#shapes}
+
+<ApiItem id="shapes" name="std::layout::shapes" signature={'shapes(value: Cell | Inst, layer: String) -> [Rect]'} summary={<>Returns the bounding rectangle of every shape on one layer of a cell or a placed instance, through all of its instances.</>}>
+
+<ParameterTable rows={[
+  {name: 'value', type: 'Cell | Inst', typeHref: '/language/types/instance', requirement: 'Required, positional', description: 'A cell value, measured in its own coordinates, or an instance, measured after placement.'},
+  {name: 'layer', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: 'The layer and purpose to collect, such as `"met1.drawing"`.'},
+]} />
+
+<Returns type="[Rect]" href="/language/types/collections">One construction rectangle per rectangle, polygon, or path on the layer. A polygon or path contributes its bounding box.</Returns>
+
+```argon
+let placed = inst(child, x=100., y=50.);
+let blockages = shapes(placed, "met1.drawing");
+```
+
+Use it to keep new geometry, such as a router's wires, clear of a block's metal. Construction-only geometry is skipped.
+
+</ApiItem>
+
+## Routing
+
+`autoroute` connects pins with wires on uniform tracks, keeps clear of obstacles and of other nets, and draws the result. It's an ordinary Argon function built on the native [`route_tracks`](#route-tracks), which does the routing and returns the geometry without drawing it.
+
+```argon
+use std::layout::{autoroute, crect, rect, RouteLayer, RouteNet, RoutePin, RouteVia};
+
+cell top() {
+    let a0 = rect("met1", x0=150., y0=950., x1=350., y1=1050.);
+    let a1 = rect("met1", x0=1650., y0=950., x1=1850., y1=1050.);
+    let b0 = rect("met2", x0=950., y0=150., x1=1050., y1=350.);
+    let b1 = rect("met2", x0=950., y0=1650., x1=1050., y1=1850.);
+    let wall = rect("met1", x0=900., y0=600., x1=1100., y1=1400.);
+    let routed = autoroute(
+        crect(x0=0., y0=0., x1=2000., y1=2000.),
+        [
+            RouteLayer { name: "met1", width: 100., space: 100., horizontal: true },
+            RouteLayer { name: "met2", width: 100., space: 100., horizontal: false },
+        ],
+        [RouteVia { cut: "via1", size: 60., space: 60., bot_enc: (10., 20.), top_enc: (10., 20.) }],
+        [[wall], []],
+        [
+            RouteNet { name: "a", pins: [RoutePin { layer: 0, rect: a0 }, RoutePin { layer: 0, rect: a1 }] },
+            RouteNet { name: "b", pins: [RoutePin { layer: 1, rect: b0 }, RoutePin { layer: 1, rect: b1 }] },
+        ],
+    );
+}
+```
+
+Net `a` climbs to `met2` to get past the wall and crosses `b` on `met1`. To route around a placed block, pass its metal as obstacles, for example `[shapes(blk, "met1"), shapes(blk, "met2")]`; an obstacle that touches pins of exactly one net counts as that net's metal, so a block's pins can be part of its shapes.
+
+### `autoroute` {#autoroute}
+
+<ApiItem id="autoroute" name="std::layout::autoroute" signature={'autoroute(area: Rect, layers: [RouteLayer], vias: [RouteVia], obstacles: [[Rect]], nets: [RouteNet]) -> [RoutedNet]'} summary={<>Routes nets between their pins and draws the wires, pin stubs, and vias.</>}>
+
+<ParameterTable rows={[
+  {name: 'area', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required, positional', description: 'The routing region. Its lower-left corner is a grid point, and routes use the grid points up to its upper and right edges.'},
+  {name: 'layers', type: '[RouteLayer]', typeHref: '#route-layer', requirement: 'Required, positional', description: 'The routing layers, lowest first. Directions must alternate, and each pitch (width + space) must be a multiple of the first layer\'s.'},
+  {name: 'vias', type: '[RouteVia]', typeHref: '#route-via', requirement: 'Required, positional', description: 'The via from each layer to the next: one fewer than there are layers.'},
+  {name: 'obstacles', type: '[[Rect]]', typeHref: '/language/types/collections', requirement: 'Required, positional', description: 'obstacles[i] holds the obstacles on layers[i]. It may be shorter than layers.'},
+  {name: 'nets', type: '[RouteNet]', typeHref: '#route-net', requirement: 'Required, positional', description: 'The nets to route, in order. Names must be distinct.'},
+]} />
+
+<Returns type="[RoutedNet]" href="#routed-net">One entry per net, in the order given, with the rectangles drawn for it.</Returns>
+
+Grid points are spaced by the first layer's pitch in both directions, starting at the area's lower-left corner. Each layer's tracks are centered on every *n*th grid line, where *n* is its pitch divided by the first layer's, and its wires run along them. A wire on a track at the area's edge extends half a width past it.
+
+A pin connects at the grid points whose wire ends it fully covers. A pin that covers none, such as one narrower than the wire or off the tracks, is extended to the nearest free grid point, and the extension is drawn on the pin's layer.
+
+Each net's first pin is routed to each of its other pins in turn, joining the net's existing wires where that is shorter. Routing takes the shortest path in grid steps. If a net cannot be routed, routing starts over with that net first, or, if that order was already tried, from the net's next pin, up to 30 attempts in all.
+
+For each pair of adjacent layers, [`max_via_array`](/language/builtins/vias#max_via_array) picks the cut array for two wires crossing, with each long enclosure along its layer's wires. Every via between the pair uses that array, centered on the crossing.
+
+The router works in units of the technology's grid: widths, spacings, cut sizes, and enclosures must be multiples of it, and rectangle coordinates are snapped to it as drawn geometry is. Like an [`extern`](/language/extern-functions) call, it waits until every coordinate in its arguments is solved. The grid may have at most 4,000,000 points, summed over the layers.
+
+Errors name the net and the pins: ``routing failed: net `b` has no route from pin 0 to pin 2`` when no attempt finds a route, and ``routing failed: pin 1 of net `b` has no free grid point nearby`` when everything around a pin is blocked. Invalid layers, vias, and pins are reported too, such as layers that do not alternate direction.
+
+</ApiItem>
+
+### Design rules {#route-design-rules}
+
+On the routing layers, the result keeps these rules by construction:
+
+- Wires are exactly the layer's width.
+- Every wire, via landing, and pin stub is at least the layer's `space` from obstacles and from every other net's pins, wires, and vias. A gap of exactly `space` is allowed. The distance is measured separately in x and y, so the result is also legal under a rule that measures diagonally between corners.
+- A gap narrower than `space` between two shapes of one net, such as via landings on neighboring tracks, is filled with metal, unless the fill would crowd another net.
+- Via cuts and their enclosures are as `vias` gives them. Cuts of vias from different connections are at least the cut `space` apart. When one connection places two vias whose cuts crowd each other and whose landings are joined on both layers, the second via is dropped and its landings stay as metal.
+- Different nets never touch, and each net's pins are connected.
+
+It does not check:
+
+- Minimum area: a short jog can leave a piece of metal smaller than the minimum.
+- Rules that depend on wire width or length, such as wide-metal spacing and end-of-line spacing, and notch or step rules on the merged shape of a net.
+- Spacing between cuts on different cut layers, such as stacked vias, and cut layers' obstacles, which `autoroute` does not take.
+- Your own pins and obstacles: they are taken as legal. A fill may be narrower than the width where a wider one would crowd another net.
+- Density and antenna rules.
+
+### Routing types {#route-types}
+
+`autoroute` takes and returns these structs, which are declared in `std::layout` and imported like its functions.
+
+#### `RouteLayer` {#route-layer}
+
+<FieldTable rows={[
+  {name: 'name', type: 'String', typeHref: '/language/types/scalars#string', description: 'The layer to draw wires on, such as "met1".'},
+  {name: 'width', type: 'Float', typeHref: '/language/types/scalars#float', description: 'Wire width.'},
+  {name: 'space', type: 'Float', typeHref: '/language/types/scalars#float', description: 'Minimum spacing to other nets and obstacles. Tracks are width + space apart.'},
+  {name: 'horizontal', type: 'Bool', typeHref: '/language/types/scalars#bool', description: 'Whether wires run horizontally.'},
+]} />
+
+#### `RouteVia` {#route-via}
+
+<FieldTable rows={[
+  {name: 'cut', type: 'String', typeHref: '/language/types/scalars#string', description: 'The cut layer, such as "via1".'},
+  {name: 'size', type: 'Float', typeHref: '/language/types/scalars#float', description: 'Width of a square cut.'},
+  {name: 'space', type: 'Float', typeHref: '/language/types/scalars#float', description: 'Spacing between cuts.'},
+  {name: 'bot_enc', type: '(Float, Float)', typeHref: '/language/types/collections#tuples', description: 'Enclosure of the cuts by the lower layer, as (short side, long side).'},
+  {name: 'top_enc', type: '(Float, Float)', typeHref: '/language/types/collections#tuples', description: 'Enclosure of the cuts by the upper layer, as (short side, long side).'},
+]} />
+
+#### `RoutePin` {#route-pin}
+
+<FieldTable rows={[
+  {name: 'layer', type: 'Int', typeHref: '/language/types/scalars#int', description: 'Index of the pin\'s layer in layers.'},
+  {name: 'rect', type: 'Rect', typeHref: '/language/types/rect', description: 'The pin. It must overlap the routing area.'},
+]} />
+
+#### `RouteNet` {#route-net}
+
+<FieldTable rows={[
+  {name: 'name', type: 'String', typeHref: '/language/types/scalars#string', description: 'The net\'s name, used in error messages.'},
+  {name: 'pins', type: '[RoutePin]', typeHref: '#route-pin', description: 'At least one pin. Pins are numbered from 0, and the first is routed to each of the others.'},
+]} />
+
+#### `RoutedNet` {#routed-net}
+
+<FieldTable rows={[
+  {name: 'name', type: 'String', typeHref: '/language/types/scalars#string', description: 'The net\'s name.'},
+  {name: 'wires', type: '[Rect]', typeHref: '/language/types/rect', description: 'The metal drawn for the net on routing layers: wires, pin stubs, fills, and via landings.'},
+  {name: 'cuts', type: '[Rect]', typeHref: '/language/types/rect', description: 'The via cuts drawn for the net.'},
+]} />
+
+### `route_tracks` {#route-tracks}
+
+<ApiItem id="route-tracks" name="std::layout::route_tracks" signature={'route_tracks(area: Rect, layers: [(Float, Float, Bool)], vias: [(Float, Float, (Float, Float), (Float, Float))], obstacles: [(Int, Rect)], nets: [(String, [(Int, Rect)])]) -> [([(Int, Rect)], [(Int, [Rect], Rect, Rect)], [(Int, Rect)])]'} summary={<>Routes nets as <code>autoroute</code> does and returns the geometry without drawing it.</>}>
+
+<ParameterTable rows={[
+  {name: 'area', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required, positional', description: 'As for autoroute.'},
+  {name: 'layers', type: '[(Float, Float, Bool)]', typeHref: '/language/types/collections#tuples', requirement: 'Required, positional', description: '(width, space, horizontal) for each layer, lowest first.'},
+  {name: 'vias', type: '[(Float, Float, (Float, Float), (Float, Float))]', typeHref: '/language/types/collections#tuples', requirement: 'Required, positional', description: '(size, space, bot_enc, top_enc) for each via.'},
+  {name: 'obstacles', type: '[(Int, Rect)]', typeHref: '/language/types/collections#tuples', requirement: 'Required, positional', description: '(layer index, rectangle) for each obstacle.'},
+  {name: 'nets', type: '[(String, [(Int, Rect)])]', typeHref: '/language/types/collections#tuples', requirement: 'Required, positional', description: '(name, pins) for each net, each pin a (layer index, rectangle).'},
+]} />
+
+<Returns type="[([(Int, Rect)], [(Int, [Rect], Rect, Rect)], [(Int, Rect)])]" href="/language/types/collections#tuples">For each net, in order: its wires as (layer index, rectangle); its vias as (lower layer index, cuts, lower landing, upper landing); and its pin stubs as (layer index, rectangle). The rectangles are construction rectangles.</Returns>
+
+Use it to draw routes differently than `autoroute` does, for example on other layers or as paths.
 
 </ApiItem>
 

@@ -24,5 +24,11 @@ cell top() {
     let widths = cons(50., cons(400., cons(120., [])));
     // A `None` with nothing to infer its argument from takes an annotation.
     let empty: Option<Float> = None;
-    let outline = rect("met2", x0=0., y0=0., w=std::unwrap_or(widest(widths), 0.), h=std::unwrap_or(empty, 300.));
+    let outline = rect(
+        "met2",
+        x0=0.,
+        y0=0.,
+        w=std::unwrap_or(widest(widths), 0.),
+        h=std::unwrap_or(empty, 300.),
+    );
 }
