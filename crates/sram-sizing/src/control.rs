@@ -525,8 +525,8 @@ fn size_tree(plan: &PlanNode, load: f64) -> TreeNode {
     for (node, plan_node) in nodes.into_iter().zip(&path).rev() {
         let mut node = node;
         node.children.extend(child.take());
-        for i in 1..plan_node.children.len() {
-            let sub = size_tree(&plan_node.children[i], node.value_for_child(i));
+        for (i, sub_plan) in plan_node.children.iter().enumerate().skip(1) {
+            let sub = size_tree(sub_plan, node.value_for_child(i));
             node.children.push(sub);
         }
         child = Some(node);

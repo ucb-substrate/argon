@@ -63,11 +63,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install protoc
-        uses: taiki-e/install-action@v2
-        with:
-          tool: protoc
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -96,11 +91,6 @@ jobs:
         rust: [stable]
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install protoc
-        uses: taiki-e/install-action@v2
-        with:
-          tool: protoc
 
       # The SRAM sizer test builds a WebAssembly module.
       - name: Install Rust
@@ -140,11 +130,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install protoc
-        uses: taiki-e/install-action@v2
-        with:
-          tool: protoc
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -213,11 +198,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install protoc
-        uses: taiki-e/install-action@v2
-        with:
-          tool: protoc
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
