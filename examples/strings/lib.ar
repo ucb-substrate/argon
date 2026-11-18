@@ -1,0 +1,19 @@
+use std::layout::{rect, text};
+use std::schematic::signals;
+
+// `n` ports `d_0`, `d_1`, ..., each with a label named after it.
+cell top(n: Int) {
+    pub let d = signals(n);
+    for i in std::range(n) {
+        let x = 200. * (i as Float);
+        rect("met1", x0=x, y0=0., x1=x + 100., y1=100.);
+        text("d_" + std::to_string(i), "met1", x + 50., 50.);
+    }
+    let layer = "met" + std::to_string(2);
+    if layer == "met2" {
+        rect(layer, x0=0., y0=200., x1=100., y1=300.);
+    }
+    if layer != "met1" {
+        rect("met3", x0=0., y0=200., x1=100., y1=300.);
+    }
+}

@@ -11,8 +11,8 @@ Built-in functions are provided by the compiler, are in scope in every module, a
 | --- | --- |
 | [Constraints](/language/builtins/constraints) | `float`, `grid_floor`, `eq` |
 | [Collections](/language/builtins/collections) | `cons`, `head`, `tail`, `range_full`, `seq_len`, `seq_concat`, `seq_flatten`, `seq_sum`, `seq_any`, `seq_all` |
-| [Math](/language/builtins/math) | `max_float`, `min_float`, `max_int`, `min_int` |
-| [Vias](/language/builtins/vias) | `max_via_array` |
+| [Math](/language/builtins/math) | `max_float`, `min_float`, `max_int`, `min_int`, `max_num`, `min_num`, `int_to_string` |
+| [Vias](/language/builtins/vias) | `max_via_array`, `tech_rule`, `tech_via` |
 
 These names are reserved: a module can't declare an item with one of them or bind one with `use`.
 

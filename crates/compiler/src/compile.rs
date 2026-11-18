@@ -27,11 +27,12 @@ mod direct;
 mod ops;
 mod result;
 mod schematic;
+mod std_items;
 mod symbol;
 
 pub use result::{
     CompileOutput, ExecError, ExecErrorCompileOutput, ExecErrorKind, StaticError,
-    StaticErrorCompileOutput, StaticErrorKind, VarObject, VarRole,
+    StaticErrorCompileOutput, StaticErrorKind, VarObject, VarRole, WaitingExpr,
 };
 pub(crate) use schematic::Namer;
 use schematic::{ConnectRecord, DeviceRecord, NodeOrigin, SchInstRecord, SchematicState};
@@ -146,7 +147,7 @@ pub const RESERVED_CELL_FIELDS: [&str; 2] = ["x", "y"];
 pub const PLACEMENT_KEYWORDS: [&str; 4] = ["x", "y", "angle", "reflect"];
 
 /// Functions the compiler implements that every module calls by bare name.
-pub const BUILTINS: [&str; 18] = [
+pub const BUILTINS: [&str; 23] = [
     "cons",
     "head",
     "tail",
@@ -161,11 +162,19 @@ pub const BUILTINS: [&str; 18] = [
     "min_float",
     "max_int",
     "min_int",
+    "max_num",
+    "min_num",
+    "int_to_string",
     "max_via_array",
+    "tech_rule",
+    "tech_via",
     "float",
     "grid_floor",
     "eq",
 ];
+
+/// Longest source text of a waiting expression an error quotes, in characters.
+const MAX_WAITING_TEXT: usize = 60;
 
 /// Helpers of `std::layout` for which a `std::` path reports the module they
 /// are in.
@@ -197,7 +206,12 @@ enum Builtin {
     MinFloat,
     MaxInt,
     MinInt,
+    MaxNum,
+    MinNum,
+    IntToString,
     MaxViaArray,
+    TechRule,
+    TechVia,
     Crect,
     Rect,
     Polygon,
@@ -242,12 +256,22 @@ impl Builtin {
             "min_float" => Self::MinFloat,
             "max_int" => Self::MaxInt,
             "min_int" => Self::MinInt,
+            "max_num" => Self::MaxNum,
+            "min_num" => Self::MinNum,
+            "int_to_string" => Self::IntToString,
             "max_via_array" => Self::MaxViaArray,
+            "tech_rule" => Self::TechRule,
+            "tech_via" => Self::TechVia,
             "float" => Self::Float,
             "grid_floor" => Self::GridFloor,
             "eq" => Self::Eq,
             _ => return None,
         })
+    }
+
+    /// Whether this min/max builtin returns the larger value.
+    fn is_max(self) -> bool {
+        matches!(self, Self::MaxFloat | Self::MaxInt | Self::MaxNum)
     }
 
     /// Whether this builtin implements a native item rather than a bare name.
@@ -293,7 +317,12 @@ impl Builtin {
             | Self::MinFloat
             | Self::MaxInt
             | Self::MinInt
+            | Self::MaxNum
+            | Self::MinNum
+            | Self::IntToString
             | Self::MaxViaArray
+            | Self::TechRule
+            | Self::TechVia
             | Self::Float
             | Self::GridFloor
             | Self::Eq => return None,
@@ -2724,6 +2753,25 @@ mod builtin_sig {
         ])
     });
 
+    pub(super) static TECH_RULE: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::String]));
+    pub(super) static TECH_VIA: LazyLock<Signature> =
+        LazyLock::new(|| Signature::positional([Ty::Rect, Ty::Rect, Ty::Bool]));
+
+    /// `[(layer, x0, y0, w, h, nx, ny, pitch)]`.
+    pub(super) fn tech_via_parts() -> Ty {
+        Ty::Seq(Box::new(Ty::Tuple(vec![
+            Ty::String,
+            Ty::Float,
+            Ty::Float,
+            Ty::Float,
+            Ty::Float,
+            Ty::Int,
+            Ty::Int,
+            Ty::Float,
+        ])))
+    }
+
     /// `(nx, ny, bot_x, bot_y, top_x, top_y, cuts, excess_area)`.
     pub(super) fn max_via_array_choice() -> Ty {
         Ty::Tuple(vec![
@@ -2748,8 +2796,9 @@ mod builtin_sig {
     pub(super) static CRECT: LazyLock<Signature> = LazyLock::new(|| {
         Signature::default().keywords(coordinates().chain([("layer", Ty::String)]))
     });
-    pub(super) static RECT: LazyLock<Signature> =
-        LazyLock::new(|| Signature::positional([Ty::String]).keywords(coordinates()));
+    pub(super) static RECT: LazyLock<Signature> = LazyLock::new(|| {
+        Signature::positional([Ty::String]).keywords(coordinates().chain([("net", Ty::Signal)]))
+    });
     pub(super) static TEXT: LazyLock<Signature> =
         LazyLock::new(|| Signature::positional([Ty::String, Ty::String, Ty::Float, Ty::Float]));
     pub(super) static RANGE_FULL: LazyLock<Signature> =
@@ -2758,6 +2807,7 @@ mod builtin_sig {
         LazyLock::new(|| Signature::positional([Ty::Float, Ty::Float]));
     pub(super) static FLOAT: LazyLock<Signature> =
         LazyLock::new(|| Signature::positional([Ty::Float]));
+    pub(super) static INT: LazyLock<Signature> = LazyLock::new(|| Signature::positional([Ty::Int]));
     pub(super) static DIMENSION: LazyLock<Signature> = LazyLock::new(|| {
         Signature::positional([
             Ty::Float,
@@ -3859,6 +3909,29 @@ impl<'a> VarIdTyPass<'a> {
                 path: format!("std::layout::{}", item.name),
             });
         }
+        // A `std` path into the wrong module, or a bare enum that is not
+        // imported, names where the item is.
+        let elsewhere = if path[0].name == "std" && module.first().is_some_and(|m| m == "std") {
+            std_items::paths(&item.name, Some(&module))
+        } else if len == 2
+            && self.lookup(&enum_ident.name).is_none()
+            && !self.mod_bindings.contains_key(&module)
+        {
+            std_items::paths(&enum_ident.name, None)
+        } else {
+            Vec::new()
+        };
+        if !elsewhere.is_empty() {
+            let name = if len == 2 && path[0].name != "std" {
+                enum_ident.name.to_string()
+            } else {
+                names().join("::")
+            };
+            return Err(QualifiedError::NotImported {
+                name,
+                paths: elsewhere,
+            });
+        }
         if module == *self.current_path || self.mod_bindings.contains_key(&module) {
             return Err(QualifiedError::Undeclared {
                 name: item.name.to_string(),
@@ -3877,6 +3950,9 @@ impl<'a> VarIdTyPass<'a> {
             QualifiedError::Undeclared { name } => (span, StaticErrorKind::UndeclaredVar { name }),
             QualifiedError::Moved { name, path } => {
                 (span, StaticErrorKind::MovedItem { name, path })
+            }
+            QualifiedError::NotImported { name, paths } => {
+                (span, StaticErrorKind::NotImported { name, paths })
             }
             QualifiedError::NotAnEnum { span } => (span, StaticErrorKind::NotAnEnum),
         };
@@ -3972,6 +4048,12 @@ impl<'a> VarIdTyPass<'a> {
                 self.errors.push(StaticError {
                     span: self.span(use_decl.span),
                     kind: StaticErrorKind::MovedItem { name, path },
+                });
+            }
+            Err(QualifiedError::NotImported { name, paths }) => {
+                self.errors.push(StaticError {
+                    span: self.span(use_decl.span),
+                    kind: StaticErrorKind::NotImported { name, paths },
                 });
             }
             Err(_) => {
@@ -4306,15 +4388,21 @@ impl<'a> VarIdTyPass<'a> {
                     self.check_ty_arg_arity(name.span, &ty.to_string(), 0, args.len());
                     return ty;
                 }
-                let unknown = if name.name.as_str() == "Inst" {
-                    StaticErrorKind::InstType
-                } else {
-                    StaticErrorKind::UnknownType
-                };
                 let Some((_, ty)) = self.lookup(name.name.as_str()) else {
+                    let paths = std_items::paths(name.name.as_str(), None);
+                    let kind = if name.name.as_str() == "Inst" {
+                        StaticErrorKind::InstType
+                    } else if !paths.is_empty() {
+                        StaticErrorKind::NotImported {
+                            name: name.name.to_string(),
+                            paths,
+                        }
+                    } else {
+                        StaticErrorKind::UnknownType
+                    };
                     self.errors.push(StaticError {
                         span: self.span(name.span),
-                        kind: unknown,
+                        kind,
                     });
                     return Ty::Unknown;
                 };
@@ -4332,7 +4420,11 @@ impl<'a> VarIdTyPass<'a> {
                     Ty::Native(_) => {
                         self.errors.push(StaticError {
                             span: self.span(name.span),
-                            kind: unknown,
+                            kind: if name.name.as_str() == "Inst" {
+                                StaticErrorKind::InstType
+                            } else {
+                                StaticErrorKind::UnknownType
+                            },
                         });
                         return Ty::Unknown;
                     }
@@ -4458,6 +4550,7 @@ impl<'a> VarIdTyPass<'a> {
 
     fn check_arith(
         &mut self,
+        op: ArithOp,
         span: cfgrammar::Span,
         left: &Expr<Substr, VarIdTyMetadata>,
         right: &Expr<Substr, VarIdTyMetadata>,
@@ -4470,6 +4563,15 @@ impl<'a> VarIdTyPass<'a> {
         }
         let left_ty = self.shallow(&left.ty());
         let right_ty = self.shallow(&right.ty());
+        // `+` also joins two strings; an `Any` side is checked when it runs.
+        let stringy = |ty: &Ty| matches!(ty, Ty::String | Ty::Any);
+        if op == ArithOp::Add
+            && (left_ty == Ty::String || right_ty == Ty::String)
+            && stringy(&left_ty)
+            && stringy(&right_ty)
+        {
+            return Ty::String;
+        }
         if !Self::is_numeric(&left_ty) {
             self.errors.push(StaticError {
                 span: self.span(left.span()),
@@ -4483,6 +4585,35 @@ impl<'a> VarIdTyPass<'a> {
             });
         }
         left_ty
+    }
+
+    /// Checks the two arguments of `max_num` or `min_num`, which must be
+    /// numbers of one type, and returns that type. A type parameter is
+    /// admitted, so that generic functions can call them.
+    fn check_num_pair(
+        &mut self,
+        call_span: cfgrammar::Span,
+        args: &crate::ast::Args<Substr, VarIdTyMetadata>,
+    ) -> Ty {
+        self.assert_eq_arity(call_span, args.posargs.len(), 2);
+        self.typecheck_kwargs(&args.kwargs, &IndexMap::new());
+        let [a, b] = args.posargs.as_slice() else {
+            return Ty::Unknown;
+        };
+        if !self.unify(&a.ty(), &b.ty()) {
+            self.errors.push(StaticError {
+                span: self.span(call_span),
+                kind: StaticErrorKind::ArithMismatchedTypes,
+            });
+        }
+        let ty = self.shallow(&a.ty());
+        if !(Self::is_numeric(&ty) || matches!(ty, Ty::Param(_))) {
+            self.errors.push(StaticError {
+                span: self.span(a.span()),
+                kind: StaticErrorKind::ArithInvalidType(self.display(&ty)),
+            });
+        }
+        ty
     }
 
     /// Requires `operand` to be a `Bool`, solving an inference variable to it.
@@ -4522,7 +4653,13 @@ impl<'a> VarIdTyPass<'a> {
         for variant in def.variants.values() {
             for payload in variant.payload.tys() {
                 match self.shallow(&subst(payload, &map)) {
-                    Ty::Int | Ty::Bool | Ty::Nil | Ty::Unknown | Ty::Any | Ty::Infer(_) => {}
+                    Ty::Int
+                    | Ty::Bool
+                    | Ty::String
+                    | Ty::Nil
+                    | Ty::Unknown
+                    | Ty::Any
+                    | Ty::Infer(_) => {}
                     Ty::Float => return Err(EqualityFailure::Float),
                     Ty::Enum(inner) => self.enum_equality(&inner, visiting)?,
                     _ => return Err(EqualityFailure::Other),
@@ -4579,6 +4716,12 @@ impl<'a> VarIdTyPass<'a> {
                 kind: StaticErrorKind::BoolNotOrd,
             });
         }
+        if left_ty == Ty::String && !is_equality {
+            self.errors.push(StaticError {
+                span: self.span(span),
+                kind: StaticErrorKind::StringNotOrd,
+            });
+        }
         if matches!(left_ty, Ty::Nil) && matches!(right_ty, Ty::Nil) && !is_equality {
             self.errors.push(StaticError {
                 span: self.span(span),
@@ -4599,7 +4742,7 @@ impl<'a> VarIdTyPass<'a> {
             });
         }
         // `Ty::Any` is deliberately *not* admitted here: the evaluator has no
-        // comparison arm for a string, so `1. < any` has to be rejected
+        // arm for most pairs of values, so `1. < any` has to be rejected
         // statically. `Ty::Unknown` is admitted, because the expression that
         // produced it was already diagnosed, and so is an unsolved inference
         // variable, which is reported if it stays unsolved.
@@ -4609,6 +4752,7 @@ impl<'a> VarIdTyPass<'a> {
                 Ty::Float
                     | Ty::Int
                     | Ty::Bool
+                    | Ty::String
                     | Ty::Enum(_)
                     | Ty::Seq(_)
                     | Ty::Nil
@@ -4958,17 +5102,29 @@ impl<'a> VarIdTyPass<'a> {
         }
     }
 
-    /// The error for a name that does not resolve. A bare name of a native
-    /// says which module to import it from.
+    /// The error for a name that does not resolve. A bare name of a `std`
+    /// item says which module to import it from.
     fn undeclared(&self, name: &str, bare: bool) -> StaticErrorKind {
-        match Native::named(name).filter(|_| bare) {
-            Some(native) => StaticErrorKind::MovedItem {
+        if let Some(native) = Native::named(name).filter(|_| bare) {
+            return StaticErrorKind::MovedItem {
                 name: name.to_owned(),
                 path: native.path(),
-            },
-            None => StaticErrorKind::UndeclaredVar {
+            };
+        }
+        let paths = if bare {
+            std_items::paths(name, None)
+        } else {
+            Vec::new()
+        };
+        if paths.is_empty() {
+            StaticErrorKind::UndeclaredVar {
                 name: name.to_owned(),
-            },
+            }
+        } else {
+            StaticErrorKind::NotImported {
+                name: name.to_owned(),
+                paths,
+            }
         }
     }
 
@@ -5028,12 +5184,12 @@ impl<'a> VarIdTyPass<'a> {
                 if let Some(arg) = args.posargs.first() {
                     let argty = self.shallow(&arg.ty());
                     // An `Any` is checked when the call runs.
-                    if !matches!(argty, Ty::Cell(_) | Ty::Inst(_) | Ty::Any) {
+                    if !matches!(argty, Ty::Cell(_) | Ty::Inst(_) | Ty::Rect | Ty::Any) {
                         self.errors.push(StaticError {
                             span: self.span(call_span),
                             kind: StaticErrorKind::IncorrectTyCategory {
                                 found: self.display(&argty),
-                                expected: "Cell/Inst".to_string(),
+                                expected: "Cell/Inst/Rect".to_string(),
                             },
                         });
                     }
@@ -5425,6 +5581,9 @@ enum QualifiedError {
     Undeclared { name: String },
     /// The item is in a `std` submodule, at `path`.
     Moved { name: String, path: String },
+    /// The path names, by its last segment or a bare enum, an item of `std`
+    /// at each of `paths`.
+    NotImported { name: String, paths: Vec<String> },
     /// The second-to-last segment names neither an enum nor a module.
     NotAnEnum { span: cfgrammar::Span },
 }
@@ -5777,9 +5936,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
             if path.path.len() == 1 {
                 self.errors.push(StaticError {
                     span: self.span(path.span),
-                    kind: StaticErrorKind::UndeclaredVar {
-                        name: name.to_string(),
-                    },
+                    kind: self.undeclared(name, true),
                 });
             }
             return StructLitTy::default();
@@ -6201,7 +6358,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
         right: &Expr<Substr, Self::OutputMetadata>,
     ) -> <Self::OutputMetadata as AstMetadata>::BinOpExpr {
         match input.op {
-            BinOp::Arith(_) => self.check_arith(input.span, left, right),
+            BinOp::Arith(op) => self.check_arith(op, input.span, left, right),
             BinOp::Cmp(op) => self.check_comparison(op, input.span, left, right),
             BinOp::Bool(_) => self.check_bool_expr(left, right),
         }
@@ -6436,9 +6593,22 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     self.typecheck_args(input.span, args, &builtin_sig::INT_PAIR);
                     (None, Ty::Int)
                 }
+                "max_num" | "min_num" => (None, self.check_num_pair(input.span, args)),
+                "int_to_string" => {
+                    self.typecheck_args(input.span, args, &builtin_sig::INT);
+                    (None, Ty::String)
+                }
                 "max_via_array" => {
                     self.typecheck_args(input.span, args, &builtin_sig::MAX_VIA_ARRAY);
                     (None, builtin_sig::max_via_array_choice())
+                }
+                "tech_rule" => {
+                    self.typecheck_args(input.span, args, &builtin_sig::TECH_RULE);
+                    (None, Ty::Float)
+                }
+                "tech_via" => {
+                    self.typecheck_args(input.span, args, &builtin_sig::TECH_VIA);
+                    (None, builtin_sig::tech_via_parts())
                 }
                 "range_full" => {
                     // Native builtin backing `std::range`/`std::range_full`: builds the
@@ -6781,9 +6951,7 @@ impl<'a> VarIdTyPass<'a> {
             if binding.is_none() {
                 self.errors.push(StaticError {
                     span: self.span(path.span),
-                    kind: StaticErrorKind::UndeclaredVar {
-                        name: path.path[0].name.to_string(),
-                    },
+                    kind: self.undeclared(&path.path[0].name, true),
                 });
             }
             binding
@@ -9080,6 +9248,8 @@ struct CellState {
     /// [`mark_emitted_proxies_as_layout`] uses this set to tell the
     /// two apart once the emission list has been resolved to object IDs.
     proxy_objects: FxIndexSet<ObjectId>,
+    /// The signal each shape drawn with `net=` belongs to.
+    net_tags: Vec<(ObjectId, NodeId)>,
     schematic: SchematicState,
     symbol: SymbolState,
     /// The `let` statement that made each top-level binding.
@@ -10278,14 +10448,19 @@ impl<'a> ExecPass<'a> {
             .filter_map(|var| Some((*var, state.var_origins.get(var)?)))
             .collect::<Vec<_>>();
         origins.sort_by_key(|(var, _)| *var);
-        let mut reports = FxIndexMap::<(Span, Option<Span>), (VarObject, Vec<VarRole>)>::default();
-        for (_, origin) in origins {
-            let (_, free) = reports
+        // Each report also keeps the values waiting on its free values.
+        let mut reports = FxIndexMap::<
+            (Span, Option<Span>),
+            (VarObject, Vec<VarRole>, FxIndexSet<ValueId>),
+        >::default();
+        for (var, origin) in origins {
+            let (_, free, waiting) = reports
                 .entry((origin.span.clone(), state.origin(origin.scope)))
-                .or_insert_with(|| (origin.object, Vec::new()));
+                .or_insert_with(|| (origin.object, Vec::new(), FxIndexSet::default()));
             if !free.contains(&origin.value) {
                 free.push(origin.value);
             }
+            waiting.extend(state.var_dependents.get(&var).into_iter().flatten());
         }
         if debug_info {
             state.sse_basis = match state.solver.sparse_nullspace_vecs() {
@@ -10302,6 +10477,12 @@ impl<'a> ExecPass<'a> {
             return;
         }
         if reports.is_empty() {
+            let waiting = unsolved_vars
+                .iter()
+                .flat_map(|var| state.var_dependents.get(var).into_iter().flatten())
+                .copied()
+                .collect::<FxIndexSet<_>>();
+            let waiting = self.waiting_exprs(cell_id, &waiting, None);
             self.errors.push(ExecError {
                 origin: None,
                 span: None,
@@ -10309,23 +10490,71 @@ impl<'a> ExecPass<'a> {
                 kind: ExecErrorKind::Underconstrained {
                     object: None,
                     free: Vec::new(),
+                    waiting,
                 },
             });
             return;
         }
-        self.errors.extend(
-            reports
-                .into_iter()
-                .map(|((span, origin), (object, free))| ExecError {
-                    origin,
-                    span: Some(span),
-                    cell: cell_id,
-                    kind: ExecErrorKind::Underconstrained {
-                        object: Some(object),
-                        free,
-                    },
-                }),
-        );
+        for ((span, origin), (object, free, waiting)) in reports {
+            let waiting = self.waiting_exprs(cell_id, &waiting, Some(&span));
+            self.errors.push(ExecError {
+                origin,
+                span: Some(span),
+                cell: cell_id,
+                kind: ExecErrorKind::Underconstrained {
+                    object: Some(object),
+                    free,
+                    waiting,
+                },
+            });
+        }
+    }
+
+    /// The expressions among `values` still waiting to be evaluated, each
+    /// once, located relative to `at`. One inside `std` is named by the call
+    /// in the cell's body that ran it.
+    fn waiting_exprs(
+        &self,
+        cell_id: CellId,
+        values: &FxIndexSet<ValueId>,
+        at: Option<&Span>,
+    ) -> Vec<WaitingExpr> {
+        let mut spans = Vec::<Span>::new();
+        for vid in values {
+            let Some(Defer::Deferred(eval)) = self.values.get(vid) else {
+                continue;
+            };
+            let mut span = self.use_span(eval, *vid);
+            if FsPath::new(crate::parse::STD_PATH)
+                .parent()
+                .is_some_and(|std| span.path.starts_with(std))
+                && let Some(origin) = self.cell_state(cell_id).origin(eval.loc.scope)
+            {
+                span = origin;
+            }
+            if !spans.contains(&span) {
+                spans.push(span);
+            }
+        }
+        spans
+            .into_iter()
+            .filter_map(|span| {
+                let module = self.ast.values().find(|module| module.path == span.path)?;
+                let text = module.text.get(span.span.start()..span.span.end())?;
+                let line = module.text[..span.span.start()].matches('\n').count() + 1;
+                let location = match (at, span.path.file_name()) {
+                    (Some(at), _) if at.path == span.path => format!("line {line}"),
+                    (_, Some(file)) => format!("{}:{line}", file.to_string_lossy()),
+                    _ => format!("line {line}"),
+                };
+                let mut text = text.split_whitespace().join(" ");
+                if let Some((cut, _)) = text.char_indices().nth(MAX_WAITING_TEXT) {
+                    text.truncate(cut);
+                    text.push_str("...");
+                }
+                Some(WaitingExpr { text, location })
+            })
+            .collect()
     }
 
     pub(crate) fn execute_cell(
@@ -10513,6 +10742,7 @@ impl<'a> ExecPass<'a> {
                         var_origins: FxIndexMap::default(),
                         var_dependents: FxIndexMap::default(),
                         proxy_objects: FxIndexSet::default(),
+                        net_tags: Vec::new(),
                         schematic: SchematicState::default(),
                         symbol: SymbolState::default(),
                         field_spans: IndexMap::new(),
@@ -11187,6 +11417,7 @@ impl<'a> ExecPass<'a> {
                     inconsistent_constraints: IndexSet::new(),
                     schematic: Schematic::default(),
                     symbol: None,
+                    net_tags: Vec::new(),
                 }),
             );
         }
@@ -11456,6 +11687,7 @@ impl<'a> ExecPass<'a> {
             ),
             schematic: Schematic::default(),
             symbol: None,
+            net_tags: Vec::new(),
         };
         if debug_info {
             for (id, scope) in state.scopes.iter() {
@@ -11562,6 +11794,11 @@ impl<'a> ExecPass<'a> {
             &mut symbol_errors,
         );
         ccell.schematic = schematic;
+        ccell.net_tags = state
+            .net_tags
+            .iter()
+            .filter_map(|(object, node)| nets.get(node).map(|net| (*object, *net)))
+            .collect();
         for (name, value, public) in &fields {
             if !public {
                 ccell.private_fields.insert((*name).to_owned());
@@ -13275,8 +13512,11 @@ impl<'a> ExecPass<'a> {
             }
             Err(OpFailure::Error(kind, at)) => {
                 let span = self.span(loc, span(at));
+                // An operation inside a function, such as one in `std`, names
+                // the call in the cell's body that led to it.
+                let origin = self.origin(loc);
                 self.errors.push(ExecError {
-                    origin: None,
+                    origin,
                     span: Some(span),
                     cell: loc.cell,
                     kind,
@@ -13751,11 +13991,39 @@ impl<'a> ExecPass<'a> {
                             }
                         }
                     };
+                    // The signal a `net=` keyword tags the rect with.
+                    let net = match c
+                        .expr
+                        .args
+                        .kwargs
+                        .iter()
+                        .zip(c.state.kwargs.iter())
+                        .find(|(k, _)| k.name.name == "net")
+                    {
+                        None => None,
+                        Some((_, arg)) => match self.values[arg].get_ready() {
+                            None => {
+                                self.add_value_dependent(*arg, vid);
+                                return Ok(false);
+                            }
+                            Some(Value::Signal(signal)) if signal.cell == cell_id => {
+                                Some(signal.node)
+                            }
+                            Some(_) => {
+                                let span = self.span(&vref.loc, c.expr.span);
+                                self.invalid_type(cell_id, &span);
+                                return self.poison(vid);
+                            }
+                        },
+                    };
                     if let Some(layer) = layer {
                         let id = self.object_id();
                         let span = self.span(&vref.loc, c.expr.span);
                         let debug_info = self.debug_info;
                         let state = self.cell_state_mut(cell_id);
+                        if let Some(node) = net {
+                            state.net_tags.push((id, node));
+                        }
                         let vars = [(); 4].map(|_| state.solver.new_var());
                         let rect = Arc::new(Rect {
                             id,
@@ -13840,7 +14108,7 @@ impl<'a> ExecPass<'a> {
                                 }
                                 "w" => (LinearExpr::difference(&rect.x1, &rect.x0), 2, None),
                                 "h" => (LinearExpr::difference(&rect.y1, &rect.y0), 1, None),
-                                "layer" => continue,
+                                "layer" | "net" => continue,
                                 x => unreachable!("unsupported kwarg `{x}`"),
                             };
                             // Use the value expression's span (e.g. `100.` in
@@ -14378,6 +14646,16 @@ impl<'a> ExecPass<'a> {
                                 construction: true,
                                 span: None,
                             })),
+                            Value::Rect(r) => Some(Some(Rect {
+                                id: r.id,
+                                layer: None,
+                                x0: r.x0.clone(),
+                                y0: r.y0.clone(),
+                                x1: r.x1.clone(),
+                                y1: r.y1.clone(),
+                                construction: true,
+                                span: None,
+                            })),
                             _ => {
                                 self.errors.push(ExecError {
                                     origin: None,
@@ -14577,16 +14855,44 @@ impl<'a> ExecPass<'a> {
                     let span = c.expr.span;
                     return self.finish_op(vid, &vref.loc, result, |_| span);
                 }
+                Some(builtin @ (Builtin::TechRule | Builtin::TechVia)) => {
+                    if let Some(&arg) = c
+                        .state
+                        .posargs
+                        .iter()
+                        .find(|arg| !self.values[*arg].is_ready())
+                    {
+                        self.add_value_dependent(arg, vid);
+                        return Ok(false);
+                    }
+                    let result = {
+                        let args: CallArgs<&Value> = c
+                            .state
+                            .posargs
+                            .iter()
+                            .map(|arg| self.values[arg].as_ref().unwrap_ready())
+                            .collect();
+                        if builtin == Builtin::TechRule {
+                            ops::tech_rule(&self.tech, args[0])
+                        } else {
+                            ops::tech_via(&self.tech, &state.solver, &args)
+                        }
+                    };
+                    let span = c.expr.span;
+                    return self.finish_op(vid, &vref.loc, result, |_| span);
+                }
                 Some(
                     builtin @ (Builtin::MaxFloat
                     | Builtin::MinFloat
                     | Builtin::MaxInt
-                    | Builtin::MinInt),
+                    | Builtin::MinInt
+                    | Builtin::MaxNum
+                    | Builtin::MinNum),
                 ) => {
                     let (a, b) = (c.state.posargs[0], c.state.posargs[1]);
                     match (&self.values[&a], &self.values[&b]) {
                         (Defer::Ready(va), Defer::Ready(vb)) => {
-                            let max = matches!(builtin, Builtin::MaxFloat | Builtin::MaxInt);
+                            let max = builtin.is_max();
                             let result = ops::min_max(&state.solver, max, va, vb);
                             let span = c.expr.span;
                             return self.finish_op(vid, &vref.loc, result, |_| span);
@@ -14632,6 +14938,16 @@ impl<'a> ExecPass<'a> {
                         for arg in unready {
                             self.add_value_dependent(arg, vid);
                         }
+                        false
+                    }
+                }
+                Some(Builtin::IntToString) => {
+                    if let Defer::Ready(value) = &self.values[&c.state.posargs[0]] {
+                        let result = ops::int_to_string(value);
+                        let span = c.expr.span;
+                        return self.finish_op(vid, &vref.loc, result, |_| span);
+                    } else {
+                        self.add_value_dependent(c.state.posargs[0], vid);
                         false
                     }
                 }
@@ -16521,6 +16837,7 @@ fn values_equal(left: &Value, right: &Value) -> Option<bool> {
     match (left, right) {
         (Value::Int(l), Value::Int(r)) => Some(l == r),
         (Value::Bool(l), Value::Bool(r)) => Some(l == r),
+        (Value::String(l), Value::String(r)) => Some(l == r),
         (Value::Nil, Value::Nil) => Some(true),
         (Value::Enum(l), Value::Enum(r)) => {
             if l.variant != r.variant {
@@ -16718,6 +17035,9 @@ pub struct CompiledCell {
     pub schematic: Schematic,
     /// The cell's symbol; `None` when the cell made no `std::symbol` call.
     pub symbol: Option<Symbol>,
+    /// The net of each shape drawn with `net=`, by the shape's object.
+    #[serde(default)]
+    pub net_tags: Vec<(ObjectId, NetIdx)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17724,6 +18044,7 @@ impl CompiledCell {
             inconsistent_constraints: _,
             schematic,
             symbol,
+            net_tags: _,
         } = self;
 
         for metadata in scope_metadata {
@@ -17876,6 +18197,7 @@ impl CompiledCell {
             inconsistent_constraints: _,
             schematic,
             symbol,
+            net_tags: _,
         } = self;
         let mut moved = false;
         let mut check = |span: &Span| -> Result<(), RebaseError> {

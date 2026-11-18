@@ -29,7 +29,7 @@ cell top() {
 
 A `use` applies only to the file that declares it, so each module imports what it calls. You can also call an item by its full path, as in `std::layout::rect("met1")`, or import it under another name with `use std::layout::rect as r;`. A module may declare its own item named `rect` or `inst`; to use the `std::layout` one as well, import it under an alias or call it by full path. See [imports](/language/modules-manifests#imports) for the full `use` syntax.
 
-`rect`, `crect`, `polygon`, `path`, `text`, `inst`, `bbox`, and `dimension` are implemented by the compiler. They can only be called, so a reference that isn't a call, such as `let f = rect;`, is an error. The [rectangle helpers](#rectangle-helpers) and [symmetry helpers](#symmetry) are ordinary Argon functions.
+`rect`, `crect`, `polygon`, `path`, `text`, `inst`, `bbox`, and `dimension` are implemented by the compiler. They can only be called, so a reference that isn't a call, such as `let f = rect;`, is an error. The [placement helpers](#placement), [rectangle helpers](#rectangle-helpers), and [symmetry helpers](#symmetry) are ordinary Argon functions.
 
 The examples below assume the names they call are imported. Signatures use the [built-in notation](/language/builtins#signature-notation).
 
@@ -39,7 +39,7 @@ These constructors add geometry to the current cell. Coordinate arguments are [`
 
 ### `rect` {#rect}
 
-<ApiItem id="rect" name="std::layout::rect" signature={'rect(layer: String, x0?, y0?, x1?, y1?, w?, h?, x0i?, y0i?, x1i?, y1i?) -> Rect'} summary={<>Draws an axis-aligned rectangle on a layer.</>}>
+<ApiItem id="rect" name="std::layout::rect" signature={'rect(layer: String, x0?, y0?, x1?, y1?, w?, h?, x0i?, y0i?, x1i?, y1i?, net?) -> Rect'} summary={<>Draws an axis-aligned rectangle on a layer.</>}>
 
 <ParameterTable rows={[
   {name: 'layer', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: 'A drawing layer from the technology file.'},
@@ -53,6 +53,7 @@ These constructors add geometry to the current cell. Coordinate arguments are [`
   {name: 'y0i', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial bottom edge, used when y0 is otherwise free.'},
   {name: 'x1i', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial right edge, used when x1 is otherwise free.'},
   {name: 'y1i', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial top edge, used when y1 is otherwise free.'},
+  {name: 'net', type: 'Signal', typeHref: '/language/schematic', requirement: 'Optional keyword', description: 'The schematic signal the rectangle belongs to, for checking connectivity. It changes nothing in the exported layout.'},
 ]} />
 
 <Returns type="Rect" href="/language/types/rect">The rectangle.</Returns>
@@ -62,6 +63,13 @@ let gate = rect("poly", x0=0., y0=0., w=80., h=400.);
 ```
 
 Give enough values or constraints to pin the rectangle down. If you drag an under-constrained rectangle in the GUI, it adds the missing initial values.
+
+A `net` tag says which of the cell's signals a rectangle carries. The headless MCP server's [`compile`](/tools/agents#headless-mode) then joins the layout's conductors through the technology file's `[[vias]]` and reports, as warnings, each short (one conductor carrying two tags or pin labels) and each open (one tag or label on separate conductors), with the source lines of the shapes involved, before LVS would. A cell is checked against its own tags and pin labels only; its subcells' are checked when they are.
+
+```argon
+let out = Signal();
+rect("met1.drawing", x0=0., y0=0., x1=140., y1=2000., net=out);
+```
 
 </ApiItem>
 
@@ -188,10 +196,10 @@ let placed = inst(inverter(1200., 2000., 4), x=100., y=50., angle=90);
 
 ### `bbox` {#bbox}
 
-<ApiItem id="bbox" name="std::layout::bbox" signature={'bbox(value: Cell | Inst) -> Rect'} summary={<>Returns the bounding box of a cell or a placed instance, as a construction rectangle.</>}>
+<ApiItem id="bbox" name="std::layout::bbox" signature={'bbox(value: Cell | Inst | Rect) -> Rect'} summary={<>Returns the bounding box of a cell, a placed instance, or a rectangle, as a construction rectangle.</>}>
 
 <ParameterTable rows={[
-  {name: 'value', type: 'Cell | Inst', typeHref: '/language/types/instance', requirement: 'Required, positional', description: 'A cell value, measured in its own coordinates, or an instance, measured after placement.'},
+  {name: 'value', type: 'Cell | Inst | Rect', typeHref: '/language/types/instance', requirement: 'Required, positional', description: 'A cell value, measured in its own coordinates; an instance, measured after placement; or a rectangle, whose own bounds it copies.'},
 ]} />
 
 <Returns type="Rect" href="/language/types/rect">A construction rectangle around the layout geometry.</Returns>
@@ -203,9 +211,73 @@ let placed = inst(child, x=100., y=50.);
 let transformed = bbox(placed);
 ```
 
-Construction-only geometry does not count toward the bounding box.
+Construction-only geometry does not count toward the bounding box of a cell or an instance.
 
-A value annotated `Any`, such as an instance from [`mirror_pair`](#mirror-pair), is checked when the call runs.
+An instance's bounding box moves with the instance, so constraining it places the instance, as [`row`](#row) does. A value annotated `Any`, such as an instance from [`mirror_pair`](#mirror-pair), is checked when the call runs.
+
+</ApiItem>
+
+### `bbox_of` {#bbox-of}
+
+<ApiItem id="bbox-of" name="std::layout::bbox_of" signature={'bbox_of(items: [Any]) -> Rect'} summary={<>Returns the bounding box of a non-empty sequence of instances or rectangles.</>}>
+
+<ParameterTable rows={[
+  {name: 'items', type: '[Any]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'Instances, rectangles, or cells, each measured as bbox measures it.'},
+]} />
+
+<Returns type="Rect" href="/language/types/rect">A construction rectangle around every item, built with [`union`](#union).</Returns>
+
+Like `union`, it waits until the solver has placed every item.
+
+```argon
+let block = bbox_of([a, b, c]);
+rect("nwell.drawing", x0=block.x0 - 180., y0=block.y0 - 180., x1=block.x1 + 180., y1=block.y1 + 180.);
+```
+
+</ApiItem>
+
+## Placement
+
+These place instances by their bounding boxes, and fix only the axis they arrange.
+
+```argon
+use std::layout::{column, inst, row};
+
+cell bank() {
+    let a = inst(unit(), x=0., y=0.);
+    let b = inst(unit(), y=0.);
+    let c = inst(unit(), y=0.);
+    row([a, b, c], 200.);
+}
+```
+
+### `row` {#row}
+
+<ApiItem id="row" name="std::layout::row" signature={'row(insts: [Any], gap: Float) -> ()'} summary={<>Places each instance <code>gap</code> right of the one before.</>}>
+
+<ParameterTable rows={[
+  {name: 'insts', type: '[Any]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'Instances, left to right.'},
+  {name: 'gap', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'Space between neighboring bounding boxes; 0. abuts them.'},
+]} />
+
+<Returns type="()">Nothing; it adds one constraint per neighboring pair.</Returns>
+
+The first instance's x and every instance's y are left to other constraints.
+
+</ApiItem>
+
+### `column` {#column}
+
+<ApiItem id="column" name="std::layout::column" signature={'column(insts: [Any], gap: Float) -> ()'} summary={<>Places each instance <code>gap</code> above the one before.</>}>
+
+<ParameterTable rows={[
+  {name: 'insts', type: '[Any]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'Instances, bottom to top.'},
+  {name: 'gap', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'Space between neighboring bounding boxes; 0. abuts them.'},
+]} />
+
+<Returns type="()">Nothing; it adds one constraint per neighboring pair.</Returns>
+
+The first instance's y and every instance's x are left to other constraints.
 
 </ApiItem>
 
@@ -230,6 +302,66 @@ A value annotated `Any`, such as an instance from [`mirror_pair`](#mirror-pair),
 :::tip Prefer the GUI for dimensions
 The Dimension tool fills in the orientation and label-placement arguments from the edges you click, and writes the call as `std::layout::dimension(...)`. In hand-written source, use [`eq`](/language/builtins/constraints#eq) unless you want a visible dimension.
 :::
+
+</ApiItem>
+
+## Vias and rules
+
+These read the technology file's [design rules and vias](/language/technology#rules-and-vias), so a generator needn't hard-code a value or draw a contact array by hand.
+
+```argon
+use std::layout::{rect, rule, via, via_stack};
+
+cell strap() {
+    let li = rect("li1.drawing", x0=0., y0=0., x1=170., y1=1000.);
+    let bar = rect("met1.drawing", x0=-100., y0=100., x1=270., y1=470.);
+    via(li, bar);
+    let wire = rect("met3.drawing", x0=-100., y0=100., x1=1000., y1=100. + rule("met3.width") + 100.);
+    via_stack(bar, wire);
+}
+```
+
+### `rule` {#rule}
+
+<ApiItem id="rule" name="std::layout::rule" signature={'rule(name: String) -> Float'} summary={<>Reads a design rule's value, such as <code>"met1.space"</code>, from the technology file.</>}>
+
+<ParameterTable rows={[
+  {name: 'name', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required', description: <>The rule's name in the technology file's <code>[rules]</code> table, such as <code>"met1.width"</code> or <code>"met1.mcon_enclosure"</code>.</>},
+]} />
+
+<Returns type="Float" href="/language/types/scalars#float">The value in source units, or in source units squared for a name ending in `.area`.</Returns>
+
+A name the file doesn't define is an error that lists the rules it does define for the same layer.
+
+</ApiItem>
+
+### `via` {#via}
+
+<ApiItem id="via" name="std::layout::via" signature={'via(bot: Rect, top: Rect) -> Rect'} summary={<>Draws the largest array of cuts that fits where two shapes on adjacent layers overlap, with the enclosures the technology file requires.</>}>
+
+<ParameterTable rows={[
+  {name: 'bot', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: <>The lower shape, such as an <code>li1.drawing</code> column.</>},
+  {name: 'top', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: <>The upper shape, such as a <code>met1.drawing</code> bar.</>},
+]} />
+
+<Returns type="Rect" href="/language/types/rect">The bounds of the cuts.</Returns>
+
+The technology file's via from `bot`'s layer to `top`'s gives the cut layer, size, spacing, and the enclosure each shape needs, as a short side for every edge and a long side for two opposite edges. `via` tries both orientations of each enclosure, keeps the one with the most cuts, and centers the array on the grid. It waits until both shapes are placed. Shapes that don't overlap, layers no via joins, and an overlap too small for one cut are errors, and the last names the size one cut needs. It doesn't know about other shapes, so a contact to diffusion still has to keep clear of the gates (`licon.gate_space`), and a contact to poly needs nitride cut around it (`npc.licon_enclosure`).
+
+</ApiItem>
+
+### `via_stack` {#via-stack}
+
+<ApiItem id="via-stack" name="std::layout::via_stack" signature={'via_stack(bot: Rect, top: Rect) -> [Rect]'} summary={<>Joins two shapes through every layer between theirs, with a via per layer and a pad on each layer in between.</>}>
+
+<ParameterTable rows={[
+  {name: 'bot', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: 'The lower shape.'},
+  {name: 'top', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required', description: 'The upper shape, any number of layers above.'},
+]} />
+
+<Returns type="[Rect]" href="/language/types/collections#sequences">The bounds of each via's cuts and each pad, from the bottom.</Returns>
+
+The vias and pads stay within the shapes' overlap, except that a pad grows about its center to its layer's minimum width and area (`<layer>.width`, `<layer>.area`). Every via must fit in the overlap, so to start from a narrow shape, such as a 170-wide li1 column, draw a landing pad on the next layer and stack from that.
 
 </ApiItem>
 
@@ -321,7 +453,7 @@ If the rectangles don't overlap, the result is inverted rather than empty: this 
 
 <Returns type="Rect" href="/language/types/rect">The bounds from [`array2`](#array2), or a zero-size rectangle if nothing fits.</Returns>
 
-A width or height smaller than `r`'s draws nothing, so a via array between two shapes that overlap too little is silently missing. Make sure the overlap fits at least one cut with its enclosure.
+A width or height smaller than `r`'s draws nothing, so a via array between two shapes that overlap too little is silently missing. [`via`](#via) reports that as an error instead.
 
 </ApiItem>
 

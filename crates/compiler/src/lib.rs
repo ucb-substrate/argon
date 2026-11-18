@@ -2,6 +2,7 @@ pub mod artifact;
 pub mod ast;
 pub mod cellcache;
 pub mod compile;
+pub mod connectivity;
 pub mod diagnostics;
 pub mod driver;
 pub mod fingerprint;
@@ -10,6 +11,7 @@ pub mod gdscache;
 pub mod incremental;
 pub mod nav;
 pub mod netlist;
+pub mod parasitics;
 pub mod parse;
 mod parser;
 pub mod solver;
@@ -227,6 +229,130 @@ mod tests {
         assert_eq!(rect.x1.0, 200.);
     }
 
+    /// Compiles `top()` from `source` against the SKY130 technology file.
+    fn compile_sky130_source(source: &str) -> CompileOutput {
+        let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+        let ast = crate::parse::with_std(root);
+        compile_sky130(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn vias_and_rules_come_from_the_technology_file() {
+        let output = compile_sky130_source(
+            "use std::layout::{rect, rule, via, via_stack};
+             cell top() {
+                 let a = rect(\"met1.drawing\", x0=0., y0=0., x1=600., y1=rule(\"met1.space\") + 180.);
+                 let b = rect(\"met2.drawing\", x0=0., y0=0., x1=600., y1=320.);
+                 via(a, b);
+                 let l = rect(\"li1.drawing\", x0=2000., y0=0., x1=2400., y1=400.);
+                 let m = rect(\"met3.drawing\", x0=2000., y0=0., x1=3000., y1=1000.);
+                 via_stack(l, m);
+             }",
+        );
+        let CompileOutput::Valid(data) = &output else {
+            panic!("the vias should compile: {output:?}");
+        };
+        // Two 150 cuts fit along the 600-wide overlap, centered on the grid.
+        let mut cuts = top_rects_on(data, "via.drawing");
+        cuts.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap());
+        assert_eq!(cuts[..2], [[65., 85., 215., 235.], [385., 85., 535., 235.]]);
+        // The stack from li1 to met3 draws an mcon, via, and via2, with pads
+        // on met1 and met2.
+        for layer in [
+            "mcon.drawing",
+            "via2.drawing",
+            "met1.drawing",
+            "met2.drawing",
+        ] {
+            assert!(!top_rects_on(data, layer).is_empty(), "{layer}");
+        }
+        assert_eq!(cuts.len(), 3);
+    }
+
+    #[test]
+    fn a_via_that_cannot_fit_names_the_size_it_needs() {
+        let output = compile_sky130_source(
+            "use std::layout::{rect, rule, via};
+             cell top() {
+                 let a = rect(\"li1.drawing\", x0=0., y0=0., x1=170., y1=1000.);
+                 let b = rect(\"met1.drawing\", x0=0., y0=0., x1=200., y1=1000.);
+                 via(a, b);
+                 rect(\"met1.drawing\", x0=0., y0=0., x1=rule(\"met1.spac\"), y1=100.);
+             }",
+        );
+        let CompileOutput::ExecErrors(output) = &output else {
+            panic!("the via should fail: {output:?}");
+        };
+        let messages = output
+            .errors
+            .iter()
+            .map(|e| e.kind.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            messages.iter().any(|m| m.contains("needs 230 by 290")),
+            "{messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("no rule `met1.spac`") && m.contains("`met1.space`")),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn the_via_docs_example_compiles() {
+        let page = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/docs/language/std-layout.mdx"
+        ))
+        .unwrap();
+        let section = &page[page.find("## Vias and rules").unwrap()..];
+        let start = section.find("```argon\n").unwrap() + "```argon\n".len();
+        let source = &section[start..start + section[start..].find("```").unwrap()];
+        let output = compile_sky130_source(&source.replace("cell strap()", "cell top()"));
+        let CompileOutput::Valid(data) = &output else {
+            panic!("the example should compile: {output:?}");
+        };
+        for layer in ["mcon.drawing", "via.drawing", "via2.drawing"] {
+            assert!(!top_rects_on(data, layer).is_empty(), "{layer}");
+        }
+    }
+
+    #[test]
+    fn a_via_on_one_layer_fails_at_the_call_that_asked_for_it() {
+        let source = "use std::layout::{rect, via, via_stack};
+             cell top() {
+                 let a = rect(\"met1.drawing\", x0=0., y0=0., x1=600., y1=600.);
+                 let b = rect(\"met1.drawing\", x0=0., y0=0., x1=600., y1=600.);
+                 via_stack(a, b);
+                 via(a, b);
+             }";
+        let output = compile_sky130_source(source);
+        let CompileOutput::ExecErrors(output) = &output else {
+            panic!("the vias should fail: {output:?}");
+        };
+        assert_eq!(output.errors.len(), 2, "{:?}", output.errors);
+        for (error, call) in output.errors.iter().zip(["via_stack(a, b)", "via(a, b)"]) {
+            assert!(
+                error
+                    .kind
+                    .to_string()
+                    .contains("both shapes are on `met1.drawing`"),
+                "{error:?}"
+            );
+            // The error is inside `std`, but names the call in the cell's body.
+            let origin = error.origin.as_ref().expect("an origin");
+            assert_eq!(&source[origin.span.start()..origin.span.end()], call);
+        }
+    }
+
     #[test]
     fn float_cell_arguments_pass_exactly_on_a_coarse_grid() {
         // sky130's 5 nm grid once snapped `0.5` to 0 on its way into `child`.
@@ -292,6 +418,8 @@ mod tests {
     const ARGON_ENUMERATIONS: &str = concatcp!(EXAMPLES_DIR, "/enumerations/lib.ar");
     const ARGON_BBOX: &str = concatcp!(EXAMPLES_DIR, "/bbox/lib.ar");
     const ARGON_BBOX_NESTED: &str = concatcp!(EXAMPLES_DIR, "/bbox_nested/lib.ar");
+    const ARGON_STRINGS: &str = concatcp!(EXAMPLES_DIR, "/strings/lib.ar");
+    const ARGON_STD_HELPERS: &str = concatcp!(EXAMPLES_DIR, "/std_helpers/lib.ar");
     const ARGON_ROUNDING: &str = concatcp!(EXAMPLES_DIR, "/rounding/lib.ar");
     const ARGON_FLIPPED_RECT: &str = concatcp!(EXAMPLES_DIR, "/flipped_rect/lib.ar");
     const ARGON_SEQ_BASIC: &str = concatcp!(EXAMPLES_DIR, "/seq_basic/lib.ar");
@@ -3428,26 +3556,47 @@ cell top() {
         let o = parse_workspace_with_std(ARGON_SKY130_LIB);
         assert!(o.static_errors().is_empty());
         let ast = o.ast();
-        for nf in 1..=4 {
+        // `mos(true, 420., nf, swap=swap, away=away)`, with every keyword given.
+        let bars = |nf: i64, swap: bool, away: bool| {
             let data = compile_sky130(
                 &ast,
                 CompileInput {
                     cell: &["mos"],
-                    args: vec![CellArg::Bool(true), CellArg::Float(420.), CellArg::Int(nf)],
+                    args: vec![
+                        CellArg::Bool(true),
+                        CellArg::Float(420.),
+                        CellArg::Int(nf),
+                        CellArg::Int(0),
+                        CellArg::Int(0),
+                        CellArg::Bool(swap),
+                        CellArg::Bool(away),
+                        CellArg::Bool(true),
+                    ],
                 },
             )
             .unwrap_valid();
             let mut bars = top_rects_on(&data, "met1.drawing");
             bars.sort_by(|a, b| a[1].partial_cmp(&b[1]).unwrap());
-            let [g, s, d] = bars[..] else {
-                panic!("mos draws three met1 bars: {bars:?}");
-            };
-            for bar in [g, s, d] {
-                assert_relative_eq!(bar[3] - bar[1], 320., epsilon = EPSILON);
+            bars
+        };
+        for nf in 1..=4 {
+            for (swap, away) in [(false, false), (true, false), (false, true), (true, true)] {
+                let bars = bars(nf, swap, away);
+                let [g, near, far] = bars[..] else {
+                    panic!("mos draws three met1 bars: {bars:?}");
+                };
+                for bar in [g, near, far] {
+                    assert_relative_eq!(bar[3] - bar[1], 320., epsilon = EPSILON);
+                }
+                // The bars keep met1's 140 spacing between them, and `away`
+                // leaves more room on the gate side.
+                if away {
+                    assert!(near[1] - g[3] > 140., "{nf} fingers: {bars:?}");
+                } else {
+                    assert_relative_eq!(near[1] - g[3], 140., epsilon = EPSILON);
+                }
+                assert!(far[1] - near[3] >= 140., "{nf} fingers: {bars:?}");
             }
-            // The bars keep met1's 140 spacing between them.
-            assert_relative_eq!(s[1] - g[3], 140., epsilon = EPSILON);
-            assert!(d[1] - s[3] >= 140., "{nf} fingers: {bars:?}");
         }
     }
 
@@ -3501,6 +3650,65 @@ cell top() {
         assert_eq!(translated_bbox_rect.y0.0, 100.);
         assert_eq!(translated_bbox_rect.x1.0, 200.);
         assert_eq!(translated_bbox_rect.y1.0, 200.);
+    }
+
+    #[test]
+    fn argon_strings() {
+        let o = parse_workspace_with_std(ARGON_STRINGS);
+        assert!(o.static_errors().is_empty());
+        let cells = compile(
+            &o.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: vec![CellArg::Int(3)],
+            },
+        );
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        let labels = cell
+            .objects
+            .values()
+            .filter_map(|object| object.get_text())
+            .map(|text| text.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["d_0", "d_1", "d_2"]);
+        let layers = cell
+            .objects
+            .values()
+            .filter_map(|object| object.get_rect())
+            .filter_map(|rect| rect.layer.as_deref())
+            .collect::<indexmap::IndexSet<_>>();
+        assert!(layers.contains("met2") && layers.contains("met3"));
+    }
+
+    #[test]
+    fn argon_std_helpers() {
+        let o = parse_workspace_with_std(ARGON_STD_HELPERS);
+        assert!(o.static_errors().is_empty());
+        let cells = compile(
+            &o.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        );
+        let cells = cells.unwrap_valid();
+        let cell = &cells.cells[&cells.top];
+        let bounds = |layer: &str| {
+            cell.objects
+                .values()
+                .filter_map(|object| object.get_rect())
+                .filter(|rect| rect.layer.as_deref() == Some(layer))
+                .map(|rect| [rect.x0.0, rect.y0.0, rect.x1.0, rect.y1.0])
+                .collect::<Vec<_>>()
+        };
+        // `row` and `column` place the blocks, and `bbox_of` bounds them.
+        assert_eq!(bounds("met2"), [[0., 0., 490., 350.]]);
+        // `bbox_of` also bounds rectangles; then the folds and `Int` min/max.
+        assert_eq!(
+            bounds("met4"),
+            [[0., -100., 610., -10.], [440., 0., 890., 30.]]
+        );
     }
 
     #[test]
@@ -4121,6 +4329,44 @@ cell top() {
         );
     }
 
+    /// A comparison or cast left waiting on a value nothing determines is
+    /// named in the error about that value.
+    #[test]
+    fn underconstrained_errors_name_what_waits_on_them() {
+        let source = "use std::layout::rect;\n\
+                      cell top() {\n\
+                      \x20   let r = rect(\"met1\", x0=0., y0=0., h=100.);\n\
+                      \x20   if r.w > 100. {\n\
+                      \x20       eq(r.x1, 200.);\n\
+                      \x20   }\n\
+                      \x20   let n = (r.x1 / 10.) as Int;\n\
+                      \x20   let q = rect(\"met1\", x0=0., y0=0., x1=10.);\n\
+                      }\n";
+        let root = parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+        let ast = crate::parse::with_std(root);
+        let errors = compile(
+            &ast,
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_exec_errors()
+        .errors;
+        let messages = errors
+            .iter()
+            .map(|error| error.kind.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            [
+                "rectangle is underconstrained: x1 is not determined, and `r.w > 100.` at line 4 \
+                 and `(r.x1 / 10.) as Int` at line 7 wait on it",
+                "rectangle is underconstrained: y1 is not determined",
+            ]
+        );
+    }
+
     #[test]
     fn underconstrained_messages_summarize_long_lists() {
         let free = (0..3)
@@ -4129,6 +4375,7 @@ cell top() {
         let kind = ExecErrorKind::Underconstrained {
             object: Some(VarObject::Polygon),
             free,
+            waiting: Vec::new(),
         };
         assert_eq!(
             kind.to_string(),
@@ -4137,6 +4384,7 @@ cell top() {
         let kind = ExecErrorKind::Underconstrained {
             object: None,
             free: Vec::new(),
+            waiting: Vec::new(),
         };
         assert_eq!(kind.to_string(), "cell is underconstrained");
     }
@@ -6081,6 +6329,79 @@ cell top() {
         );
     }
 
+    /// Every `std` item a name could mean is named with its import: functions,
+    /// enums, natives, and types, bare or by a `std` path into another module.
+    #[test]
+    fn an_unimported_std_item_names_its_import() {
+        // A parameter's type is checked twice; diagnostics drop the repeat.
+        let not_imported = |source: &str| {
+            let mut errors = static_errors_of(source)
+                .into_iter()
+                .map(|error| match error {
+                    StaticErrorKind::NotImported { name, paths } => (name, paths),
+                    other => panic!("{source}: {other:?}"),
+                })
+                .collect::<Vec<_>>();
+            errors.dedup();
+            errors
+        };
+        let one = |name: &str, path: &str| vec![(name.to_owned(), vec![path.to_owned()])];
+        assert_eq!(
+            not_imported("cell top() { let k = DeviceKind::Nmos; }"),
+            one("DeviceKind", "std::schematic::DeviceKind")
+        );
+        assert_eq!(
+            not_imported("cell top() { let r = std::layout::rect(\"met1\"); center_rects(r, r); }"),
+            one("center_rects", "std::layout::center_rects")
+        );
+        assert_eq!(
+            not_imported("cell top() { let m = max(1., 2.); }"),
+            one("max", "std::max")
+        );
+        assert_eq!(
+            not_imported("fn f(a: Align) {}"),
+            one("Align", "std::symbol::Align")
+        );
+        assert_eq!(
+            not_imported("cell top() { std::device(); }"),
+            one("std::device", "std::schematic::device")
+        );
+        assert_eq!(
+            not_imported("use std::layout::Signal;"),
+            one("std::layout::Signal", "std::schematic::Signal")
+        );
+        assert_eq!(
+            not_imported("cell top() { let r = std::rect(\"met1\"); }"),
+            vec![(
+                "std::rect".to_owned(),
+                vec![
+                    "std::layout::rect".to_owned(),
+                    "std::symbol::rect".to_owned()
+                ]
+            )]
+        );
+        // A declaration of the same name is not a `std` item.
+        assert!(
+            static_errors_of(
+                "enum DeviceKind { A, }\nfn max(a: Int) -> Int { a }\n\
+                 cell top() { let k = DeviceKind::A; let m = max(1); }"
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            StaticErrorKind::NotImported {
+                name: "std::rect".to_owned(),
+                paths: vec![
+                    "std::layout::rect".to_owned(),
+                    "std::symbol::rect".to_owned()
+                ],
+            }
+            .to_string(),
+            "`std::rect` is not in scope; import it with `use std::layout::rect;` or \
+             `use std::symbol::rect;`"
+        );
+    }
+
     /// The geometry helpers live in `std::layout`; a `std::` path to one
     /// names the module, whether it is called or imported.
     #[test]
@@ -6898,6 +7219,49 @@ cell top() {
     }
 
     #[test]
+    fn strings_compare_for_equality_only() {
+        assert!(check_source(r#"cell top() { let a = "a" == "b"; }"#).is_empty());
+        assert!(check_source(r#"cell top() { let a = "a" + "b" != "ab"; }"#).is_empty());
+        let errors = check_source(r#"cell top() { let a = "a" < "b"; }"#);
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::StringNotOrd)),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn plus_joins_strings_and_nothing_else_does() {
+        assert!(check_source(r#"cell top() { let a = "n" + std::to_string(3); }"#).is_empty());
+        let errors = check_source(r#"cell top() { let a = "a" - "b"; }"#);
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::ArithInvalidType(_))),
+            "{errors:#?}"
+        );
+        let errors = check_source(r#"cell top() { let a = "a" + 1; }"#);
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, StaticErrorKind::ArithMismatchedTypes)),
+            "{errors:#?}"
+        );
+        assert!(!check_source("cell top() { let a = std::to_string(1.); }").is_empty());
+    }
+
+    #[test]
+    fn min_and_max_take_two_ints_or_two_floats() {
+        assert!(check_source("cell top() { let a = std::max(1, 2) + std::min(3, 4); }").is_empty());
+        assert!(check_source("cell top() { let a = std::max(1., 2.) + 1.; }").is_empty());
+        assert!(!check_source("cell top() { let a = std::max(1, 2.); }").is_empty());
+        assert!(!check_source("cell top() { let a = std::max(1, 2) + 1.; }").is_empty());
+        let errors = run_source(r#"cell top() { let a = std::max("a", "b"); }"#);
+        assert_reports(&errors, |error| matches!(error, ExecErrorKind::NotNumeric));
+    }
+
+    #[test]
     fn booleans_compare_for_equality_only() {
         // `Ty::Bool` was missing from the comparison whitelist, so even
         // `true == false` was rejected.
@@ -7103,7 +7467,7 @@ cell top() {
                 if expected == "Float" && found == "Int"
         ));
         assert!(matches!(
-            generic_errors("cell c() { let n = std::max::<Int>(1., 2.); }").as_slice(),
+            generic_errors("cell c() { let n = std::sum::<Int>([1, 2]); }").as_slice(),
             [StaticErrorKind::TypeArgArity {
                 expected: 0,
                 found: 1,
@@ -8220,34 +8584,33 @@ cell inv(pw: Float, nw: Float, nf: Int) {
              fn same(s: Signal) -> Signal { s }\n\
              cell top() { let s: Signal = same(Signal()); }",
         );
-        let errors = static_errors_of("cell top() { let s = Signal(); }");
-        assert!(
-            matches!(
-                errors.as_slice(),
-                [StaticErrorKind::UndeclaredVar { name }] if name == "Signal"
-            ),
-            "{errors:?}"
-        );
-        let errors = static_errors_of("fn f(s: Signal) {}");
-        assert!(
-            !errors.is_empty()
-                && errors
-                    .iter()
-                    .all(|error| matches!(error, StaticErrorKind::UnknownType)),
-            "{errors:?}"
-        );
+        // Unimported, it is named in either position, with its import.
+        for source in ["cell top() { let s = Signal(); }", "fn f(s: Signal) {}"] {
+            let errors = static_errors_of(source);
+            assert!(
+                !errors.is_empty()
+                    && errors.iter().all(|error| matches!(
+                        error,
+                        StaticErrorKind::NotImported { name, paths }
+                            if name == "Signal" && *paths == ["std::schematic::Signal"]
+                    )),
+                "{source}: {errors:?}"
+            );
+        }
     }
 
     /// Only the `std::layout` natives were ever bare builtins, so only they
-    /// say where they moved.
+    /// say they moved; other `std` items say how to import them.
     #[test]
-    fn bare_schematic_natives_are_undeclared() {
+    fn bare_schematic_natives_name_their_import() {
         for name in ["connect", "device"] {
             let errors = static_errors_of(&format!("cell top() {{ {name}(); }}"));
+            let path = format!("std::schematic::{name}");
             assert!(
                 matches!(
                     errors.as_slice(),
-                    [StaticErrorKind::UndeclaredVar { name: found }] if found == name
+                    [StaticErrorKind::NotImported { name: found, paths }]
+                        if found == name && *paths == [path.clone()]
                 ),
                 "{name}: {errors:?}"
             );

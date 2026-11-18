@@ -4,8 +4,8 @@ use std::layout::{array, center_rects, crect, rect};
 cell inv(nw: Float, pw: Float, nf: Int) {
     pub let nmos = std::layout::inst(fet1v8(true, nw, nf), xi=0.0, yi=0.0);
     pub let pmos = std::layout::inst(fet1v8(false, pw, nf), xi=0.0, yi=3000.0);
-    pub let ptap = std::layout::inst(tap(0, nmos.sdm.w - 260., 800.), xi=-355.0, yi=-1500.0);
-    pub let ntap = std::layout::inst(tap(1, pmos.sdm.w - 260., 800.), xi=-355.0, yi=5500.0);
+    pub let ptap = std::layout::inst(tap(false, nmos.sdm.w - 260., 800.), xi=-285.0, yi=-1500.0);
+    pub let ntap = std::layout::inst(tap(true, pmos.sdm.w - 260., 800.), xi=-285.0, yi=5500.0);
     eq(nmos.x, 0.);
     eq(nmos.y, 0.);
     eq(pmos.x, 0.);

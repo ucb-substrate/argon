@@ -98,6 +98,17 @@ pub(super) fn arith(solver: &Solver, op: ArithOp, left: &Value, right: &Value) -
                 ))
             })
         }
+        (Value::String(vl), Value::String(vr)) if op == ArithOp::Add => {
+            Ok(Value::String(format!("{vl}{vr}")))
+        }
+        _ => Err(error(ExecErrorKind::InvalidType)),
+    }
+}
+
+/// `int_to_string`: an integer's decimal digits.
+pub(super) fn int_to_string(value: &Value) -> OpResult {
+    match value {
+        Value::Int(value) => Ok(Value::String(value.to_string())),
         _ => Err(error(ExecErrorKind::InvalidType)),
     }
 }
@@ -154,6 +165,7 @@ pub(super) fn compare(
         }
         (Value::Int(vl), Value::Int(vr)) => ordered(vl.cmp(vr)),
         (Value::Bool(vl), Value::Bool(vr)) => equality(vl == vr),
+        (Value::String(vl), Value::String(vr)) => equality(vl == vr),
         (Value::Enum(_), Value::Enum(_)) => values_equal(left, right).and_then(equality),
         (Value::Nil, Value::Nil) => equality(true),
         (Value::Seq(x), Value::Seq(y)) if x.is_empty() || y.is_empty() => {
@@ -396,8 +408,9 @@ pub(super) fn tail(list: &Value) -> OpResult {
     }
 }
 
-/// `max_float`, `min_float`, `max_int` or `min_int`: the second value when the
-/// first is less, the first for `max` and the second for `min` on ties.
+/// `max_float`, `min_float`, `max_int`, `min_int`, `max_num` or `min_num`: the
+/// second value when the first is less, the first for `max` and the second for
+/// `min` on ties.
 pub(super) fn min_max(solver: &Solver, max: bool, a: &Value, b: &Value) -> OpResult {
     let less = match (a, b) {
         (Value::Int(x), Value::Int(y)) => x < y,
@@ -409,7 +422,7 @@ pub(super) fn min_max(solver: &Solver, max: bool, a: &Value, b: &Value) -> OpRes
                 .ok_or_else(|| error(ExecErrorKind::InvalidType))?
                 .is_lt()
         }
-        _ => return Err(error(ExecErrorKind::InvalidType)),
+        _ => return Err(error(ExecErrorKind::NotNumeric)),
     };
     Ok(if less == max { b.clone() } else { a.clone() })
 }
@@ -480,4 +493,196 @@ pub(super) fn max_via_array(solver: &Solver, args: &[&Value]) -> OpResult {
         Value::Int(choice.6),
         float(choice.7),
     ])))
+}
+
+/// `tech_rule(name)`: the technology file's value for the design rule `name`.
+pub(super) fn tech_rule(tech: &Technology, name: &Value) -> OpResult {
+    let Value::String(name) = name else {
+        return Err(error(ExecErrorKind::InvalidType));
+    };
+    tech.rule(name)
+        .map(|value| Value::Linear(LinearExpr::from(value)))
+        .ok_or_else(|| {
+            let layer = name.split('.').next().unwrap_or(name);
+            let similar = tech
+                .rules
+                .keys()
+                .filter(|k| k.split('.').next() == Some(layer))
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>();
+            let message = if tech.rules.is_empty() {
+                format!("the technology file defines no rules, so it has no rule `{name}`")
+            } else if similar.is_empty() {
+                format!("the technology file has no rule `{name}`, nor any rule for `{layer}`")
+            } else {
+                format!(
+                    "the technology file has no rule `{name}`; its rules for `{layer}` are {}",
+                    similar.join(", ")
+                )
+            };
+            error(ExecErrorKind::Tech(message))
+        })
+}
+
+/// `tech_via(bot, top, stack)`: the cut arrays, and with `stack` the pads,
+/// that join `bot` to `top`, each as `(layer, x0, y0, w, h, nx, ny, pitch)`:
+/// `nx` by `ny` rectangles `w` by `h` on a `pitch`, the first at (`x0`, `y0`).
+/// Without `stack`, one via joins the two layers directly; with it, a via per
+/// layer between them, with a pad on each, all within the shapes' overlap.
+pub(super) fn tech_via(tech: &Technology, solver: &Solver, args: &[&Value]) -> OpResult {
+    let ([Value::Rect(bot), Value::Rect(top), Value::Bool(stack)], grid) = (args, solver.grid())
+    else {
+        return Err(error(ExecErrorKind::InvalidType));
+    };
+    let exprs = [
+        &bot.x0, &bot.y0, &bot.x1, &bot.y1, &top.x0, &top.y0, &top.x1, &top.y1,
+    ];
+    let Some(x) = exprs
+        .iter()
+        .map(|expr| solver.eval_expr_exact(expr))
+        .collect::<Option<Vec<f64>>>()
+    else {
+        return Err(wait(exprs));
+    };
+    let fail = |message: String| Err(error(ExecErrorKind::Tech(message)));
+    let (Some(bot_layer), Some(top_layer)) = (&bot.layer, &top.layer) else {
+        return fail(
+            "a via needs both shapes to have a layer, which a `crect` without `layer=` lacks"
+                .to_owned(),
+        );
+    };
+    let (b, t) = ([x[0], x[1], x[2], x[3]], [x[4], x[5], x[6], x[7]]);
+    let overlap = [
+        b[0].max(t[0]),
+        b[1].max(t[1]),
+        b[2].min(t[2]),
+        b[3].min(t[3]),
+    ];
+    if overlap[2] <= overlap[0] || overlap[3] <= overlap[1] {
+        return fail(format!(
+            "`{bot_layer}` from ({}, {}) to ({}, {}) and `{top_layer}` from ({}, {}) to ({}, {}) don't overlap, so no via can join them",
+            b[0], b[1], b[2], b[3], t[0], t[1], t[2], t[3]
+        ));
+    }
+    if bot_layer == top_layer {
+        return fail(format!(
+            "both shapes are on `{bot_layer}`, and a via joins two different layers"
+        ));
+    }
+    let layers = if *stack {
+        match tech.via_path(bot_layer, top_layer) {
+            Some(layers) => layers,
+            None => {
+                return fail(format!(
+                    "no stack of vias joins `{bot_layer}` up to `{top_layer}`"
+                ));
+            }
+        }
+    } else {
+        vec![bot_layer.clone(), top_layer.clone()]
+    };
+    let float = |v: f64| Value::Linear(LinearExpr::from(v));
+    let entry = |layer: &str, x0: f64, y0: f64, w: f64, h: f64, nx: i64, ny: i64, pitch: f64| {
+        Value::Tuple(Arc::new([
+            Value::String(layer.to_owned()),
+            float(x0),
+            float(y0),
+            float(w),
+            float(h),
+            Value::Int(nx),
+            Value::Int(ny),
+            float(pitch),
+        ]))
+    };
+    let mut seq = Seq::new();
+    let last = layers.len() - 2;
+    for (i, pair) in layers.windows(2).enumerate() {
+        let Some(via) = tech.via(&pair[0], &pair[1]) else {
+            let vias = tech
+                .vias
+                .iter()
+                .map(|v| format!("`{}` to `{}`", v.bot, v.top))
+                .collect::<Vec<_>>();
+            let hint = if tech.via_path(&pair[0], &pair[1]).is_some() {
+                "; `via_stack` joins them through the layers between".to_owned()
+            } else if vias.is_empty() {
+                "; the technology file defines no vias".to_owned()
+            } else {
+                format!("; the technology file's vias join {}", vias.join(", "))
+            };
+            return fail(format!("no via joins `{}` to `{}`{hint}", pair[0], pair[1]));
+        };
+        let below = if i == 0 { b } else { overlap };
+        let above = if i == last { t } else { overlap };
+        let Some(fit) = crate::via_array::fit_via(
+            via.size,
+            via.space,
+            via.bot_enclosure,
+            via.top_enclosure,
+            below,
+            above,
+            grid,
+        ) else {
+            let need = |e: (f64, f64), f: (f64, f64)| {
+                let short = e.0.max(f.0);
+                let long = e.1.max(f.1);
+                format!("{} by {}", via.size + 2. * short, via.size + 2. * long)
+            };
+            return fail(format!(
+                "no `{}` cut fits where `{}` and `{}` overlap, from ({}, {}) to ({}, {}); one cut with its enclosures needs {}",
+                via.cut,
+                pair[0],
+                pair[1],
+                overlap[0],
+                overlap[1],
+                overlap[2],
+                overlap[3],
+                need(via.bot_enclosure, via.top_enclosure)
+            ));
+        };
+        let pitch = via.size + via.space;
+        seq.push_back(entry(
+            &via.cut, fit.x0, fit.y0, via.size, via.size, fit.nx, fit.ny, pitch,
+        ));
+        if i != last {
+            let pad = grow_pad(tech, &pair[1], overlap, grid);
+            seq.push_back(entry(
+                &pair[1],
+                pad[0],
+                pad[1],
+                pad[2] - pad[0],
+                pad[3] - pad[1],
+                1,
+                1,
+                0.,
+            ));
+        }
+    }
+    Ok(Value::Seq(Arc::new(seq)))
+}
+
+/// `region` grown about its center, on the grid, to the minimum width and
+/// area the technology file gives `layer`, if any.
+fn grow_pad(tech: &Technology, layer: &str, region: [f64; 4], grid: f64) -> [f64; 4] {
+    let base = layer.split('.').next().unwrap_or(layer);
+    let width = tech.rule(&format!("{base}.width")).unwrap_or(0.);
+    let area = tech.rule(&format!("{base}.area")).unwrap_or(0.);
+    let up = |v: f64| (v / grid - 1e-9).ceil() * grid;
+    let (mut w, mut h) = (region[2] - region[0], region[3] - region[1]);
+    w = w.max(width);
+    h = h.max(width);
+    if w * h < area {
+        if w >= h {
+            w = area / h;
+        } else {
+            h = area / w;
+        }
+    }
+    let grow = |lo: f64, hi: f64, len: f64| {
+        let extra = up(((len - (hi - lo)) / 2.).max(0.));
+        [lo - extra, hi + extra]
+    };
+    let [x0, x1] = grow(region[0], region[2], w);
+    let [y0, y1] = grow(region[1], region[3], h);
+    [x0, y0, x1, y1]
 }

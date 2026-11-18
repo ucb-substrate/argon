@@ -71,7 +71,18 @@ function sky130Items() {
   const lines = readFileSync(sky130, 'utf8').split('\n');
   const items = [];
   for (let i = 0; i < lines.length; i++) {
-    const decl = lines[i].match(/^(cell|fn) (.*?)\s*\{$/);
+    // A declaration whose parameters span several lines ends at the line with `{`.
+    let last = i;
+    if (/^(cell|fn) \w+(<[^>]*>)?\($/.test(lines[i])) {
+      while (last < lines.length - 1 && !lines[last].endsWith('{')) last++;
+    }
+    const text = lines
+      .slice(i, last + 1)
+      .map((l) => l.trim())
+      .join(' ')
+      .replace(/\( /, '(')
+      .replace(/,? \)/, ')');
+    const decl = text.match(/^(cell|fn) (.*?)\s*\{$/);
     if (!decl || !lines[i - 1]?.startsWith('///')) continue;
     let start = i;
     while (lines[start - 1]?.startsWith('///')) start--;
@@ -82,7 +93,7 @@ function sky130Items() {
       .split('\n\n')[0]
       .replace(/\s+/g, ' ');
     const sentence = doc.match(/^.*?\.(?=\s+[A-Z`]|$)/)[0];
-    let end = i + 1;
+    let end = last + 1;
     while (lines[end] !== '}') end++;
     const pub = [...lines.slice(i, end).join('\n').matchAll(/pub let (\w+)/g)].map((m) => `\`${m[1]}\``);
     const extra = pub.length ? ` Fields: ${pub.join(', ')}.` : '';

@@ -833,6 +833,16 @@ fn builtin_signature(name: &str) -> Option<SignatureInfo> {
             &["a: Float", "b: Float"],
             &[],
         ),
+        "tech_rule" => signature(
+            "fn tech_rule(name: String) -> Float",
+            &["name: String"],
+            &[],
+        ),
+        "tech_via" => signature(
+            "fn tech_via(bot: Rect, top: Rect, stack: Bool) -> [(String, Float, Float, Float, Float, Int, Int, Float)]",
+            &["bot: Rect", "top: Rect", "stack: Bool"],
+            &[],
+        ),
         "max_via_array" => signature(
             "fn max_via_array(size: Float, space: Float, bot_enc: (Float, Float), top_enc: (Float, Float), bot: Rect, top: Rect, bot_ext_dir: Int, top_ext_dir: Int, longer: Bool, later_wins_ties: Bool) -> (Int, Int, Float, Float, Float, Float, Int, Float)",
             &[
@@ -857,6 +867,13 @@ fn builtin_signature(name: &str) -> Option<SignatureInfo> {
         "min_int" => signature(
             "fn min_int(a: Int, b: Int) -> Int",
             &["a: Int", "b: Int"],
+            &[],
+        ),
+        "max_num" => signature("fn max_num(a: T, b: T) -> T", &["a: T", "b: T"], &[]),
+        "min_num" => signature("fn min_num(a: T, b: T) -> T", &["a: T", "b: T"], &[]),
+        "int_to_string" => signature(
+            "fn int_to_string(value: Int) -> String",
+            &["value: Int"],
             &[],
         ),
         "float" => signature("fn float() -> Float", &[], &[]),
@@ -895,11 +912,15 @@ fn native_signature(native: Native) -> SignatureInfo {
             keywords.push("layer: String");
             signature("fn crect(*, coordinates...) -> Rect", &[], &keywords)
         }
-        Native::Rect => signature(
-            "fn rect(layer: String, *, coordinates...) -> Rect",
-            &["layer: String"],
-            &rect_keywords,
-        ),
+        Native::Rect => {
+            let mut keywords = rect_keywords.to_vec();
+            keywords.push("net: Signal");
+            signature(
+                "fn rect(layer: String, *, coordinates..., net: Signal) -> Rect",
+                &["layer: String"],
+                &keywords,
+            )
+        }
         Native::Polygon => signature(
             "fn polygon(layer: String, points: Int, *, xN/yN: Float) -> Polygon",
             &["layer: String", "points: Int"],
@@ -949,8 +970,8 @@ fn native_signature(native: Native) -> SignatureInfo {
             ],
         ),
         Native::Bbox => signature(
-            "fn bbox(value: Cell | Inst) -> Rect",
-            &["value: Cell | Inst"],
+            "fn bbox(value: Cell | Inst | Rect) -> Rect",
+            &["value: Cell | Inst | Rect"],
             &[],
         ),
         Native::Signal => signature(
@@ -3172,7 +3193,7 @@ cell top() {
             .expect("an aliased native has hover text");
         assert_eq!(
             hover.contents,
-            "fn rect(layer: String, *, coordinates...) -> Rect"
+            "fn rect(layer: String, *, coordinates..., net: Signal) -> Rect"
         );
         let signature = index
             .signature_at(Path::new(ROOT), call)
@@ -3205,7 +3226,10 @@ cell top() {
                 &["std".to_owned(), "layout".to_owned(), "bbox".to_owned()],
             )
             .expect("a native resolves by full path");
-        assert_eq!(qualified.label, "fn bbox(value: Cell | Inst) -> Rect");
+        assert_eq!(
+            qualified.label,
+            "fn bbox(value: Cell | Inst | Rect) -> Rect"
+        );
     }
 
     /// Natives complete as items of their module, and in a module only once

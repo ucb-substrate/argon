@@ -320,10 +320,15 @@ impl<'a> ExecPass<'a> {
                 }
                 Builtin::Head => ops::head(refs.first()?).ok(),
                 Builtin::Tail => ops::tail(refs.first()?).ok(),
-                Builtin::MaxFloat | Builtin::MinFloat | Builtin::MaxInt | Builtin::MinInt => {
-                    let max = matches!(builtin, Builtin::MaxFloat | Builtin::MaxInt);
-                    ops::min_max(solver, max, refs.first()?, refs.get(1)?).ok()
+                Builtin::MaxFloat
+                | Builtin::MinFloat
+                | Builtin::MaxInt
+                | Builtin::MinInt
+                | Builtin::MaxNum
+                | Builtin::MinNum => {
+                    ops::min_max(solver, builtin.is_max(), refs.first()?, refs.get(1)?).ok()
                 }
+                Builtin::IntToString => ops::int_to_string(refs.first()?).ok(),
                 Builtin::SeqLen
                 | Builtin::SeqConcat
                 | Builtin::SeqFlatten
@@ -546,6 +551,9 @@ impl Builtin {
                 | Builtin::MinFloat
                 | Builtin::MaxInt
                 | Builtin::MinInt
+                | Builtin::MaxNum
+                | Builtin::MinNum
+                | Builtin::IntToString
                 | Builtin::MaxViaArray
         )
     }

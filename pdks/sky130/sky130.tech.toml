@@ -8878,3 +8878,360 @@ name = "thickLine"
 "met5.pin" = "met5.label"
 "pad.pin" = "pad.label"
 "rdl.pin" = "rdl.label"
+
+# Design rules, in nm and nm² for areas, read with `std::layout::rule`. The
+# values are SKY130's public periphery rules; each comment names the rule.
+# `<layer>.<other>_enclosure` is the enclosure on every side and
+# `<layer>.<other>_end_enclosure` the larger one on two opposite sides.
+[rules]
+"nwell.width" = 840                 # nwell.1
+"nwell.space" = 1270                # nwell.2a
+"nwell.pdiff_enclosure" = 180       # difftap.8
+"nwell.ntap_enclosure" = 180        # difftap.10
+"nwell.ndiff_space" = 340           # difftap.9
+"nwell.ptap_space" = 130            # difftap.11
+"diff.width" = 150                  # difftap.1
+"diff.space" = 270                  # difftap.3
+"diff.gate_width" = 420             # difftap.2
+"diff.tap_space" = 270              # difftap.3, a tap not butting the diffusion
+"diff.tap_edge_space" = 130         # difftap.7, to a tap edge off a butting junction
+"diff.gate_extension" = 250         # poly.7
+"tap.width" = 150                   # difftap.1
+"tap.space" = 270                   # difftap.3
+"poly.width" = 150                  # poly.1a
+"poly.space" = 210                  # poly.2
+"poly.diff_space" = 75              # poly.4
+"poly.tap_space" = 55               # poly.5
+"poly.gate_extension" = 130         # poly.8
+"poly.gate_tap_space" = 300         # poly.6
+"poly.licon_enclosure" = 50         # licon.8
+"poly.licon_end_enclosure" = 80     # licon.8a
+"nsdm.width" = 380                  # nsd.1
+"nsdm.space" = 380                  # nsd.2
+"nsdm.diff_enclosure" = 125         # nsd.5a
+"nsdm.tap_enclosure" = 125          # nsd.5b
+"nsdm.area" = 265000                # nsd.10a
+"psdm.width" = 380                  # psd.1
+"psdm.space" = 380                  # psd.2
+"psdm.diff_enclosure" = 125         # psd.5a
+"psdm.tap_enclosure" = 125          # psd.5b
+"psdm.area" = 265000                # psd.10b
+"npc.width" = 270                   # npc.1
+"npc.space" = 270                   # npc.2
+"npc.gate_space" = 90               # npc.4
+"npc.licon_enclosure" = 100         # licon.15
+"licon.size" = 170                  # licon.1
+"licon.space" = 170                 # licon.2
+"licon.gate_space" = 55             # licon.11
+"licon.npc_space" = 90              # licon.13
+"licon.poly_diff_space" = 190       # licon.14
+"licon.poly_psdm_space" = 110       # licon.9
+"diff.licon_enclosure" = 40         # licon.5a
+"diff.licon_end_enclosure" = 60     # licon.5c
+"tap.licon_enclosure" = 40          # as licon.5a for diffusion
+"tap.licon_end_enclosure" = 120     # licon.7
+"li1.width" = 170                   # li.1
+"li1.space" = 170                   # li.3
+"li1.area" = 56100                  # li.6
+"li1.licon_enclosure" = 0           # licon.4
+"li1.licon_end_enclosure" = 80      # li.5
+"mcon.size" = 170                   # ct.1
+"mcon.space" = 190                  # ct.2
+"li1.mcon_enclosure" = 0            # ct.4
+"met1.width" = 140                  # m1.1
+"met1.space" = 140                  # m1.2
+"met1.wide_space" = 280             # m1.3ab, beside metal wider than 3 µm
+"met1.area" = 83000                 # m1.6
+"met1.mcon_enclosure" = 30          # m1.4
+"met1.mcon_end_enclosure" = 60      # m1.5
+"via.size" = 150                    # via.1a
+"via.space" = 170                   # via.2
+"met1.via_enclosure" = 55           # via.4a
+"met1.via_end_enclosure" = 85       # via.5a
+"met2.width" = 140                  # m2.1
+"met2.space" = 140                  # m2.2
+"met2.wide_space" = 280             # m2.3ab, beside metal wider than 3 µm
+"met2.area" = 67600                 # m2.6
+"met2.via_enclosure" = 55           # m2.4
+"met2.via_end_enclosure" = 85       # m2.5
+"via2.size" = 200                   # via2.1a
+"via2.space" = 200                  # via2.2
+"met2.via2_enclosure" = 40          # via2.4
+"met2.via2_end_enclosure" = 85      # via2.5
+"met3.width" = 300                  # m3.1
+"met3.space" = 300                  # m3.2
+"met3.wide_space" = 400             # m3.3ab, beside metal wider than 3 µm
+"met3.area" = 240000                # m3.6
+"met3.via2_enclosure" = 65          # m3.4
+"met3.via2_end_enclosure" = 85      # m3.4 needs 65; kept larger
+"via3.size" = 200                   # via3.1
+"via3.space" = 200                  # via3.2
+"met3.via3_enclosure" = 60          # via3.4
+"met3.via3_end_enclosure" = 90      # via3.5
+"met4.width" = 300                  # m4.1
+"met4.space" = 300                  # m4.2
+"met4.wide_space" = 400             # m4.5ab, beside metal wider than 3 µm
+"met4.area" = 240000                # m4.4a
+"met4.via3_enclosure" = 65          # m4.3
+"met4.via3_end_enclosure" = 85      # m4.3 needs 65; kept larger
+"via4.size" = 800                   # via4.1
+"via4.space" = 800                  # via4.2
+"met4.via4_enclosure" = 190         # via4.4
+"met5.width" = 1600                 # m5.1
+"met5.space" = 1600                 # m5.2
+"met5.area" = 4000000               # m5.4
+"met5.via4_enclosure" = 310         # m5.3
+"capm.width" = 1000                 # capm.1
+"capm.space" = 840                  # capm.2a
+"met3.capm_enclosure" = 140         # capm.3
+"capm.via3_enclosure" = 140         # capm.4
+"capm.via3_space" = 140             # capm.5, to via3 off the capacitor
+"capm.via2_space" = 140             # capm.8
+"capm.met3_space" = 500             # capm.11, to unrelated met3
+"capm.bottom_space" = 1200          # capm.2b, between capacitors' bottom plates
+
+# Cuts that join two layers, for `std::layout::via` and `via_stack`, in nm.
+[[vias]]
+cut = "licon1.drawing"
+bot = "diff.drawing"
+top = "li1.drawing"
+size = 170
+space = 170
+bot_enclosure = [40, 60]
+top_enclosure = [0, 80]
+
+[[vias]]
+cut = "licon1.drawing"
+bot = "tap.drawing"
+top = "li1.drawing"
+size = 170
+space = 170
+bot_enclosure = [40, 120]
+top_enclosure = [0, 80]
+
+[[vias]]
+cut = "licon1.drawing"
+bot = "poly.drawing"
+top = "li1.drawing"
+size = 170
+space = 170
+bot_enclosure = [50, 80]
+top_enclosure = [0, 80]
+
+[[vias]]
+cut = "mcon.drawing"
+bot = "li1.drawing"
+top = "met1.drawing"
+size = 170
+space = 190
+bot_enclosure = [0, 0]
+top_enclosure = [30, 60]
+
+[[vias]]
+cut = "via.drawing"
+bot = "met1.drawing"
+top = "met2.drawing"
+size = 150
+space = 170
+bot_enclosure = [55, 85]
+top_enclosure = [55, 85]
+
+[[vias]]
+cut = "via2.drawing"
+bot = "met2.drawing"
+top = "met3.drawing"
+size = 200
+space = 200
+bot_enclosure = [40, 85]
+top_enclosure = [65, 85]
+
+[[vias]]
+cut = "via3.drawing"
+bot = "met3.drawing"
+top = "met4.drawing"
+size = 200
+space = 200
+bot_enclosure = [60, 90]
+top_enclosure = [65, 85]
+
+[[vias]]
+cut = "via3.drawing"
+bot = "capm.drawing"
+top = "met4.drawing"
+size = 200
+space = 200
+bot_enclosure = [140, 140]
+top_enclosure = [65, 85]
+
+[[vias]]
+cut = "via4.drawing"
+bot = "met4.drawing"
+top = "met5.drawing"
+size = 800
+space = 800
+bot_enclosure = [190, 190]
+top_enclosure = [310, 310]
+
+# Layers that split a conductor where they cross it, for checking
+# connectivity: a transistor's gate splits its diffusion into source and drain.
+[[gates]]
+layer = "poly.drawing"
+splits = "diff.drawing"
+
+# Rough wiring capacitance for the `nets` tool, in aF per µm² of area and per
+# µm of perimeter, from the public open-source SKY130 extraction defaults:
+# each layer to the substrate, from the lowest layer up, then between layers
+# where one overlaps the other.
+# Diffusion carries no wiring capacitance, but it shields the poly over it,
+# so a transistor's gate isn't counted as wiring.
+[[capacitance]]
+layer = "diff.drawing"
+area = 0
+perimeter = 0
+
+[[capacitance]]
+layer = "poly.drawing"
+area = 106
+perimeter = 55
+
+[[capacitance]]
+layer = "li1.drawing"
+area = 37
+perimeter = 55
+
+[[capacitance]]
+layer = "met1.drawing"
+area = 26
+perimeter = 41
+
+[[capacitance]]
+layer = "met2.drawing"
+area = 17
+perimeter = 41
+
+[[capacitance]]
+layer = "met3.drawing"
+area = 12
+perimeter = 41
+
+# A MIM capacitor's top plate is a device, not wiring, but it shields met4
+# from the bottom plate under it.
+[[capacitance]]
+layer = "capm.drawing"
+area = 0
+perimeter = 0
+
+[[capacitance]]
+layer = "met4.drawing"
+area = 8
+perimeter = 37
+
+[[capacitance]]
+layer = "met5.drawing"
+area = 6
+perimeter = 39
+
+[[overlap_capacitance]]
+top = "met1.drawing"
+bot = "li1.drawing"
+area = 114
+
+[[overlap_capacitance]]
+top = "met2.drawing"
+bot = "li1.drawing"
+area = 38
+
+[[overlap_capacitance]]
+top = "met2.drawing"
+bot = "met1.drawing"
+area = 134
+
+[[overlap_capacitance]]
+top = "met3.drawing"
+bot = "li1.drawing"
+area = 21
+
+[[overlap_capacitance]]
+top = "met3.drawing"
+bot = "met1.drawing"
+area = 35
+
+[[overlap_capacitance]]
+top = "met3.drawing"
+bot = "met2.drawing"
+area = 86
+
+[[overlap_capacitance]]
+top = "met4.drawing"
+bot = "li1.drawing"
+area = 12
+
+[[overlap_capacitance]]
+top = "met4.drawing"
+bot = "met1.drawing"
+area = 15
+
+[[overlap_capacitance]]
+top = "met4.drawing"
+bot = "met2.drawing"
+area = 20
+
+[[overlap_capacitance]]
+top = "met4.drawing"
+bot = "met3.drawing"
+area = 84
+
+[[overlap_capacitance]]
+top = "met5.drawing"
+bot = "li1.drawing"
+area = 8
+
+[[overlap_capacitance]]
+top = "met5.drawing"
+bot = "met1.drawing"
+area = 9
+
+[[overlap_capacitance]]
+top = "met5.drawing"
+bot = "met2.drawing"
+area = 11
+
+[[overlap_capacitance]]
+top = "met5.drawing"
+bot = "met3.drawing"
+area = 20
+
+[[overlap_capacitance]]
+top = "met5.drawing"
+bot = "met4.drawing"
+area = 68
+
+[[overlap_capacitance]]
+top = "li1.drawing"
+bot = "poly.drawing"
+area = 94
+
+[[overlap_capacitance]]
+top = "met1.drawing"
+bot = "poly.drawing"
+area = 45
+
+[[overlap_capacitance]]
+top = "met2.drawing"
+bot = "poly.drawing"
+area = 24
+
+[[overlap_capacitance]]
+top = "met3.drawing"
+bot = "poly.drawing"
+area = 16
+
+[[overlap_capacitance]]
+top = "met4.drawing"
+bot = "poly.drawing"
+area = 10
+
+[[overlap_capacitance]]
+top = "met5.drawing"
+bot = "poly.drawing"
+area = 7

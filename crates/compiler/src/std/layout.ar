@@ -132,3 +132,57 @@ fn common_centroid(n: Int) -> [Bool] {
 fn interdigitated(n: Int) -> [Bool] {
     [for i in std::range(2 * n) { i % 2 == 0 }]
 }
+
+/// The technology file's value for the design rule `name`, such as
+/// `"met1.space"`, in source units.
+fn rule(name: String) -> Float {
+    tech_rule(name)
+}
+
+/// Draws the largest array of cuts that fits where `bot` and `top` overlap,
+/// enclosed by both as the technology file's via between their layers
+/// requires, and centered on the grid. Returns the array's bounds.
+fn via(bot: Rect, top: Rect) -> Rect {
+    via_part(head(tech_via(bot, top, false)))
+}
+
+/// Joins `bot` up to `top` through every layer between them, with a via per
+/// layer and a pad on each layer in between. Everything stays within the
+/// shapes' overlap, except where a pad grows to its layer's minimum width or
+/// area. Returns the bounds of each via's cuts and each pad, from the bottom.
+fn via_stack(bot: Rect, top: Rect) -> [Rect] {
+    [for part in tech_via(bot, top, true) { via_part(part) }]
+}
+
+/// Draws one part from `tech_via`: an array of rectangles on its layer.
+fn via_part(part: (String, Float, Float, Float, Float, Int, Int, Float)) -> Rect {
+    let shapes = array2(crect(layer=part.0, x0=0., y0=0., w=part.3, h=part.4), part.5, part.6, part.7, part.7);
+    eq(shapes.x0, part.1);
+    eq(shapes.y0, part.2);
+    shapes
+}
+
+/// The bounding box of a non-empty sequence of instances or rectangles.
+fn bbox_of(items: [Any]) -> Rect {
+    let first = bbox(head(items));
+    let rest = tail(items);
+    if rest == [] {
+        first
+    } else {
+        union(first, bbox_of(rest))
+    }
+}
+
+/// Places each instance `gap` right of the one before, by their bounding boxes.
+fn row(insts: [Any], gap: Float) {
+    for i in std::range(std::len(insts) - 1) {
+        eq(bbox(insts[i + 1]).x0, bbox(insts[i]).x1 + gap);
+    }
+}
+
+/// Places each instance `gap` above the one before, by their bounding boxes.
+fn column(insts: [Any], gap: Float) {
+    for i in std::range(std::len(insts) - 1) {
+        eq(bbox(insts[i + 1]).y0, bbox(insts[i]).y1 + gap);
+    }
+}

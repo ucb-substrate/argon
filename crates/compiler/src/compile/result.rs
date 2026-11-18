@@ -50,6 +50,10 @@ pub enum StaticErrorKind {
     /// `std` submodule.
     #[error("`{name}` moved to `{path}`; import it with `use {path};`")]
     MovedItem { name: String, path: String },
+    /// A name that does not resolve where it is used names an item of `std`
+    /// at each of `paths`.
+    #[error("{}", not_imported_message(.name, .paths))]
+    NotImported { name: String, paths: Vec<String> },
     /// A native item was used as a value rather than called.
     #[error("`{name}` can only be called")]
     NativeNotCallable { name: String },
@@ -215,6 +219,9 @@ pub enum StaticErrorKind {
     /// Boolean values cannot be ordered.
     #[error("cannot perform greater/less than comparisons on booleans")]
     BoolNotOrd,
+    /// Strings cannot be ordered.
+    #[error("cannot perform greater/less than comparisons on strings")]
+    StringNotOrd,
     /// Nil values cannot be ordered.
     #[error("cannot perform greater/less than comparisons on nil")]
     NilNotOrd,
@@ -372,13 +379,21 @@ pub enum ExecErrorKind {
     NotACell,
     /// Nothing determines some of an object's values, or some of the cell's
     /// when they belong to no known object.
-    #[error("{}", underconstrained_message(.object, .free))]
+    #[error("{}", underconstrained_message(.object, .free, .waiting))]
     Underconstrained {
         /// The object the free values belong to, if known.
         object: Option<VarObject>,
         /// The values nothing determines, in the order the object declares them.
         free: Vec<VarRole>,
+        /// Expressions, such as comparisons and casts, that wait on the free
+        /// values and so never finish.
+        #[serde(default)]
+        waiting: Vec<WaitingExpr>,
     },
+    /// A design rule or via the technology file does not define, or a via
+    /// that does not fit where it was asked for.
+    #[error("{0}")]
+    Tech(String),
     /// A rectangle uses a layer absent from the technology file.
     #[error("rectangle uses layer `{layer}`, which is not defined in technology file `{tech}`")]
     IllegalLayer { layer: String, tech: String },
@@ -504,6 +519,9 @@ pub enum ExecErrorKind {
     /// An operation received an incompatible runtime value.
     #[error("operation on an incompatible type (check usage of `Any`)")]
     InvalidType,
+    /// A minimum or maximum of values that are not all `Int` or all `Float`.
+    #[error("`min` and `max` take two `Int`s or two `Float`s")]
+    NotNumeric,
     /// A runtime cast received an incompatible value.
     #[error("cast to an incompatible type (check usage of `Any`)")]
     InvalidCast,
@@ -553,8 +571,22 @@ fn signal_cell_param(
     format!("{subject}{location}; cells cannot take signals, schematic instances, or devices")
 }
 
+/// The message of [`StaticErrorKind::NotImported`].
+fn not_imported_message(name: &str, paths: &[String]) -> String {
+    let imports = paths
+        .iter()
+        .map(|path| format!("`use {path};`"))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    format!("`{name}` is not in scope; import it with {imports}")
+}
+
 /// How many free values an underconstrained message names before summarizing.
 const NAMED_FREE_VALUES: usize = 4;
+
+/// How many waiting expressions an underconstrained message names before
+/// summarizing.
+const NAMED_WAITING_EXPRS: usize = 2;
 
 /// The message of [`ExecErrorKind::InconsistentConstraint`].
 fn inconsistent_message(conflict: &Option<Conflict>) -> String {
@@ -571,29 +603,68 @@ fn inconsistent_message(conflict: &Option<Conflict>) -> String {
 }
 
 /// The message of [`ExecErrorKind::Underconstrained`].
-fn underconstrained_message(object: &Option<VarObject>, free: &[VarRole]) -> String {
-    let Some(object) = object else {
-        return "cell is underconstrained".to_owned();
+fn underconstrained_message(
+    object: &Option<VarObject>,
+    free: &[VarRole],
+    waiting: &[WaitingExpr],
+) -> String {
+    let message = match object {
+        None => "cell is underconstrained".to_owned(),
+        Some(object) if free.is_empty() || *object == VarObject::Float => {
+            format!("{object} is underconstrained")
+        }
+        Some(object) => {
+            let names = free.iter().map(ToString::to_string).collect::<Vec<_>>();
+            let verb = if free.len() == 1 { "is" } else { "are" };
+            format!(
+                "{object} is underconstrained: {} {verb} not determined",
+                list(names, NAMED_FREE_VALUES)
+            )
+        }
     };
-    if free.is_empty() || *object == VarObject::Float {
-        return format!("{object} is underconstrained");
+    if waiting.is_empty() {
+        return message;
     }
-    let mut names = free
+    let exprs = waiting
         .iter()
-        .take(NAMED_FREE_VALUES)
-        .map(ToString::to_string)
+        .map(|expr| format!("`{}` at {}", expr.text, expr.location))
         .collect::<Vec<_>>();
-    if free.len() > NAMED_FREE_VALUES {
-        names.push(format!("{} more", free.len() - NAMED_FREE_VALUES));
+    let (verb, object) = match (waiting.len(), free.len() > 1) {
+        (1, false) => ("waits", "it"),
+        (1, true) => ("waits", "them"),
+        (_, false) => ("wait", "it"),
+        (_, true) => ("wait", "them"),
+    };
+    format!(
+        "{message}, and {} {verb} on {object}",
+        list(exprs, NAMED_WAITING_EXPRS)
+    )
+}
+
+/// `items` as an English list, naming at most `named` before counting the rest.
+fn list(mut items: Vec<String>, named: usize) -> String {
+    if items.len() > named {
+        let more = items.len() - named;
+        items.truncate(named);
+        items.push(format!("{more} more"));
     }
-    let list = match names.as_slice() {
+    match items.as_slice() {
+        [] => String::new(),
         [one] => one.clone(),
         [first, second] => format!("{first} and {second}"),
         [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
-        [] => unreachable!("`free` is not empty"),
-    };
-    let verb = if free.len() == 1 { "is" } else { "are" };
-    format!("{object} is underconstrained: {list} {verb} not determined")
+    }
+}
+
+/// An expression still waiting on values when its cell finished, such as a
+/// comparison of a coordinate nothing determines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitingExpr {
+    /// The expression's source text, on one line.
+    pub text: String,
+    /// Where it is: `line 12` in the file of the error that names it, or
+    /// `lib.ar:12` in another file.
+    pub location: String,
 }
 
 /// A kind of object whose values the compiler solves for.

@@ -66,7 +66,7 @@ cell strong_arm(
         eq(input_top[0].g.y0, input[0].d.y1 + 155.);
         implant(n, input_top);
     }
-    let latch = pair(mos(n, latch_in_w, latch_in_nf), 265.);
+    let latch = pair(mos(n, latch_in_w, latch_in_nf), 195.);
     eq(latch[0].g.y0, input_top[0].d.y1 + 155.);
     implant(n, latch);
     let latch_rst = pair(mos(!n, latch_rst_w, latch_rst_nf), middle(latch_rst_nf));
@@ -83,9 +83,9 @@ cell strong_arm(
     implant(!n, rst_mid);
 
     let half = std::max(std::max(std::max(t.sdm.x1, input[1].sdm.x1), latch[1].sdm.x1), std::max(latch_rst[1].sdm.x1, rst_mid[1].sdm.x1));
-    let ev_tap = inst(rail(if n { 0 } else { 1 }, 2. * half - 260.), x=0.);
+    let ev_tap = inst(rail(!n, 2. * half - 260.), x=0.);
     eq(ev_tap.m1.y1 + 205., t.g.y0);
-    let rs_tap = inst(rail(if n { 1 } else { 0 }, 2. * half - 260.), x=0.);
+    let rs_tap = inst(rail(n, 2. * half - 260.), x=0.);
     eq(rs_tap.m1.y0, latch_rst[0].d.y1 + 140.);
     eq(rst_out[0].d.y0, rs_tap.m1.y1 + 140.);
     let well_y0 = if n { latch_rst[0].sdm.y0 } else { ev_tap.sdm.y0 };
@@ -162,13 +162,13 @@ fn fet(nfet: Bool, d: Signal, g: Signal, s: Signal, b: Signal, w: Float, nf: Int
 /// the left one's first contact column, unless single fingers' gate contacts
 /// would collide.
 fn middle(nf: Int) -> Float {
-    if nf == 1 { 265. } else { -85. }
+    if nf == 1 { 195. } else { -85. }
 }
 
 /// Places two copies of `c` mirrored about x = 0, the right one's first contact
 /// column from `x0`, and returns the left one first. Their first columns,
 /// sources, face each other, and with `x0 = -85.` they are one column;
-/// with `x0 = 265.` their diffusions keep 270 apart.
+/// with `x0 = 195.` their diffusions keep 270 apart.
 fn pair(c: Any, x0: Float) -> [Any] {
     let p = mirror_pair(c, 0.);
     eq(p[0].cols.x0, x0);
@@ -192,7 +192,7 @@ fn implant(nfet: Bool, p: [Any]) {
 }
 
 /// A tap `w` wide, centered on x = 0 and strapped with met1.
-cell rail(ntap: Int, w: Float) {
+cell rail(ntap: Bool, w: Float) {
     let t = inst(tap(ntap, w, 500.), x=-w / 2., y=0.);
     pub let sdm = t.sdm;
     pub let m1 = rect("met1.drawing", x0=t.li1.x0, y0=t.li1.y0, x1=t.li1.x1, y1=t.li1.y1);

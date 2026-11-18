@@ -1,6 +1,6 @@
 ---
 title: Standard library
-description: Comparison, option, and sequence helpers in std.
+description: Comparison, option, sequence, and string helpers in std.
 ---
 
 import {ApiItem, ParameterTable, Returns} from '@site/src/components/ApiReference';
@@ -13,27 +13,62 @@ Layout functions live in the submodule [`std::layout`](/language/std-layout): th
 
 ## `std::max` {#max}
 
-<ApiItem id="max" name="std::max" signature={'std::max(x0: Float, x1: Float) -> Float'} summary={<>Returns the greater of two floats.</>}>
+<ApiItem id="max" name="std::max" signature={'std::max<T>(x0: T, x1: T) -> T'} summary={<>Returns the greater of two <code>Int</code>s or two <code>Float</code>s.</>}>
 
 <ParameterTable rows={[
-  {name: 'x0', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'First value.'},
-  {name: 'x1', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'Second value.'},
+  {name: 'x0', type: 'T', requirement: 'Required', description: 'First value, an Int or a Float.'},
+  {name: 'x1', type: 'T', requirement: 'Required', description: 'Second value, of the same type.'},
 ]} />
 
-<Returns type="Float" href="/language/types/scalars#float">`x1` when `x0 < x1`; otherwise `x0`.</Returns>
+<Returns type="T">`x1` when `x0 < x1`; otherwise `x0`.</Returns>
+
+A `Float` comparison waits until the solver has fixed both values. Any type but `Int` or `Float` is an error when the call runs.
+
+```argon
+let half = std::max(0., (270. - poly.w) / 2.);
+let rows = std::max(nf / 2, 1);
+```
 
 </ApiItem>
 
 ## `std::min` {#min}
 
-<ApiItem id="min" name="std::min" signature={'std::min(x0: Float, x1: Float) -> Float'} summary={<>Returns the lesser of two floats.</>}>
+<ApiItem id="min" name="std::min" signature={'std::min<T>(x0: T, x1: T) -> T'} summary={<>Returns the lesser of two <code>Int</code>s or two <code>Float</code>s.</>}>
 
 <ParameterTable rows={[
-  {name: 'x0', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'First value.'},
-  {name: 'x1', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'Second value.'},
+  {name: 'x0', type: 'T', requirement: 'Required', description: 'First value, an Int or a Float.'},
+  {name: 'x1', type: 'T', requirement: 'Required', description: 'Second value, of the same type.'},
 ]} />
 
-<Returns type="Float" href="/language/types/scalars#float">`x0` when `x0 < x1`; otherwise `x1`.</Returns>
+<Returns type="T">`x0` when `x0 < x1`; otherwise `x1`.</Returns>
+
+</ApiItem>
+
+## `std::max_of` {#max-of}
+
+<ApiItem id="max-of" name="std::max_of" signature={'std::max_of<T>(items: [T]) -> T'} summary={<>Returns the greatest of a non-empty sequence of <code>Int</code>s or <code>Float</code>s.</>}>
+
+<ParameterTable rows={[
+  {name: 'items', type: '[T]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'At least one Int or Float.'},
+]} />
+
+<Returns type="T">The greatest element, compared as `std::max` compares.</Returns>
+
+```argon
+let top = std::max_of([for d in devices { d.sdm.y1 }]);
+```
+
+</ApiItem>
+
+## `std::min_of` {#min-of}
+
+<ApiItem id="min-of" name="std::min_of" signature={'std::min_of<T>(items: [T]) -> T'} summary={<>Returns the least of a non-empty sequence of <code>Int</code>s or <code>Float</code>s.</>}>
+
+<ParameterTable rows={[
+  {name: 'items', type: '[T]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'At least one Int or Float.'},
+]} />
+
+<Returns type="T">The least element, compared as `std::min` compares.</Returns>
 
 </ApiItem>
 
@@ -87,7 +122,7 @@ fn count(n: Option<Int>) -> Int {
 
 <ParameterTable rows={[
   {name: 'o', type: 'Option<T>', typeHref: '/language/std#option', requirement: 'Required', description: 'The option to unwrap.'},
-  {name: 'default', type: 'T', requirement: 'Required', description: 'The value returned for `None`.'},
+  {name: 'default', type: 'T', requirement: 'Required', description: <>The value returned for <code>None</code>.</>},
 ]} />
 
 <Returns type="T">The payload of `Some`, or `default`.</Returns>
@@ -171,6 +206,22 @@ let wires = std::flatten([for net in nets { net.wires }]);
 
 </ApiItem>
 
+## `std::sum_float` {#sum-float}
+
+<ApiItem id="sum-float" name="std::sum_float" signature={'std::sum_float(values: [Float]) -> Float'} summary={<>Adds up a sequence of floats.</>}>
+
+<ParameterTable rows={[
+  {name: 'values', type: '[Float]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: 'The floats to add, which need not be solved yet.'},
+]} />
+
+<Returns type="Float" href="/language/types/scalars#float">Their sum; 0. for [].</Returns>
+
+```argon
+let width = std::sum_float([for d in devices { d.sdm.w }]);
+```
+
+</ApiItem>
+
 ## `std::any` {#any}
 
 <ApiItem id="any" name="std::any" signature={'std::any(values: [Bool]) -> Bool'} summary={<>Whether any value is true.</>}>
@@ -212,6 +263,26 @@ let blocked = std::any([for other in rails { overlaps(rail, other) }]);
 ```argon
 for index in std::range(4) {
     // index is 0, 1, 2, then 3
+}
+```
+
+</ApiItem>
+
+## `std::to_string` {#to-string}
+
+<ApiItem id="to-string" name="std::to_string" signature={'std::to_string(value: Int) -> String'} summary={<>Returns an integer's decimal digits.</>}>
+
+<ParameterTable rows={[
+  {name: 'value', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required', description: <>The integer to write; convert a Float with <code>as Int</code> first.</>},
+]} />
+
+<Returns type="String" href="/language/types/scalars#string">The digits, with a leading `-` for a negative value.</Returns>
+
+[`+` joins two strings](/language/types/scalars#string), so this names numbered labels. `pub let d = signals(n);` makes ports named `d_0`, `d_1`, and so on, which these labels match:
+
+```argon
+for i in std::range(n) {
+    text("d_" + std::to_string(i), "met1.label", 200. * (i as Float), 0.);
 }
 ```
 

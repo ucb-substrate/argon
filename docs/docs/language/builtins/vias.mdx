@@ -1,6 +1,6 @@
 ---
 title: Via built-ins
-description: Choosing the largest via array between two shapes.
+description: Choosing the largest via array between two shapes, and reading the technology file's rules and vias.
 sidebar_label: Vias
 ---
 
@@ -33,5 +33,35 @@ It tries the four orientations of the two enclosures and keeps the one with the 
 let choice = max_via_array(170., 170., (0., 80.,), (30., 60.,), active, li, 0, 0, false, false);
 let cuts = choice.6;
 ```
+
+</ApiItem>
+
+## `tech_rule`
+
+<ApiItem id="tech-rule" name="tech_rule" signature={'tech_rule(name: String) -> Float'} summary={<>The technology file's value for a design rule.</>}>
+
+<ParameterTable rows={[
+  {name: 'name', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: <>The rule's name in the <code>[rules]</code> table.</>},
+]} />
+
+<Returns type="Float" href="/language/types/scalars#float">The value in source units, or source units squared for a name ending in `.area`.</Returns>
+
+[`std::layout::rule`](/language/std-layout#rule) calls it.
+
+</ApiItem>
+
+## `tech_via`
+
+<ApiItem id="tech-via" name="tech_via" signature={'tech_via(bot: Rect, top: Rect, stack: Bool) -> [(String, Float, Float, Float, Float, Int, Int, Float)]'} summary={<>The cut arrays, and with <code>stack</code> the pads, that join two shapes.</>}>
+
+<ParameterTable rows={[
+  {name: 'bot', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required, positional', description: 'The lower shape.'},
+  {name: 'top', type: 'Rect', typeHref: '/language/types/rect', requirement: 'Required, positional', description: 'The upper shape.'},
+  {name: 'stack', type: 'Bool', typeHref: '/language/types/scalars#bool', requirement: 'Required, positional', description: 'Whether to pass through the layers between the two shapes\' layers, with a pad on each.'},
+]} />
+
+<Returns type="[(String, Float, Float, Float, Float, Int, Int, Float)]" href="/language/types/collections#tuples">Each part as `(layer, x0, y0, w, h, nx, ny, pitch)`: `nx` by `ny` rectangles `w` by `h` on `pitch`, the first with its lower-left corner at (`x0`, `y0`).</Returns>
+
+Like a comparison, it waits until both shapes are placed. [`std::layout::via`](/language/std-layout#via) and [`via_stack`](/language/std-layout#via-stack) draw what it returns.
 
 </ApiItem>

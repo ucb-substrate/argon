@@ -85,6 +85,12 @@ let n = ((met1.w - vias.w) / 10.) as Int;
 eq(vias.x0, met1.x0 + (n as Float) * 5.);
 ```
 
+The error names each expression still waiting on the values it reports, with its line:
+
+```text
+error: rectangle is underconstrained: x1 is not determined, and `r.w > 100.` at line 4 waits on it
+```
+
 Compute counts and offsets from parameters and from shapes that are already placed. To center one shape in another, use [`std::layout::center_rects`](/language/std-layout#center-rects), which needs no numbers.
 
 ## Staying on the grid

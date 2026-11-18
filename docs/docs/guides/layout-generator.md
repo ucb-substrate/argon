@@ -10,13 +10,13 @@ This guide builds a SKY130 cross-coupled latch: two CMOS inverters, each driving
 
 - describe the schematic in the same cell as the layout;
 - place transistors from the [SKY130 library](/language/sky130) with constraints rather than coordinates;
-- mirror a half, share diffusion across the axis, and fill implants;
-- add taps and a well;
-- route with met1 bars, met2 wires, and vias;
+- mirror a half and share diffusion across the axis;
+- add tap columns and a well;
+- route with met1 bars, met2 wires, and vias the technology file sizes;
 - label pins;
 - check a sweep of parameters with DRC and LVS, and trace each violation back to source.
 
-The finished library is [`examples/sky130_latch`](https://github.com/ucb-substrate/argon/tree/main/examples/sky130_latch). The guide assumes you know the basics from [Getting started](/guides/getting-started/installation), and the [quick reference](/language/reference) lists every function it calls.
+The finished library is [`examples/sky130_latch`](https://github.com/ucb-substrate/argon/tree/main/examples/sky130_latch). The guide assumes you know the basics from [Getting started](/guides/getting-started/installation), and the [quick reference](/language/reference) lists every function it calls. A [checklist](#a-density-checklist) at the end lists what keeps a generator's layout small.
 
 ## The library
 
@@ -32,11 +32,11 @@ sky130 = "../../pdks/sky130"
 
 ## The top cell
 
-`latch` takes each transistor's finger width in nm and finger count. Its body first describes the schematic: four ports, then the four transistors. It then places the two halves of the layout, adds taps and a well, routes, and labels the ports. Each step calls a helper that the sections below go through.
+`latch` takes each transistor's finger width in nm and finger count. Its body first describes the schematic: four ports, then the four transistors. It then places the two halves of the layout, joins each row's sources to its taps, adds a well, routes, and labels the ports. Each step calls a helper that the sections below go through.
 
 ```argon title="lib.ar"
-use sky130::{mos, tap};
-use std::layout::{center_rects, crect, inst, max_array, mirror_pair, rect, text};
+use sky130::{mos, tap_m1};
+use std::layout::{center_rects, inst, mirror_pair, rect, text, via};
 use std::schematic::{DeviceKind, Signal, device};
 
 /// Two cross-coupled CMOS inverters, mirrored about x = 0. `wn` and `wp` are
@@ -52,75 +52,76 @@ cell latch(wn: Float, nfn: Int, wp: Float, nfp: Int) {
     fet(true, outn, outp, vss, wn, nfn);
     fet(false, outn, outp, vdd, wp, nfp);
 
-    // B is drawn right of the axis and A is its mirror image, so their
-    // sources meet at x = 0.
+    // B is drawn right of the axis and A is its mirror image, so they share
+    // a source column at x = 0.
     let halves = mirror_pair(inverter(wn, nfn, wp, nfp), 0.);
     let b = halves[0];
     let a = halves[1];
     eq(b.x, 0.);
     eq(b.y, 0.);
-    implant("nsdm.drawing", a.n.sdm, b.n.sdm);
-    implant("psdm.drawing", a.p.sdm, b.p.sdm);
 
-    // Taps below the NMOS gates and above the PMOS gates, 205 from the gate
-    // bars so the gates' poly contacts clear the taps (licon.9, licon.14).
-    let half = std::max(b.n.sdm.x1, b.p.sdm.x1);
-    let ptap = inst(rail(0, half), x=0.);
-    eq(ptap.m1.y1 + 205., b.n.g.y0);
-    let ntap = inst(rail(1, half), x=0.);
-    eq(ntap.m1.y0, b.p.g.y1 + 205.);
-    // The n-well encloses p-diffusion and the n-tap by 180, 50 past their implants.
-    rect("nwell.drawing", x0=-half - 50., x1=half + 50., y0=b.p.sdm.y0 - 50., y1=ntap.sdm.y1 + 50.);
+    // A met1 rail over each row's source bars joins them to the row's tap columns.
+    let ground = rect("met1.drawing", x0=a.ptap.m1.x0, x1=b.ptap.m1.x1, y0=b.n.s.y0, y1=b.n.s.y1);
+    let supply = rect("met1.drawing", x0=a.ntap.m1.x0, x1=b.ntap.m1.x1, y0=b.p.s.y0, y1=b.p.s.y1);
+    // The n-well encloses p-diffusion and the n-taps by 180, and is at least 840 tall.
+    rect("nwell.drawing", x0=a.ntap.tap.x0 - 180., x1=b.ntap.tap.x1 + 180., y0=b.p.sdm.y0 - 50., y1=std::max(b.p.sdm.y1 + 50., b.p.sdm.y0 + 790.));
 
-    tie(a.n.s, b.n.s, ptap.m1);
-    tie(a.p.s, b.p.s, ntap.m1);
     // Each output's via at x = ±430 runs on met2 to the other inverter's gate
     // trunk at x = ∓860, the two at different heights so that they cross.
-    via1(430., mid_y(b.n.d));
+    via1(b.out, 430., mid_y(b.n.d));
     wire(430., mid_y(b.n.d), -860., mid_y(b.n.d));
-    via1(-430., mid_y(b.p.d));
+    via1(a.out, -430., mid_y(b.p.d));
     wire(-430., mid_y(b.p.d), 860., mid_y(b.p.d));
 
     pin("outp", a.out);
     pin("outn", b.out);
-    pin("vss", ptap.m1);
-    pin("vdd", ntap.m1);
+    pin("vss", ground);
+    pin("vdd", supply);
 }
 ```
 
 - **Ports.** Each `pub let … = Signal()` is a port, in declaration order. `fet` adds a transistor to the schematic.
 - **Halves.** `mirror_pair` places two copies of `inverter` that mirror each other about x = 0, and returns the unreflected copy first. `b`, right of the axis, is pinned to the origin. Its fields read through the instance, so `b.n.sdm` is the implant of its NMOS, in the latch's coordinates.
-- **Taps.** `rail` draws a tap under the NMOS row and one over the PMOS row. Each is placed with one `eq` on its y, and centered with `x=0.`.
-- **Routing.** `tie` joins each row's sources to its tap. Each output then runs on met2 to the other inverter's gates.
+- **Supplies.** Each half ends its rows in tap columns. One met1 rail over each row's source bars, from one tap column to the other, joins the sources to the taps.
+- **Routing.** Each output runs on met2 to the other inverter's gates.
 
 ## One inverter
 
-The `mos` cell from the SKY130 library draws a transistor with its gate fingers joined under a met1 bar `g`, and with met1 bars `s` and `d` over its source and drain columns. Each bar is 320 tall, enough for a via1. Its gate bar is below the diffusion. Placed with `reflect=true`, the cell flips about the x axis, so the PMOS's gate is on top and its drain bar faces the NMOS's.
+The `mos` cell from the SKY130 library draws a transistor with its gate fingers joined under a met1 bar `g`, and with met1 bars `s` and `d` over its source and drain columns. Each bar is 320 tall, enough for a via1. Its gate bar is below the diffusion, and its source bar is the one nearer the gate. Placed with `reflect=true`, the cell flips about the x axis, so the PMOS's gate is on top and its drain bar faces the NMOS's.
 
 ```argon title="lib.ar"
 /// One inverter of the latch, right of the axis x = 0 with its sources toward
 /// it: the NMOS at the bottom with its gate below, and the PMOS above it with
-/// its gate on top.
+/// its gate on top. A tap column ends each row.
 cell inverter(wn: Float, nfn: Int, wp: Float, nfp: Int) {
-    pub let n = inst(mos(true, wn, nfn), y=0.);
-    pub let p = inst(mos(false, wp, nfp), reflect=true);
-    eq(n.cols.x0, middle(nfn));
-    eq(p.cols.x0, middle(nfp));
-    // The drain bars reach 190 past their diffusions, which must be 520 apart:
-    // 340 from n-diffusion to the n-well (difftap.9), which encloses p-diffusion by 180.
-    eq(p.d.y0, n.d.y1 + 140.);
+    // Each transistor's first contact column, a source, is centered on the
+    // axis, where its mirror image shares it. A lone finger's gate contact
+    // widens away from the axis, clear of its mirror image's.
+    pub let n = inst(mos(true, wn, nfn, gate_side=1), y=0.);
+    pub let p = inst(mos(false, wp, nfp, gate_side=1), reflect=true);
+    eq(n.cols.x0, -85.);
+    eq(p.cols.x0, -85.);
+    // The drain bars reach 190 past their diffusions, which must be 640 apart,
+    // so each tap column's implant is 380 from the same implant in the other
+    // row (nsd.2, psd.2).
+    eq(p.d.y0, n.d.y1 + 260.);
     // One met1 block joins the drains and reaches the output's via at x = 430.
     pub let out = rect("met1.drawing", x0=std::min(std::min(n.d.x0, p.d.x0), 430. - 130.), x1=std::max(n.d.x1, p.d.x1), y0=n.d.y0, y1=p.d.y1);
     // A met2 trunk at x = 860 joins the gates.
     hook(n.g, 860.);
     hook(p.g, 860.);
     wire(860., mid_y(n.g), 860., mid_y(p.g));
+
+    // Both rows' tap columns sit past the wider row, clear of `out`.
+    let edge = std::max(n.sdm.x1, p.sdm.x1);
+    pub let ptap = tap_column(false, n.sdm, edge);
+    pub let ntap = tap_column(true, p.sdm, edge);
 }
 ```
 
-Neither transistor gets a coordinate except the NMOS's `y`. Each transistor's x comes from where its first contact column `cols` starts, and the PMOS's y from the gap between the drain bars. The gap comes from two SKY130 rules. N-diffusion must stay 0.34 µm from the n-well (difftap.9), and the well must enclose p-diffusion by 0.18 µm, so the diffusions are at least 0.52 µm apart. Each drain bar reaches 0.19 µm past its diffusion, which leaves 0.14 µm between them.
+Neither transistor gets a coordinate except the NMOS's `y`. Each transistor's x comes from where its first contact column `cols` starts, and the PMOS's y from the gap between the drain bars. The gap comes from SKY130 rules. N-diffusion must stay 0.34 µm from the n-well (difftap.9), and the well must enclose p-diffusion by 0.18 µm, so the diffusions are at least 0.52 µm apart. The tap columns need more: each column's implant must be 0.38 µm from the same implant in the other row (nsd.2, psd.2), which puts the diffusions 0.64 µm apart. Each drain bar reaches 0.19 µm past its diffusion, which leaves 0.26 µm between them.
 
-`out` is one met1 rectangle over both drain bars, so it joins them and is the inverter's output. `std::min` and `std::max` make it cover the wider of the two bars. `hook` extends each gate bar to x = 860, where a met2 wire joins the two gates.
+`out` is one met1 rectangle over both drain bars, so it joins them and is the inverter's output. `std::min` and `std::max` make it cover the wider of the two bars. `hook` extends each gate bar to x = 860, where a met2 wire joins the two gates. Both tap columns sit past the wider row, so `out` never reaches over a tap.
 
 ## The schematic
 
@@ -142,71 +143,44 @@ LVS merges a transistor's parallel fingers into one device and compares its tota
 
 ## Mirrored halves
 
-Every transistor of the right half starts its first contact column at `middle(nf)`, so its mirror image's first column lands on top of it. That first column is a source, so the two halves share one source column on the axis. With a single finger, the two gates' contacts would collide there, so single-finger transistors keep their diffusions apart instead. Their diffusions are 0.27 µm apart (difftap.3), and their poly gate bars at least 0.21 µm (poly.2).
+Every transistor of the right half starts its first contact column at x = -85, centered on the axis, so its mirror image's first column lands on top of it. That first column is a source, so the two halves share one source column, and one diffusion, on the axis. A lone finger's gate contact is 270 wide, wider than its finger, so two of them would collide beside the shared column; `gate_side=1` widens each one away from the axis instead, and they keep their poly 0.21 µm apart (poly.2). With more fingers, `gate_side` changes nothing, since the gate contact spans the fingers.
 
-```argon title="lib.ar"
-/// Where a device with `nf` fingers starts right of the axis: its first contact
-/// column centered on it, so a mirrored copy shares that column, unless single
-/// fingers' gate contacts would collide.
-fn middle(nf: Int) -> Float {
-    if nf == 1 { 265. } else { -85. }
-}
-
-/// Fills the implant `layer` across a mirrored pair's implants `l` and `r`,
-/// which would otherwise leave a notch between single fingers (nsd.2, psd.2).
-fn implant(layer: String, l: Rect, r: Rect) {
-    rect(layer, x0=l.x0, x1=r.x1, y0=r.y0, y1=r.y1);
-}
-```
-
-Two separate implant rectangles of the same type closer than 0.38 µm leave a notch (nsd.2, psd.2), so `implant` draws one rectangle across both halves.
+Because the halves share diffusion, their implants overlap into one rectangle. Two separate implant rectangles of the same type closer than 0.38 µm would leave a notch (nsd.2, psd.2).
 
 ## Taps and the well
 
-A tap ties the substrate or the n-well to a supply. `rail` places a `tap` from the SKY130 library and covers its local interconnect with met1. It contacts the two with mcons:
-
-- `max_array` draws as many mcons as fit, 170 square on a 360 pitch, in the width it's given.
-- `center_rects` centers the array on the bar, rounding to the 5 nm grid when the margin is odd.
+A tap ties the substrate or the n-well to a supply. `tap_column` places a `tap_m1` from the SKY130 library, a tap covered with met1 and contacted to it, as tall as a row's diffusion and 0.27 µm past its end (difftap.3). The top cell's rails then reach each column on met1.
 
 ```argon title="lib.ar"
-/// A tap strapped with met1, centered on x = 0, with its implant spanning ±`half`.
-cell rail(ntap: Int, half: Float) {
-    let w = 2. * half - 260.;
-    let t = inst(tap(ntap, w, 500.), x=-w / 2., y=0.);
-    pub let sdm = t.sdm;
-    pub let m1 = rect("met1.drawing", x0=t.li1.x0, y0=t.li1.y0, x1=t.li1.x1, y1=t.li1.y1);
-    let mcon = crect(layer="mcon.drawing", x0=0., y0=0., w=170., h=170.);
-    center_rects(m1, max_array(mcon, m1.w - 120., 170., 360., 360.));
+/// A tap column as tall as the diffusion under the implant `sdm`, 270 right
+/// of the diffusion that ends 130 inside `edge` (difftap.3).
+fn tap_column(ntap: Bool, sdm: Rect, edge: Float) -> Any {
+    let t = inst(tap_m1(ntap, 250., sdm.h - 260.));
+    eq(t.tap.x0, edge - 130. + 270.);
+    eq(t.tap.y0, sdm.y0 + 130.);
+    t
 }
 ```
 
-The top cell keeps each tap 205 from its row's gate bar. That keeps the gates' poly contacts 0.19 µm from the taps (licon.14), and the NMOS gate's 0.11 µm from the p-tap's P+ implant (licon.9). The n-well reaches 50 past the PMOS implant and the n-tap's implant, which encloses their diffusions by 0.18 µm.
+A column at each row's end costs about 0.52 µm of width there. A full-width tap rail above and below the cell would instead cost about 0.7 µm of height each, across the whole width. Columns are the cheaper choice unless a cell is much taller than it is wide, as this latch is only with wide PMOS fingers.
+
+The n-well reaches 50 past the PMOS implant, which encloses the PMOS diffusion by 0.18 µm, and 0.18 µm past the n-taps. It is at least 0.84 µm tall (nwell.1).
 
 ## Routing
 
 The routing uses met1 for the bars the transistors already have, met2 for wires between them, and a via1 wherever a wire meets a bar. Wires run on tracks 430 apart:
-- x = 0 for the sources;
 - ±430 for the outputs;
 - ±860 for the gates.
 
 ```argon title="lib.ar"
-/// Joins a mirrored pair's source bars `l` and `r` across the axis, and drops
-/// them to the met1 `rail` on a met2 trunk at x = 0.
-fn tie(l: Rect, r: Rect, rail: Rect) {
-    let bar = rect("met1.drawing", x0=l.x0, x1=r.x1, y0=r.y0, y1=r.y1);
-    via1(0., mid_y(bar));
-    via1(0., mid_y(rail));
-    wire(0., mid_y(bar), 0., mid_y(rail));
-}
-
 fn mid_y(r: Rect) -> Float {
     grid_floor((r.y0 + r.y1) / 2.)
 }
 
-/// A via1 centered at (`x`, `y`), with its met2 pad.
-fn via1(x: Float, y: Float) {
-    rect("via.drawing", x0=x - 75., y0=y - 75., w=150., h=150.);
-    rect("met2.drawing", x0=x - 130., y0=y - 160., w=260., h=320.);
+/// A met2 pad centered at (`x`, `y`) over the met1 `bar`, with a via1 between them.
+fn via1(bar: Rect, x: Float, y: Float) {
+    let pad = rect("met2.drawing", x0=x - 130., y0=y - 160., w=260., h=320.);
+    via(bar, pad);
 }
 
 /// A met2 wire 140 wide from (`x0`, `y0`) to (`x1`, `y1`), either horizontal
@@ -217,12 +191,12 @@ fn wire(x0: Float, y0: Float, x1: Float, y1: Float) {
 
 /// Extends the met1 `bar` to reach `x`, with a via1 there.
 fn hook(bar: Rect, x: Float) {
-    rect("met1.drawing", x0=std::min(bar.x0, x - 130.), x1=std::max(bar.x1, x + 130.), y0=bar.y0, y1=bar.y1);
-    via1(x, mid_y(bar));
+    let ext = rect("met1.drawing", x0=std::min(bar.x0, x - 130.), x1=std::max(bar.x1, x + 130.), y0=bar.y0, y1=bar.y1);
+    via1(ext, x, mid_y(bar));
 }
 ```
 
-`mid_y` rounds a bar's center down to the grid with `grid_floor`: a center halfway between grid points would put a via off the grid, which is an error. `tie` joins the two halves' source bars across the axis and runs one met2 wire down to the tap. In the top cell, each output's wire runs to the other half's gate track, one at the NMOS drains' height and the other at the PMOS drains', so the two never touch.
+`mid_y` rounds a bar's center down to the grid with `grid_floor`: a center halfway between grid points would put a via off the grid, which is an error. `via1` draws a met2 pad and calls [`via`](/language/std-layout#via), which draws the largest array of cuts that fits where the bar and the pad overlap, with the enclosures the technology file gives, centered on the grid. In the top cell, each output's wire runs to the other half's gate track, one at the NMOS drains' height and the other at the PMOS drains', so the two never touch.
 
 ## Pins
 
@@ -239,17 +213,17 @@ fn pin(name: String, r: Rect) {
 
 ## Check a sweep
 
-A generator is correct only if every point of its parameter range passes DRC and LVS. Check a sweep at once with the `compile` tool of the [headless MCP server](/tools/agents#headless-mode): it compiles each invocation in parallel, reports its size, and with `export` writes each one's GDS and SPICE netlist to its own directory.
+A generator is correct only if every point of its parameter range passes DRC and LVS. Check a sweep at once with the `compile` tool of the [headless MCP server](/tools/agents#headless-mode): it compiles each invocation in parallel, reports their sizes, and with `export` writes each one's GDS and SPICE netlist to its own directory.
 
 ```json
 {"cells": ["latch(420., 1, 420., 1)", "latch(1000., 2, 2000., 2)", "latch(1000., 4, 1000., 4)"], "export": "target/sweep"}
 ```
 
 ```text
-latch(420., 1, 420., 1): 2.35 × 4.3 µm = 10.11 µm², (-1175, -1315) to (1175, 2985); 25 shapes, 4 instances in the top cell → target/sweep/latch-420-1-420-1/
-latch(1000., 2, 2000., 2): 2.51 × 6.46 µm = 16.21 µm², (-1255, -1315) to (1255, 5145); 25 shapes, 4 instances in the top cell → target/sweep/latch-1000-2-2000-2/
-latch(1000., 4, 1000., 4): 4.23 × 5.46 µm = 23.10 µm², (-2115, -1315) to (2115, 4145); 25 shapes, 4 instances in the top cell → target/sweep/latch-1000-4-1000-4/
+All 3 cells compile: 2.55–5.13 × 2.83–4.99 µm; 7.22 µm² at latch(420., 1, 420., 1) to 20.47 µm² at latch(1000., 4, 1000., 4); each exported to target/sweep/<name>/.
 ```
+
+Several cells are summarized in one line, and any that fail are listed with each distinct error once; `"verbose": true` lists every cell. A [`sweep`](/tools/agents#sweeps) argument gives each parameter's values instead, and compiles every combination.
 
 Without the server, `arc run --cell 'latch(1000., 2, 2000., 2)' --gds --spice` writes one point to `target/argon.gds` and `target/argon.spice`. Then run DRC on each `argon.gds`, and LVS on each `argon.gds` against its `argon.spice`. Include the corners of the range: single fingers, the narrowest widths, rows of different widths, and the largest sizes.
 
@@ -260,40 +234,57 @@ Without the server, `arc run --cell 'latch(1000., 2, 2000., 2)' --gds --spice` w
 ```
 
 ```text
-b.p.d.y0 - b.n.d.y1 = 140.
+b.p.d.y0 - b.n.d.y1 = 260.
 b.n.g = Rect met1.drawing (285, -520) to (575, -200), 290 × 320
 ```
 
 ## Fix what the checks find
 
-Suppose the inverter's drain gap were 60 instead of 140. At `latch(1000., 1, 1000., 2)`, DRC reports two violations:
-- difftap.9 in cell `latch`, from (-1.214, 1.13) to (1.214, 1.39) µm;
-- poly.2 in cell `inverter`, from (0.49, 1.26) to (0.72, 1.44) µm.
+Suppose the inverter's drain gap were 60 instead of 260. At `latch(1000., 1, 1000., 2)`, DRC reports these violations, among others:
+- difftap.9 in cell `latch`, from (-0.794, 1.13) to (0.794, 1.39) µm;
+- psd.2 in cell `inverter`, from (0.81, 1.06) to (1.47, 1.64) µm;
+- poly.2 in cell `inverter`, from (0.14, 1.26) to (0.29, 1.44) µm.
 
-Pass both to `locate`, each with the cell the report names as `gds_cell`, since a violation inside a subcell is in that cell's coordinates:
+Pass them to `locate`, each with the cell the report names as `gds_cell`, since a violation inside a subcell is in that cell's coordinates:
 
 ```json
 {"cell": "latch(1000., 1, 1000., 2)", "boxes": [
-  {"x0": -1.214, "y0": 1.13, "x1": 1.214, "y1": 1.39, "gds_cell": "latch", "layers": ["diff", "nwell"], "label": "difftap.9"},
-  {"x0": 0.49, "y0": 1.26, "x1": 0.72, "y1": 1.44, "gds_cell": "inverter", "layers": ["poly"], "label": "poly.2"}]}
+  {"x0": -0.794, "y0": 1.13, "x1": 0.794, "y1": 1.39, "gds_cell": "latch", "layers": ["diff", "nwell"], "label": "difftap.9"},
+  {"x0": 0.81, "y0": 1.06, "x1": 1.47, "y1": 1.64, "gds_cell": "inverter", "layers": ["psdm"], "label": "psd.2"},
+  {"x0": 0.14, "y0": 1.26, "x1": 0.29, "y1": 1.44, "gds_cell": "inverter", "layers": ["poly"], "label": "poly.2"}]}
 ```
 
 ```text
-difftap.9 (-1.214, 1.13) to (1.214, 1.39) µm in latch:
-  diff.drawing (135, 130) to (995, 1130): sky130/lib.ar:15:16; in halves[0] (<argon-std>/layout.ar:114:13, called from lib.ar:20:18) > n (lib.ar:57:17) > fet (sky130/lib.ar:62:15)
-  diff.drawing (-995, 130) to (-135, 1130): sky130/lib.ar:15:16; in halves[1] (<argon-std>/layout.ar:115:13, called from lib.ar:20:18) > n (lib.ar:57:17) > fet (sky130/lib.ar:62:15)
-  nwell.drawing (-1255, 1390) to (1255, 4065): lib.ar:36:5
-poly.2 (0.49, 1.26) to (0.72, 1.44) µm in inverter:
-  poly.drawing (490, 0) to (640, 1260): <argon-std>/layout.ar:20:30, called from sky130/lib.ar:12:25; in n (lib.ar:57:17) > fet (sky130/lib.ar:62:15)
-  poly.drawing (570, 1440) to (720, 2700): <argon-std>/layout.ar:20:30, called from sky130/lib.ar:12:25; in p (lib.ar:58:17) > fet (sky130/lib.ar:62:15)
+difftap.9 (-0.794, 1.13) to (0.794, 1.39) µm in latch:
+  diff.drawing (-145, 130) to (575, 1130): sky130/lib.ar:16:16; in halves[0] (<argon-std>/layout.ar:114:13, called from lib.ar:20:18) > n (lib.ar:52:17) > fet (sky130/lib.ar:121:15)
+  diff.drawing (-575, 130) to (145, 1130): sky130/lib.ar:16:16; in halves[1] (<argon-std>/layout.ar:115:13, called from lib.ar:20:18) > n (lib.ar:52:17) > fet (sky130/lib.ar:121:15)
+  nwell.drawing (-1705, 1390) to (1705, 2750): lib.ar:30:5
+psd.2 (0.81, 1.06) to (1.47, 1.64) µm in inverter:
+  psdm.drawing (-275, 1440) to (1135, 2700): sky130/lib.ar:27:19; in p (lib.ar:53:17) > fet (sky130/lib.ar:121:15)
+  psdm.drawing (1145, 0) to (1655, 1260): sky130/lib.ar:45:19; in ptap (lib.ar:86:13, called from lib.ar:69:20) > t (sky130/lib.ar:62:13)
+poly.2 (0.14, 1.26) to (0.29, 1.44) µm in inverter:
+  poly.drawing (140, 0) to (290, 1260): <argon-std>/layout.ar:20:30, called from sky130/lib.ar:13:25; in n (lib.ar:52:17) > fet (sky130/lib.ar:121:15)
+  poly.drawing (140, 1440) to (290, 2700): <argon-std>/layout.ar:26:30, called from sky130/lib.ar:13:25; in p (lib.ar:53:17) > fet (sky130/lib.ar:121:15)
 ```
 
-Paths into the SKY130 library are shortened here. Each shape comes with the line that drew it and the instances leading to it. Both violations involve the NMOS `n`, the PMOS `p`, and the well between them, so the fix is the constraint between the two rows, the drain gap. `locate` names the lines that drew the shapes, not the `eq` that placed them, so look for the constraint that sets the distance it reports.
+Paths into the SKY130 library are shortened here. Each shape comes with the line that drew it and the instances leading to it. All three violations involve the NMOS `n` or its tap column, the PMOS `p`, and the gap between them, so the fix is the constraint between the two rows, the drain gap. `locate` names the lines that drew the shapes, not the `eq` that placed them, so look for the constraint that sets the distance it reports.
 
-LVS catches what DRC can't. If both output wires ran at the NMOS drains' height, they would overlap on met2. The layout would still pass DRC, but LVS would report a short between `outn` and `outp`, and one port fewer in the layout than in the schematic.
+LVS catches what DRC can't. If both output wires ran at the NMOS drains' height, they would overlap on met2. The layout would still pass DRC, but LVS would report a short between `outn` and `outp`, and one port fewer in the layout than in the schematic. The `compile` tool checks the pin labels against the layout's connectivity first, so it reports that short, with the chain of shapes joining the two outputs, before LVS runs. The [`nets`](/tools/agents#headless-mode) tool compares the two outputs' wiring and rough capacitance, which should match in a mirrored layout.
+
+## A density checklist
+
+Before settling a floorplan, check it against these. Each is cheaper to choose at the start than to retrofit.
+
+- **Share diffusion.** Devices on one rail, or that share a drain, belong in one diffusion. Choose each one's source and drain parity by mirroring it (`reflect=true, angle=180`) so neighbors share a column, and place them with `abut`. Lone fingers with different gates abut when their contacts widen apart, the left one left and the right one right (`gate_side`), or alternate rows (`gate_row`).
+- **Share gates.** An NMOS and a PMOS with the same gate can share their fingers, as `cmos` draws them, rather than each needing its own gate contact.
+- **Fold long devices.** A device far wider than its neighbors is tall can be folded into rows (`fold`) to the height a taller block next to it already sets.
+- **Keep loops short.** Fold a chain or a loop so that the wire returning to its start is short, and keep long wires on one layer away from wide metal of other nets.
+- **Put taps where area is cheapest.** A tap column at a row's end usually costs less than a tap rail across the row.
+- **Keep supplies narrow near switching nets.** A wide supply sheet under a capacitor's bottom plate or beside a switching net adds capacitance to it. Draw supplies as wide as their current needs, and route them around such nets.
+- **Check parasitics.** When power or speed matters, extract the layout's parasitics and compare the nets that matter. Geometry that passes DRC and LVS, such as drain straps between source straps, can still add coupling.
 
 ## Next steps
 
-- [`examples/sky130_strongarm`](https://github.com/ucb-substrate/argon/tree/main/examples/sky130_strongarm) builds a larger circuit the same way, with rows of different devices, more routing tracks, and met3 crossings.
-- The [SKY130 library](/language/sky130) page lists its layers and cells.
+- [`examples/sky130_strongarm`](https://github.com/ucb-substrate/argon/tree/main/examples/sky130_strongarm) builds a larger circuit with rows of different devices, more routing tracks, and met3 crossings. Its rows are wide and short, so it uses full-width tap rails rather than tap columns.
+- The [SKY130 library](/language/sky130) page lists its layers, rules, vias, and cells.
 - [Constraints](/language/constraints) explains underconstrained and inconsistent errors, and [staying on the grid](/language/constraints#staying-on-the-grid).

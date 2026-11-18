@@ -8,6 +8,7 @@ pub mod headless;
 pub mod hook;
 pub mod mcp;
 mod navigation;
+mod nets;
 mod recents;
 pub mod rpc;
 mod schematic_edit;

@@ -35,12 +35,15 @@ std::layout::rect("met1");
 std::layout::text("VDD", "text.label", 0., 0.);
 ```
 
-A string can only be written as a literal and passed along. Strings can't be compared, joined, or formatted, and numbers can't be converted to strings, so choose between literals with `if` or `match`, or pass them in:
+`+` joins two strings, and [`std::to_string`](/language/std#to-string) writes an `Int`'s digits. Strings compare with `==` and `!=`, but not with `<` or `>`.
 
 ```argon
 let implant = if nfet { "nsdm.drawing" } else { "psdm.drawing" };
-let port = ["d0", "d1", "d2", "d3"][i];
+let port = "d_" + std::to_string(i);
+let metal = layer == "met1.drawing";
 ```
+
+`+` joins only strings, so convert a number first: `"w" + 1` is an error.
 
 ## `Any` {#any}
 

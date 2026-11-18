@@ -19,7 +19,7 @@ use std::{
 use arcstr::ArcStr;
 use argonc::{
     COMPILE_STACK_SIZE, WorkspaceConfig,
-    ast::Span,
+    ast::{Decl, Span, TySpecKind},
     compile::{
         Arrayed, CellId, CompileOutput, CompiledCell, CompiledData, CompiledEmit, FieldValue,
         ObjectId, SolvedInstance, SolvedValue,
@@ -36,8 +36,8 @@ use crate::mcp::{Tools, string_argument};
 const INSTRUCTIONS: &str = "These tools compile the Argon library on disk with the same compiler as \
 `arc run`, so edit .ar files with your own tools and call the tools after each edit. Use compile to \
 check cells, measure them, and export their GDS and SPICE for pv.py, passing a whole sweep in one \
-call; inspect to read values the solver determined; and locate to find the shapes at DRC violations \
-and the source lines that drew them. Coordinates are in the technology's source units, nm for \
+call; inspect to read values the solver determined; locate to find the shapes at DRC violations \
+and the source lines that drew them; and nets to measure each net's wiring and rough capacitance. Coordinates are in the technology's source units, nm for \
 SKY130. Each tool uses the library whose Argon.toml is in your working directory or above it, or \
 the one `workspace` names; other paths, in arguments and in results, are relative to that \
 library's directory.";
@@ -47,6 +47,169 @@ const MAX_SHAPES_PER_BOX: usize = 20;
 
 /// Items of a list value shown by `inspect` before the rest are counted.
 const MAX_LIST_ITEMS: usize = 50;
+
+/// The most points one `sweep` argument expands to.
+const MAX_SWEEP_POINTS: usize = 4096;
+
+/// Cells named in a list of a sweep's results before the rest are counted.
+const MAX_LISTED_CELLS: usize = 8;
+
+/// Calls named for one diagnostic before the rest are counted.
+const MAX_LISTED_CALLS: usize = 5;
+
+/// One cell's result in `compile`.
+enum CellReport {
+    Compiled {
+        /// Its size and bounding box, export, and layer areas, as one entry.
+        line: String,
+        /// Width and height in µm, if it has a layout.
+        size: Option<(f64, f64)>,
+        /// Whether a sweep's summary shows it in full: some coordinates are
+        /// set only by initial conditions, or its export failed.
+        notable: bool,
+    },
+    Failed(Vec<Rendered>),
+    /// The compiler panicked.
+    Internal,
+}
+
+/// A diagnostic as `path:line:column: message`, with the calls in the top
+/// cell's body that led to it.
+#[derive(Clone, PartialEq, Eq)]
+struct Rendered {
+    line: String,
+    calls: Vec<String>,
+}
+
+/// Writes each of `rendered` with its calls on the line after it.
+fn write_rendered(text: &mut String, rendered: &[Rendered], indent: &str) {
+    for diagnostic in rendered {
+        let _ = writeln!(text, "{indent}{}", diagnostic.line);
+        if !diagnostic.calls.is_empty() {
+            let _ = writeln!(
+                text,
+                "{indent}  called from {}",
+                english_list(&diagnostic.calls, MAX_LISTED_CALLS)
+            );
+        }
+    }
+}
+
+/// Cell invocations as an English list.
+fn listed(cells: &[&str]) -> String {
+    english_list(cells, MAX_LISTED_CELLS)
+}
+
+/// `items` as an English list, naming at most `named` before counting the rest.
+fn english_list(items: &[impl AsRef<str>], named: usize) -> String {
+    let mut shown = items
+        .iter()
+        .take(named)
+        .map(|item| item.as_ref().to_owned())
+        .collect::<Vec<_>>();
+    if items.len() > named {
+        shown.push(format!("{} more", items.len() - named));
+    }
+    match shown.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
+}
+
+/// The range of `values`, such as `2.35–4.23`, or one number when they agree.
+fn range(values: impl Iterator<Item = f64> + Clone) -> String {
+    let low = number(values.clone().fold(f64::INFINITY, f64::min));
+    let high = number(values.fold(f64::NEG_INFINITY, f64::max));
+    if low == high {
+        low
+    } else {
+        format!("{low}–{high}")
+    }
+}
+
+/// A parameter of a cell, as a sweep passes it.
+struct Param {
+    name: String,
+    /// The name of its declared type, such as `Float`; empty for a sequence
+    /// or tuple type.
+    ty: String,
+    /// Whether it has a default, which lets it be passed by keyword.
+    default: bool,
+}
+
+/// The parameters of the cell at `path`, such as `latch` or `sky130::mos`.
+fn cell_params(workspace: &WorkspaceConfig, path: &str) -> Result<Vec<Param>, String> {
+    let parsed = argonc::parse::parse_workspace_with_config_and_sources(workspace, &Sources::new());
+    if !parsed.static_errors().is_empty() {
+        return Err(format!(
+            "The library has parse errors, so `sweep` can't read `{path}`'s parameters. Compile it with `cells` to see them."
+        ));
+    }
+    let ast = parsed.ast();
+    let segments = path.split("::").map(str::trim).collect::<Vec<_>>();
+    let (name, module) = segments.split_last().expect("split yields a segment");
+    let module = module
+        .iter()
+        .skip_while(|segment| **segment == "lib")
+        .map(|segment| segment.to_string())
+        .collect::<Vec<_>>();
+    let cell = ast
+        .get(&module)
+        .and_then(|module| {
+            module.ast.decls.iter().find_map(|decl| match decl {
+                Decl::Cell(cell) if cell.name.name.as_str() == *name => Some(cell),
+                _ => None,
+            })
+        })
+        .ok_or_else(|| format!("No cell `{path}` in the library."))?;
+    Ok(cell
+        .args
+        .iter()
+        .map(|arg| Param {
+            name: arg.name.name.to_string(),
+            ty: match &arg.ty.kind {
+                TySpecKind::Path { name, args } if args.is_empty() => name.name.to_string(),
+                _ => String::new(),
+            },
+            default: arg.default.is_some(),
+        })
+        .collect())
+}
+
+/// `value` as Argon source for a parameter of type `ty`: a number in the
+/// type's form, a boolean, a string quoted for a `String` parameter, and any
+/// other string as source, such as `Mode::Fast`.
+fn argon_literal(value: &Value, ty: &str) -> Result<String, String> {
+    match value {
+        Value::Number(number) => {
+            let float = number
+                .as_f64()
+                .filter(|float| float.is_finite())
+                .ok_or_else(|| format!("{number} is not a finite number"))?;
+            match ty {
+                "Float" if float.fract() == 0. && float.abs() < 1e15 => {
+                    Ok(format!("{}.", float as i64))
+                }
+                "Float" => Ok(format!("{float}")),
+                "Int" => number
+                    .as_i64()
+                    .or_else(|| (float.fract() == 0. && float.abs() < 9e15).then_some(float as i64))
+                    .map(|int| int.to_string())
+                    .ok_or_else(|| format!("{number} is not an Int")),
+                _ => Ok(number.to_string()),
+            }
+        }
+        Value::Bool(value) => Ok(value.to_string()),
+        Value::String(text) if ty == "String" => Ok(format!(
+            "\"{}\"",
+            text.replace('\\', "\\\\").replace('"', "\\\"")
+        )),
+        Value::String(source) => Ok(source.clone()),
+        _ => Err(format!("{value} is not a number, a boolean, or a string")),
+    }
+}
 
 /// The headless tools, answering for libraries under `directory`.
 pub struct Headless {
@@ -79,6 +242,7 @@ impl Tools for Headless {
                 "compile" => call?.compile(),
                 "inspect" => call?.inspect(),
                 "locate" => call?.locate(),
+                "nets" => call?.nets(),
                 _ => Err(format!("Unknown tool `{name}`.")),
             }
         })
@@ -157,7 +321,12 @@ impl Call {
 
     fn compile(&self) -> Result<String, String> {
         let workspace = &self.workspace;
-        let cells = self.strings("cells")?;
+        let mut cells = self.strings("cells")?;
+        if let Some(sweep) = self.arguments.get("sweep") {
+            cells.extend(self.sweep(sweep)?);
+        }
+        let mut unique = HashSet::new();
+        cells.retain(|cell| unique.insert(cell.clone()));
         if cells.is_empty() {
             let diagnostics = parallel(&[()], |_| driver::check(workspace, &Sources::new()))
                 .remove(0)
@@ -173,11 +342,14 @@ impl Call {
             .get("export")
             .and_then(Value::as_str)
             .map(|directory| self.path(directory));
-        let layers = self
-            .arguments
-            .get("layers")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let flag = |name: &str| {
+            self.arguments
+                .get(name)
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
+        let layers = flag("layers");
+        let verbose = flag("verbose") || layers || cells.len() == 1;
         let names = cells
             .iter()
             .map(|cell| export_name(cell))
@@ -202,54 +374,342 @@ impl Call {
                 }
             }
             let output = driver::compile_cell(workspace, &Sources::new(), cell, true);
-            self.report(cell, output, destination.as_deref(), layers)
+            self.report(output, destination.as_deref(), layers)
         });
-        let mut text = String::new();
-        for (cell, report) in cells.iter().zip(reports) {
-            text.push_str(&report.unwrap_or_else(|| format!("{cell}: {INTERNAL_ERROR}\n")));
-        }
+        let reports = reports
+            .into_iter()
+            .map(|report| report.unwrap_or(CellReport::Internal))
+            .collect::<Vec<_>>();
+        let text = if verbose {
+            let mut text = String::new();
+            for (cell, report) in cells.iter().zip(&reports) {
+                match report {
+                    CellReport::Compiled { line, .. } => {
+                        let _ = writeln!(text, "{cell}: {line}");
+                    }
+                    CellReport::Failed(rendered) => {
+                        let _ = writeln!(text, "{cell}: error");
+                        write_rendered(&mut text, rendered, "  ");
+                    }
+                    CellReport::Internal => {
+                        let _ = writeln!(text, "{cell}: {INTERNAL_ERROR}");
+                    }
+                }
+            }
+            text
+        } else {
+            self.sweep_summary(&cells, &reports, export.as_deref())
+        };
         Ok(text.trim_end().to_owned())
     }
 
-    /// One cell's lines in `compile`'s result, exporting it to `destination`.
-    fn report(
-        &self,
-        cell: &str,
-        output: Result<CompileOutput, Vec<Diagnostic>>,
-        destination: Option<&Path>,
-        layers: bool,
-    ) -> String {
-        let output = match output {
-            Ok(output) => output,
-            Err(diagnostics) => {
-                return format!("{cell}: error\n{}", self.diagnostics(&diagnostics, "  "));
+    /// The invocations of a `sweep` argument: its cell with every combination
+    /// of its parameters' values, each written as the parameter's declared
+    /// type needs.
+    fn sweep(&self, sweep: &Value) -> Result<Vec<String>, String> {
+        let cell = sweep
+            .get("cell")
+            .and_then(Value::as_str)
+            .ok_or("`sweep` needs `cell`, the cell's name, such as `latch`.")?;
+        let params = sweep.get("params").ok_or(
+            "`sweep` needs `params`: a list of value lists, one per positional parameter, or an object of value lists by parameter name.",
+        )?;
+        let declared = cell_params(&self.workspace, cell)?;
+        // Each parameter given, in declaration order, with whether it is passed
+        // by keyword and its values.
+        let given = match params {
+            Value::Array(lists) => {
+                if lists.len() > declared.len() {
+                    return Err(format!(
+                        "`{cell}` takes {} parameters, but `sweep` gives {}.",
+                        declared.len(),
+                        lists.len()
+                    ));
+                }
+                declared
+                    .iter()
+                    .zip(lists)
+                    .map(|(param, values)| (param, false, values))
+                    .collect::<Vec<_>>()
+            }
+            Value::Object(lists) => {
+                if let Some(name) = lists
+                    .keys()
+                    .find(|name| declared.iter().all(|param| &param.name != *name))
+                {
+                    return Err(format!("`{cell}` has no parameter `{name}`."));
+                }
+                let mut given = Vec::new();
+                for param in &declared {
+                    match lists.get(&param.name) {
+                        // A parameter without a default can only be positional.
+                        Some(values) => given.push((param, param.default, values)),
+                        None if !param.default => {
+                            return Err(format!(
+                                "`sweep` must give `{}`, which has no default.",
+                                param.name
+                            ));
+                        }
+                        None => {}
+                    }
+                }
+                given
+            }
+            _ => {
+                return Err(
+                    "`sweep`'s `params` must be a list of lists or an object of lists.".to_owned(),
+                );
             }
         };
-        let CompileOutput::Valid(data) = &output else {
-            return format!("{cell}: {INTERNAL_ERROR}\n");
-        };
-        let mut text = format!("{cell}: {}", summary(data));
-        if let Some(destination) = destination {
-            match export(&output, destination) {
-                Ok(()) => {
-                    let _ = write!(text, " → {}/", self.show(destination));
+        // Each parameter's `name=` prefix, empty when positional, and its literals.
+        let mut axes = Vec::<(String, Vec<String>)>::new();
+        for (param, keyword, values) in given {
+            let values = values
+                .as_array()
+                .filter(|values| !values.is_empty())
+                .ok_or_else(|| format!("`sweep` gives `{}` no list of values.", param.name))?;
+            let literals = values
+                .iter()
+                .map(|value| {
+                    argon_literal(value, &param.ty)
+                        .map_err(|error| format!("`{}`: {error}", param.name))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let prefix = if keyword {
+                format!("{}=", param.name)
+            } else {
+                String::new()
+            };
+            axes.push((prefix, literals));
+        }
+        let points = axes
+            .iter()
+            .try_fold(1usize, |count, (_, values)| count.checked_mul(values.len()))
+            .filter(|count| *count <= MAX_SWEEP_POINTS)
+            .ok_or_else(|| {
+                format!(
+                    "`sweep` makes more than {MAX_SWEEP_POINTS} points; split it into several calls."
+                )
+            })?;
+        Ok((0..points)
+            .map(|mut index| {
+                // The last parameter varies fastest.
+                let mut args = vec![String::new(); axes.len()];
+                for (arg, (prefix, values)) in args.iter_mut().zip(&axes).rev() {
+                    *arg = format!("{prefix}{}", values[index % values.len()]);
+                    index /= values.len();
                 }
-                Err(error) => {
-                    let _ = write!(text, "; export failed: {error}");
+                format!("{cell}({})", args.join(", "))
+            })
+            .collect())
+    }
+
+    /// A sweep's results: one line for the cells that compile, those that
+    /// need a look in full, and each distinct error once with its cells.
+    fn sweep_summary(
+        &self,
+        cells: &[String],
+        reports: &[CellReport],
+        export: Option<&Path>,
+    ) -> String {
+        let mut text = String::new();
+        let sized = cells
+            .iter()
+            .zip(reports)
+            .filter_map(|(cell, report)| match report {
+                CellReport::Compiled { size, .. } => Some((cell.as_str(), *size)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let failed = cells
+            .iter()
+            .zip(reports)
+            .filter(|(_, report)| !matches!(report, CellReport::Compiled { .. }))
+            .collect::<Vec<_>>();
+        if sized.is_empty() {
+            let _ = writeln!(text, "None of the {} cells compile.", cells.len());
+        } else {
+            let mut line = if failed.is_empty() {
+                format!("All {} cells compile", cells.len())
+            } else {
+                format!("{} of {} cells compile", sized.len(), cells.len())
+            };
+            let sizes = sized
+                .iter()
+                .filter_map(|(cell, size)| Some((*cell, (*size)?)))
+                .collect::<Vec<_>>();
+            let by_area = |a: &&(&str, (f64, f64)), b: &&(&str, (f64, f64))| {
+                (a.1.0 * a.1.1).total_cmp(&(b.1.0 * b.1.1))
+            };
+            if let (Some(smallest), Some(largest)) =
+                (sizes.iter().min_by(by_area), sizes.iter().max_by(by_area))
+            {
+                let _ = write!(
+                    line,
+                    ": {} × {} µm; {:.2} µm² at {} to {:.2} µm² at {}",
+                    range(sizes.iter().map(|(_, size)| size.0)),
+                    range(sizes.iter().map(|(_, size)| size.1)),
+                    smallest.1.0 * smallest.1.1,
+                    smallest.0,
+                    largest.1.0 * largest.1.1,
+                    largest.0,
+                );
+            }
+            if let Some(export) = export {
+                let _ = write!(line, "; each exported to {}/<name>/", self.show(export));
+            }
+            let _ = writeln!(text, "{line}.");
+        }
+        for (cell, report) in cells.iter().zip(reports) {
+            if let CellReport::Compiled {
+                line,
+                notable: true,
+                ..
+            } = report
+            {
+                let _ = writeln!(text, "{cell}: {line}");
+            }
+        }
+        if failed.is_empty() {
+            return text;
+        }
+        let names = failed
+            .iter()
+            .map(|(cell, _)| cell.as_str())
+            .collect::<Vec<_>>();
+        let _ = writeln!(
+            text,
+            "{} {}: {}",
+            failed.len(),
+            if failed.len() == 1 {
+                "cell fails"
+            } else {
+                "cells fail"
+            },
+            listed(&names)
+        );
+        // Each distinct diagnostic once, with the failing cells that report it.
+        let mut groups = Vec::<(Rendered, Vec<&str>)>::new();
+        for (cell, report) in &failed {
+            let rendered = match report {
+                CellReport::Failed(rendered) => rendered.clone(),
+                _ => vec![Rendered {
+                    line: INTERNAL_ERROR.to_owned(),
+                    calls: Vec::new(),
+                }],
+            };
+            for diagnostic in rendered {
+                match groups.iter_mut().find(|(seen, _)| *seen == diagnostic) {
+                    Some((_, group)) => group.push(cell),
+                    None => groups.push((diagnostic, vec![cell])),
                 }
             }
         }
-        text.push('\n');
-        if layers {
-            let _ = writeln!(text, "  {}", layer_report(data));
+        for (diagnostic, group) in groups {
+            write_rendered(&mut text, std::slice::from_ref(&diagnostic), "");
+            if failed.len() > 1 {
+                if group.len() == failed.len() {
+                    let _ = writeln!(text, "  in all {} failing cells", group.len());
+                } else {
+                    let _ = writeln!(text, "  in {}", listed(&group));
+                }
+            }
         }
         text
     }
 
-    /// Each diagnostic as `path:line:column: message`, with the call it ran under.
+    /// One cell's result in `compile`, exporting it to `destination`.
+    fn report(
+        &self,
+        output: Result<CompileOutput, Vec<Diagnostic>>,
+        destination: Option<&Path>,
+        layers: bool,
+    ) -> CellReport {
+        let output = match output {
+            Ok(output) => output,
+            Err(diagnostics) => return CellReport::Failed(self.render(&diagnostics)),
+        };
+        let CompileOutput::Valid(data) = &output else {
+            return CellReport::Internal;
+        };
+        let mut line = summary(data);
+        let mut notable = !data.cells[&data.top].unsolved_vars.is_empty();
+        if let Some(destination) = destination {
+            match export(&output, destination) {
+                Ok(()) => {
+                    let _ = write!(line, " → {}/", self.show(destination));
+                }
+                Err(error) => {
+                    notable = true;
+                    let _ = write!(line, "; export failed: {error}");
+                }
+            }
+        }
+        if layers {
+            let _ = write!(line, "\n  {}", layer_report(data));
+        }
+        let show = |path: &Path| self.show(path);
+        let (nets, problems) =
+            crate::nets::connectivity_lines(data, &crate::nets::Sources::new(&show), "  ");
+        if !nets.is_empty() {
+            let _ = write!(line, "\n{}", nets.trim_end());
+        }
+        // A cell with connectivity problems is listed in full in a summary.
+        notable |= problems > 0;
+        let um = um_per_unit(&data.tech);
+        let size = data
+            .layout_bbox(data.top)
+            .map(|bbox| ((bbox.x1 - bbox.x0) * um, (bbox.y1 - bbox.y0) * um));
+        CellReport::Compiled {
+            line,
+            size,
+            notable,
+        }
+    }
+
+    fn nets(&self) -> Result<String, String> {
+        let cell = string_argument(&self.arguments, "cell")?;
+        let only = self.strings("nets")?;
+        let pairs = match self.arguments.get("pairs") {
+            None => Vec::new(),
+            Some(value) => value
+                .as_array()
+                .and_then(|pairs| {
+                    pairs
+                        .iter()
+                        .map(|pair| match pair.as_array()?.as_slice() {
+                            [a, b] => Some((a.as_str()?.to_owned(), b.as_str()?.to_owned())),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>()
+                })
+                .ok_or("`pairs` must be a list of two-name lists.")?,
+        };
+        let output = self.compile_cell(&self.workspace, &Sources::new(), cell)?;
+        let CompileOutput::Valid(data) = &output else {
+            return Err(INTERNAL_ERROR.to_owned());
+        };
+        let show = |path: &Path| self.show(path);
+        Ok(crate::nets::nets_report(
+            data,
+            &crate::nets::Sources::new(&show),
+            &only,
+            &pairs,
+        ))
+    }
+
+    /// Each diagnostic as `path:line:column: message`, with the calls it ran under.
     fn diagnostics(&self, diagnostics: &[Diagnostic], indent: &str) -> String {
-        let files = Files::default();
         let mut text = String::new();
+        write_rendered(&mut text, &self.render(diagnostics), indent);
+        text
+    }
+
+    /// `diagnostics` as lines, each distinct line once with every call that
+    /// led to it.
+    fn render(&self, diagnostics: &[Diagnostic]) -> Vec<Rendered> {
+        let files = Files::default();
+        let mut rendered = Vec::<Rendered>::new();
         for diagnostic in diagnostics {
             let location = match (&diagnostic.path, diagnostic.start) {
                 (Some(path), Some(start)) => {
@@ -261,17 +721,29 @@ impl Call {
                 }
                 _ => String::new(),
             };
-            let _ = writeln!(text, "{indent}{location}{}", diagnostic.message);
-            if let Some(call) = &diagnostic.called_at {
+            let line = format!("{location}{}", diagnostic.message);
+            let call = diagnostic.called_at.as_ref().map(|call| {
                 let (line, column) = files.line_column(&call.path, call.start);
-                let _ = writeln!(
-                    text,
-                    "{indent}  called from {}:{line}:{column}",
-                    self.show(&call.path)
-                );
+                format!("{}:{line}:{column}", self.show(&call.path))
+            });
+            let index = match rendered.iter().position(|seen| seen.line == line) {
+                Some(index) => index,
+                None => {
+                    rendered.push(Rendered {
+                        line,
+                        calls: Vec::new(),
+                    });
+                    rendered.len() - 1
+                }
+            };
+            let calls = &mut rendered[index].calls;
+            if let Some(call) = call
+                && !calls.contains(&call)
+            {
+                calls.push(call);
             }
         }
-        text
+        rendered
     }
 
     /// Compiles `cell` with `sources` on the compiler's stack.
@@ -1346,7 +1818,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "compile",
-            "description": "Compile cells and report each one's size, bounding box, and errors. Pass every point of a sweep in one call; the cells compile in parallel. With `export`, also write each cell that compiles to `<export>/<name>/argon.gds` and `argon.spice`, exactly as `arc run --gds --spice` writes them, where <name> is the invocation's tokens joined by `-`, such as `inv-1000-1600-4`; a cell that fails removes its old files there. With no `cells`, only parse and type-check the library.",
+            "description": "Compile cells and report their sizes, bounding boxes, and errors. Pass every point of a sweep in one call, as `cells`, as `sweep`, or both; the cells compile in parallel. One cell is reported in full. Several are summarized: one line for those that compile, with the range of their sizes and the smallest and largest by area; in full, any that compile with coordinates set only by initial conditions or whose export failed; and each distinct error once, with the cells it occurs in. `verbose` lists every cell in full instead. With `export`, also write each cell that compiles to `<export>/<name>/argon.gds` and `argon.spice`, exactly as `arc run --gds --spice` writes them, where <name> is the invocation's tokens joined by `-`, such as `inv-1000-1600-4`; a cell that fails removes its old files there. With no cells, only parse and type-check the library.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1355,13 +1827,35 @@ fn tool_definitions() -> Value {
                         "items": { "type": "string" },
                         "description": "Cell invocations, such as `inv(1000., 1600., 4)`."
                     },
+                    "sweep": {
+                        "type": "object",
+                        "description": "A grid of invocations of one cell: every combination of its parameters' values, the last parameter varying fastest. Each number is written as its parameter's declared type needs, so `1000` passes `1000.` to a Float. A string is Argon source, such as `\"Mode::Fast\"`, except for a String parameter, which receives it as text. Example: `{\"cell\": \"inv\", \"params\": [[1000, 2000], [1600], [1, 2, 4]]}` compiles `inv(1000., 1600., 1)` through `inv(2000., 1600., 4)`.",
+                        "properties": {
+                            "cell": {
+                                "type": "string",
+                                "description": "The cell's name, such as `inv`, or its path, such as `sky130::mos`."
+                            },
+                            "params": {
+                                "description": "A list of value lists, one per parameter from the first, or an object of value lists by parameter name, which must give every parameter without a default and passes those with one as keyword arguments.",
+                                "oneOf": [
+                                    { "type": "array", "items": { "type": "array" } },
+                                    { "type": "object", "additionalProperties": { "type": "array" } }
+                                ]
+                            }
+                        },
+                        "required": ["cell", "params"]
+                    },
+                    "verbose": {
+                        "type": "boolean",
+                        "description": "List every cell's size, bounding box, and errors in full, even when there are several."
+                    },
                     "export": {
                         "type": "string",
                         "description": "Directory to export into, relative to the library's directory, such as `target/sweep`."
                     },
                     "layers": {
                         "type": "boolean",
-                        "description": "Also report each layer's drawn area, with overlaps counted once, and the fraction of the bounding box it covers."
+                        "description": "Also report each layer's drawn area, with overlaps counted once, and the fraction of the bounding box it covers. Lists every cell in full, as `verbose` does."
                     },
                     "workspace": workspace
                 }
@@ -1428,7 +1922,8 @@ fn tool_definitions() -> Value {
                 },
                 "required": ["cell", "boxes"]
             }
-        }
+        },
+        crate::nets::tool_definition(&cell, &workspace)
     ])
 }
 
@@ -1517,7 +2012,7 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["compile", "inspect", "locate"]);
+        assert_eq!(names, ["compile", "inspect", "locate", "nets"]);
     }
 
     #[tokio::test]
@@ -1530,13 +2025,13 @@ mod tests {
         let (error, text) = call(
             &tools,
             "compile",
-            json!({ "cells": [INVERTER, "inv(1001., 1600., 4)"], "export": "target/sweep" }),
+            json!({ "cells": [INVERTER, "inv(1001., 1600., 4)"], "export": "target/sweep", "verbose": true }),
         )
         .await;
         assert!(!error, "{text}");
         assert!(
             text.contains(
-                "inv(1000., 1600., 4): 2.77 × 6.72 µm = 18.61 µm², (-665, -1160) to (2105, 5560); \
+                "inv(1000., 1600., 4): 2.63 × 6.72 µm = 17.67 µm², (-595, -1160) to (2035, 5560); \
                  25 shapes, 4 instances in the top cell → target/sweep/inv-1000-1600-4/\n"
             ),
             "{text}"
@@ -1578,7 +2073,7 @@ mod tests {
         )
         .unwrap();
         let (_, text) = call(&tools, "compile", json!({ "cells": [INVERTER] })).await;
-        assert!(text.contains("(-865, -1160) to (2105, 5560)"), "{text}");
+        assert!(text.contains("(-795, -1160) to (2035, 5560)"), "{text}");
     }
 
     #[tokio::test]
@@ -1620,8 +2115,8 @@ mod tests {
              out = Rect li1.drawing (1700, 1400) to (1870, 2250), 170 × 850\n\
              out.bogus: error at column 5: no field bogus on type Rect\n\
              nf = 4\n\
-             nmos.sdm = Rect nsdm.drawing (-485, 0) to (1925, 1260), 2410 × 1260\n\
-             std::layout::bbox(nmos) = construction Rect (no layer) (-485, 0) to (1925, 1260), 2410 × 1260"
+             nmos.sdm = Rect nsdm.drawing (-415, 0) to (1855, 1260), 2270 × 1260\n\
+             std::layout::bbox(nmos) = construction Rect (no layer) (-415, 0) to (1855, 1260), 2270 × 1260"
         );
         assert_eq!(
             fs::read_to_string(library.path().join("lib.ar")).unwrap(),
@@ -1666,17 +2161,160 @@ mod tests {
             "li.1 (1.75, 1.5) to (1.8, 1.6) µm in inv:\n".to_owned(),
             "  li1.drawing (1700, 1400) to (1870, 2250): lib.ar:33:19\n".to_owned(),
             format!(
-                "(0.6, 1) to (0.7, 1.1) µm in inv: (no layer in the technology matches `COREID`)\n  diff.drawing (-355, 130) to (1795, 1130): {}:15:16; in nmos (lib.ar:5:20)\n",
+                "(0.6, 1) to (0.7, 1.1) µm in inv: (no layer in the technology matches `COREID`)\n  diff.drawing (-285, 130) to (1725, 1130): {}:16:16; in nmos (lib.ar:5:20)\n",
                 pdk.display()
             ),
             format!(
-                "(0.6, 1) to (0.7, 1.1) µm in sky130__fet1v8:\n  diff.drawing (-355, 130) to (1795, 1130): {}:15:16\n",
+                "(0.6, 1) to (0.7, 1.1) µm in sky130__fet1v8:\n  diff.drawing (-285, 130) to (1725, 1130): {}:16:16\n",
                 pdk.display()
             ),
             "no GDS cell named `missing`".to_owned(),
         ] {
             assert!(text.contains(&expected), "{expected}\n{text}");
         }
+    }
+
+    /// A library of `source` on the basic technology, whose unit is 0.1 nm.
+    fn basic_library(source: &str) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        fs::write(
+            directory.path().join("Argon.toml"),
+            format!(
+                "name = \"basic\"\ntech = \"{}\"\n",
+                fs::canonicalize(tech).unwrap().display()
+            ),
+        )
+        .unwrap();
+        fs::write(directory.path().join("lib.ar"), source).unwrap();
+        directory
+    }
+
+    const BARS: &str = "use std::layout::rect;\n\
+        cell bar(w: Float, n: Int, layer: String = \"met1\") {\n\
+        \x20   let r = rect(layer, x0=0., y0=0., x1=w, y1=100. * (n as Float));\n\
+        \x20   if n > 2 {\n\
+        \x20       eq(r.x0, 5.);\n\
+        \x20   }\n\
+        }\n\
+        fn pin(r: Rect) {\n\
+        \x20   eq(r.x0, 7.);\n\
+        }\n\
+        cell twice() {\n\
+        \x20   let a = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.);\n\
+        \x20   pin(a);\n\
+        \x20   let b = rect(\"met1\", x0=0., y0=20., x1=10., y1=30.);\n\
+        \x20   pin(b);\n\
+        }\n";
+
+    #[tokio::test]
+    async fn summarizes_sweeps_with_each_error_once() {
+        let library = basic_library(BARS);
+        let tools = Headless::new(library.path().to_path_buf());
+        let (error, text) = call(
+            &tools,
+            "compile",
+            json!({
+                "sweep": { "cell": "bar", "params": [[1000, 2000.5], [1, 2, 3]] },
+                "cells": ["bar(1000., 1)", "twice()"],
+                "export": "target/sweep"
+            }),
+        )
+        .await;
+        assert!(!error, "{text}");
+        assert_eq!(
+            text,
+            "4 of 7 cells compile: 1–2.001 × 0.1–0.2 µm; 0.10 µm² at bar(1000., 1) to 0.40 µm² \
+             at bar(2000.5, 2); each exported to target/sweep/<name>/.\n\
+             3 cells fail: twice(), bar(1000., 3), and bar(2000.5, 3)\n\
+             lib.ar:9:5: inconsistent constraint: other constraints already determine every value \
+             in it, and leave its two sides 7 apart\n\
+             \x20 called from lib.ar:13:5 and lib.ar:15:5\n\
+             \x20 in twice()\n\
+             lib.ar:5:9: inconsistent constraint: other constraints already determine every value \
+             in it, and leave its two sides 5 apart\n\
+             \x20 in bar(1000., 3) and bar(2000.5, 3)"
+        );
+        assert!(
+            library
+                .path()
+                .join("target/sweep/bar-2000.5-2/argon.gds")
+                .is_file()
+        );
+
+        // Keywords pass only parameters with defaults, and `verbose` lists each cell.
+        let (error, text) = call(
+            &tools,
+            "compile",
+            json!({
+                "sweep": { "cell": "bar", "params": { "layer": ["met2"], "n": [1], "w": [1000] } },
+                "verbose": true
+            }),
+        )
+        .await;
+        assert!(!error, "{text}");
+        assert!(
+            text.starts_with("bar(1000., 1, layer=\"met2\"): 1 × 0.1 µm"),
+            "{text}"
+        );
+        let (error, text) = call(
+            &tools,
+            "compile",
+            json!({ "sweep": { "cell": "bar", "params": { "w": [1000] } } }),
+        )
+        .await;
+        assert!(error);
+        assert_eq!(text, "`sweep` must give `n`, which has no default.");
+        let (error, text) = call(
+            &tools,
+            "compile",
+            json!({ "sweep": { "cell": "bar", "params": [[1000], [1.5]] } }),
+        )
+        .await;
+        assert!(error);
+        assert_eq!(text, "`n`: 1.5 is not an Int");
+    }
+
+    #[tokio::test]
+    async fn reports_an_error_every_cell_shares_once() {
+        let library = basic_library(
+            "cell top(n: Int) {\n    let s = Signal();\n    device(\"r\", [s, s], \"res\");\n}\n",
+        );
+        let tools = Headless::new(library.path().to_path_buf());
+        let (error, text) = call(
+            &tools,
+            "compile",
+            json!({ "sweep": { "cell": "top", "params": [[1, 2, 3]] } }),
+        )
+        .await;
+        assert!(!error, "{text}");
+        assert_eq!(
+            text,
+            "None of the 3 cells compile.\n\
+             3 cells fail: top(1), top(2), and top(3)\n\
+             lib.ar:2:13: `Signal` is not in scope; import it with `use std::schematic::Signal;`\n\
+             \x20 in all 3 failing cells\n\
+             lib.ar:3:5: `device` is not in scope; import it with `use std::schematic::device;`\n\
+             \x20 in all 3 failing cells"
+        );
+    }
+
+    #[test]
+    fn writes_sweep_values_as_their_parameters_need() {
+        assert_eq!(argon_literal(&json!(1000), "Float").unwrap(), "1000.");
+        assert_eq!(argon_literal(&json!(-0.15), "Float").unwrap(), "-0.15");
+        assert_eq!(argon_literal(&json!(4.0), "Int").unwrap(), "4");
+        assert_eq!(argon_literal(&json!(true), "Bool").unwrap(), "true");
+        assert_eq!(
+            argon_literal(&json!("say \"hi\""), "String").unwrap(),
+            "\"say \\\"hi\\\"\""
+        );
+        assert_eq!(
+            argon_literal(&json!("Mode::Fast"), "Mode").unwrap(),
+            "Mode::Fast"
+        );
+        assert!(argon_literal(&json!([1]), "Float").is_err());
     }
 
     #[test]

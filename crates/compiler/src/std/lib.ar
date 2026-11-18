@@ -1,9 +1,10 @@
-fn max(x0: Float, x1: Float) -> Float {
-  max_float(x0, x1)
+// `T` is `Int` or `Float`.
+fn max<T>(x0: T, x1: T) -> T {
+  max_num(x0, x1)
 }
 
-fn min(x0: Float, x1: Float) -> Float {
-  min_float(x0, x1)
+fn min<T>(x0: T, x1: T) -> T {
+  min_num(x0, x1)
 }
 
 enum Option<T> {
@@ -77,4 +78,36 @@ fn all(values: [Bool]) -> Bool {
 // `cons`, so `range(n)` is O(n) instead of O(n^2).
 fn range(stop: Int) -> [Int] {
     range_full(0, stop, 1)
+}
+
+// The largest of a non-empty sequence of `Int`s or `Float`s.
+fn max_of<T>(items: [T]) -> T {
+    let rest = tail(items);
+    if rest == [] {
+        head(items)
+    } else {
+        max(head(items), max_of(rest))
+    }
+}
+
+// The smallest of a non-empty sequence of `Int`s or `Float`s.
+fn min_of<T>(items: [T]) -> T {
+    let rest = tail(items);
+    if rest == [] {
+        head(items)
+    } else {
+        min(head(items), min_of(rest))
+    }
+}
+
+fn sum_float(values: [Float]) -> Float {
+    if values == [] {
+        0.
+    } else {
+        head(values) + sum_float(tail(values))
+    }
+}
+
+fn to_string(value: Int) -> String {
+    int_to_string(value)
 }

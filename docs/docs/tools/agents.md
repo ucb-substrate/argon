@@ -114,20 +114,58 @@ Each call uses the library whose `Argon.toml` is in the agent's working director
 
 | Tool | Arguments | Description |
 | --- | --- | --- |
-| `compile` | `cells`, `export`, `layers` | Compiles cell invocations in parallel and reports each one's size, bounding box, and errors. With `export`, writes each cell that compiles to `<export>/<name>/argon.gds` and `argon.spice`, exactly as `arc run --gds --spice` writes them, where `<name>` is the invocation's tokens joined by `-`; a cell that fails removes its old files there. With `layers`, adds each layer's drawn area. With no `cells`, only parses and type-checks the library. |
+| `compile` | `cells`, `sweep`, `export`, `layers`, `verbose` | Compiles cell invocations in parallel and reports their sizes, bounding boxes, and errors: one cell in full, and several as a [summary](#sweeps). `sweep` adds a grid of invocations of one cell. With `export`, writes each cell that compiles to `<export>/<name>/argon.gds` and `argon.spice`, exactly as `arc run --gds --spice` writes them, where `<name>` is the invocation's tokens joined by `-`; a cell that fails removes its old files there. With `layers`, adds each layer's drawn area. `verbose` or `layers` lists every cell in full. When the cell or its subcells have [`net=` tags](/language/std-layout#rect) or pin labels, also checks them against the layout's connectivity and lists each short, open, and label with no pin or conductor under it, as warnings. With no cells, only parses and type-checks the library. |
 | `inspect` | `cell`, `exprs` | Evaluates expressions at the end of the cell's body after it is solved, where its parameters and top-level `let`s are in scope, such as `out.x1 - out.x0`. |
+| `nets` | `cell`, `nets`, `pairs` | Reports each net of the cell's layout: its wiring's length and area on each layer, its cuts, and a rough capacitance to the substrate and to each net it overlaps on another layer, from the technology file's [capacitance coefficients](/language/technology#capacitance). Nets are the conductors the technology's vias join, named by `net=` tags and pin labels; unnamed nets are listed largest first. A shape at least half the cell's longer side and 20 times as long as it is wide is listed as long. `nets` limits the report to those names, and `pairs`, such as `[["outp", "outn"]]`, compares nets that should match, flagging differences over 5%. Lateral coupling between neighbors on one layer isn't counted. |
 | `locate` | `cell`, `boxes`, `unit` | Finds the shapes that overlap or touch each box, such as a DRC violation, with the source line that drew each one, the call in its cell's body when that line is in a function, and the instances leading to it. A box takes optional `layers`, a `gds_cell` whose coordinates it is in (the cell a DRC report names for the violation), and a `label`. `unit` is `um`, the default, or `nm`. |
 
 The [quick reference](/language/reference) lists the language's rules and every function on one page, and [Writing a layout generator](/guides/layout-generator) builds and checks a generator with these tools.
 
-An error names the line that failed and, when that line is in a function or another cell, the call in the top cell's body that led to it:
+An error names the line that failed and, when that line is in a function or another cell, each call in the top cell's body that led to it:
 
 ```
-inv(1000., 1600., 4): 2.77 × 6.72 µm = 18.61 µm², (-665, -1160) to (2105, 5560); 25 shapes, 4 instances in the top cell → target/sweep/inv-1000-1600-4/
 inv(1001., 1600., 4): error
-  /path/to/pdks/sky130/lib.ar:11:16: solved value 1261 is off the 5 grid (nearest grid point is 1260)
+  /path/to/pdks/sky130/lib.ar:12:16: solved value 1261 is off the 5 grid (nearest grid point is 1260)
     called from lib.ar:5:38
 ```
+
+### Sweeps
+
+`sweep` compiles every combination of one cell's parameter values, the last parameter varying fastest. `params` is a list of value lists, one per parameter from the first, or an object of value lists by name, which must give every parameter without a default. A number is written as its parameter's declared type needs, so `1000` passes `1000.` to a `Float`. A string is Argon source, such as `"Mode::Fast"`, except for a `String` parameter, which receives it as text.
+
+```json
+{"sweep": {"cell": "inv", "params": [[1000, 1001, 2000], [1600], [2, 4]]}, "export": "target/sweep"}
+```
+
+Several cells are summarized: one line for those that compile, with the ranges of their widths and heights and the smallest and largest by area; in full, any that compile with coordinates set only by initial values or whose export failed; and each distinct error once, with the cells it occurs in:
+
+```
+4 of 6 cells compile: 1.77–2.63 × 6.72–7.72 µm; 11.89 µm² at inv(1000., 1600., 2) to 20.30 µm² at inv(2000., 1600., 4); each exported to target/sweep/<name>/.
+2 cells fail: inv(1001., 1600., 2) and inv(1001., 1600., 4)
+/path/to/pdks/sky130/lib.ar:12:16: solved value 1261 is off the 5 grid (nearest grid point is 1260)
+  called from lib.ar:5:38
+  in all 2 failing cells
+```
+
+### Connectivity
+
+A connectivity problem names the shapes on each side, and for a short, the chain of touching shapes that joins the two names. Here both of the [latch](/guides/layout-generator)'s output wires run at one height:
+
+```
+latch(1000., 2, 2000., 2): 3.41 × 4.99 µm = 17.02 µm², (-1705, -545) to (1705, 4445); 13 shapes, 2 instances in the top cell
+  nets: 1 connectivity problem (warnings; LVS would fail):
+    short in latch: `outp`, `outn` are one net
+      outp: met1.drawing (-575, 1000) to (-285, 1900): lib.ar:118:5, called from lib.ar:39:5
+      outn: met1.drawing (285, 1000) to (575, 1900): lib.ar:118:5, called from lib.ar:40:5
+      joined by, from `outp` to `outn`:
+        met1.drawing (-575, 1000) to (-285, 1900): lib.ar:61:19 in halves[1]
+        via.drawing (-505, 1085) to (-355, 1235): <argon-std>/layout.ar:20:30, called from lib.ar:36:5
+        met2.drawing (-930, 1090) to (500, 1230): lib.ar:105:5, called from lib.ar:35:5
+        via.drawing (355, 1085) to (505, 1235): <argon-std>/layout.ar:20:30, called from lib.ar:34:5
+        met1.drawing (285, 1000) to (575, 1900): lib.ar:61:19 in halves[0]
+```
+
+In a summary of several cells, a cell with connectivity problems is listed in full.
 
 ## Security
 

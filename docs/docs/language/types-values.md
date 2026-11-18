@@ -56,7 +56,7 @@ Arithmetic: `+`, `-`, `*`, `/`, and `%`. Comparison: `==`, `!=`, `<`, `<=`, `>`,
 - `%` takes `Int`s. `Int` division and `%` truncate toward zero, so `-7 / 2` is `-3` and `-7 % 2` is `-1`.
 - `as Int` truncates toward zero too, so `-0.5 as Int` is `0`.
 - `==` and `!=` reject `Float`s, with the error `cannot compare equality or inequality of floating point numbers`. Compare floats with `<`, `<=`, `>`, and `>=`.
-- [`String`s](/language/types/scalars#string) can't be compared or joined.
+- [`String`s](/language/types/scalars#string) compare with `==` and `!=` only, and `+` joins two of them.
 
 ```argon
 let offset = (index as Float) * pitch;

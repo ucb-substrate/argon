@@ -40,7 +40,7 @@ Coordinates are in nanometers, and the dimensions in this guide satisfy the SKY1
 | Cell | Draws | Public fields |
 | --- | --- | --- |
 | `fet1v8(nfet: Bool, w: Float, nf: Int)` | A 1.8 V transistor with `nf` gate fingers, each `w` wide | `poly_bbox`, `li1_bbox`, `sdm` |
-| `tap(ntap: Int, w: Float, h: Float)` | A substrate tap if `ntap` is `0`, a well tap if it's `1` | `tap`, `li1`, `sdm` |
+| `tap(ntap: Bool, w: Float, h: Float)` | A well tap if `ntap` is `true`, a substrate tap if it's `false` | `tap`, `li1`, `sdm` |
 
 `poly_bbox` bounds the gate fingers, and `li1_bbox` bounds the `li1` columns over the sources and drains. `sdm` is a cell's implant, its outermost rectangle. A tap's `li1` is its contact strip.
 
@@ -80,8 +80,8 @@ Place the devices in the order below. For each, press <kbd>I</kbd> for the Insta
 | --- | --- | --- |
 | `nmos` | `fet1v8(true, nw, nf)` | Anywhere |
 | `pmos` | `fet1v8(false, pw, nf)` | Above the NMOS |
-| `ptap` | `tap(0, nmos.sdm.w - 260., 800.)` | Below the NMOS |
-| `ntap` | `tap(1, pmos.sdm.w - 260., 800.)` | Above the PMOS |
+| `ptap` | `tap(false, nmos.sdm.w - 260., 800.)` | Below the NMOS |
+| `ntap` | `tap(true, pmos.sdm.w - 260., 800.)` | Above the PMOS |
 
 A tap's implant extends 130 nm past each side of the tap, so a width of `sdm.w - 260.` matches it to the transistor's implant.
 

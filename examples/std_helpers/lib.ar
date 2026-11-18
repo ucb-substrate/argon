@@ -1,0 +1,31 @@
+use std::layout::{bbox_of, column, inst, rect, row};
+
+cell block(w: Float, h: Float) {
+    rect("met1", x0=0., y0=0., x1=w, y1=h);
+}
+
+cell top() {
+    // Three blocks in a row, 20 apart, with their bottoms at y = 0.
+    let a = inst(block(100., 200.), x=0., y=0.);
+    let b = inst(block(300., 50.), y=0.);
+    let c = inst(block(50., 50.), y=0.);
+    row([a, b, c], 20.);
+    // Two more stacked above `a`, 10 apart, with their left edges at x = 0.
+    let d = inst(block(100., 100.), x=0.);
+    let e = inst(block(80., 30.), x=0.);
+    column([a, d, e], 10.);
+
+    let all = bbox_of([a, b, c, d, e]);
+    rect("met2", x0=all.x0, y0=all.y0, x1=all.x1, y1=all.y1);
+    let r = rect("met3", x0=0., y0=-100., x1=10., y1=-50.);
+    let s = rect("met3", x0=600., y0=-20., x1=610., y1=-10.);
+    let rs = bbox_of([r, s]);
+    rect("met4", x0=rs.x0, y0=rs.y0, x1=rs.x1, y1=rs.y1);
+
+    // Folds and `min`/`max` take `Int`s or `Float`s.
+    let widest = std::max_of([a.x, b.x, c.x]);
+    let lowest = std::min_of([3, 1, 2]);
+    let total = std::sum_float([100., 300., 50.]);
+    let count = std::max(std::len([a, b, c]), 2) + std::min(lowest, 0);
+    rect("met4", x0=widest, y0=0., x1=widest + total, y1=(count as Float) * 10.);
+}

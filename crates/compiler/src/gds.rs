@@ -1252,6 +1252,11 @@ mod tests {
             custom_dither_patterns: Vec::new(),
             custom_line_styles: Vec::new(),
             pin_layers: IndexMap::new(),
+            rules: IndexMap::new(),
+            vias: Vec::new(),
+            gates: Vec::new(),
+            capacitance: Vec::new(),
+            overlap_capacitance: Vec::new(),
         };
         // `tempfile` cleans up on unwind; a hand-rolled directory removed by a
         // trailing statement leaks on every assertion failure.

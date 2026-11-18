@@ -27,6 +27,62 @@ pub struct Technology {
     pub custom_line_styles: Vec<CustomLineStyle>,
     /// Pin-shape layer name to the text-label layer carrying the pin name.
     pub pin_layers: IndexMap<String, String>,
+    /// Design-rule values by name, such as `met1.space`, in DBUs (DBUs squared
+    /// for names ending in `.area`).
+    pub rules: IndexMap<String, f64>,
+    /// Cut layers and the rules for placing them between two layers.
+    pub vias: Vec<Via>,
+    /// Layers that split another where they cross it.
+    pub gates: Vec<Gate>,
+    /// Each layer's capacitance to the substrate, from the lowest layer up.
+    pub capacitance: Vec<LayerCapacitance>,
+    /// Capacitance between two layers where one overlaps the other.
+    pub overlap_capacitance: Vec<OverlapCapacitance>,
+}
+
+/// A layer that splits the conductor `splits` where it crosses it, as a
+/// transistor's gate splits its diffusion into source and drain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Gate {
+    pub layer: String,
+    pub splits: String,
+}
+
+/// A layer's capacitance to the substrate, in aF per µm² of area and per µm
+/// of perimeter.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LayerCapacitance {
+    pub layer: String,
+    pub area: f64,
+    pub perimeter: f64,
+}
+
+/// The capacitance where a shape on `top` overlaps one on `bot`, in aF per µm².
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OverlapCapacitance {
+    pub top: String,
+    pub bot: String,
+    pub area: f64,
+}
+
+/// A cut layer that joins `bot` to `top`, with its size, spacing, and the
+/// enclosure each layer needs, in DBUs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Via {
+    pub cut: String,
+    pub bot: String,
+    pub top: String,
+    pub size: f64,
+    pub space: f64,
+    /// Enclosure of each cut by `bot`, as (short side, long side): every side
+    /// gets the first, and two opposite sides the second.
+    pub bot_enclosure: (f64, f64),
+    /// Enclosure of each cut by `top`, as for [`Via::bot_enclosure`].
+    pub top_enclosure: (f64, f64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,7 +189,69 @@ impl Technology {
             custom_dither_patterns: Vec::new(),
             custom_line_styles: Vec::new(),
             pin_layers: IndexMap::new(),
+            rules: IndexMap::new(),
+            vias: Vec::new(),
+            gates: Vec::new(),
+            capacitance: Vec::new(),
+            overlap_capacitance: Vec::new(),
         }
+    }
+
+    /// Microns per source unit.
+    pub fn microns_per_unit(&self) -> f64 {
+        self.dbu * self.display_unit as f64 * 1e6
+    }
+
+    /// The rule `name` in source units, or `None` if the file has no such rule.
+    pub fn rule(&self, name: &str) -> Option<f64> {
+        let unit = self.display_unit as f64;
+        let scale = if name.ends_with(".area") {
+            unit * unit
+        } else {
+            unit
+        };
+        self.rules.get(name).map(|value| value / scale)
+    }
+
+    /// The via joining `bot` to `top`, with its lengths in source units.
+    pub fn via(&self, bot: &str, top: &str) -> Option<Via> {
+        let unit = self.display_unit as f64;
+        self.vias
+            .iter()
+            .find(|via| via.bot == bot && via.top == top)
+            .map(|via| Via {
+                size: via.size / unit,
+                space: via.space / unit,
+                bot_enclosure: (via.bot_enclosure.0 / unit, via.bot_enclosure.1 / unit),
+                top_enclosure: (via.top_enclosure.0 / unit, via.top_enclosure.1 / unit),
+                ..via.clone()
+            })
+    }
+
+    /// The layers a stack of vias passes through from `bot` up to `top`,
+    /// both included, or `None` if no chain of vias joins them.
+    pub fn via_path(&self, bot: &str, top: &str) -> Option<Vec<String>> {
+        let mut previous: IndexMap<&str, &str> = IndexMap::new();
+        let mut queue = std::collections::VecDeque::from([bot]);
+        while let Some(layer) = queue.pop_front() {
+            if layer == top {
+                let mut path = vec![top.to_owned()];
+                let mut at = top;
+                while at != bot {
+                    at = previous[at];
+                    path.push(at.to_owned());
+                }
+                path.reverse();
+                return Some(path);
+            }
+            for via in self.vias.iter().filter(|via| via.bot == layer) {
+                if via.top != bot && !previous.contains_key(via.top.as_str()) {
+                    previous.insert(&via.top, layer);
+                    queue.push_back(&via.top);
+                }
+            }
+        }
+        None
     }
 
     /// Snap-grid spacing in Argon source/display coordinate units.
@@ -204,6 +322,16 @@ struct ParsedTechnology {
     pin_layers: IndexMap<String, ParsedPinLayer>,
     #[serde(default)]
     pins: Vec<ParsedPinMapping>,
+    #[serde(default)]
+    rules: IndexMap<String, f64>,
+    #[serde(default)]
+    vias: Vec<Via>,
+    #[serde(default)]
+    gates: Vec<Gate>,
+    #[serde(default)]
+    capacitance: Vec<LayerCapacitance>,
+    #[serde(default)]
+    overlap_capacitance: Vec<OverlapCapacitance>,
 }
 
 /// Accept either an SI scale (`1e-9`) or a familiar unit name (`"nm"`).
@@ -380,6 +508,68 @@ pub fn parse_tech(text: &str) -> Result<Technology> {
         }
     }
 
+    for (name, value) in &input.rules {
+        if !value.is_finite() || *value < 0. {
+            bail!("rule `{name}` must be finite and not negative");
+        }
+    }
+    for via in &input.vias {
+        for layer in [&via.cut, &via.bot, &via.top] {
+            if !layer_names.contains(layer.as_str()) {
+                bail!("via `{}` refers to undefined layer `{layer}`", via.cut);
+            }
+        }
+        let lengths = [
+            via.size,
+            via.space,
+            via.bot_enclosure.0,
+            via.bot_enclosure.1,
+            via.top_enclosure.0,
+            via.top_enclosure.1,
+        ];
+        if via.size <= 0. || lengths.iter().any(|v| !v.is_finite() || *v < 0.) {
+            bail!(
+                "via `{}` needs a positive size and lengths that are not negative",
+                via.cut
+            );
+        }
+    }
+
+    let defined = |layer: &str, what: &str| {
+        if layer_names.contains(layer) {
+            Ok(())
+        } else {
+            Err(anyhow!("{what} refers to undefined layer `{layer}`"))
+        }
+    };
+    for gate in &input.gates {
+        defined(&gate.layer, "a gate")?;
+        defined(&gate.splits, "a gate")?;
+    }
+    for cap in &input.capacitance {
+        defined(&cap.layer, "a capacitance")?;
+        if !(cap.area.is_finite() && cap.perimeter.is_finite())
+            || cap.area < 0.
+            || cap.perimeter < 0.
+        {
+            bail!(
+                "the capacitance of `{}` must be finite and not negative",
+                cap.layer
+            );
+        }
+    }
+    for cap in &input.overlap_capacitance {
+        defined(&cap.top, "an overlap capacitance")?;
+        defined(&cap.bot, "an overlap capacitance")?;
+        if !cap.area.is_finite() || cap.area < 0. {
+            bail!(
+                "the capacitance of `{}` over `{}` must be finite and not negative",
+                cap.top,
+                cap.bot
+            );
+        }
+    }
+
     Ok(Technology {
         dbu,
         display_unit: input.display_unit,
@@ -389,6 +579,11 @@ pub fn parse_tech(text: &str) -> Result<Technology> {
         custom_dither_patterns: input.custom_dither_patterns,
         custom_line_styles: input.custom_line_styles,
         pin_layers,
+        rules: input.rules,
+        vias: input.vias,
+        gates: input.gates,
+        capacitance: input.capacitance,
+        overlap_capacitance: input.overlap_capacitance,
     })
 }
 
@@ -455,6 +650,21 @@ border = "#445566"
 "met1.pin" = "met1.label"
 "##;
 
+    const RULES: &str = r##"
+[rules]
+"met1.space" = 140
+"met1.area" = 83000
+
+[[vias]]
+cut = "met1.label"
+bot = "met1.pin"
+top = "met1.label"
+size = 150
+space = 170
+bot_enclosure = [55, 85]
+top_enclosure = [0, 0]
+"##;
+
     #[test]
     fn parses_units_layers_and_pin_mappings() {
         let tech = parse_tech(TECH).unwrap();
@@ -471,6 +681,69 @@ border = "#445566"
         assert_eq!(tech.custom_line_styles[0].pattern, "**..");
         assert_eq!(tech.pin_layers["met1.pin"], "met1.label");
         assert_eq!(tech.display_unit, 1000);
+    }
+
+    #[test]
+    fn reads_rules_and_vias_in_source_units() {
+        let tech = parse_tech(&format!("{TECH}{RULES}")).unwrap();
+        assert_relative_eq!(tech.rule("met1.space").unwrap(), 0.14, epsilon = 1e-12);
+        assert_relative_eq!(tech.rule("met1.area").unwrap(), 0.083, epsilon = 1e-12);
+        assert!(tech.rule("met2.space").is_none());
+        let via = tech.via("met1.pin", "met1.label").unwrap();
+        assert_relative_eq!(via.size, 0.15, epsilon = 1e-12);
+        assert_relative_eq!(via.bot_enclosure.1, 0.085, epsilon = 1e-12);
+        assert!(tech.via("met1.label", "met1.pin").is_none());
+        assert_eq!(
+            tech.via_path("met1.pin", "met1.label").unwrap(),
+            ["met1.pin", "met1.label"]
+        );
+        assert!(tech.via_path("met1.label", "met1.pin").is_none());
+        assert!(
+            parse_tech(&format!(
+                "{TECH}{}",
+                RULES.replace("bot = \"met1.pin\"", "bot = \"met9\"")
+            ))
+            .is_err()
+        );
+        assert!(parse_tech(&format!("{TECH}{}", RULES.replace("= 140", "= -1"))).is_err());
+    }
+
+    #[test]
+    fn reads_gates_and_capacitances() {
+        let extra = r##"
+[[gates]]
+layer = "met1.pin"
+splits = "met1.label"
+
+[[capacitance]]
+layer = "met1.pin"
+area = 26
+perimeter = 41
+
+[[overlap_capacitance]]
+top = "met1.label"
+bot = "met1.pin"
+area = 114
+"##;
+        let tech = parse_tech(&format!("{TECH}{extra}")).unwrap();
+        assert_eq!(tech.gates[0].splits, "met1.label");
+        assert_eq!(tech.capacitance[0].perimeter, 41.);
+        assert_eq!(tech.overlap_capacitance[0].area, 114.);
+        assert_relative_eq!(tech.microns_per_unit(), 1., epsilon = 1e-12);
+        assert!(
+            parse_tech(&format!(
+                "{TECH}{}",
+                extra.replace("splits = \"met1.label\"", "splits = \"met9\"")
+            ))
+            .is_err()
+        );
+        assert!(
+            parse_tech(&format!(
+                "{TECH}{}",
+                extra.replace("area = 26", "area = -26")
+            ))
+            .is_err()
+        );
     }
 
     #[test]

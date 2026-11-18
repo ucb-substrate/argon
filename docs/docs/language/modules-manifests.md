@@ -57,7 +57,11 @@ A group imports several items from one module: `use utils::{default_spacing, pad
 | [`std::layout`](/language/std-layout) | Geometry constructors, `inst`, `bbox`, `dimension`, and rectangle helpers |
 | [`std::schematic`](/language/std-schematic) | `Signal`, `connect`, `device`, `inst`, and `DeviceKind` |
 
-Call a standard library item by its full path, such as `std::max(a, b)` or `std::layout::rect("met1")`, or import it with `use`. `Option`, `Some`, and `None` are in scope in every module without an import.
+Call a standard library item by its full path, such as `std::max(a, b)` or `std::layout::rect("met1")`, or import it with `use`. `Option`, `Some`, and `None` are in scope in every module without an import. Using a standard library item that isn't imported, or by a path into the wrong module, is an error that gives the `use` to import it:
+
+```text
+error: `Signal` is not in scope; import it with `use std::schematic::Signal;`
+```
 
 ## Library manifest
 

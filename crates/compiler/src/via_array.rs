@@ -193,3 +193,101 @@ pub fn max_via_array(q: &ViaArrayQuery, grid: f64) -> ViaArrayChoice {
     let c11 = candidate(q, &grid, true, true);
     better(better(better(c00, c01), c10), c11)
 }
+
+/// A via's cut array: `nx` by `ny` cuts whose lower-left one is at (`x0`, `y0`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ViaFit {
+    pub nx: i64,
+    pub ny: i64,
+    pub x0: f64,
+    pub y0: f64,
+}
+
+/// The array with the most cuts that `bot` and `top` both enclose as their
+/// enclosures require, centered in the region they allow, or `None` if not
+/// even one cut fits. Each enclosure is `(short, long)`: every side gets the
+/// first and two opposite sides the second, whichever pair fits more cuts.
+pub fn fit_via(
+    size: f64,
+    space: f64,
+    bot_enc: (f64, f64),
+    top_enc: (f64, f64),
+    bot: Bounds,
+    top: Bounds,
+    grid: f64,
+) -> Option<ViaFit> {
+    let g = Grid(grid);
+    let turn = |enc: (f64, f64), t: bool| if t { (enc.1, enc.0) } else { enc };
+    let count = |len: f64| max_cuts(g.snap(len), 0., size, space);
+    let mut best: Option<(i64, ViaFit)> = None;
+    for (bt, tt) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (b, t) = (turn(bot_enc, bt), turn(top_enc, tt));
+        let x0 = g.max(bot[0] + b.0, top[0] + t.0);
+        let y0 = g.max(bot[1] + b.1, top[1] + t.1);
+        let x1 = g.min(bot[2] - b.0, top[2] - t.0);
+        let y1 = g.min(bot[3] - b.1, top[3] - t.1);
+        let (nx, ny) = (count(x1 - x0), count(y1 - y0));
+        if nx * ny == 0 || best.is_some_and(|(cuts, _)| cuts >= nx * ny) {
+            continue;
+        }
+        let margin = |len: f64, n: i64| {
+            let extra = len - (n as f64 * size + (n - 1) as f64 * space);
+            ((g.snap(extra) / 2. / grid) + 1e-9).floor() * grid
+        };
+        let fit = ViaFit {
+            nx,
+            ny,
+            x0: g.snap(x0 + margin(x1 - x0, nx)),
+            y0: g.snap(y0 + margin(y1 - y0, ny)),
+        };
+        best = Some((nx * ny, fit));
+    }
+    best.map(|(_, fit)| fit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fits_the_largest_centered_array_both_shapes_enclose() {
+        // An mcon between a 170-wide li1 column and a 290 by 320 met1 bar.
+        let fit = fit_via(
+            170.,
+            190.,
+            (0., 0.),
+            (30., 60.),
+            [0., 0., 170., 1000.],
+            [-60., 100., 230., 420.],
+            5.,
+        )
+        .unwrap();
+        assert_eq!((fit.nx, fit.ny, fit.x0, fit.y0), (1, 1, 0., 175.));
+        // Two cuts fit along a long overlap, centered on the 5 nm grid.
+        let fit = fit_via(
+            150.,
+            170.,
+            (55., 85.),
+            (55., 85.),
+            [0., 0., 600., 320.],
+            [0., 0., 600., 320.],
+            5.,
+        )
+        .unwrap();
+        assert_eq!((fit.nx, fit.ny, fit.x0, fit.y0), (2, 1, 65., 85.));
+    }
+
+    #[test]
+    fn fits_nothing_when_the_enclosures_leave_no_room() {
+        let fit = fit_via(
+            170.,
+            190.,
+            (0., 0.),
+            (30., 60.),
+            [0., 0., 170., 1000.],
+            [0., 0., 200., 1000.],
+            5.,
+        );
+        assert_eq!(fit, None);
+    }
+}
