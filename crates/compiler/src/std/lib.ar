@@ -108,6 +108,12 @@ fn sum_float(values: [Float]) -> Float {
     }
 }
 
-fn to_string(value: Int) -> String {
-    int_to_string(value)
+fn to_string<T>(value: T) -> String {
+    format_string("{}", [value])
+}
+
+/// `template` with each `{}` replaced, in order, by one of `values` as
+/// `to_string` writes it, and `{{` and `}}` by single braces.
+fn format<T>(template: String, values: [T]) -> String {
+    format_string(template, values)
 }

@@ -42,7 +42,7 @@ arc fmt
 arc fmt --check
 ```
 
-`arc fmt` indents each line four spaces deeper than the line that opened the innermost bracket around it, and it collapses repeated blank lines. It breaks lines wider than 100 columns, rustfmt style. On such a line, the widest call, list, tuple, struct literal, parameter list, or `use` group is split. Its opening bracket ends the line, each element goes on its own line with a trailing comma, and the closing bracket starts a new line. This repeats until every line fits. A call whose only argument is a list, call, or struct literal keeps both openers on one line, as in `merge_rects([`. A block or `match` written on one line is split into one statement or arm per line. `use` groups, and lists of short literals and names, are packed several to a line. Line breaks you write are kept, comments stay where they are, and files with syntax errors are only re-indented. A file whose leading comments include the line `// arc-fmt: no-wrap` is only re-indented, which suits generated or transcribed geometry.
+`arc fmt` indents each line four spaces deeper than the line that opened the innermost bracket around it, and it collapses repeated blank lines. It breaks lines wider than 100 columns, rustfmt style. On such a line, a block body, such as an `if` branch or a `match`, breaks first: the last one on the line, along with the bodies `else` chains to it, goes one statement or arm per line. Otherwise the widest call, list, tuple, struct literal, parameter list, or `use` group is split. Its opening bracket ends the line, each element goes on its own line with a trailing comma, and the closing bracket starts a new line. This repeats until every line fits. A call whose only argument is a list, call, or struct literal keeps both openers on one line, as in `merge_rects([`. `use` groups, and lists of short literals and names, are packed several to a line. Line breaks you write are kept, comments stay where they are, and files with syntax errors are only re-indented. A file whose leading comments include the line `// arc-fmt: no-wrap` is only re-indented, which suits generated or transcribed geometry.
 
 ```argon
 let pins = router::merge_rects([
@@ -76,7 +76,7 @@ arc run --cell <EXPR> [--output <PATH>] [--gds | --gds-only] [--spice] [--spectr
 | `--cell <EXPR>` | Required | Cell to run, such as `top(10., 20.)`. Arguments are Argon expressions evaluated in the library's scope. |
 | `-o, --output <PATH>` | `target/argon.bin` | Where to write the compiled layout. |
 | `--gds` | Off | Also write `target/argon.gds`. |
-| `--gds-only` | Off | Write only `target/argon.gds`, without the compiled layout the editor opens. Uses much less memory, so it suits generating large layouts. |
+| `--gds-only` | Off | Write only `target/argon.gds`, without the compiled layout the editor opens. Uses much less memory, so it suits generating large layouts. Can't be combined with `--output` or `--gds`. |
 | `--spice` | Off | Also write a SPICE netlist to `target/argon.spice`. |
 | `--spectre` | Off | Also write a Spectre netlist to `target/argon.scs`. |
 | `--netlist-width <COLS>` | `80` | Break netlist lines longer than this many characters; `0` turns wrapping off. Requires `--spice` or `--spectre`. |

@@ -16,6 +16,13 @@ npm start
 `npm run build` writes a production build to `build/`. Internal links and
 anchors are checked as part of the build and a broken one fails it.
 
+`scripts/check.sh` runs what CI runs: it checks that the quick reference is
+up to date (`scripts/reference.mjs`), that the layout-generator guide's code
+blocks still join to `examples/sky130_latch/lib.ar` (`scripts/guide.mjs`), and
+builds the site. `scripts/check.sh --external` also checks the built site's
+external links (`scripts/external-links.mjs`), which CI leaves out so that a
+third-party outage can't fail it.
+
 ## Deployment
 
 The site is published to GitHub Pages at <https://ucb-substrate.github.io/argon/>

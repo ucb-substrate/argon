@@ -9079,9 +9079,10 @@ layer = "poly.drawing"
 splits = "diff.drawing"
 
 # Rough wiring capacitance for the `nets` tool, in aF per µm² of area and per
-# µm of perimeter, from the public open-source SKY130 extraction defaults:
-# each layer to the substrate, from the lowest layer up, then between layers
-# where one overlaps the other.
+# µm of perimeter or facing edge, from the public open-source SKY130
+# extraction defaults: each layer to the substrate and between facing edges on
+# it, from the lowest layer up, then between layers where one overlaps the
+# other.
 # Diffusion carries no wiring capacitance, but it shields the poly over it,
 # so a transistor's gate isn't counted as wiring.
 [[capacitance]]
@@ -9093,26 +9094,31 @@ perimeter = 0
 layer = "poly.drawing"
 area = 106
 perimeter = 55
+sidewall = 23
 
 [[capacitance]]
 layer = "li1.drawing"
 area = 37
 perimeter = 55
+sidewall = 33
 
 [[capacitance]]
 layer = "met1.drawing"
 area = 26
 perimeter = 41
+sidewall = 45
 
 [[capacitance]]
 layer = "met2.drawing"
 area = 17
 perimeter = 41
+sidewall = 50
 
 [[capacitance]]
 layer = "met3.drawing"
 area = 12
 perimeter = 41
+sidewall = 63
 
 # A MIM capacitor's top plate is a device, not wiring, but it shields met4
 # from the bottom plate under it.
@@ -9125,11 +9131,13 @@ perimeter = 0
 layer = "met4.drawing"
 area = 8
 perimeter = 37
+sidewall = 67
 
 [[capacitance]]
 layer = "met5.drawing"
 area = 6
 perimeter = 39
+sidewall = 127
 
 [[overlap_capacitance]]
 top = "met1.drawing"

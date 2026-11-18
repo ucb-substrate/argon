@@ -53,9 +53,9 @@ cell inv(pw: Float, nw: Float, nf: Int) {
 A cell body may mix layout and schematic statements. Calling a cell runs its body once and produces both views. [`std::layout::inst`](/language/std-layout#inst) places the cell's layout, and [`std::schematic::inst`](/language/std-schematic#inst) places its schematic. The same cell value can be placed both ways:
 
 ```argon
-let cell = inv(2., 1., 2);
-let drawn = std::layout::inst(cell, x=0., y=0.);
-let wired = std::schematic::inst(cell);
+let c = inv(2., 1., 2);
+let drawn = std::layout::inst(c, x=0., y=0.);
+let wired = std::schematic::inst(c);
 ```
 
 A cell with no schematic content has an empty schematic, with no ports.

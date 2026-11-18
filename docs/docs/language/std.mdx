@@ -270,13 +270,13 @@ for index in std::range(4) {
 
 ## `std::to_string` {#to-string}
 
-<ApiItem id="to-string" name="std::to_string" signature={'std::to_string(value: Int) -> String'} summary={<>Returns an integer's decimal digits.</>}>
+<ApiItem id="to-string" name="std::to_string" signature={'std::to_string<T>(value: T) -> String'} summary={<>Writes an <code>Int</code>, <code>Float</code>, <code>Bool</code>, or <code>String</code> as text.</>}>
 
 <ParameterTable rows={[
-  {name: 'value', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required', description: <>The integer to write; convert a Float with <code>as Int</code> first.</>},
+  {name: 'value', type: 'T', requirement: 'Required', description: <>The value to write. Anything else is an error when the call runs.</>},
 ]} />
 
-<Returns type="String" href="/language/types/scalars#string">The digits, with a leading `-` for a negative value.</Returns>
+<Returns type="String" href="/language/types/scalars#string">An <code>Int</code>'s digits, with a leading <code>-</code> for a negative value; a <code>Float</code> without a trailing <code>.</code> when it is whole, so <code>1000.</code> is <code>1000</code> and <code>0.25</code> is <code>0.25</code>, rounded to nine decimal places; <code>true</code> or <code>false</code>; or the string itself.</Returns>
 
 [`+` joins two strings](/language/types/scalars#string), so this names numbered labels. `pub let d = signals(n);` makes ports named `d_0`, `d_1`, and so on, which these labels match:
 
@@ -284,6 +284,28 @@ for index in std::range(4) {
 for i in std::range(n) {
     text("d_" + std::to_string(i), "met1.label", 200. * (i as Float), 0.);
 }
+```
+
+A `Float` waits until the solver has fixed it.
+
+</ApiItem>
+
+## `std::format` {#format}
+
+<ApiItem id="format" name="std::format" signature={'std::format<T>(template: String, values: [T]) -> String'} summary={<>Replaces each <code>{'{}'}</code> in a template, in order, with one of a list of values.</>}>
+
+<ParameterTable rows={[
+  {name: 'template', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required', description: <>Text with one <code>{'{}'}</code> per value. <code>{'{{'}</code> and <code>{'}}'}</code> write single braces.</>},
+  {name: 'values', type: '[T]', typeHref: '/language/types/collections#sequences', requirement: 'Required', description: <>The values, each written as <a href="#to-string"><code>to_string</code></a> writes it.</>},
+]} />
+
+<Returns type="String" href="/language/types/scalars#string">The template with its <code>{'{}'}</code>s replaced.</Returns>
+
+A sequence holds one type, so values of different types are each converted with `to_string` first. A template with more or fewer `{}` than values, or a lone brace, is an error that quotes the template.
+
+```argon
+let name = std::format("d_{}_{}", [row, col]);
+let label = std::format("{}_{}", [net, std::to_string(i)]);
 ```
 
 </ApiItem>

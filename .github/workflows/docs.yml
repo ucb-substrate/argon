@@ -6,11 +6,13 @@ on:
     paths:
       - 'docs/**'
       - 'pdks/sky130/lib.ar'
+      - 'examples/sky130_latch/lib.ar'
       - '.github/workflows/docs.yml'
   pull_request:
     paths:
       - 'docs/**'
       - 'pdks/sky130/lib.ar'
+      - 'examples/sky130_latch/lib.ar'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -44,6 +46,10 @@ jobs:
 
       - name: Check the generated reference
         run: node scripts/reference.mjs --check
+        working-directory: docs
+
+      - name: Check the guide against its example
+        run: node scripts/guide.mjs
         working-directory: docs
 
       # The build fails on broken internal links and anchors, so this also

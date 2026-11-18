@@ -189,7 +189,7 @@ pub(crate) fn connectivity_lines(
         let untracked = check
             .issues
             .iter()
-            .filter(|issue| matches!(issue, Issue::Untracked { .. }))
+            .filter(|issue| matches!(issue, Issue::Untracked { .. } | Issue::UnknownPort { .. }))
             .count();
         notes += untracked;
         problems += check.issues.len() - untracked;
@@ -203,9 +203,9 @@ pub(crate) fn connectivity_lines(
         )
     } else if notes > 0 {
         format!(
-            "{indent}nets: {named} named {} the layout's connectivity, and {notes} {} unchecked:\n{text}",
+            "{indent}nets: {named} named {} the layout's connectivity, with {notes} {}:\n{text}",
             plural(named, "net matches", "nets match"),
-            plural(notes, "tag is", "tags are")
+            plural(notes, "note", "notes")
         )
     } else {
         format!(
@@ -283,6 +283,22 @@ fn issue_lines(data: &CompiledData, check: &Check, sources: &Sources, indent: &s
                     sources.site(data, site)
                 );
             }
+            Issue::UnknownPort {
+                name,
+                cell: child,
+                site,
+            } => {
+                let at = site
+                    .source
+                    .span
+                    .as_ref()
+                    .map(|span| sources.at(span))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    text,
+                    "{indent}  `nets=` in {cell} names `{name}`, which {child} has no signal of, so it maps nothing: {at}"
+                );
+            }
         }
     }
     text
@@ -340,7 +356,7 @@ pub(crate) fn nets_report(
     let unnamed_count = reports.iter().filter(|r| r.name.is_none()).count();
     let _ = writeln!(
         text,
-        "{}: {} named and {unnamed_count} unnamed nets. Capacitances are rough, in fF: area and perimeter to the substrate, plus overlaps with other nets; lateral coupling isn't counted.",
+        "{}: {} named and {unnamed_count} unnamed nets. Capacitances are rough, in fF: area and perimeter to the substrate, plus overlaps with other nets and their facing edges on one layer.",
         data.cells[&data.top].name,
         by_name.len(),
     );
@@ -418,12 +434,20 @@ fn net_lines(
     // Each neighbor's couplings, summed over layer pairs, largest first.
     let mut neighbors: Vec<(usize, f64, Vec<String>)> = Vec::new();
     for coupling in &report.couplings {
-        let pair = format!(
-            "{}/{} {} µm²",
-            short(&coupling.top),
-            short(&coupling.bot),
-            number(coupling.area)
-        );
+        let pair = if coupling.side {
+            format!(
+                "{} side {} µm",
+                short(&coupling.top),
+                number(coupling.length)
+            )
+        } else {
+            format!(
+                "{}/{} {} µm²",
+                short(&coupling.top),
+                short(&coupling.bot),
+                number(coupling.area)
+            )
+        };
         match neighbors.iter_mut().find(|(n, _, _)| *n == coupling.other) {
             Some((_, cap, pairs)) => {
                 *cap += coupling.cap;
@@ -656,9 +680,7 @@ cell top() {
         let tools = Headless::new(library.path().to_path_buf());
         let text = call(&tools, "compile", json!({"cells": ["top()"]})).await;
         assert!(
-            text.contains(
-                "nets: 1 named net matches the layout's connectivity, and 1 tag is unchecked"
-            ),
+            text.contains("nets: 1 named net matches the layout's connectivity, with 1 note"),
             "{text}"
         );
         assert!(!text.contains("LVS would fail"), "{text}");
@@ -749,6 +771,34 @@ cell shorted() {
         assert!(!text.contains("no net has this name"), "{text}");
         assert!(!text.contains("no net is named"), "{text}");
         assert!(text.contains("a+b: "), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_nets_map_naming_no_signal_is_a_note() {
+        let library = library_with(
+            r#"use std::layout::{inst, rect};
+use std::schematic::Signal;
+
+cell child() {
+    pub let a = Signal();
+    rect("met1.drawing", x0=0., y0=0., x1=1000., y1=300., net=a);
+}
+
+cell parent() {
+    pub let p = Signal();
+    inst(child(), x=0., y=0., nets=[("b", p)]);
+    rect("met1.drawing", x0=900., y0=0., x1=2000., y1=300., net=p);
+}
+"#,
+        );
+        let tools = Headless::new(library.path().to_path_buf());
+        let text = call(&tools, "compile", json!({"cells": ["parent()"]})).await;
+        assert!(text.contains("with 1 note"), "{text}");
+        assert!(
+            text.contains("`nets=` in parent names `b`, which child has no signal of"),
+            "{text}"
+        );
+        assert!(!text.contains("LVS would fail"), "{text}");
     }
 
     async fn call(tools: &Headless, name: &str, arguments: serde_json::Value) -> String {
@@ -884,9 +934,10 @@ cell devices() {
             json!({"cell": "tagged(false)", "pairs": [["a", "b"]]}),
         )
         .await;
-        // `b`'s met2 crosses `a`'s met1 over 140 by 320 nm, at 134 aF/µm².
+        // `b`'s met2 crosses `a`'s met1 over 140 by 320 nm, at 134 aF/µm², and
+        // faces `a`'s met2 for 320 nm, 100 nm away, at 50 aF/µm.
         assert!(
-            text.contains("+ b (piece 1 of 3) 0.006 (met2/met1 0.045 µm²)"),
+            text.contains("+ b (piece 1 of 3) 0.166 (met2 side 0.32 µm, met2/met1 0.045 µm²)"),
             "{text}"
         );
         assert!(
@@ -902,5 +953,146 @@ cell devices() {
         .await;
         assert!(only.contains("z: no net has this name"), "{only}");
         assert!(!only.contains("\nb "), "{only}");
+    }
+
+    #[tokio::test]
+    async fn polygons_and_paths_carry_tags() {
+        let library = library_with(
+            r#"use std::layout::{path, polygon, rect};
+use std::schematic::Signal;
+
+cell shapes(short: Bool) {
+    pub let a = Signal();
+    pub let b = Signal();
+    polygon("met1.drawing", 4, x0=0., y0=0., x1=1000., y1=0., x2=1000., y2=300., x3=0., y3=300., net=a);
+    path("met1.drawing", 2, x0=500., y0=if short { 150. } else { 1000. }, x1=500., y1=2000., width=200., net=b);
+    rect("met1.drawing", x0=2000., y0=0., x1=2300., y1=300., net=a);
+}
+"#,
+        );
+        let tools = Headless::new(library.path().to_path_buf());
+        let text = call(&tools, "compile", json!({"cells": ["shapes(true)"]})).await;
+        assert!(text.contains("short in shapes: `a`, `b`"), "{text}");
+        let text = call(&tools, "compile", json!({"cells": ["shapes(false)"]})).await;
+        assert!(
+            text.contains("open in shapes: `a` is on 2 separate nets"),
+            "{text}"
+        );
+        assert!(!text.contains("short"), "{text}");
+    }
+
+    const PORTS: &str = r#"use std::layout::{inst, rect, text};
+use std::schematic::Signal;
+
+// A bar on met1 tagged with the cell's port `p`, and a labeled pin for `q`.
+cell leaf() {
+    pub let p = Signal();
+    pub let q = Signal();
+    rect("met1.drawing", x0=0., y0=0., x1=1000., y1=300., net=p);
+    rect("met1.drawing", x0=0., y0=1000., x1=1000., y1=1300.);
+    rect("met1.pin", x0=100., y0=1100., x1=240., y1=1240.);
+    text("q", "met1.label", 170., 1170.);
+}
+
+// A `leaf` whose ports pass up as its own `p` and `q`, mirrored.
+cell middle() {
+    pub let p = Signal();
+    pub let q = Signal();
+    inst(leaf(), x=0., y=0., reflect=true, angle=180, nets=[("p", p), ("q", q)]);
+}
+
+// Two `middle`s side by side, each port mapped to `a` or `b`, joined on met1
+// when `join` and kept apart otherwise.
+cell top(join: Bool, swap: Bool) {
+    pub let a = Signal();
+    pub let b = Signal();
+    inst(middle(), x=0., y=0., nets=[("p", a), ("q", b)]);
+    inst(middle(), x=3000., y=0., nets=[("p", if swap { b } else { a }), ("q", b)]);
+    if join {
+        rect("met1.drawing", x0=-1000., y0=0., x1=3000., y1=300., net=a);
+    }
+}
+"#;
+
+    #[tokio::test]
+    async fn instance_ports_carry_names_through_the_hierarchy() {
+        let library = library_with(PORTS);
+        let tools = Headless::new(library.path().to_path_buf());
+        // Joined, each `a` piece is one net; `b`'s labeled pins stay apart.
+        let text = call(&tools, "compile", json!({"cells": ["top(true, false)"]})).await;
+        assert!(
+            text.contains("open in top: `b` is on 2 separate nets"),
+            "{text}"
+        );
+        assert!(!text.contains("`a` is on"), "{text}");
+        assert!(!text.contains("short"), "{text}");
+        // Not joined, `a` is open too.
+        let text = call(&tools, "compile", json!({"cells": ["top(false, false)"]})).await;
+        assert!(
+            text.contains("open in top: `a` is on 2 separate nets"),
+            "{text}"
+        );
+        // The second instance's `p` mapped to `b` meets `a` through the join.
+        let text = call(&tools, "compile", json!({"cells": ["top(true, true)"]})).await;
+        assert!(text.contains("short in top: `a`, `b`"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn port_nets_leave_the_exported_layout_and_netlist_unchanged() {
+        let untagged = PORTS
+            .replace(", nets=[(\"p\", p), (\"q\", q)]", "")
+            .replace(", nets=[(\"p\", a), (\"q\", b)]", "")
+            .replace(", nets=[(\"p\", if swap { b } else { a }), (\"q\", b)]", "");
+        assert!(!untagged.contains("nets="));
+        let mut exports = Vec::new();
+        for source in [PORTS, untagged.as_str()] {
+            let library = library_with(source);
+            let tools = Headless::new(library.path().to_path_buf());
+            call(
+                &tools,
+                "compile",
+                json!({"cells": ["top(true, false)"], "export": "out"}),
+            )
+            .await;
+            let directory = library.path().join("out/top-true-false");
+            exports.push((
+                gds_without_timestamps(&directory.join("argon.gds")),
+                std::fs::read_to_string(directory.join("argon.spice")).unwrap(),
+            ));
+        }
+        assert_eq!(exports[0], exports[1]);
+    }
+
+    #[tokio::test]
+    async fn facing_edges_couple_unless_shielded() {
+        let library = library_with(
+            r#"use std::layout::rect;
+use std::schematic::Signal;
+
+// Two 10 µm met1 wires 140 nm apart, with a third between them if `shield`.
+cell pair(shield: Bool) {
+    pub let a = Signal();
+    pub let b = Signal();
+    rect("met1.drawing", x0=0., y0=0., x1=10000., y1=140., net=a);
+    rect("met1.drawing", x0=0., y0=if shield { 700. } else { 280. }, x1=10000., y1=if shield { 840. } else { 420. }, net=b);
+    if shield {
+        rect("met1.drawing", x0=2000., y0=280., x1=8000., y1=560.);
+    }
+}
+"#,
+        );
+        let tools = Headless::new(library.path().to_path_buf());
+        // 45 aF/µm × 10 µm / 0.14 µm.
+        let text = call(
+            &tools,
+            "nets",
+            json!({"cell": "pair(false)", "nets": ["a"]}),
+        )
+        .await;
+        assert!(text.contains("+ b 3.214 (met1 side 10 µm)"), "{text}");
+        // The shield covers 6 of the 10 µm, 140 nm from each.
+        let text = call(&tools, "nets", json!({"cell": "pair(true)", "nets": ["a"]})).await;
+        assert!(text.contains("met1 side 4 µm"), "{text}");
+        assert!(text.contains("met1 side 6 µm"), "{text}");
     }
 }

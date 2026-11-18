@@ -244,6 +244,41 @@ mod tests {
     }
 
     #[test]
+    fn a_via_stack_grows_its_pads_past_a_narrow_overlap() {
+        let output = compile_sky130_source(
+            "use std::layout::{rect, via_stack};
+             cell top() {
+                 let li = rect(\"li1.drawing\", x0=0., y0=0., x1=170., y1=1000.);
+                 let m3 = rect(\"met3.drawing\", x0=-165., y0=250., x1=335., y1=750.);
+                 via_stack(li, m3);
+             }",
+        );
+        let CompileOutput::Valid(data) = &output else {
+            panic!("the stack should compile: {output:?}");
+        };
+        // The li1 column takes an mcon; the met1 and met2 pads grow past its
+        // 170-wide overlap with the met3 pad to enclose the vias above.
+        let only = |layer: &str| {
+            let rects = top_rects_on(data, layer);
+            assert_eq!(rects.len(), 1, "{layer}: {rects:?}");
+            rects[0]
+        };
+        for layer in ["met1.drawing", "met2.drawing"] {
+            let pad = only(layer);
+            assert!(pad[0] < 0. && pad[2] > 170., "{layer}: {pad:?}");
+        }
+        // Every cut is centered on the column, within the met3 pad's span.
+        for layer in ["mcon.drawing", "via.drawing", "via2.drawing"] {
+            let cuts = top_rects_on(data, layer);
+            assert!(!cuts.is_empty(), "{layer}");
+            for cut in cuts {
+                assert_eq!(cut[0] + cut[2], 170., "{layer}: {cut:?}");
+                assert!(cut[1] >= 250. && cut[3] <= 750., "{layer}: {cut:?}");
+            }
+        }
+    }
+
+    #[test]
     fn vias_and_rules_come_from_the_technology_file() {
         let output = compile_sky130_source(
             "use std::layout::{rect, rule, via, via_stack};
@@ -3454,6 +3489,79 @@ cell top() {
         }
     }
 
+    /// A value waiting on a shape that only the waiting value would place is
+    /// reported as underconstrained, and the equation that reads it doesn't
+    /// also conflict with the values the compiler pins to finish the cell.
+    #[test]
+    fn a_wait_cycle_is_only_underconstrained() {
+        for source in [
+            r#"
+use std::layout::rect;
+
+cell top() {
+    let r = rect("met1", y0=0., w=100., h=100.);
+    let n = if r.w > 50. { 1 } else { 2 };
+    eq(r.x0, (n as Float) * 10.);
+}
+"#,
+            r#"
+use std::layout::{array, rect};
+
+cell top() {
+    let met1 = rect("met1", x0=0., y0=0., w=1000., h=200.);
+    let cut = rect("via1", x0=0., y0=0., w=150., h=150.);
+    let vias = array(cut, 3, 320., 0.);
+    let n = ((met1.w - vias.w) / 10.) as Int;
+    eq(vias.x0, met1.x0 + (n as Float) * 5.);
+}
+"#,
+        ] {
+            let output = compile_source(source, "top", Vec::new()).unwrap_exec_errors();
+            assert!(!output.errors.is_empty());
+            assert!(
+                output
+                    .errors
+                    .iter()
+                    .all(|error| matches!(error.kind, ExecErrorKind::Underconstrained { .. })),
+                "{:?}",
+                output.errors
+            );
+            let cells = output.output.expect("the layout is still produced");
+            assert!(cells.cells[&cells.top].inconsistent_constraints.is_empty());
+        }
+    }
+
+    /// Equations that conflict before anything is pinned are reported beside
+    /// the free values they leave.
+    #[test]
+    fn a_conflict_among_free_values_is_still_reported() {
+        let source = r#"
+use std::layout::rect;
+
+cell top() {
+    let a = rect("met1", y0=0., w=100., h=100.);
+    let b = rect("met1", y0=200., w=100., h=100.);
+    eq(a.x0 + b.x0, 10.);
+    eq(a.x0 + b.x0, 20.);
+}
+"#;
+        let errors = compile_source(source, "top", Vec::new())
+            .unwrap_exec_errors()
+            .errors;
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error.kind, ExecErrorKind::Underconstrained { .. })),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error.kind, ExecErrorKind::InconsistentConstraint(..))),
+            "{errors:?}"
+        );
+    }
+
     /// A shape whose coordinates the caller never pins down is passed once the
     /// caller's solver has settled them, and the caller is the cell reported.
     #[test]
@@ -3873,6 +3981,8 @@ cell top() {
                         CellArg::Bool(swap),
                         CellArg::Bool(away),
                         CellArg::Bool(true),
+                        CellArg::Int(-1),
+                        CellArg::Int(0),
                     ],
                 },
             )
@@ -3900,6 +4010,48 @@ cell top() {
                 assert!(far[1] - near[3] >= 140., "{nf} fingers: {bars:?}");
             }
         }
+    }
+
+    #[test]
+    fn argon_sky130_mos_ties_its_dummies_above_the_far_bar() {
+        let o = parse_workspace_with_std(ARGON_SKY130_LIB);
+        assert!(o.static_errors().is_empty());
+        let ast = o.ast();
+        let args = |dummies: i64| {
+            vec![
+                CellArg::Bool(true),
+                CellArg::Float(420.),
+                CellArg::Int(2),
+                CellArg::Int(0),
+                CellArg::Int(0),
+                CellArg::Bool(false),
+                CellArg::Bool(false),
+                CellArg::Bool(true),
+                CellArg::Int(-1),
+                CellArg::Int(dummies),
+            ]
+        };
+        let bars = |dummies: i64| {
+            let data = compile_sky130(
+                &ast,
+                CompileInput {
+                    cell: &["mos"],
+                    args: args(dummies),
+                },
+            )
+            .unwrap_valid();
+            let mut bars = top_rects_on(&data, "met1.drawing");
+            bars.sort_by(|a, b| a[1].partial_cmp(&b[1]).unwrap());
+            bars
+        };
+        let plain = bars(0);
+        let tied = bars(1);
+        // One more bar, `dum`, 140 past the far bar and as wide as the
+        // diffusion's contact columns plus 60 on each side.
+        assert_eq!(tied.len(), plain.len() + 1, "{tied:?}");
+        let (far, dum) = (tied[tied.len() - 2], tied[tied.len() - 1]);
+        assert_relative_eq!(dum[1] - far[3], 140., epsilon = EPSILON);
+        assert_relative_eq!(dum[2] - dum[0], 4. * 430. + 170. + 120., epsilon = EPSILON);
     }
 
     #[test]
@@ -3981,6 +4133,55 @@ cell top() {
             .filter_map(|rect| rect.layer.as_deref())
             .collect::<indexmap::IndexSet<_>>();
         assert!(layers.contains("met2") && layers.contains("met3"));
+    }
+
+    #[test]
+    fn format_writes_values_in_order() {
+        let data = compile_top(
+            "use std::layout::{rect, text};
+             cell top() {
+                 let r = rect(\"met1\", x0=0., y0=0., w=100., h=50.);
+                 text(std::format(\"d_{}_{}\", [3, -4]), \"met1\", 0., 0.);
+                 text(std::format(\"{} {{}} {}\", [r.w, 0.1 + 0.2]), \"met1\", 0., 0.);
+                 text(std::format(\"{}{}\", [std::to_string(true), \"x\"]), \"met1\", 0., 0.);
+                 text(std::to_string(2.5) + std::to_string(-7), \"met1\", 0., 0.);
+             }",
+        );
+        let labels = data.cells[&data.top]
+            .objects
+            .values()
+            .filter_map(|object| object.get_text())
+            .map(|text| text.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["d_3_-4", "100 {} 0.3", "truex", "2.5-7"]);
+    }
+
+    #[test]
+    fn format_reports_a_template_that_does_not_match() {
+        for (template, values, message) in [
+            ("{}{}", "[1]", "has more `{}` than the 1 values given"),
+            ("{}", "[1, 2]", "has 1 `{}` for 2 values"),
+            ("a}", "[1]", "has a lone `}`; write `}}` for a brace"),
+        ] {
+            let (_dir, output) = scratch_workspace(
+                "format",
+                &format!(
+                    "use std::layout::text;\ncell top() {{\n    text(std::format(\"{template}\", {values}), \"met1\", 0., 0.);\n}}\n"
+                ),
+            );
+            let output = compile(
+                &output.ast(),
+                CompileInput {
+                    cell: &["top"],
+                    args: Vec::new(),
+                },
+            );
+            let CompileOutput::ExecErrors(output) = &output else {
+                panic!("`{template}` should fail: {output:?}");
+            };
+            let text = output.errors[0].kind.to_string();
+            assert!(text.contains(message), "{text}");
+        }
     }
 
     #[test]
@@ -8059,7 +8260,16 @@ cell top() {
                 .any(|error| matches!(error, StaticErrorKind::ArithMismatchedTypes)),
             "{errors:#?}"
         );
-        assert!(!check_source("cell top() { let a = std::to_string(1.); }").is_empty());
+        // `to_string` writes any Int, Float, Bool, or String, and reports
+        // anything else when it runs.
+        assert!(check_source("cell top() { let a = std::to_string(1.); }").is_empty());
+        let errors = run_source(
+            r#"cell top() { let a = std::to_string(std::layout::crect(x0=0., y0=0., x1=1., y1=1.)); }"#,
+        );
+        assert_reports(
+            &errors,
+            |error| matches!(error, ExecErrorKind::InvalidFormat(message) if message.contains("not a Rect")),
+        );
     }
 
     #[test]
@@ -10605,12 +10815,19 @@ cell device_inv(pw: Float, nw: Float) {
                  device(DeviceKind::Res, [a, m.b], \"\", value=1., x=2., y=0);\n\
                  let b = Signal(x=0, y=0, reflect=true);\n\
                  let n = sinst(r(), x=0, y=0, reflect=1);\n\
+                 connect(b, m.b, route=[\n\
+                     (-4., 0),\n\
+                     (-4., 2),\n\
+                 ]);\n\
+                 let w = 3.;\n\
+                 let c = Signal(x=w / 2., y=0);\n\
+                 connect(c, m.a, route=[(1.5, 0.)]);\n\
              }",
         );
         let hints = errors
             .iter()
             .map(|error| match error {
-                StaticErrorKind::GridUnits { hint } => hint.as_str(),
+                StaticErrorKind::GridUnits { hint, .. } => hint.as_deref().unwrap_or("<none>"),
                 StaticErrorKind::InvalidKwArg => "<invalid keyword>",
                 StaticErrorKind::IncorrectTy { expected, .. } => expected.as_str(),
                 other => panic!("{other:?}"),
@@ -10620,11 +10837,26 @@ cell device_inv(pw: Float, nw: Float) {
             hints,
             [
                 "x=0",
-                "angle=0",
-                "route=[(0, 0)]",
-                "x=0",
+                "angle=90",
+                "route=[(0, 1)]",
+                "x=2",
                 "<invalid keyword>",
-                "Bool"
+                "Bool",
+                "route=[(-4, 0), (-4, 2)]",
+                "<none>",
+                "<none>",
+            ]
+        );
+        let messages = errors
+            .iter()
+            .filter(|error| matches!(error, StaticErrorKind::GridUnits { hint: None, .. }))
+            .map(ToString::to_string)
+            .collect_vec();
+        assert_eq!(
+            messages,
+            [
+                "schematic coordinates are grid units; `x` takes an Int",
+                "schematic coordinates are grid units; `route` takes [(Int, Int)]",
             ]
         );
     }
@@ -11373,7 +11605,7 @@ cell device_inv(pw: Float, nw: Float) {
             matches!(
                 errors.as_slice(),
                 [
-                    StaticErrorKind::GridUnits { hint },
+                    StaticErrorKind::GridUnits { hint: Some(hint), .. },
                     StaticErrorKind::MissingKwArg { name: x1 },
                     StaticErrorKind::MissingKwArg { name: y1 },
                     StaticErrorKind::MissingKwArg { name: x },

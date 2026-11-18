@@ -32,7 +32,7 @@ cell strap(w: Float, h: Float, dummy: Bool) {
     let met1 = rect("met1", x0=0., y0=0., x1=w, y1=h)!;
 
     if !dummy && w >= 40. {
-        let via = rect("via1")!;
+        let via = rect("via1", y0=met1.y0 + 10., y1=met1.y1 - 10.)!;
         eq(via.x0, met1.x0 + 10.);
         eq(via.x1, met1.x1 - 10.);
     }

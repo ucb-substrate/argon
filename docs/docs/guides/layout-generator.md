@@ -155,7 +155,7 @@ LVS merges a transistor's parallel fingers into one device and compares its tota
 
 ## Mirrored halves
 
-Every transistor of the right half starts its first contact column at x = -85, centered on the axis, so its mirror image's first column lands on top of it. That first column is a source, so the two halves share one source column, and one diffusion, on the axis. A lone finger's gate contact is 270 wide, wider than its finger, so two of them would collide beside the shared column; `gate_side=1` widens each one away from the axis instead, and they keep their poly 0.21 µm apart (poly.2). With more fingers, `gate_side` changes nothing, since the gate contact spans the fingers.
+Every transistor of the right half starts its first contact column at x = -85, centered on the axis, so its mirror image's first column lands on top of it. That first column is a source, so the two halves share one source column, and one diffusion, on the axis. A lone finger's gate contact is 270 wide, wider than its finger, so two of them would collide beside the shared column; `gate_side=1` widens each one away from the axis instead, and their poly stays more than 0.21 µm apart (poly.2). With more fingers, `gate_side` changes nothing, since the gate contact spans the fingers.
 
 Because the halves share diffusion, their implants overlap into one rectangle. Two separate implant rectangles of the same type closer than 0.38 µm would leave a notch (nsd.2, psd.2).
 
@@ -264,7 +264,7 @@ b.n.g = Rect met1.drawing (285, -520) to (575, -200), 290 × 320
 
 ## Fix what the checks find
 
-Suppose the inverter's drain gap were 60 instead of 260. At `latch(1000., 1, 1000., 2)`, DRC reports these violations, among others:
+Suppose the inverter's drain gap were 60 instead of 260. At `latch(1000., 1, 1000., 2)`, DRC reports three violations:
 - difftap.9 in cell `latch`, from (-0.794, 1.13) to (0.794, 1.39) µm;
 - psd.2 in cell `inverter`, from (0.81, 1.06) to (1.47, 1.64) µm;
 - poly.2 in cell `inverter`, from (0.14, 1.26) to (0.29, 1.44) µm.
@@ -280,15 +280,15 @@ Pass them to `locate`, each with the cell the report names as `gds_cell`, since 
 
 ```text
 difftap.9 (-0.794, 1.13) to (0.794, 1.39) µm in latch:
-  diff.drawing (-145, 130) to (575, 1130): sky130/lib.ar:16:16; in halves[0] (<argon-std>/layout.ar:114:13, called from lib.ar:20:18) > n (lib.ar:58:17) > fet (sky130/lib.ar:145:15)
-  diff.drawing (-575, 130) to (145, 1130): sky130/lib.ar:16:16; in halves[1] (<argon-std>/layout.ar:115:13, called from lib.ar:20:18) > n (lib.ar:58:17) > fet (sky130/lib.ar:145:15)
+  diff.drawing (-145, 130) to (575, 1130): sky130/lib.ar:17:16; in halves[0] (<argon-std>/layout.ar:114:13, called from lib.ar:20:18) > n (lib.ar:58:17) > fet (sky130/lib.ar:171:15)
+  diff.drawing (-575, 130) to (145, 1130): sky130/lib.ar:17:16; in halves[1] (<argon-std>/layout.ar:115:13, called from lib.ar:20:18) > n (lib.ar:58:17) > fet (sky130/lib.ar:171:15)
   nwell.drawing (-1705, 1390) to (1705, 2750): lib.ar:30:5
 psd.2 (0.81, 1.06) to (1.47, 1.64) µm in inverter:
-  psdm.drawing (-275, 1440) to (1135, 2700): sky130/lib.ar:33:19; in p (lib.ar:59:17) > fet (sky130/lib.ar:145:15)
-  psdm.drawing (1145, 0) to (1655, 1260): sky130/lib.ar:63:19; in ptap (lib.ar:98:13, called from lib.ar:81:20) > t (sky130/lib.ar:86:13)
+  psdm.drawing (-275, 1440) to (1135, 2700): sky130/lib.ar:34:19; in p (lib.ar:59:17) > fet (sky130/lib.ar:171:15)
+  psdm.drawing (1145, 0) to (1655, 1260): sky130/lib.ar:67:19; in ptap (lib.ar:98:13, called from lib.ar:81:20) > t (sky130/lib.ar:95:13)
 poly.2 (0.14, 1.26) to (0.29, 1.44) µm in inverter:
-  poly.drawing (140, 0) to (290, 1260): <argon-std>/layout.ar:20:30, called from sky130/lib.ar:13:25; in n (lib.ar:58:17) > fet (sky130/lib.ar:145:15)
-  poly.drawing (140, 1440) to (290, 2700): <argon-std>/layout.ar:26:30, called from sky130/lib.ar:13:25; in p (lib.ar:59:17) > fet (sky130/lib.ar:145:15)
+  poly.drawing (140, 0) to (290, 1260): <argon-std>/layout.ar:20:30, called from sky130/lib.ar:14:25; in n (lib.ar:58:17) > fet (sky130/lib.ar:171:15)
+  poly.drawing (140, 1440) to (290, 2700): <argon-std>/layout.ar:26:30, called from sky130/lib.ar:14:25; in p (lib.ar:59:17) > fet (sky130/lib.ar:171:15)
 ```
 
 Paths into the SKY130 library are shortened here. Each shape comes with the line that drew it and the instances leading to it. All three violations involve the NMOS `n` or its tap column, the PMOS `p`, and the gap between them, so the fix is the constraint between the two rows, the drain gap. `locate` names the lines that drew the shapes, not the `eq` that placed them, so look for the constraint that sets the distance it reports.

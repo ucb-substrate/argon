@@ -61,7 +61,7 @@ fn pin(name: String, r: Rect) {
 - **Types.** A `Float` literal needs a decimal point or an exponent, as in `12.` or `1e3`; `12` is an `Int`. An instance's type can't be written, so annotate one as `Any`. An `Option<T>` is `Some(value)` or `None`. See [types and values](/language/types-values).
 - **Operators.** `+`, `-`, `*`, and `/` take two `Int`s or two `Float`s, never one of each; convert with `as Float` and `as Int`. `+` also joins two `String`s. `%` takes `Int`s. `Int` division and `as Int` truncate toward zero, so `-0.5 as Int` is `0`. There are no power or bitwise operators. `==` and `!=` reject `Float`s; `<`, `<=`, `>`, and `>=` take numbers. `&&`, `||`, and `!` take `Bool`s.
 - **Schematics.** `pub let vdd = Signal();` declares a port, in declaration order, and `let n = Signal();` an internal net. `device(DeviceKind::Nmos, [d, g, s, b], "sky130_fd_pr__nfet_01v8", w=w, l=0.15, nf=nf)` adds a transistor, and its keyword arguments go to the netlist as written, so for SKY130 `w` and `l` are in µm and `w` is the total width of all fingers. The other kinds are `Pmos`, `Mos`, `Res`, `Cap`, `Diode`, `Npn`, `Pnp`, `Bjt`, and `Subckt`. See [schematics](/language/schematic).
-- **Strings.** A `String` is text, such as a layer name. `+` joins two, `==` and `!=` compare them, and `std::to_string(i)` writes an `Int`, so `"d_" + std::to_string(i)` is the name of `d[i]`'s port when `pub let d = signals(n);`.
+- **Strings.** A `String` is text, such as a layer name. `+` joins two, `==` and `!=` compare them, `std::to_string(x)` writes an `Int`, `Float`, or `Bool`, and `std::format("r{}c{}", [i, j])` fills a template, so `"d_" + std::to_string(i)` is the name of `d[i]`'s port when `pub let d = signals(n);`.
 - **Control flow.** `if`/`else` and `match` are expressions. `for x in xs { ... }` runs once per element, `[for x in xs { value }]` builds a sequence, and `std::range(n)` is `[0, 1, …, n - 1]`. Functions and cells may recurse. See [control flow](/language/control-flow).
 - **Constraints.** Coordinates are solved: a coordinate keyword such as `x0=0.` is an equation, and `eq(a, b)` adds one. Comparisons, casts, and `std::max` or `std::min` on a coordinate wait until it's determined; both also take `Int`s. Solved coordinates must lie on the technology's grid, 5 nm in SKY130, so center with `center_rects` and round with `grid_floor` rather than dividing by 2. See [constraints](/language/constraints).
 - **Emission.** `value!` emits a value for the GUI to list in its hierarchy. It adds no exported geometry and no constraint.
@@ -83,10 +83,10 @@ fn pin(name: String, r: Rect) {
 
 - `rect(layer: String, x0?, y0?, x1?, y1?, w?, h?, x0i?, y0i?, x1i?, y1i?, net?) -> Rect`: Draws an axis-aligned rectangle on a layer.
 - `crect(x0?, y0?, x1?, y1?, w?, h?, layer?, x0i?, y0i?, x1i?, y1i?) -> Rect`: Creates a construction rectangle: usable in constraints and as bounds, but not exported.
-- `polygon(layer: String, points: Int, x0?, y0?, …, x0i?, y0i?, …) -> Polygon`: Creates a polygon with a fixed number of vertices, each constrained on its own.
-- `path(layer: String, points: Int, width?, begin_extension?, end_extension?, x0?, y0?, …) -> Path`: Creates a constant-width path along a centerline.
+- `polygon(layer: String, points: Int, x0?, y0?, …, x0i?, y0i?, …, net?) -> Polygon`: Creates a polygon with a fixed number of vertices, each constrained on its own.
+- `path(layer: String, points: Int, width?, begin_extension?, end_extension?, x0?, y0?, …, net?) -> Path`: Creates a constant-width path along a centerline.
 - `text(value: String, layer: String, x: Float, y: Float) -> ()`: Places a text label on a layer.
-- `inst(cell: Cell, reflect?, angle?, x?, y?, xi?, yi?, construction?) -> Inst`: Places a cell in the current scope.
+- `inst(cell: Cell, reflect?, angle?, x?, y?, xi?, yi?, construction?, nets?) -> Inst`: Places a cell in the current scope.
 - `bbox(value: Cell | Inst | Rect) -> Rect`: Returns the bounding box of a cell, a placed instance, or a rectangle, as a construction rectangle.
 - `bbox_of(items: [Any]) -> Rect`: Returns the bounding box of a non-empty sequence of instances or rectangles.
 - `shapes(value: Cell | Inst, layer: String) -> [Rect]`: Returns the bounding rectangle of every shape on one layer of a cell or a placed instance, through all of its instances.
@@ -138,7 +138,8 @@ fn pin(name: String, r: Rect) {
 - `std::any(values: [Bool]) -> Bool`: Whether any value is true.
 - `std::all(values: [Bool]) -> Bool`: Whether every value is true.
 - `std::range(stop: Int) -> [Int]`: Returns the integers from 0 up to stop.
-- `std::to_string(value: Int) -> String`: Returns an integer's decimal digits.
+- `std::to_string<T>(value: T) -> String`: Writes an <code>Int</code>, <code>Float</code>, <code>Bool</code>, or <code>String</code> as text.
+- `std::format<T>(template: String, values: [T]) -> String`: Replaces each <code>{'{}'}</code> in a template, in order, with one of a list of values.
 
 ## [Built-in functions](/language/builtins)
 
@@ -152,6 +153,7 @@ fn pin(name: String, r: Rect) {
 - `max_num(a: T, b: T) -> T`: Returns the larger of two <code>Int</code>s or two <code>Float</code>s.
 - `min_num(a: T, b: T) -> T`: Returns the smaller of two <code>Int</code>s or two <code>Float</code>s.
 - `int_to_string(value: Int) -> String`: Returns an integer's decimal digits.
+- `format_string<T>(template: String, values: [T]) -> String`: Replaces each <code>{'{}'}</code> in a template with one of a list of values.
 - `cons(value: T, tail: [T]) -> [T]`: Prepends one value to an existing sequence.
 - `head(sequence: [T]) -> T`: Returns the first element of a sequence.
 - `tail(sequence: [T]) -> [T]`: Returns every element after the first.
@@ -163,13 +165,16 @@ fn pin(name: String, r: Rect) {
 ## [SKY130 library](/language/sky130)
 
 - `sky130::fet1v8(nfet: Bool, w: Float, nf: Int)`: A 1.8 V transistor with `nf` gate fingers over one diffusion, contacted with local interconnect between and beside the fingers. Fields: `poly_bbox`, `li1_bbox`, `sdm`.
-- `sky130::tap(ntap: Bool, w: Float, h: Float)`: A well or substrate tap: a `w` by `h` tap diffusion covered with local interconnect and as many contacts as fit on a 340 pitch. Fields: `tap`, `li1`, `sdm`.
+- `sky130::tap(ntap: Bool, w: Float, h: Float)`: A well or substrate tap: a `w` by `h` tap diffusion covered with local interconnect and as many contacts as fit on a 340 pitch, which the tap encloses by 120 at the ends of its longer side. Fields: `tap`, `li1`, `sdm`.
 - `sky130::tap_m1(ntap: Bool, w: Float, h: Float)`: A `tap` with met1 over its whole outline, contacted to its local interconnect with as many mcons as fit, so a supply can strap it directly. Fields: `tap`, `li1`, `sdm`, `m1`.
 - `sky130::fill_tap(ntap: Bool, span: Rect) -> Any`: Places a `tap_m1` whose implant fills `span` exactly, such as the room at the end of a row, and returns the instance.
-- `sky130::mos(nfet: Bool, w: Float, nf: Int, gate_row: Int = 0, gate_side: Int = 0, swap: Bool = false, away: Bool = false, straps: Bool = true)`: A `fet1v8` wired on met1: its gate fingers join a poly pad below the diffusion, contacted under the met1 bar `g`, and the met1 bars `s` and `d` strap its sources (even contact columns, counting from 0 at the left) and its drains (odd columns). Fields: `sdm`, `poly`, `cols`, `s`, `d`, `g`.
+- `sky130::mos(nfet: Bool, w: Float, nf: Int, gate_row: Int = 0, gate_side: Int = 0, swap: Bool = false, away: Bool = false, straps: Bool = true, gate_col: Int = -1, dummies: Int = 0)`: A `fet1v8` wired on met1: its gate fingers join a poly pad below the diffusion, contacted under the met1 bar `g`, and the met1 bars `s` and `d` strap its sources (even contact columns, counting from 0 at the left) and its drains (odd columns). Fields: `sdm`, `cols`, `poly`, `s`, `d`, `g`, `dum`.
+- `sky130::dummy_devices(nfet: Bool, w: Float, nf: Int, dummies: Int, s: Signal, d: Signal, dum: Signal, b: Signal)`: Adds the transistors a `mos` with `dummies` draws to the schematic, since LVS extracts them like any other: at each end, one from the device's outer column (`s` on the left; `s` for an even `nf` or `d` for an odd one on the right) to `dum`, and the rest from `dum` to `dum`, all with their gates on `dum` and their bodies on `b`.
+- `sky130::dummy_device(nfet: Bool, outer: Signal, dum: Signal, b: Signal, w: Float, nf: Int)`: `nf` dummy fingers `w` wide from `outer` to `dum`, gated by `dum`.
+- `sky130::dummy_ties(fingers: Rect, cols: Rect, dummies: Int, nf: Int) -> Rect`: Ties the `dummies` fingers at each end of `fingers`, around `nf` device fingers, to a met1 bar above the far end of the contact columns `cols`, which it returns: each group's poly is contacted over its outermost column, which joins the group's other outer columns on li1.
 - `sky130::fold(nfet: Bool, w: Float, nf: Int, rows: Int)`: One transistor folded into `rows` rows of `mos`, each with `nf / rows` fingers, stacked upward on a pitch of `w + 1000`, so a long device fits the height a taller neighbor sets. Fields: `devices`, `sdm`, `s`, `d`, `g`.
-- `sky130::cmos(nw: Float, pw: Float, nf: Int, rows: Int = 1, gate_row: Int = 0, gate_side: Int = 0)`: An NMOS and a PMOS `fet1v8` sharing `nf` gate fingers, as in an inverter: the NMOS below, the PMOS above in an n-well, and the gate contacted on the met1 bar `g` between them, with the drain bars on either side of it. Fields: `cols`, `n_sdm`, `n_s`, `n_d`, `p_cols`, `p_sdm`, `p_d`, `p_s`, `poly`, `g`, `nwell`.
-- `sky130::gate_contact(fingers: Rect, li_y0: Float, pad_y1: Float, side: Int, npc_y0: Float, npc_y1: Float) -> Rect`: Contacts the gate fingers spanning `fingers` on met1: a poly pad from 80 below `li_y0` to `pad_y1`, li1 170 tall from `li_y0`, the nitride cut from `npc_y0` to `npc_y1`, and the met1 bar 320 tall that it returns.
+- `sky130::cmos(nw: Float, pw: Float, nf: Int, rows: Int = 1, gate_row: Int = 0, gate_side: Int = 0, gate_col: Int = -1)`: An NMOS and a PMOS `fet1v8` sharing `nf` gate fingers, as in an inverter: the NMOS below, the PMOS above in an n-well, and the gate contacted on the met1 bar `g` between them, with the drain bars on either side of it. Fields: `cols`, `n_sdm`, `n_s`, `n_d`, `p_cols`, `p_sdm`, `p_d`, `p_s`, `poly`, `g`, `nwell`.
+- `sky130::gate_contact(fingers: Rect, li_y0: Float, pad_y1: Float, side: Int, col: Int, npc_y0: Float, npc_y1: Float) -> Rect`: Contacts the gate fingers spanning `fingers` on met1: a poly pad from 80 below `li_y0` to `pad_y1`, li1 170 tall from `li_y0`, the nitride cut from `npc_y0` to `npc_y1`, and the met1 bar 320 tall that it returns.
 - `sky130::strap(x0: Float, y: Float, n: Int, below: Float, draw: Bool) -> Rect`: A met1 bar 320 tall over `n` mcons at `y`, on every other contact column from the one at `x0`, reaching `below` under them.
 - `sky130::abut(devices: [Any])`: Places each `mos` or `cmos` instance of `devices` right of the one before, with its leftmost contact column on that one's rightmost, so their diffusions merge and the shared column is a terminal of both.
 - `sky130::inv(nw: Float, pw: Float, nf: Int)`: A CMOS inverter drawn from `fet1v8` and `tap`, with taps under the NMOS and over the PMOS, and its gate and output on local interconnect. Fields: `ptap`, `pmos`, `ntap`, `nwell`, `a_li_mid`, `o_li_right`.

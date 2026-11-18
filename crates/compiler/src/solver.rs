@@ -434,6 +434,12 @@ impl Solver {
         }
     }
 
+    /// The ID the next constraint will get; IDs only increase.
+    #[inline]
+    pub fn next_constraint_id(&self) -> ConstraintId {
+        self.next_constraint
+    }
+
     #[inline]
     pub fn inconsistent_constraints(&self) -> &FxIndexSet<ConstraintId> {
         &self.inconsistent_constraints

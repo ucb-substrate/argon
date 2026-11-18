@@ -2,13 +2,18 @@
 //! vias, and checks of those nets against the names the source gives them
 //! with `net=` tags and pin labels.
 //!
-//! A cell is checked against its own tags and labels only: its subcells'
-//! shapes conduct, but their names are checked when they are.
+//! A cell is checked against its own tags and labels, and against its
+//! subcells' where an instance's `nets=` maps them to the cell's signals.
+//! Other names in subcells are checked when those cells are.
 
 use std::collections::HashMap;
 
+use std::cell::RefCell;
+
 use crate::ast::Span;
-use crate::compile::{CellId, CompiledData, ObjectId, SolvedInstance, SolvedValue};
+use crate::compile::{
+    CellId, CompiledCell, CompiledData, NodeSource, ObjectId, SolvedInstance, SolvedValue,
+};
 use crate::tech::Technology;
 
 /// A rectangle as `(x0, y0, x1, y1)`.
@@ -43,7 +48,7 @@ pub struct Shape {
     pub source: usize,
 }
 
-/// A text label of the flattened cell itself.
+/// A text label in the flattened cell's frame.
 #[derive(Clone, Debug)]
 pub struct Label {
     pub id: ObjectId,
@@ -52,6 +57,11 @@ pub struct Label {
     pub x: f64,
     pub y: f64,
     pub span: Option<Span>,
+    /// The cell whose body drew the label.
+    pub cell: CellId,
+    /// The instances leading to `cell`, as for [`Source::instances`]; empty
+    /// for the flattened cell's own labels.
+    pub instances: Vec<(CellId, ObjectId)>,
 }
 
 /// The conductors of a cell and its subcells, joined into nets.
@@ -105,6 +115,13 @@ pub enum Issue {
     Unattached { label: Naming, reason: String },
     /// A `net=` tag on a shape whose layer doesn't conduct.
     Untracked { name: String, site: Site },
+    /// A name in an instance's `nets=` that its cell has no signal of, so it
+    /// maps nothing.
+    UnknownPort {
+        name: String,
+        cell: String,
+        site: Site,
+    },
 }
 
 /// A cell's connectivity and what checking its names found.
@@ -152,6 +169,7 @@ pub fn named_cells(data: &CompiledData, top: CellId) -> Vec<CellId> {
         .filter(|cell| {
             let compiled = &data.cells[cell];
             !compiled.net_tags.is_empty()
+                || !compiled.inst_nets.is_empty()
                 || compiled.objects.values().any(|object| {
                     matches!(object, SolvedValue::Text(text) if labels.contains_key(text.layer.as_str()))
                 })
@@ -190,56 +208,86 @@ pub fn check(data: &CompiledData, cell: CellId) -> Check {
     let mut names: Vec<Vec<Naming>> = vec![Vec::new(); conductors.nets];
     let mut issues = Vec::new();
 
-    // Tags, on the cell's own shapes.
-    let tags: HashMap<ObjectId, &str> = compiled
-        .net_tags
-        .iter()
-        .filter_map(|(object, net)| {
-            let name = compiled.schematic.nets.get(*net as usize)?.name.as_str();
-            Some((*object, name))
-        })
-        .collect();
+    // Tags: the cell's own, and its subcells' that instances' `nets=` carry up.
+    let names_of = Names::new(data);
     let mut tagged = HashMap::<ObjectId, bool>::new();
     for (index, shape) in conductors.shapes.iter().enumerate() {
         let source = &conductors.sources[shape.source];
-        if !source.instances.is_empty() {
+        let Some(tag) = names_of.tag(source.cell, source.object) else {
+            continue;
+        };
+        let name = if source.instances.is_empty() {
+            tagged.insert(source.object, true);
+            tag
+        } else {
+            match names_of.carry(source.cell, &tag, &source.instances) {
+                Some(name) => name,
+                None => continue,
+            }
+        };
+        let net = conductors.net[index];
+        // One naming per tagged object and net is enough.
+        if names[net]
+            .iter()
+            .any(|n| n.name == name && n.site.source.object == source.object)
+        {
             continue;
         }
-        if let Some(name) = tags.get(&source.object) {
-            tagged.insert(source.object, true);
-            let net = conductors.net[index];
-            // One naming per tagged object and net is enough.
-            if names[net]
-                .iter()
-                .any(|n| n.name == *name && n.site.source.object == source.object)
-            {
-                continue;
-            }
-            names[net].push(Naming {
-                name: (*name).to_owned(),
-                site: conductors.site(index),
-            });
-        }
+        names[net].push(Naming {
+            name,
+            site: conductors.site(index),
+        });
     }
     for (object, layer) in &conductors.untracked {
-        if let Some(name) = tags.get(object)
+        if let Some(name) = names_of.tag(cell, *object)
             && !tagged.contains_key(object)
-            && let Some(SolvedValue::Rect(rect)) = compiled.objects.get(object)
+            && let Some(object_value) = compiled.objects.get(object)
+            && let Some(bounds) = object_bounds(object_value)
         {
             issues.push(Issue::Untracked {
-                name: (*name).to_owned(),
+                name,
                 site: Site {
                     layer: layer.clone(),
-                    bounds: [rect.x0.0, rect.y0.0, rect.x1.0, rect.y1.0],
+                    bounds,
                     shape: None,
                     source: Source {
                         cell,
                         object: *object,
-                        span: rect.span.clone(),
+                        span: object_span(object_value).cloned(),
                         instances: Vec::new(),
                     },
                 },
             });
+        }
+    }
+
+    // Names in instances' `nets=` that their cells don't have.
+    for (instance, ports) in &compiled.inst_nets {
+        let Some(SolvedValue::Instance(inst)) = compiled.objects.get(instance) else {
+            continue;
+        };
+        let child = &data.cells[&inst.cell];
+        let known = cell_names(child);
+        for (port, _) in ports {
+            let declared = known.aliases.contains_key(port)
+                || child.schematic.nets.iter().any(|net| &net.name == port);
+            if !declared {
+                issues.push(Issue::UnknownPort {
+                    name: port.clone(),
+                    cell: child.name.clone(),
+                    site: Site {
+                        layer: String::new(),
+                        bounds: [inst.x, inst.y, inst.x, inst.y],
+                        shape: None,
+                        source: Source {
+                            cell,
+                            object: *instance,
+                            span: Some(inst.span.clone()),
+                            instances: Vec::new(),
+                        },
+                    },
+                });
+            }
         }
     }
 
@@ -256,18 +304,27 @@ pub fn check(data: &CompiledData, cell: CellId) -> Check {
         let Some(pin_layers) = label_pins.get(label.layer.as_str()) else {
             continue;
         };
+        let own = label.instances.is_empty();
+        let name = if own {
+            label.text.clone()
+        } else {
+            match names_of.carry(label.cell, &label.text, &label.instances) {
+                Some(name) => name,
+                None => continue,
+            }
+        };
         let point = [label.x, label.y, label.x, label.y];
         let naming = |shape: Option<usize>, layer: &str, bounds: Bounds| Naming {
-            name: label.text.clone(),
+            name: name.clone(),
             site: Site {
                 layer: layer.to_owned(),
                 bounds,
                 shape,
                 source: Source {
-                    cell,
+                    cell: label.cell,
                     object: label.id,
                     span: label.span.clone(),
-                    instances: Vec::new(),
+                    instances: label.instances.clone(),
                 },
             },
         };
@@ -275,6 +332,10 @@ pub fn check(data: &CompiledData, cell: CellId) -> Check {
             pin_layers.contains(&layer.as_str()) && contains(*bounds, point)
         });
         let Some((pin_layer, pin_bounds)) = pin else {
+            // A subcell's label is that cell's own business when unattached.
+            if !own {
+                continue;
+            }
             issues.push(Issue::Unattached {
                 label: naming(None, &label.layer, point),
                 reason: format!(
@@ -297,7 +358,7 @@ pub fn check(data: &CompiledData, cell: CellId) -> Check {
         match under {
             Some(shape) => {
                 let net = conductors.net[shape];
-                if !names[net].iter().any(|n| n.name == label.text) {
+                if !names[net].iter().any(|n| n.name == name) {
                     names[net].push(naming(
                         Some(shape),
                         &drawing,
@@ -305,27 +366,17 @@ pub fn check(data: &CompiledData, cell: CellId) -> Check {
                     ));
                 }
             }
-            None => issues.push(Issue::Unattached {
+            None if own => issues.push(Issue::Unattached {
                 label: naming(None, pin_layer, *pin_bounds),
                 reason: format!("its {pin_layer} pin is not over any {drawing} shape"),
             }),
+            None => {}
         }
     }
 
     // Signals joined by `connect` are one schematic net, so each signal's own
     // name stands for its net's.
-    let schematic = &compiled.schematic;
-    let aliases: HashMap<String, &str> = schematic
-        .nodes
-        .iter()
-        .filter(|node| matches!(node.source, crate::compile::NodeSource::Signal { .. }))
-        .filter_map(|node| {
-            let net = schematic.nets.get(node.net as usize)?.name.as_str();
-            Some((schematic.path_text(node.path?), net))
-        })
-        .collect();
-    let canonical =
-        |name: &str| -> String { aliases.get(name).map_or(name, |net| *net).to_owned() };
+    let canonical = |name: &str| names_of.canonical(cell, name);
 
     // Shorts: one net, several names.
     let adjacency = conductors.adjacency();
@@ -480,16 +531,20 @@ impl Conductors {
                         None => return,
                     },
                     SolvedValue::Text(text) => {
-                        if path.is_empty() {
-                            this.labels.push(Label {
-                                id: text.id,
-                                text: text.text.clone(),
-                                layer: text.layer.clone(),
-                                x: text.x,
-                                y: text.y,
-                                span: text.span.clone(),
-                            });
-                        }
+                        let (x, y) = transform.apply((text.x, text.y));
+                        this.labels.push(Label {
+                            id: text.id,
+                            text: text.text.clone(),
+                            layer: text.layer.clone(),
+                            x,
+                            y,
+                            span: text.span.clone(),
+                            cell: owner,
+                            instances: path
+                                .iter()
+                                .map(|(parent, inst)| (*parent, inst.id))
+                                .collect(),
+                        });
                         return;
                     }
                     _ => return,
@@ -690,6 +745,108 @@ impl Conductors {
             shape: Some(index),
             source: self.sources[shape.source].clone(),
         }
+    }
+}
+
+/// Names of nets across a hierarchy: each cell's signal names, its tags, and
+/// the names its instances' `nets=` maps carry up to their parents.
+struct Names<'a> {
+    data: &'a CompiledData,
+    cells: RefCell<HashMap<CellId, CellNames>>,
+}
+
+/// A cell's signal names, by the name of the net each stands for, and the
+/// net name of each object it tags.
+#[derive(Clone, Default)]
+struct CellNames {
+    aliases: HashMap<String, String>,
+    tags: HashMap<ObjectId, String>,
+}
+
+impl<'a> Names<'a> {
+    fn new(data: &'a CompiledData) -> Self {
+        Self {
+            data,
+            cells: RefCell::default(),
+        }
+    }
+
+    fn with<R>(&self, cell: CellId, read: impl FnOnce(&CellNames) -> R) -> R {
+        let mut cells = self.cells.borrow_mut();
+        let names = cells
+            .entry(cell)
+            .or_insert_with(|| cell_names(&self.data.cells[&cell]));
+        read(names)
+    }
+
+    /// The name of the net `name` stands for in `cell`: a signal's own name
+    /// stands for its net's, as `connect` may have joined it to another.
+    fn canonical(&self, cell: CellId, name: &str) -> String {
+        self.with(cell, |names| {
+            names
+                .aliases
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| name.to_owned())
+        })
+    }
+
+    /// The net name `object`'s `net=` tag gives it in `cell`.
+    fn tag(&self, cell: CellId, object: ObjectId) -> Option<String> {
+        self.with(cell, |names| names.tags.get(&object).cloned())
+    }
+
+    /// `name`, a name in `cell`, as the outermost instance of `instances`
+    /// names it through each instance's `nets=` map, or `None` if an instance
+    /// on the way doesn't map it.
+    fn carry(&self, cell: CellId, name: &str, instances: &[(CellId, ObjectId)]) -> Option<String> {
+        let mut name = self.canonical(cell, name);
+        let mut child = cell;
+        for (parent, instance) in instances.iter().rev() {
+            let compiled = &self.data.cells[parent];
+            let map = &compiled.inst_nets.iter().find(|(id, _)| id == instance)?.1;
+            let (_, net) = map
+                .iter()
+                .find(|(port, _)| self.canonical(child, port) == name)?;
+            name = compiled.schematic.nets.get(*net as usize)?.name.clone();
+            child = *parent;
+        }
+        Some(name)
+    }
+}
+
+fn cell_names(compiled: &CompiledCell) -> CellNames {
+    let schematic = &compiled.schematic;
+    let net_name = |net: u32| schematic.nets.get(net as usize).map(|n| n.name.clone());
+    let aliases = schematic
+        .nodes
+        .iter()
+        .filter(|node| matches!(node.source, NodeSource::Signal { .. }))
+        .filter_map(|node| Some((schematic.path_text(node.path?), net_name(node.net)?)))
+        .collect();
+    let tags = compiled
+        .net_tags
+        .iter()
+        .filter_map(|(object, net)| Some((*object, net_name(*net)?)))
+        .collect();
+    CellNames { aliases, tags }
+}
+
+/// The bounding box of a shape's points in its cell's frame.
+fn object_bounds(object: &SolvedValue) -> Option<Bounds> {
+    let bounds = |points: &mut dyn Iterator<Item = (f64, f64)>| {
+        points.fold(None, |acc: Option<Bounds>, (x, y)| {
+            Some(match acc {
+                None => [x, y, x, y],
+                Some(b) => [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)],
+            })
+        })
+    };
+    match object {
+        SolvedValue::Rect(r) => Some([r.x0.0, r.y0.0, r.x1.0, r.y1.0]),
+        SolvedValue::Polygon(p) => bounds(&mut p.points.iter().map(|(x, y)| (x.0, y.0))),
+        SolvedValue::Path(p) => bounds(&mut p.outline()?.into_iter()),
+        _ => None,
     }
 }
 

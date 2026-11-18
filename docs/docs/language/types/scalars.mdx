@@ -35,11 +35,12 @@ std::layout::rect("met1");
 std::layout::text("VDD", "text.label", 0., 0.);
 ```
 
-`+` joins two strings, and [`std::to_string`](/language/std#to-string) writes an `Int`'s digits. Strings compare with `==` and `!=`, but not with `<` or `>`.
+`+` joins two strings, [`std::to_string`](/language/std#to-string) writes a number or a `Bool`, and [`std::format`](/language/std#format) fills a template's `{}`s. Strings compare with `==` and `!=`, but not with `<` or `>`.
 
 ```argon
 let implant = if nfet { "nsdm.drawing" } else { "psdm.drawing" };
 let port = "d_" + std::to_string(i);
+let name = std::format("r{}c{}", [row, col]);
 let metal = layer == "met1.drawing";
 ```
 

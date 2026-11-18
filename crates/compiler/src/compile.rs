@@ -150,7 +150,7 @@ pub const RESERVED_CELL_FIELDS: [&str; 2] = ["x", "y"];
 pub const PLACEMENT_KEYWORDS: [&str; 4] = ["x", "y", "angle", "reflect"];
 
 /// Functions the compiler implements that every module calls by bare name.
-pub const BUILTINS: [&str; 23] = [
+pub const BUILTINS: [&str; 24] = [
     "cons",
     "head",
     "tail",
@@ -168,6 +168,7 @@ pub const BUILTINS: [&str; 23] = [
     "max_num",
     "min_num",
     "int_to_string",
+    "format_string",
     "max_via_array",
     "tech_rule",
     "tech_via",
@@ -212,6 +213,7 @@ enum Builtin {
     MaxNum,
     MinNum,
     IntToString,
+    FormatString,
     MaxViaArray,
     TechRule,
     TechVia,
@@ -266,6 +268,7 @@ impl Builtin {
             "max_num" => Self::MaxNum,
             "min_num" => Self::MinNum,
             "int_to_string" => Self::IntToString,
+            "format_string" => Self::FormatString,
             "max_via_array" => Self::MaxViaArray,
             "tech_rule" => Self::TechRule,
             "tech_via" => Self::TechVia,
@@ -329,6 +332,7 @@ impl Builtin {
             | Self::MaxNum
             | Self::MinNum
             | Self::IntToString
+            | Self::FormatString
             | Self::MaxViaArray
             | Self::TechRule
             | Self::TechVia
@@ -1652,8 +1656,33 @@ fn check_cell_layers(
     tech_file: &FsPath,
     errs: &mut Vec<ExecError>,
 ) {
+    let start = errs.len();
     for (_, obj) in cell.objects.iter() {
         check_object_layer(cell_id, obj, layers, tech_file, errs);
+    }
+    attach_emit_origins(cell, &mut errs[start..]);
+}
+
+/// Names the call in the cell's body under which each of `errs` drew its
+/// shape, from the cell's emit records, which only a cell compiled with debug
+/// information keeps.
+fn attach_emit_origins(cell: &CompiledCell, errs: &mut [ExecError]) {
+    if errs.is_empty() {
+        return;
+    }
+    let origins: HashMap<&Span, &Span> = cell
+        .scopes
+        .values()
+        .flat_map(|scope| scope.emit.iter())
+        .filter_map(|(_, emit)| Some((&emit.span, emit.origin.as_ref()?)))
+        .collect();
+    for error in errs {
+        if error.origin.is_none()
+            && let Some(span) = &error.span
+            && let Some(origin) = origins.get(span)
+        {
+            error.origin = Some((*origin).clone());
+        }
     }
 }
 
@@ -1731,9 +1760,11 @@ fn check_cell_geometry(
     tech: &crate::tech::Technology,
     errs: &mut Vec<ExecError>,
 ) {
+    let start = errs.len();
     for (_, obj) in cell.objects.iter() {
         check_object_geometry(cell_id, obj, tech, errs);
     }
+    attach_emit_origins(cell, &mut errs[start..]);
 }
 
 /// The checks of [`check_cell_geometry`] for one object.
@@ -2790,6 +2821,20 @@ struct PolygonCoordinate {
     initial: bool,
 }
 
+/// The value of a call's keyword argument `name`, from its keywords and their
+/// values in the same order.
+fn keyword_arg<S: AsRef<str>, T: AstMetadata>(
+    kwargs: &[crate::ast::KwArgValue<S, T>],
+    values: &[ValueId],
+    name: &str,
+) -> Option<ValueId> {
+    kwargs
+        .iter()
+        .zip(values)
+        .find(|(kwarg, _)| kwarg.name.name.as_ref() == name)
+        .map(|(_, value)| *value)
+}
+
 fn polygon_coordinate(name: &str) -> Option<PolygonCoordinate> {
     let (axis, index) = name.split_at_checked(1)?;
     let (index, initial) = index
@@ -3082,6 +3127,8 @@ mod builtin_sig {
     pub(super) static SEQ_SUM: LazyLock<FnTy> = LazyLock::new(|| fold(Ty::Int, Ty::Int));
     pub(super) static SEQ_ANY: LazyLock<FnTy> = LazyLock::new(|| fold(Ty::Bool, Ty::Bool));
     pub(super) static SEQ_ALL: LazyLock<FnTy> = LazyLock::new(|| fold(Ty::Bool, Ty::Bool));
+    pub(super) static FORMAT_STRING: LazyLock<FnTy> =
+        LazyLock::new(|| scheme([Ty::String, seq()], Ty::String));
     pub(super) static FLOAT_PAIR: LazyLock<Signature> =
         LazyLock::new(|| Signature::positional([Ty::Float, Ty::Float]));
     pub(super) static INT_PAIR: LazyLock<Signature> =
@@ -3215,6 +3262,10 @@ mod builtin_sig {
             ("xi", Ty::Float),
             ("yi", Ty::Float),
             ("construction", Ty::Bool),
+            (
+                "nets",
+                Ty::Seq(Box::new(Ty::Tuple(vec![Ty::String, Ty::Signal]))),
+            ),
         ])
     });
     /// The placement keywords of a schematic element.
@@ -3407,6 +3458,31 @@ impl AstMetadata for VarIdTyMetadata {
     /// The sequence type the literal was inferred to have.
     type SeqExpr = Ty;
     type StructLitExpr = StructLitTy;
+}
+
+/// `expr` with its whole `Float`s written as `Int`s, when it is built only of
+/// numeric literals, tuples, and lists, such as `[(0., -4.)]`.
+fn int_literals<T: AstMetadata>(expr: &Expr<Substr, T>) -> Option<String> {
+    let join = |items: &[Expr<Substr, T>]| {
+        items
+            .iter()
+            .map(int_literals)
+            .collect::<Option<Vec<_>>>()
+            .map(|items| items.join(", "))
+    };
+    match expr {
+        Expr::IntLiteral(lit) => Some(lit.value.to_string()),
+        Expr::FloatLiteral(lit) if lit.value.fract() == 0. => Some((lit.value as i64).to_string()),
+        Expr::UnaryOp(op)
+            if op.op == UnaryOp::Neg
+                && matches!(op.operand, Expr::IntLiteral(_) | Expr::FloatLiteral(_)) =>
+        {
+            Some(format!("-{}", int_literals(&op.operand)?))
+        }
+        Expr::Tuple(tuple) => Some(format!("({})", join(&tuple.items)?)),
+        Expr::Seq(seq) => Some(format!("[{}]", join(&seq.items)?)),
+        _ => None,
+    }
 }
 
 impl<'a> VarIdTyPass<'a> {
@@ -5633,6 +5709,9 @@ impl<'a> VarIdTyPass<'a> {
             Native::Polygon => {
                 let coordinates = args.kwargs.iter().filter_map(|kwarg| {
                     let name = kwarg.name.name.as_str();
+                    if name == "net" {
+                        return Some((name, Ty::Signal));
+                    }
                     polygon_coordinate(name).map(|_| (name, Ty::Float))
                 });
                 let sig = Signature::positional([Ty::String, Ty::Int]).keywords(coordinates);
@@ -5642,6 +5721,9 @@ impl<'a> VarIdTyPass<'a> {
             Native::Path => {
                 let keywords = args.kwargs.iter().filter_map(|kwarg| {
                     let name = kwarg.name.name.as_str();
+                    if name == "net" {
+                        return Some((name, Ty::Signal));
+                    }
                     (matches!(
                         name,
                         "width"
@@ -5890,8 +5972,8 @@ impl<'a> VarIdTyPass<'a> {
     fn report_grid_units(&mut self, kwarg: &KwArgValue<Substr, VarIdTyMetadata>) -> bool {
         let name = kwarg.name.name.as_str();
         let ty = self.shallow(&kwarg.value.ty());
-        let hint = match name {
-            "x" | "y" | "angle" if ty == Ty::Float => format!("{name}=0"),
+        match name {
+            "x" | "y" | "angle" if ty == Ty::Float => {}
             "route" => {
                 let Ty::Seq(inner) = ty else {
                     return false;
@@ -5902,13 +5984,15 @@ impl<'a> VarIdTyPass<'a> {
                 if !items.iter().any(|item| self.shallow(item) == Ty::Float) {
                     return false;
                 }
-                "route=[(0, 0)]".to_owned()
             }
             _ => return false,
-        };
+        }
         self.errors.push(StaticError {
             span: self.span(kwarg.value.span()),
-            kind: StaticErrorKind::GridUnits { hint },
+            kind: StaticErrorKind::GridUnits {
+                name: name.to_owned(),
+                hint: int_literals(&kwarg.value).map(|value| format!("{name}={value}")),
+            },
         });
         true
     }
@@ -7127,6 +7211,7 @@ impl<'a> AstTransformer for VarIdTyPass<'a> {
                     self.typecheck_args(input.span, args, &builtin_sig::INT);
                     (None, Ty::String)
                 }
+                "format_string" => self.call_scheme(&builtin_sig::FORMAT_STRING, input.span, args),
                 "max_via_array" => {
                     self.typecheck_args(input.span, args, &builtin_sig::MAX_VIA_ARRAY);
                     (None, builtin_sig::max_via_array_choice())
@@ -9831,6 +9916,9 @@ struct CellState {
     compiler_defaults: VecDeque<(LinearExpr, Span)>,
     sse_basis: SseBasis,
     unsolved_vars: Option<IndexSet<Var>>,
+    /// The first constraint recorded after the compiler pinned the cell's
+    /// free values, if it has.
+    forced_from: Option<ConstraintId>,
     constraint_span_map: FxIndexMap<ConstraintId, Span>,
     /// The scope each constraint in `constraint_span_map` was made in, when known.
     constraint_scopes: FxIndexMap<ConstraintId, ScopeId>,
@@ -9847,6 +9935,9 @@ struct CellState {
     proxy_objects: FxIndexSet<ObjectId>,
     /// The signal each shape drawn with `net=` belongs to.
     net_tags: Vec<(ObjectId, NodeId)>,
+    /// The signal of this cell each instance drawn with `nets=` maps its
+    /// cell's signals to, by name.
+    inst_nets: Vec<(ObjectId, Vec<(String, NodeId)>)>,
     schematic: SchematicState,
     symbol: SymbolState,
     /// The `let` statement that made each top-level binding.
@@ -9878,6 +9969,22 @@ impl CellState {
     fn record_constraint(&mut self, constraint: ConstraintId, span: Span, scope: ScopeId) {
         self.constraint_span_map.insert(constraint, span);
         self.constraint_scopes.insert(constraint, scope);
+    }
+
+    /// The inconsistent constraints worth reporting. In a cell reported as
+    /// underconstrained, one recorded after its free values were pinned only
+    /// conflicts with the pins, which repeats that error.
+    fn reported_inconsistencies(&self) -> impl Iterator<Item = ConstraintId> + '_ {
+        let underconstrained = self
+            .unsolved_vars
+            .as_ref()
+            .is_some_and(|vars| !vars.is_empty());
+        let forced_from = self.forced_from.filter(|_| underconstrained);
+        self.solver
+            .inconsistent_constraints()
+            .iter()
+            .copied()
+            .filter(move |&constraint| forced_from.is_none_or(|from| constraint < from))
     }
 
     /// The call in the cell's body that `scope` ran under, when it is inside
@@ -10289,6 +10396,33 @@ impl<'a> ExecPass<'a> {
     /// load-bearing rather than an escape hatch. Every builtin that reads a
     /// concrete runtime type therefore has to report through here instead of
     /// unwrapping: the static checker cannot have proven the type.
+    /// The node the `net=` argument `arg` of a shape call at `loc` tags it
+    /// with, if any. `Err` carries the call's progress when the argument
+    /// isn't ready yet or isn't a signal of the cell.
+    fn net_tag(
+        &mut self,
+        arg: Option<ValueId>,
+        vid: ValueId,
+        loc: &DynLoc,
+        span: cfgrammar::Span,
+    ) -> Result<Option<NodeId>, Result<bool, ()>> {
+        let Some(arg) = arg else {
+            return Ok(None);
+        };
+        match self.values[&arg].get_ready() {
+            None => {
+                self.add_value_dependent(arg, vid);
+                Err(Ok(false))
+            }
+            Some(Value::Signal(signal)) if signal.cell == loc.cell => Ok(Some(signal.node)),
+            Some(_) => {
+                let span = self.span(loc, span);
+                self.invalid_type(loc.cell, &span);
+                Err(self.poison(vid))
+            }
+        }
+    }
+
     fn invalid_type(&mut self, cell_id: CellId, span: &Span) {
         self.errors.push(ExecError {
             origin: None,
@@ -11385,6 +11519,7 @@ impl<'a> ExecPass<'a> {
                         sse_basis: SseBasis::Nullspace(Vec::new()),
                         root_scope: root_scope_id,
                         unsolved_vars: Default::default(),
+                        forced_from: None,
                         objects: Vec::new(),
                         constraint_span_map: FxIndexMap::default(),
                         constraint_scopes: FxIndexMap::default(),
@@ -11392,6 +11527,7 @@ impl<'a> ExecPass<'a> {
                         var_dependents: FxIndexMap::default(),
                         proxy_objects: FxIndexSet::default(),
                         net_tags: Vec::new(),
+                        inst_nets: Vec::new(),
                         schematic: SchematicState::default(),
                         symbol: SymbolState::default(),
                         field_spans: IndexMap::new(),
@@ -11510,6 +11646,9 @@ impl<'a> ExecPass<'a> {
                     if has_fallback {
                         Self::apply_independent_fallbacks(state);
                     } else {
+                        state
+                            .forced_from
+                            .get_or_insert(state.solver.next_constraint_id());
                         state.solver.force_solution();
                     }
                 }
@@ -11522,8 +11661,8 @@ impl<'a> ExecPass<'a> {
             }
         }
 
-        let state = self.cell_state_mut(cell_id);
-        for constraint in state.solver.inconsistent_constraints().clone() {
+        let state = self.cell_state(cell_id);
+        for constraint in state.reported_inconsistencies().collect_vec() {
             let state = self.cell_state(cell_id);
             let span = state.constraint_span_map.get(&constraint).cloned();
             let origin = state
@@ -12091,6 +12230,7 @@ impl<'a> ExecPass<'a> {
                     schematic: Schematic::default(),
                     symbol: None,
                     net_tags: Vec::new(),
+                    inst_nets: Vec::new(),
                 }),
             );
         }
@@ -12116,6 +12256,24 @@ impl<'a> ExecPass<'a> {
         let mut objects = std::mem::take(&mut self.cell_state_mut(cell).objects);
         let debug_info = self.debug_info;
         let state = self.cell_states.get(&cell).expect("cell not found");
+        // The call in the cell's body each drawn object was made under.
+        let object_origin = |id: ObjectId| {
+            state
+                .emit
+                .iter()
+                .find_map(|emit| match emit.target {
+                    EmitTarget::Object(object) if object == id => Some(emit.scope),
+                    _ => None,
+                })
+                .or_else(|| {
+                    state
+                        .object_emit
+                        .iter()
+                        .find(|emit| emit.object == id)
+                        .map(|emit| emit.scope)
+                })
+                .and_then(|scope| state.origin(scope))
+        };
         let mut emit_obj = |obj: Object| -> SolvedValue {
             match obj {
                 Object::Rect(rect) => {
@@ -12139,7 +12297,7 @@ impl<'a> ExecPass<'a> {
                         .expect("rect y1 not solved");
                     if x0 > x1 {
                         self.errors.push(ExecError {
-                            origin: None,
+                            origin: object_origin(rect.id),
                             span: rect.span.clone(),
                             cell,
                             kind: ExecErrorKind::FlippedRect("x0 > x1".to_string()),
@@ -12147,7 +12305,7 @@ impl<'a> ExecPass<'a> {
                     }
                     if y0 > y1 {
                         self.errors.push(ExecError {
-                            origin: None,
+                            origin: object_origin(rect.id),
                             span: rect.span.clone(),
                             cell,
                             kind: ExecErrorKind::FlippedRect("y0 > y1".to_string()),
@@ -12348,12 +12506,7 @@ impl<'a> ExecPass<'a> {
             sse_basis: state.sse_basis.clone(),
             fallback_constraints_used: state.fallback_constraints_used.clone(),
             unsolved_vars: state.unsolved_vars.clone().unwrap_or_default(),
-            inconsistent_constraints: state
-                .solver
-                .inconsistent_constraints()
-                .iter()
-                .copied()
-                .collect(),
+            inconsistent_constraints: state.reported_inconsistencies().collect(),
             objects: FxIndexMap::with_capacity_and_hasher(
                 if debug_info { objects.len() } else { 0 },
                 Default::default(),
@@ -12361,6 +12514,7 @@ impl<'a> ExecPass<'a> {
             schematic: Schematic::default(),
             symbol: None,
             net_tags: Vec::new(),
+            inst_nets: Vec::new(),
         };
         if debug_info {
             for (id, scope) in state.scopes.iter() {
@@ -12471,6 +12625,17 @@ impl<'a> ExecPass<'a> {
             .net_tags
             .iter()
             .filter_map(|(object, node)| nets.get(node).map(|net| (*object, *net)))
+            .collect();
+        ccell.inst_nets = state
+            .inst_nets
+            .iter()
+            .map(|(object, pairs)| {
+                let pairs = pairs
+                    .iter()
+                    .filter_map(|(name, node)| nets.get(node).map(|net| (name.clone(), *net)))
+                    .collect();
+                (*object, pairs)
+            })
             .collect();
         for (name, value, public) in &fields {
             if !public {
@@ -14662,6 +14827,24 @@ impl<'a> ExecPass<'a> {
     /// leaving it out of the value table to be put back as still pending or
     /// inserting its result.
     fn eval_deferred(&mut self, vid: ValueId, vref: &mut PartialEval<'a>) -> Result<bool, ()> {
+        let errors = self.errors.len();
+        let progress = self.advance_deferred(vid, vref);
+        // An error raised inside a function names the call in the cell's body
+        // that led to it, unless it already names one, as a subcell's does.
+        if self.errors.len() > errors
+            && let Some(origin) = self.origin(&vref.loc)
+        {
+            for error in &mut self.errors[errors..] {
+                if error.origin.is_none() && error.cell == vref.loc.cell {
+                    error.origin = Some(origin.clone());
+                }
+            }
+        }
+        progress
+    }
+
+    /// The body of [`Self::eval_deferred`].
+    fn advance_deferred(&mut self, vid: ValueId, vref: &mut PartialEval<'a>) -> Result<bool, ()> {
         // Poison propagates here rather than at each read: a value built from
         // one whose diagnostic was already reported would otherwise raise a
         // second, derived error at every level of the expression tree it
@@ -14785,29 +14968,10 @@ impl<'a> ExecPass<'a> {
                         }
                     };
                     // The signal a `net=` keyword tags the rect with.
-                    let net = match c
-                        .expr
-                        .args
-                        .kwargs
-                        .iter()
-                        .zip(c.state.kwargs.iter())
-                        .find(|(k, _)| k.name.name == "net")
-                    {
-                        None => None,
-                        Some((_, arg)) => match self.values[arg].get_ready() {
-                            None => {
-                                self.add_value_dependent(*arg, vid);
-                                return Ok(false);
-                            }
-                            Some(Value::Signal(signal)) if signal.cell == cell_id => {
-                                Some(signal.node)
-                            }
-                            Some(_) => {
-                                let span = self.span(&vref.loc, c.expr.span);
-                                self.invalid_type(cell_id, &span);
-                                return self.poison(vid);
-                            }
-                        },
+                    let net_arg = keyword_arg(&c.expr.args.kwargs, &c.state.kwargs, "net");
+                    let net = match self.net_tag(net_arg, vid, &vref.loc, c.expr.span) {
+                        Ok(net) => net,
+                        Err(progress) => return progress,
                     };
                     if let Some(layer) = layer {
                         let id = self.object_id();
@@ -15061,7 +15225,15 @@ impl<'a> ExecPass<'a> {
                             });
                             return self.poison(vid);
                         }
+                        let net_arg = keyword_arg(&c.expr.args.kwargs, &c.state.kwargs, "net");
+                        let net = match self.net_tag(net_arg, vid, &vref.loc, c.expr.span) {
+                            Ok(net) => net,
+                            Err(progress) => return progress,
+                        };
                         for kwarg in &c.expr.args.kwargs {
+                            if kwarg.name.name == "net" {
+                                continue;
+                            }
                             let coordinate = polygon_coordinate(kwarg.name.name.as_str())
                                 .expect("polygon kwargs were statically validated");
                             if coordinate.index >= points.len() {
@@ -15084,6 +15256,9 @@ impl<'a> ExecPass<'a> {
                             span: Some(span.clone()),
                         };
                         let state = self.cell_state_mut(cell_id);
+                        if let Some(node) = net {
+                            state.net_tags.push((id, node));
+                        }
                         let polygon = Arc::new(polygon);
                         state.objects.push((id, Object::Polygon(polygon.clone())));
                         state.emit.push(Emit {
@@ -15094,6 +15269,9 @@ impl<'a> ExecPass<'a> {
                         self.values
                             .insert(vid, Defer::Ready(Value::Polygon(polygon.clone())));
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
+                            if kwarg.name.name == "net" {
+                                continue;
+                            }
                             let coordinate = polygon_coordinate(kwarg.name.name.as_str())
                                 .expect("polygon kwargs were statically validated");
                             let expr = match coordinate.axis {
@@ -15198,6 +15376,11 @@ impl<'a> ExecPass<'a> {
                             }
                         }
 
+                        let net_arg = keyword_arg(&c.expr.args.kwargs, &c.state.kwargs, "net");
+                        let net = match self.net_tag(net_arg, vid, &vref.loc, c.expr.span) {
+                            Ok(net) => net,
+                            Err(progress) => return progress,
+                        };
                         let id = self.object_id();
                         let span = self.span(&vref.loc, c.expr.span);
                         let has_begin_extension = c.expr.args.kwargs.iter().any(|kwarg| {
@@ -15271,6 +15454,9 @@ impl<'a> ExecPass<'a> {
                             span: Some(span.clone()),
                         };
                         let path = Arc::new(path);
+                        if let Some(node) = net {
+                            state.net_tags.push((id, node));
+                        }
                         state.objects.push((id, Object::Path(path.clone())));
                         state.emit.push(Emit {
                             scope: vref.loc.scope,
@@ -15281,6 +15467,9 @@ impl<'a> ExecPass<'a> {
                             .insert(vid, Defer::Ready(Value::Path(path.clone())));
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
                             let name = kwarg.name.name.as_str();
+                            if name == "net" {
+                                continue;
+                            }
                             let (expr, fallback, priority, initial_condition) = match name {
                                 "width" | "widthi" => (
                                     path.width.clone(),
@@ -15856,6 +16045,24 @@ impl<'a> ExecPass<'a> {
                         false
                     }
                 }
+                Some(Builtin::FormatString) => {
+                    let (template, values) = (c.state.posargs[0], c.state.posargs[1]);
+                    match (&self.values[&template], &self.values[&values]) {
+                        (Defer::Ready(template), Defer::Ready(values)) => {
+                            let result = ops::format_string(&state.solver, template, values);
+                            let span = c.expr.span;
+                            return self.finish_op(vid, &vref.loc, result, |_| span);
+                        }
+                        (Defer::Ready(_), _) => {
+                            self.add_value_dependent(values, vid);
+                            false
+                        }
+                        _ => {
+                            self.add_value_dependent(template, vid);
+                            false
+                        }
+                    }
+                }
                 Some(Builtin::Tail) => {
                     if let Defer::Ready(list) = &self.values[&c.state.posargs[0]] {
                         let result = ops::tail(list);
@@ -15943,6 +16150,38 @@ impl<'a> ExecPass<'a> {
                     let reflect_arg = kwarg_vid("reflect");
                     let angle_arg = kwarg_vid("angle");
                     let construction_arg = kwarg_vid("construction");
+                    // `nets=`: the instance's cell's signals, by name, and the
+                    // signals of this cell they stand for.
+                    let mut port_nets = Vec::new();
+                    if let Some((kwarg, arg_vid)) = kwarg_vid("nets") {
+                        let Some(value) = self.values[&arg_vid].get_ready() else {
+                            self.add_value_dependent(arg_vid, vid);
+                            return Ok(false);
+                        };
+                        let pairs = match value {
+                            Value::Seq(items) => items
+                                .iter()
+                                .map(|item| match item {
+                                    Value::Tuple(pair) => match &pair[..] {
+                                        [Value::String(name), Value::Signal(signal)]
+                                            if signal.cell == cell_id =>
+                                        {
+                                            Some((name.clone(), signal.node))
+                                        }
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                })
+                                .collect::<Option<Vec<_>>>(),
+                            _ => None,
+                        };
+                        let Some(pairs) = pairs else {
+                            let span = self.span(&vref.loc, kwarg.value.span());
+                            self.invalid_type(cell_id, &span);
+                            return self.poison(vid);
+                        };
+                        port_nets = pairs;
+                    }
 
                     let mut pending = false;
                     let mut read_bool = |this: &mut Self,
@@ -16021,6 +16260,9 @@ impl<'a> ExecPass<'a> {
                             target: EmitTarget::Object(inst.id),
                             span,
                         });
+                        if !port_nets.is_empty() {
+                            state.inst_nets.push((id, port_nets));
+                        }
                         let inst = Arc::new(inst);
                         state.objects.push((inst.id, Object::Inst(inst.clone())));
                         for (kwarg, rhs) in c.expr.args.kwargs.iter().zip(c.state.kwargs.iter()) {
@@ -18176,6 +18418,10 @@ pub struct CompiledCell {
     /// The net of each shape drawn with `net=`, by the shape's object.
     #[serde(default)]
     pub net_tags: Vec<(ObjectId, NetIdx)>,
+    /// For each instance drawn with `nets=`, the net of this cell each of its
+    /// cell's signals, by name, stands for.
+    #[serde(default)]
+    pub inst_nets: Vec<(ObjectId, Vec<(String, NetIdx)>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19204,6 +19450,7 @@ impl CompiledCell {
             schematic,
             symbol,
             net_tags: _,
+            inst_nets: _,
         } = self;
 
         for metadata in scope_metadata {
@@ -19357,6 +19604,7 @@ impl CompiledCell {
             schematic,
             symbol,
             net_tags: _,
+            inst_nets: _,
         } = self;
         let mut moved = false;
         let mut check = |span: &Span| -> Result<(), RebaseError> {

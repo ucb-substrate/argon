@@ -102,9 +102,12 @@ level = "info"
 
 [agent]
 approval = "never"
+
+[analyzer]
+compile_debounce_ms = 150
 ```
 
-`font_size` and `icon_size` are in logical pixels, from 1 to 256. On macOS, <kbd>Option</kbd> types characters such as `ß` in Neovim; set `option_as_meta = true` to send it as Meta (`<M-…>`) instead. On Linux, <kbd>Alt</kbd> always sends Meta. `agent.approval` is `"never"` or `"always"`; see [Agents](/tools/agents#approving-edits). After editing the file, run `:Argon reload`. To change a value for this session only, use `:Argon set`; to write the current settings back to disk, use `:Argon saveConfig`.
+`font_size` and `icon_size` are in logical pixels, from 1 to 256. On macOS, <kbd>Option</kbd> types characters such as `ß` in Neovim; set `option_as_meta = true` to send it as Meta (`<M-…>`) instead. On Linux, <kbd>Alt</kbd> always sends Meta. `agent.approval` is `"never"` or `"always"`; see [Agents](/tools/agents#approving-edits). `analyzer.compile_debounce_ms` is how long the analyzer waits after an edit before it recompiles. After editing the file, run `:Argon reload`. To change a value for this session only, use `:Argon set`; to write the current settings back to disk, use `:Argon saveConfig`.
 
 ## Troubleshooting
 

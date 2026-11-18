@@ -4,7 +4,8 @@
 //! Each net's capacitance is its area and perimeter to the substrate, less
 //! the area lower conductors shield, plus its overlap with other nets' shapes
 //! on the layers the technology pairs, less the area a layer between them
-//! shields. Lateral coupling between neighbors on one layer is not counted.
+//! shields, plus its coupling to other nets' facing edges on one layer within
+//! [`SIDE_HALO`], less the length a shape between them shields.
 
 use std::collections::HashMap;
 
@@ -13,6 +14,9 @@ use crate::tech::Technology;
 
 /// Coordinates closer than this are equal.
 const EPS: f64 = 1e-6;
+
+/// Facing edges farther apart than this, in µm, don't couple.
+pub const SIDE_HALO: f64 = 2.;
 
 /// A shape is long when it is at least this fraction of the cell's longer side…
 pub const LONG_FRACTION: f64 = 0.5;
@@ -31,14 +35,20 @@ pub struct LayerUse {
     pub perimeter: f64,
 }
 
-/// Where one net's shapes on `top` overlap another's on `bot`.
+/// Where one net's shapes on `top` overlap another's on `bot`, or, when
+/// `side`, face another's across a gap on the layer `top` and `bot` both name.
 #[derive(Clone, Debug)]
 pub struct Coupling {
     pub other: usize,
     pub top: String,
     pub bot: String,
-    /// Overlap not shielded by a layer between, in µm².
+    /// Overlap not shielded by a layer between, in µm²; zero when `side`.
     pub area: f64,
+    /// Whether this is coupling between facing edges on one layer.
+    pub side: bool,
+    /// The facing length not shielded by a shape between, in µm; zero unless
+    /// `side`.
+    pub length: f64,
     /// In aF; zero when the technology gives the pair no coefficient.
     pub cap: f64,
 }
@@ -237,12 +247,85 @@ pub fn report(check: &Check, tech: &Technology) -> Vec<NetReport> {
                 top: pair.top.clone(),
                 bot: pair.bot.clone(),
                 area: a * um2,
+                side: false,
+                length: 0.,
                 cap: a * um2 * pair.area,
             };
             reports[net].couplings.push(coupling(other));
             reports[other].couplings.push(coupling(net));
         }
     }
+    // Facing edges of different nets on one layer, less what a shape between
+    // them shields, each pair once.
+    let halo = SIDE_HALO / um;
+    for (layer, cap) in &order {
+        if cap.sidewall <= 0. {
+            continue;
+        }
+        let mut pieces = unions
+            .iter()
+            .filter(|((_, l), _)| l == layer)
+            .flat_map(|((net, _), u)| u.pieces.iter().map(move |p| (*p, *net)))
+            .collect::<Vec<_>>();
+        pieces.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.partial_cmp(&b.0).unwrap()));
+        let bounds = pieces.iter().map(|(b, _)| *b).collect::<Vec<_>>();
+        let index = Index::new(&bounds);
+        let mut sides: HashMap<(usize, usize), (f64, f64)> = HashMap::new();
+        for (i, (p, net)) in pieces.iter().enumerate() {
+            let reach = [p[0] - halo, p[1] - halo, p[2] + halo, p[3] + halo];
+            for j in index.query(reach) {
+                let (q, other) = pieces[j];
+                if j <= i || other == *net {
+                    continue;
+                }
+                let Some(face) = facing(*p, q) else {
+                    continue;
+                };
+                if face.gap <= EPS || face.gap > halo {
+                    continue;
+                }
+                let shadows = index
+                    .query(face.between)
+                    .into_iter()
+                    .filter(|&k| k != i && k != j && overlaps(bounds[k], face.between))
+                    .map(|k| {
+                        let b = bounds[k];
+                        let (lo, hi) = if face.vertical {
+                            (b[1], b[3])
+                        } else {
+                            (b[0], b[2])
+                        };
+                        (lo.max(face.lo), hi.min(face.hi))
+                    })
+                    .collect::<Vec<_>>();
+                let length = face.hi - face.lo - covered(shadows);
+                if length <= EPS {
+                    continue;
+                }
+                let entry = sides
+                    .entry(((*net).min(other), (*net).max(other)))
+                    .or_default();
+                entry.0 += cap.sidewall * length / face.gap;
+                entry.1 += length * um;
+            }
+        }
+        let mut sides = sides.into_iter().collect::<Vec<_>>();
+        sides.sort_by_key(|(pair, _)| *pair);
+        for ((a, b), (aff, length)) in sides {
+            let coupling = |other| Coupling {
+                other,
+                top: c.layers[*layer].clone(),
+                bot: c.layers[*layer].clone(),
+                area: 0.,
+                side: true,
+                length,
+                cap: aff,
+            };
+            reports[a].couplings.push(coupling(b));
+            reports[b].couplings.push(coupling(a));
+        }
+    }
+
     for report in &mut reports {
         report.couplings.sort_by(|a, b| {
             b.cap
@@ -253,6 +336,72 @@ pub fn report(check: &Check, tech: &Technology) -> Vec<NetReport> {
         });
     }
     reports
+}
+
+/// How two shapes face each other across a gap: its width, the span of
+/// their facing edges from `lo` to `hi`, the region between them, and whether
+/// the edges are vertical.
+struct Facing {
+    gap: f64,
+    lo: f64,
+    hi: f64,
+    between: Bounds,
+    vertical: bool,
+}
+
+/// How `a` and `b` face each other, if their edges share a span.
+fn facing(a: Bounds, b: Bounds) -> Option<Facing> {
+    let (lo, hi) = (a[1].max(b[1]), a[3].min(b[3]));
+    if hi - lo > EPS {
+        let (left, right) = if a[2] <= b[0] + EPS {
+            (a, b)
+        } else if b[2] <= a[0] + EPS {
+            (b, a)
+        } else {
+            return None;
+        };
+        return Some(Facing {
+            gap: right[0] - left[2],
+            lo,
+            hi,
+            between: [left[2], lo, right[0], hi],
+            vertical: true,
+        });
+    }
+    let (lo, hi) = (a[0].max(b[0]), a[2].min(b[2]));
+    if hi - lo > EPS {
+        let (low, high) = if a[3] <= b[1] + EPS {
+            (a, b)
+        } else if b[3] <= a[1] + EPS {
+            (b, a)
+        } else {
+            return None;
+        };
+        return Some(Facing {
+            gap: high[1] - low[3],
+            lo,
+            hi,
+            between: [lo, low[3], hi, high[1]],
+            vertical: false,
+        });
+    }
+    None
+}
+
+/// The length `intervals` cover together.
+fn covered(mut intervals: Vec<(f64, f64)>) -> f64 {
+    intervals.retain(|(lo, hi)| hi > lo);
+    intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut total = 0.;
+    let mut reach = f64::MIN;
+    for (lo, hi) in intervals {
+        let start = lo.max(reach);
+        if hi > start {
+            total += hi - start;
+        }
+        reach = reach.max(hi);
+    }
+    total
 }
 
 fn area(r: Bounds) -> f64 {
@@ -388,6 +537,21 @@ fn symmetric_difference(a: &[(f64, f64)], b: &[(f64, f64)]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_facing_edges_and_the_length_shapes_between_cover() {
+        // Side by side, 1 apart, facing from y = 1 to 2.
+        let f = facing([0., 0., 1., 2.], [2., 1., 3., 4.]).unwrap();
+        assert_eq!((f.gap, f.lo, f.hi, f.vertical), (1., 1., 2., true));
+        assert_eq!(f.between, [1., 1., 2., 2.]);
+        // One above the other, in either order.
+        let f = facing([0., 3., 2., 4.], [1., 0., 5., 1.]).unwrap();
+        assert_eq!((f.gap, f.lo, f.hi, f.vertical), (2., 1., 2., false));
+        // Only corners face: no span in common.
+        assert!(facing([0., 0., 1., 1.], [2., 2., 3., 3.]).is_none());
+        // Overlapping intervals count once.
+        assert_eq!(covered(vec![(0., 2.), (1., 3.), (5., 6.), (4., 4.)]), 4.);
+    }
 
     #[test]
     fn unions_overlapping_rectangles_with_their_outline() {

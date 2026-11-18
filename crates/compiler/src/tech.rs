@@ -50,13 +50,17 @@ pub struct Gate {
 }
 
 /// A layer's capacitance to the substrate, in aF per µm² of area and per µm
-/// of perimeter.
+/// of perimeter, and between facing edges on the layer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LayerCapacitance {
     pub layer: String,
     pub area: f64,
     pub perimeter: f64,
+    /// Coupling between facing edges of two shapes on the layer, in aF per µm
+    /// of facing length at 1 µm apart; it falls off as the spacing grows.
+    #[serde(default)]
+    pub sidewall: f64,
 }
 
 /// The capacitance where a shape on `top` overlaps one on `bot`, in aF per µm².
@@ -548,9 +552,10 @@ pub fn parse_tech(text: &str) -> Result<Technology> {
     }
     for cap in &input.capacitance {
         defined(&cap.layer, "a capacitance")?;
-        if !(cap.area.is_finite() && cap.perimeter.is_finite())
+        if !(cap.area.is_finite() && cap.perimeter.is_finite() && cap.sidewall.is_finite())
             || cap.area < 0.
             || cap.perimeter < 0.
+            || cap.sidewall < 0.
         {
             bail!(
                 "the capacitance of `{}` must be finite and not negative",
@@ -728,7 +733,21 @@ area = 114
         let tech = parse_tech(&format!("{TECH}{extra}")).unwrap();
         assert_eq!(tech.gates[0].splits, "met1.label");
         assert_eq!(tech.capacitance[0].perimeter, 41.);
+        assert_eq!(tech.capacitance[0].sidewall, 0.);
         assert_eq!(tech.overlap_capacitance[0].area, 114.);
+        let sided = parse_tech(&format!(
+            "{TECH}{}",
+            extra.replace("perimeter = 41", "perimeter = 41\nsidewall = 45")
+        ))
+        .unwrap();
+        assert_eq!(sided.capacitance[0].sidewall, 45.);
+        assert!(
+            parse_tech(&format!(
+                "{TECH}{}",
+                extra.replace("perimeter = 41", "perimeter = 41\nsidewall = -1")
+            ))
+            .is_err()
+        );
         assert_relative_eq!(tech.microns_per_unit(), 1., epsilon = 1e-12);
         assert!(
             parse_tech(&format!(

@@ -21,7 +21,7 @@ cell top() {
 
 `mod utils;` loads `utils.ar`. A module can also be a directory containing a `mod.ar`.
 
-Paths start with `std::` for the standard library, `lib::` for the root of the current library, a dependency's name for that dependency, or a module imported with [`use`](#module-imports).
+Paths start with `std::` for the standard library, `lib::` for the root of the current library, a dependency's name for that dependency, a child module declared with `mod`, or a module imported with [`use`](#module-imports).
 
 ## Imports
 
@@ -77,7 +77,8 @@ Here `geometry::pitch()` is `lib::blocks::geometry::pitch()`. Functions, cells, 
 | --- | --- |
 | [`std`](/language/std) | `max`, `min`, `Option`, and sequence helpers |
 | [`std::layout`](/language/std-layout) | Geometry constructors, `inst`, `bbox`, `shapes`, `autoroute`, `dimension`, and rectangle helpers |
-| [`std::schematic`](/language/std-schematic) | `Signal`, `connect`, `device`, `inst`, and `DeviceKind` |
+| [`std::schematic`](/language/std-schematic) | `Signal`, `signals`, `connect`, `device`, `inst`, `Device`, and `DeviceKind` |
+| [`std::symbol`](/language/std-symbol) | The shapes, text, and pins of a cell's symbol, and the device symbol helpers |
 
 Call a standard library item by its full path, such as `std::max(a, b)` or `std::layout::rect("met1")`, or import it with `use`. `Option`, `Some`, and `None` are in scope in every module without an import. Using a standard library item that isn't imported, or by a path into the wrong module, is an error that gives the `use` to import it:
 

@@ -45,6 +45,7 @@ argone ssh <HOST> [PATH] [OPTIONS]
 | `--local-analyzer-port <PORT>` | Allocated | Local port forwarded to the remote analyzer. |
 | `--remote-analyzer-port <PORT>` | Allocated | Analyzer port on the remote machine. |
 | `--terminal` | Off | Run remote Neovim in this terminal and the GUI in a window of its own. |
+| `--nvim <PATH>` | `nvim` | Neovim executable on the remote machine. |
 
 ```bash
 argone ssh layout-host ~/work/chip

@@ -30,16 +30,26 @@ border = "#0080ff"
 
 | Key | Meaning |
 | --- | --- |
-| `dbu` | Physical size of one GDS database unit |
+| `dbu` | Physical size of one GDS database unit, in meters (`1e-9`) or as a unit name (`"nm"`, `"um"`) |
 | `display_unit` | Size of one source-coordinate unit, in database units |
-| `grid` | Grid that solved coordinates of shapes and instances, and the GUI, snap to |
+| `grid` | Grid that solved coordinates of shapes and instances must lie on, an error otherwise, and that the GUI snaps to |
 | `style_name` | Name given to the layer-style collection |
 
 ## Layers
 
-Each `[[layers]]` entry names a layer and gives its GDS layer and datatype. The optional style settings control fill, border, line style, visibility, validity, grouping, patterns, transparency, markings, and animation.
+Each `[[layers]]` entry needs a `name`, its GDS layer and datatype as `gds`, and the `fill` and `border` colors the GUI draws it with. An optional `[layers.style]` subtable after it sets the line style, visibility, validity, grouping, patterns, transparency, markings, and animation.
 
 The GUI's layer sidebar comes from this file. A layer that is visible but not valid can be looked at but not drawn on.
+
+## Pin layers
+
+The optional `[pin_layers]` table names, for each pin layer, the layer its labels' text goes on. LVS reads a port from a pin shape with its label's text inside it, and the [connectivity check](/tools/agents#connectivity) reads labels the same way:
+
+```toml
+[pin_layers]
+"met1.pin" = "met1.label"
+"li1.pin" = "li1.label"
+```
 
 ## Rules and vias
 
@@ -84,13 +94,14 @@ The headless MCP server's `compile` and `nets` tools use these to check [`net=` 
 
 ## Capacitance
 
-The optional `[[capacitance]]` and `[[overlap_capacitance]]` entries give the rough coefficients the `nets` tool estimates wiring capacitance with, in aF per µm² of area and aF per µm of perimeter. List the `[[capacitance]]` layers from the lowest up: a layer's area to the substrate excludes what the layers listed before it cover, and an overlap between two layers excludes what a layer listed between them covers. A layer listed with zero coefficients only shields.
+The optional `[[capacitance]]` and `[[overlap_capacitance]]` entries give the rough coefficients the `nets` tool estimates wiring capacitance with, in aF per µm² of area and aF per µm of perimeter. A `[[capacitance]]` entry's optional `sidewall`, in aF per µm, couples facing edges of different nets on the layer: two edges facing for a length L at a spacing s couple `sidewall` · L / s, with L and s in µm, out to 2 µm apart. List the `[[capacitance]]` layers from the lowest up: a layer's area to the substrate excludes what the layers listed before it cover, and an overlap between two layers excludes what a layer listed between them covers. A layer listed with zero coefficients only shields.
 
 ```toml
 [[capacitance]]
 layer = "met1.drawing"
 area = 26
 perimeter = 41
+sidewall = 45
 
 [[overlap_capacitance]]
 top = "met2.drawing"

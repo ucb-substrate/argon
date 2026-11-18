@@ -202,6 +202,7 @@ cell mos(nfet: Bool, w: Float, nf: Int) {
     pub let g = Signal();
     pub let s = Signal();
     pub let b = Signal();
+    let model = if nfet { "sky130_fd_pr__nfet_01v8" } else { "sky130_fd_pr__pfet_01v8" };
     let kind = if nfet { DeviceKind::Nmos } else { DeviceKind::Pmos };
     device(kind, [d, g, s, b], model, l=0.15, w=w, nf=nf);
 

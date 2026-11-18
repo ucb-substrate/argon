@@ -91,8 +91,12 @@ pub enum StaticErrorKind {
     )]
     ReservedDeviceParam { name: String, lower: String },
     /// A schematic placement or route was given a `Float` coordinate.
-    #[error("schematic coordinates are grid units; write `{hint}`")]
-    GridUnits { hint: String },
+    #[error("{}", grid_units_message(.name, .hint.as_deref()))]
+    GridUnits {
+        name: String,
+        /// The argument rewritten with `Int`s, when it is written in literals.
+        hint: Option<String>,
+    },
     /// A schematic placement gave `x` without `y`, or `y` without `x`.
     #[error("`{given}` is given without `{missing}`; a placement needs both")]
     UnpairedCoordinate { given: String, missing: String },
@@ -565,6 +569,9 @@ pub enum ExecErrorKind {
     /// `std::layout::route_tracks` could not route its nets.
     #[error("routing failed: {0}")]
     Routing(String),
+    /// A `format` template that doesn't match its values.
+    #[error("{0}")]
+    InvalidFormat(String),
 }
 
 /// The message of [`StaticErrorKind::SignalCellParam`].
@@ -615,6 +622,17 @@ fn inconsistent_message(conflict: &Option<Conflict>) -> String {
             "inconsistent constraint: other constraints already determine every value in it, and leave its two sides {} apart",
             residual.abs()
         ),
+    }
+}
+
+/// The message of [`StaticErrorKind::GridUnits`].
+fn grid_units_message(name: &str, hint: Option<&str>) -> String {
+    match hint {
+        Some(hint) => format!("schematic coordinates are grid units; write `{hint}`"),
+        None if name == "route" => {
+            "schematic coordinates are grid units; `route` takes [(Int, Int)]".to_owned()
+        }
+        None => format!("schematic coordinates are grid units; `{name}` takes an Int"),
     }
 }
 

@@ -1,4 +1,5 @@
 use std::layout::{array, center_rects, crect, inst, max_array, rect, via};
+use std::schematic::{DeviceKind, Signal, device};
 
 /// A 1.8 V transistor with `nf` gate fingers over one diffusion, contacted
 /// with local interconnect between and beside the fingers. The diffusion ends
@@ -44,14 +45,17 @@ cell fet1v8(nfet: Bool, w: Float, nf: Int) {
 }
 
 /// A well or substrate tap: a `w` by `h` tap diffusion covered with local
-/// interconnect and as many contacts as fit on a 340 pitch. Contacts fit
-/// only when `w` is at least 250 and `h` at least 410.
+/// interconnect and as many contacts as fit on a 340 pitch, which the tap
+/// encloses by 120 at the ends of its longer side. Contacts fit only when the
+/// shorter side is at least 250 and the longer at least 410.
 ///
 /// # Arguments
 /// - `ntap`: an N+ tap, which contacts an n-well, if true; a P+ tap, which contacts the substrate, if false.
 /// - `w`: width of the tap diffusion.
 /// - `h`: height of the tap diffusion.
 cell tap(ntap: Bool, w: Float, h: Float) {
+    // Contacts fit only when the shorter side is 250 and the longer 410.
+    eq(if std::min(w, h) >= 250. && std::max(w, h) >= 410. { 0. } else { 1. }, 0.);
     pub let tap = rect("tap.drawing", x0=0., y0=0., w=w, h=h);
     pub let li1 = rect(
         "li1.drawing",
@@ -68,14 +72,19 @@ cell tap(ntap: Bool, w: Float, h: Float) {
         y1=tap.y1 + 130.,
     );
     let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
-    let cons = crect(x0=li1.x0, x1=li1.x1, y0=li1.y0+80., y1=li1.y1-80.);
+    let cons = if w >= h {
+        crect(x0=li1.x0 + 80., x1=li1.x1 - 80., y0=li1.y0, y1=li1.y1)
+    } else {
+        crect(x0=li1.x0, x1=li1.x1, y0=li1.y0 + 80., y1=li1.y1 - 80.)
+    };
     std::layout::center_rects(cons, std::layout::max_array(licon, cons.w, cons.h, 340., 340.));
 }
 
 /// A `tap` with met1 over its whole outline, contacted to its local
 /// interconnect with as many mcons as fit, so a supply can strap it directly.
-/// A narrow, tall one is a tap column for the end of a row of devices. It
-/// needs `w` of at least 250 and `h` of at least 410. Keep tap diffusion 270
+/// A narrow, tall one is a tap column for the end of a row of devices. Its
+/// sizes are limited as `tap`'s are, and its met1 needs an area of 0.083 µm².
+/// Keep tap diffusion 270
 /// from transistor diffusion; an n-tap also needs an n-well over it, 180 past
 /// its diffusion.
 ///
@@ -123,11 +132,20 @@ fn fill_tap(ntap: Bool, span: Rect) -> Any {
 ///   gate side free of met1. Abutted devices need the same `away` unless `w`
 ///   is at least 860.
 /// - `straps`: draws `s` and `d` and their mcons; if false, they are only bounds.
+/// - `gate_col`: contacts the gate centered on this contact column, counting
+///   from 0, rather than across the fingers; -1 for across. An outer column
+///   suits only the end of a row, where no neighbor's or dummy finger is
+///   beside it.
+/// - `dummies`: extra fingers at each end of the diffusion. Their gates and
+///   outer columns join the met1 bar `dum`, 140 beyond the far bar, which you
+///   tie to a supply. LVS sees them as transistors, so add them to the
+///   schematic with `dummy_devices`.
 ///
 /// # Fields
-/// - `g`, `s`, `d`: the met1 bars.
-/// - `cols`: the bounds of the li1 contact columns, 170 wide on a 430 pitch.
-/// - `poly`: the bounds of the gate fingers.
+/// - `g`, `s`, `d`, `dum`: the met1 bars; `dum` is only bounds without dummies.
+/// - `cols`: the bounds of the li1 contact columns, dummies' included, 170
+///   wide on a 430 pitch. The device's own columns start at column `dummies`.
+/// - `poly`: the bounds of the device's gate fingers.
 /// - `sdm`: the N+ or P+ implant.
 cell mos(
     nfet: Bool,
@@ -137,29 +155,41 @@ cell mos(
     gate_side: Int = 0,
     swap: Bool = false,
     away: Bool = false,
-    straps: Bool = true
+    straps: Bool = true,
+    gate_col: Int = -1,
+    dummies: Int = 0
 ) {
-    // `gate_row` counts from 0, and `gate_side` is -1, 0, or 1.
+    // `gate_row` and `dummies` count from 0, `gate_side` is -1, 0, or 1, and
+    // `gate_col` is -1 or a column of the device.
     eq(std::max(gate_row, 0) as Float, gate_row as Float);
+    eq(std::max(dummies, 0) as Float, dummies as Float);
     eq(std::min(std::max(gate_side, -1), 1) as Float, gate_side as Float);
-    let fet = inst(fet1v8(nfet, w, nf), x=0., y=0.);
+    eq(std::min(std::max(gate_col, -1), nf) as Float, gate_col as Float);
+    // A contact on an outer column would touch the dummy finger beside it.
+    let beside = dummies > 0 && (gate_col == 0 || gate_col == nf);
+    eq(if beside { 1. } else { 0. }, 0.);
+    let fet = inst(fet1v8(nfet, w, nf + 2 * dummies), x=0., y=0.);
     pub let sdm = fet.sdm;
-    pub let poly = fet.poly_bbox;
     pub let cols = fet.li1_bbox;
+    // The device's fingers and columns lie inside its dummies'.
+    let dx = 430. * (dummies as Float);
+    let fingers = fet.poly_bbox;
+    pub let poly = crect(x0=fingers.x0 + dx, x1=fingers.x1 - dx, y0=fingers.y0, y1=fingers.y1);
+    let col0 = cols.x0 + dx;
     // The far bar's mcons are at the columns' top; the near bar's are at their
     // bottom, or with `away`, just under the far bar.
     let far_y = cols.y1 - 170.;
     let near_y = if away { cols.y1 - 615. } else { cols.y0 };
     let near_below = if away { 75. } else { 90. };
     pub let s = strap(
-        cols.x0,
+        col0,
         if swap { far_y } else { near_y },
         nf / 2 + 1,
         if swap { 60. } else { near_below },
         straps,
     );
     pub let d = strap(
-        cols.x0 + 430.,
+        col0 + 430.,
         if swap { near_y } else { far_y },
         (nf + 1) / 2,
         if swap { near_below } else { 60. },
@@ -177,7 +207,98 @@ cell mos(
         eq(fingers.x0, poly.x0);
         eq(fingers.y0, pad_y1);
     }
-    pub let g = gate_contact(poly, li_y0, pad_y1, gate_side, li_y0 - 100., li0 + 270.);
+    pub let g = gate_contact(poly, li_y0, pad_y1, gate_side, gate_col, li_y0 - 100., li0 + 270.);
+    pub let dum = if dummies > 0 {
+        dummy_ties(fingers, cols, dummies, nf)
+    } else {
+        crect(layer="met1.drawing", x0=cols.x0 - 60., x1=cols.x1 + 60., y0=cols.y1 + 230., h=320.)
+    };
+}
+
+/// Adds the transistors a `mos` with `dummies` draws to the schematic, since
+/// LVS extracts them like any other: at each end, one from the device's outer
+/// column (`s` on the left; `s` for an even `nf` or `d` for an odd one on the
+/// right) to `dum`, and the rest from `dum` to `dum`, all with their gates on
+/// `dum` and their bodies on `b`.
+fn dummy_devices(
+    nfet: Bool,
+    w: Float,
+    nf: Int,
+    dummies: Int,
+    s: Signal,
+    d: Signal,
+    dum: Signal,
+    b: Signal,
+) {
+    if dummies > 0 {
+        let right = if nf % 2 == 0 { s } else { d };
+        dummy_device(nfet, s, dum, b, w, 1);
+        dummy_device(nfet, right, dum, b, w, 1);
+        if dummies > 1 {
+            dummy_device(nfet, dum, dum, b, w, 2 * (dummies - 1));
+        }
+    }
+}
+
+/// `nf` dummy fingers `w` wide from `outer` to `dum`, gated by `dum`.
+fn dummy_device(nfet: Bool, outer: Signal, dum: Signal, b: Signal, w: Float, nf: Int) {
+    let total = w * (nf as Float) / 1000.;
+    if nfet {
+        device(
+            DeviceKind::Nmos,
+            [outer, dum, dum, b],
+            "sky130_fd_pr__nfet_01v8",
+            w=total,
+            l=0.15,
+            nf=nf,
+        );
+    } else {
+        device(
+            DeviceKind::Pmos,
+            [outer, dum, dum, b],
+            "sky130_fd_pr__pfet_01v8",
+            w=total,
+            l=0.15,
+            nf=nf,
+        );
+    }
+}
+
+/// Ties the `dummies` fingers at each end of `fingers`, around `nf` device
+/// fingers, to a met1 bar above the far end of the contact columns `cols`,
+/// which it returns: each group's poly is contacted over its outermost
+/// column, which joins the group's other outer columns on li1.
+fn dummy_ties(fingers: Rect, cols: Rect, dummies: Int, nf: Int) -> Rect {
+    let reach = 430. * ((dummies - 1) as Float) + 170.;
+    let li_y0 = cols.y1 + 170.;
+    let poly_y0 = fingers.y1;
+    // Each group: its outer columns' span, its fingers' span, and the x of
+    // its outermost column's center.
+    let left = crect(x0=cols.x0, x1=cols.x0 + reach, y0=0., y1=5.);
+    let right = crect(x0=cols.x1 - reach, x1=cols.x1, y0=0., y1=5.);
+    let left_fingers = crect(x0=fingers.x0, x1=fingers.x0 + reach - 20., y0=0., y1=5.);
+    let right_fingers = crect(x0=fingers.x1 - reach + 20., x1=fingers.x1, y0=0., y1=5.);
+    for group in [(left, left_fingers, cols.x0 + 85.), (right, right_fingers, cols.x1 - 85.)] {
+        let span = group.0;
+        let tied = group.1;
+        let x = group.2;
+        rect(
+            "poly.drawing",
+            x0=std::min(tied.x0, x - 135.),
+            x1=std::max(tied.x1, x + 135.),
+            y0=poly_y0,
+            y1=li_y0 + 250.,
+        );
+        rect("licon1.drawing", x0=x - 85., y0=li_y0, w=170., h=170.);
+        rect("npc.drawing", x0=x - 185., x1=x + 185., y0=li_y0 - 100., y1=li_y0 + 270.);
+        let li = rect("li1.drawing", x0=span.x0, x1=span.x1, y0=cols.y1, y1=li_y0 + 305.);
+        let mcon = crect(layer="mcon.drawing", x0=0., y0=0., w=170., h=170.);
+        // One mcon per outer column, where an abutted neighbor's lands too.
+        let cuts = array(mcon, dummies, 430., 0.);
+        eq(cuts.x0, span.x0);
+        eq(cuts.y0, li_y0 + 135.);
+    }
+    rect("met1.drawing", x0=cols.x0 - 60., x1=cols.x1 + 60., y0=li_y0 + 60., h=320.)
 }
 
 /// One transistor folded into `rows` rows of `mos`, each with `nf / rows`
@@ -221,17 +342,27 @@ cell fold(nfet: Bool, w: Float, nf: Int, rows: Int) {
 /// # Arguments
 /// - `rows`: the number of gate contact rows between the diffusions, 540 apart.
 /// - `gate_row`: this column's row, counting from 0 nearest the NMOS.
-/// - `gate_side`: where a lone finger's contact widens, as for `mos`.
+/// - `gate_side`, `gate_col`: where the gate contact sits, as for `mos`.
 ///
 /// # Fields
 /// - `g`, `n_s`, `n_d`, `p_s`, `p_d`: the met1 bars, each 320 tall.
 /// - `cols`, `p_cols`: the bounds of the NMOS and PMOS li1 contact columns.
 /// - `poly`: the bounds of the gate fingers.
 /// - `n_sdm`, `p_sdm`, `nwell`: the implants and the n-well.
-cell cmos(nw: Float, pw: Float, nf: Int, rows: Int = 1, gate_row: Int = 0, gate_side: Int = 0) {
-    // `gate_row` is one of the `rows` rows, and `gate_side` is -1, 0, or 1.
+cell cmos(
+    nw: Float,
+    pw: Float,
+    nf: Int,
+    rows: Int = 1,
+    gate_row: Int = 0,
+    gate_side: Int = 0,
+    gate_col: Int = -1
+) {
+    // `gate_row` is one of the `rows` rows, `gate_side` is -1, 0, or 1, and
+    // `gate_col` is -1 or a column.
     eq(std::min(std::max(gate_row, 0), rows - 1) as Float, gate_row as Float);
     eq(std::min(std::max(gate_side, -1), 1) as Float, gate_side as Float);
+    eq(std::min(std::max(gate_col, -1), nf) as Float, gate_col as Float);
     let n = inst(fet1v8(true, nw, nf), x=0., y=0.);
     pub let cols = n.li1_bbox;
     pub let n_sdm = n.sdm;
@@ -264,7 +395,15 @@ cell cmos(nw: Float, pw: Float, nf: Int, rows: Int = 1, gate_row: Int = 0, gate_
         y1=p.poly_bbox.y1,
     );
     let li_y0 = li0 + 540. * (gate_row as Float);
-    pub let g = gate_contact(poly, li_y0, li_y0 + 250., gate_side, li0 - 100., top + 270.);
+    pub let g = gate_contact(
+        poly,
+        li_y0,
+        li_y0 + 250.,
+        gate_side,
+        gate_col,
+        li0 - 100.,
+        top + 270.,
+    );
 
     // The n-well encloses the PMOS diffusion by 180 and is at least 840 tall.
     pub let nwell = rect(
@@ -279,27 +418,36 @@ cell cmos(nw: Float, pw: Float, nf: Int, rows: Int = 1, gate_row: Int = 0, gate_
 /// Contacts the gate fingers spanning `fingers` on met1: a poly pad from 80
 /// below `li_y0` to `pad_y1`, li1 170 tall from `li_y0`, the nitride cut from
 /// `npc_y0` to `npc_y1`, and the met1 bar 320 tall that it returns. A lone
-/// finger's pad widens to 270 toward `side`: -1 left, 1 right, or 0 both.
+/// finger's pad widens to 270 toward `side`: -1 left, 1 right, or 0 both. With
+/// `col` other than -1, one contact is centered on that contact column.
 fn gate_contact(
     fingers: Rect,
     li_y0: Float,
     pad_y1: Float,
     side: Int,
+    col: Int,
     npc_y0: Float,
     npc_y1: Float,
 ) -> Rect {
-    let ext = std::max(0., 270. - fingers.w);
+    let ext = if col < 0 { std::max(0., 270. - fingers.w) } else { 0. };
     let left = if side < 0 { ext } else if side > 0 { 0. } else { ext / 2. };
+    // The center of contact column `col`, 140 left of the first finger for 0.
+    let x = fingers.x0 - 140. + 430. * (col as Float);
     let pad = rect(
         "poly.drawing",
-        x0=fingers.x0 - left,
-        x1=fingers.x1 + ext - left,
+        x0=if col < 0 { fingers.x0 - left } else { std::min(fingers.x0, x - 135.) },
+        x1=if col < 0 { fingers.x1 + ext - left } else { std::max(fingers.x1, x + 135.) },
         y0=li_y0 - 80.,
         y1=pad_y1,
     );
     let licon = crect(layer="licon1.drawing", x0=0., y0=0., w=170., h=170.);
-    let licons = max_array(licon, pad.w - 100., 170., 340., 340.);
-    center_rects(crect(x0=pad.x0, x1=pad.x1, y0=li_y0, h=170.), licons);
+    let licons = max_array(licon, if col < 0 { pad.w - 100. } else { 170. }, 170., 340., 340.);
+    let site = if col < 0 {
+        crect(x0=pad.x0, x1=pad.x1, y0=li_y0, h=170.)
+    } else {
+        crect(x0=x - 85., w=170., y0=li_y0, h=170.)
+    };
+    center_rects(site, licons);
     let li = rect("li1.drawing", x0=licons.x0 - 80., x1=licons.x1 + 80., y0=li_y0, h=170.);
     let mcon = crect(layer="mcon.drawing", x0=0., y0=0., w=170., h=170.);
     let mcons = max_array(mcon, li.w - 120., 170., 360., 360.);

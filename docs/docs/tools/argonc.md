@@ -20,6 +20,7 @@ argonc <ROOT> (--check | --cell <EXPR>) [OPTIONS]
 | `--tech <PATH>` | Required with `--cell` | Technology file. |
 | `--dependency <NAME=PATH>` | Repeatable | Add a dependency. The path can be a directory or a `lib.ar`. |
 | `--gds-import <NAME=PATH>` | Repeatable | Import a GDS cell. `NAME` may be a module path. |
+| `--wasm-module <NAME=PATH>` | Repeatable | Load a WASM module for [`extern` functions](/language/extern-functions). |
 | `-o, --output <PATH>` | Beside `lib.ar` | Where to write the compiled layout. |
 | `--gds <PATH>` | None | Also write GDS to this path. |
 | `--gds-only` | Off | Write only the GDS given by `--gds`. Skips the compiled layout and the debugging information only the editor reads, so it uses much less memory. Can't be combined with `--output`. |

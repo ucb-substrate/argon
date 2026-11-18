@@ -129,7 +129,7 @@ These names can't be used where noted:
 
 | Names | Not allowed as | Why |
 | --- | --- | --- |
-| `as`, `cell`, `const`, `else`, `enum`, `false`, `fn`, `for`, `if`, `in`, `let`, `match`, `mod`, `pub`, `struct`, `true`, `use` | Any name | Keywords. |
+| `as`, `cell`, `const`, `else`, `enum`, `extern`, `false`, `fn`, `for`, `if`, `in`, `let`, `match`, `mod`, `pub`, `struct`, `true`, `use` | Any name | Keywords. |
 | The [built-in functions](/language/builtins), such as `eq`, `float`, `grid_floor`, `head`, and `cons` | The name of a cell, function, or other module item, or a name bound with `use` | Every module calls them by bare name. A local `let` may shadow one. |
 | `x`, `y` | A `let` at the top level of a cell | They are an [instance's](/language/types/instance#instance-values) position, so they can't also be fields. Cell parameters, and `let`s in functions, loops, branches, and blocks, may use them. |
 | `x`, `y`, `angle`, `reflect`, in any case | A [device](/language/std-schematic#device) parameter | They place the device in the schematic; see [placement and routes](/language/schematic-drawing#placement-and-routes). |

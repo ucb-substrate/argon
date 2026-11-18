@@ -113,6 +113,77 @@ pub(super) fn int_to_string(value: &Value) -> OpResult {
     }
 }
 
+/// `format_string(template, values)`: `template` with each `{}` replaced, in
+/// order, by the next of `values`, and `{{` and `}}` by single braces.
+pub(super) fn format_string(solver: &Solver, template: &Value, values: &Value) -> OpResult {
+    let (Value::String(template), Value::Seq(values)) = (template, values) else {
+        return Err(error(ExecErrorKind::InvalidType));
+    };
+    let fail = |message: String| Err(error(ExecErrorKind::InvalidFormat(message)));
+    let mut texts = Vec::with_capacity(values.len());
+    for value in values.iter() {
+        texts.push(match value {
+            Value::String(text) => text.clone(),
+            Value::Int(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Linear(expr) => match solver.eval_expr_exact(expr) {
+                Some(x) => format_float(x),
+                None => return Err(wait([expr])),
+            },
+            other => {
+                return fail(format!(
+                    "`format` writes Ints, Floats, Bools, and Strings, not a {}",
+                    other.kind_name()
+                ));
+            }
+        });
+    }
+    let count = values.len();
+    let mut out = String::with_capacity(template.len());
+    let mut next = texts.into_iter();
+    let mut used = 0;
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek()) {
+            ('{', Some('{')) | ('}', Some('}')) => {
+                out.push(c);
+                chars.next();
+            }
+            ('{', Some('}')) => {
+                chars.next();
+                used += 1;
+                match next.next() {
+                    Some(text) => out.push_str(&text),
+                    None => {
+                        return fail(format!(
+                            "`format` template `{template}` has more `{{}}` than the {count} values given"
+                        ));
+                    }
+                }
+            }
+            ('{', _) | ('}', _) => {
+                return fail(format!(
+                    "`format` template `{template}` has a lone `{c}`; write `{c}{c}` for a brace"
+                ));
+            }
+            _ => out.push(c),
+        }
+    }
+    if used < count {
+        return fail(format!(
+            "`format` template `{template}` has {used} `{{}}` for {count} values"
+        ));
+    }
+    Ok(Value::String(out))
+}
+
+/// A float as `format` writes it: without a trailing `.` when it is whole,
+/// and with floating-point noise below a billionth rounded away.
+fn format_float(x: f64) -> String {
+    let rounded = (x * 1e9).round() / 1e9;
+    format!("{}", rounded + 0.)
+}
+
 pub(super) fn unary(op: UnaryOp, value: &Value) -> OpResult {
     match (value, op) {
         (Value::Linear(v), UnaryOp::Neg) => Ok(Value::Linear(LinearExpr {
@@ -619,6 +690,7 @@ pub(super) fn tech_via(tech: &Technology, solver: &Solver, args: &[&Value]) -> O
     };
     let mut seq = Seq::new();
     let last = layers.len() - 2;
+    let mut fits = Vec::with_capacity(layers.len() - 1);
     for (i, pair) in layers.windows(2).enumerate() {
         let Some(via) = tech.via(&pair[0], &pair[1]) else {
             let vias = tech
@@ -637,15 +709,30 @@ pub(super) fn tech_via(tech: &Technology, solver: &Solver, args: &[&Value]) -> O
         };
         let below = if i == 0 { b } else { overlap };
         let above = if i == last { t } else { overlap };
-        let Some(fit) = crate::via_array::fit_via(
-            via.size,
-            via.space,
-            via.bot_enclosure,
-            via.top_enclosure,
-            below,
-            above,
-            grid,
-        ) else {
+        let fit = |bot_enc, top_enc| {
+            crate::via_array::fit_via(via.size, via.space, bot_enc, top_enc, below, above, grid)
+        };
+        // A pad between two vias can grow past the overlap, so failing the
+        // enclosures within it, the cuts need only fill the overlap, or else
+        // one cut sits at its center; `bot` and `top` still enclose theirs.
+        let free = |enc, real: bool| if real { enc } else { (0., 0.) };
+        let Some(fit) = fit(via.bot_enclosure, via.top_enclosure)
+            .or_else(|| {
+                fit(
+                    free(via.bot_enclosure, i == 0),
+                    free(via.top_enclosure, i == last),
+                )
+            })
+            .or_else(|| {
+                centered_cut(
+                    &via,
+                    overlap,
+                    (i == 0).then_some(b),
+                    (i == last).then_some(t),
+                    grid,
+                )
+            })
+        else {
             let need = |e: (f64, f64), f: (f64, f64)| {
                 let short = e.0.max(f.0);
                 let long = e.1.max(f.1);
@@ -663,14 +750,27 @@ pub(super) fn tech_via(tech: &Technology, solver: &Solver, args: &[&Value]) -> O
                 need(via.bot_enclosure, via.top_enclosure)
             ));
         };
+        fits.push((via, fit));
+    }
+    for (i, (via, fit)) in fits.iter().enumerate() {
         let pitch = via.size + via.space;
         seq.push_back(entry(
             &via.cut, fit.x0, fit.y0, via.size, via.size, fit.nx, fit.ny, pitch,
         ));
         if i != last {
-            let pad = grow_pad(tech, &pair[1], overlap, grid);
+            // The pad above this via encloses its cuts and the next via's.
+            let (next, next_fit) = &fits[i + 1];
+            let lower = enclosed(via, fit, via.top_enclosure, overlap);
+            let upper = enclosed(next, next_fit, next.bot_enclosure, overlap);
+            let region = [
+                overlap[0].min(lower[0]).min(upper[0]),
+                overlap[1].min(lower[1]).min(upper[1]),
+                overlap[2].max(lower[2]).max(upper[2]),
+                overlap[3].max(lower[3]).max(upper[3]),
+            ];
+            let pad = grow_pad(tech, &layers[i + 1], region, grid);
             seq.push_back(entry(
-                &pair[1],
+                &layers[i + 1],
                 pad[0],
                 pad[1],
                 pad[2] - pad[0],
@@ -682,6 +782,57 @@ pub(super) fn tech_via(tech: &Technology, solver: &Solver, args: &[&Value]) -> O
         }
     }
     Ok(Value::Seq(Arc::new(seq)))
+}
+
+/// One cut of `via` centered on `overlap`, on the grid, if `bot` and `top`,
+/// where given, enclose it as the via requires.
+fn centered_cut(
+    via: &crate::tech::Via,
+    overlap: [f64; 4],
+    bot: Option<[f64; 4]>,
+    top: Option<[f64; 4]>,
+    grid: f64,
+) -> Option<crate::via_array::ViaFit> {
+    let down = |v: f64| ((v / grid) + 1e-9).floor() * grid;
+    let x0 = down((overlap[0] + overlap[2] - via.size) / 2.);
+    let y0 = down((overlap[1] + overlap[3] - via.size) / 2.);
+    let cut = [x0, y0, x0 + via.size, y0 + via.size];
+    let inside = |shape: [f64; 4], enc: (f64, f64)| {
+        [enc, (enc.1, enc.0)].iter().any(|(ex, ey)| {
+            shape[0] <= cut[0] - ex + 1e-9
+                && shape[1] <= cut[1] - ey + 1e-9
+                && shape[2] + 1e-9 >= cut[2] + ex
+                && shape[3] + 1e-9 >= cut[3] + ey
+        })
+    };
+    let fits = bot.is_none_or(|b| inside(b, via.bot_enclosure))
+        && top.is_none_or(|t| inside(t, via.top_enclosure));
+    fits.then_some(crate::via_array::ViaFit {
+        nx: 1,
+        ny: 1,
+        x0,
+        y0,
+    })
+}
+
+/// The bounds of `fit`'s cuts grown by `enc`, in whichever orientation adds
+/// the least area to `overlap`.
+fn enclosed(
+    via: &crate::tech::Via,
+    fit: &crate::via_array::ViaFit,
+    enc: (f64, f64),
+    overlap: [f64; 4],
+) -> [f64; 4] {
+    let x1 = fit.x0 + fit.nx as f64 * via.size + (fit.nx - 1) as f64 * via.space;
+    let y1 = fit.y0 + fit.ny as f64 * via.size + (fit.ny - 1) as f64 * via.space;
+    let grown = |(ex, ey): (f64, f64)| [fit.x0 - ex, fit.y0 - ey, x1 + ex, y1 + ey];
+    let added = |r: [f64; 4]| {
+        let w = overlap[2].max(r[2]) - overlap[0].min(r[0]);
+        let h = overlap[3].max(r[3]) - overlap[1].min(r[1]);
+        w * h
+    };
+    let (a, b) = (grown(enc), grown((enc.1, enc.0)));
+    if added(b) < added(a) { b } else { a }
 }
 
 /// `region` grown about its center, on the grid, to the minimum width and

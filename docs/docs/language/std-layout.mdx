@@ -59,12 +59,12 @@ These constructors add geometry to the current cell. Coordinate arguments are [`
 <Returns type="Rect" href="/language/types/rect">The rectangle.</Returns>
 
 ```argon
-let gate = rect("poly", x0=0., y0=0., w=80., h=400.);
+let gate = rect("met1", x0=0., y0=0., w=80., h=400.);
 ```
 
 Give enough values or constraints to pin the rectangle down. If you drag an under-constrained rectangle in the GUI, it adds the missing initial values.
 
-A `net` tag says which of the cell's signals a rectangle carries. The headless MCP server's [`compile`](/tools/agents#headless-mode) then joins the layout's conductors through the technology file's `[[vias]]` and reports, as warnings, each short (one conductor carrying two tags or pin labels) and each open (one tag or label on separate conductors), with the source lines of the shapes involved, before LVS would. A cell is checked against its own tags and pin labels only; its subcells' are checked when they are.
+A `net` tag says which of the cell's signals a rectangle carries; `polygon` and `path` take one too. The headless MCP server's [`compile`](/tools/agents#headless-mode) then joins the layout's conductors through the technology file's `[[vias]]` and reports, as warnings, each short (one conductor carrying two tags or pin labels) and each open (one tag or label on separate conductors), with the source lines of the shapes involved, before LVS would. A cell is checked against its own tags and pin labels, and against a subcell's where [`inst`](#inst)'s `nets` maps them to the cell's signals; other names in a subcell are checked when it is.
 
 ```argon
 let out = Signal();
@@ -101,7 +101,7 @@ let bounds = crect(x0=0., y0=0., w=1000., h=800.);
 
 ### `polygon` {#polygon}
 
-<ApiItem id="polygon" name="std::layout::polygon" signature={'polygon(layer: String, points: Int, x0?, y0?, …, x0i?, y0i?, …) -> Polygon'} summary={<>Creates a polygon with a fixed number of vertices, each constrained on its own.</>}>
+<ApiItem id="polygon" name="std::layout::polygon" signature={'polygon(layer: String, points: Int, x0?, y0?, …, x0i?, y0i?, …, net?) -> Polygon'} summary={<>Creates a polygon with a fixed number of vertices, each constrained on its own.</>}>
 
 <ParameterTable rows={[
   {name: 'layer', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: 'A drawing layer.'},
@@ -110,6 +110,7 @@ let bounds = crect(x0=0., y0=0., w=1000., h=800.);
   {name: 'yN', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional keyword', description: 'y coordinate of vertex N.'},
   {name: 'xNi', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial x coordinate of vertex N.'},
   {name: 'yNi', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial y coordinate of vertex N.'},
+  {name: 'net', type: 'Signal', typeHref: '/language/schematic', requirement: 'Optional keyword', description: <>The schematic signal the polygon belongs to, for checking connectivity, as for <code>rect</code>.</>},
 ]} />
 
 <Returns type="Polygon" href="/language/types/polygon">The polygon.</Returns>
@@ -126,7 +127,7 @@ let triangle = polygon("met1", 3,
 
 ### `path` {#path}
 
-<ApiItem id="path" name="std::layout::path" signature={'path(layer: String, points: Int, width?, begin_extension?, end_extension?, x0?, y0?, …) -> Path'} summary={<>Creates a constant-width path along a centerline.</>}>
+<ApiItem id="path" name="std::layout::path" signature={'path(layer: String, points: Int, width?, begin_extension?, end_extension?, x0?, y0?, …, net?) -> Path'} summary={<>Creates a constant-width path along a centerline.</>}>
 
 <ParameterTable rows={[
   {name: 'layer', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: 'A drawing layer.'},
@@ -140,6 +141,7 @@ let triangle = polygon("met1", 3,
   {name: 'begin_extensioni', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial begin extension.'},
   {name: 'end_extensioni', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial end extension.'},
   {name: 'xNi / yNi', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial coordinates of centerline point N.'},
+  {name: 'net', type: 'Signal', typeHref: '/language/schematic', requirement: 'Optional keyword', description: <>The schematic signal the path belongs to, for checking connectivity, as for <code>rect</code>.</>},
 ]} />
 
 <Returns type="Path" href="/language/types/path">The path.</Returns>
@@ -173,7 +175,7 @@ text("VDD", "text.label", 40., 80.);
 
 ### `inst` {#inst}
 
-<ApiItem id="inst" name="std::layout::inst" signature={'inst(cell: Cell, reflect?, angle?, x?, y?, xi?, yi?, construction?) -> Inst'} summary={<>Places a cell in the current scope.</>}>
+<ApiItem id="inst" name="std::layout::inst" signature={'inst(cell: Cell, reflect?, angle?, x?, y?, xi?, yi?, construction?, nets?) -> Inst'} summary={<>Places a cell in the current scope.</>}>
 
 <ParameterTable rows={[
   {name: 'cell', type: 'Cell', typeHref: '/language/types/instance#cell-values', requirement: 'Required, positional', description: 'The cell value to place, such as inverter(1200., 2000., 4).'},
@@ -184,6 +186,7 @@ text("VDD", "text.label", 40., 80.);
   {name: 'xi', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial x position.'},
   {name: 'yi', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Optional fallback', description: 'Initial y position.'},
   {name: 'construction', type: 'Bool', typeHref: '/language/types/scalars#bool', requirement: 'Optional; false', description: 'When true, leave the instance out of layout export and of the parent bounding box.'},
+  {name: 'nets', type: '[(String, Signal)]', typeHref: '/language/types/collections#tuples', requirement: 'Optional keyword', description: <>For checking connectivity: each of the cell's signals, by name, and the signal of this cell it stands for. It changes nothing in the exported layout.</>},
 ]} />
 
 <Returns type="Inst" href="/language/types/instance#instance-values">The instance, with its position and the public fields of its cell.</Returns>
@@ -191,6 +194,14 @@ text("VDD", "text.label", 40., 80.);
 ```argon
 let placed = inst(inverter(1200., 2000., 4), x=100., y=50., angle=90);
 ```
+
+With `nets`, the shapes the cell tags with a mapped signal, and its pins labeled with one, count toward the parent's signal in the parent's [connectivity check](#rect), through any number of levels whose instances map them in turn. Here the inverter's `out` and `vdd` are this cell's `z` and `vdd`:
+
+```argon
+inst(inverter(1200., 2000., 4), x=0., y=0., nets=[("out", z), ("vdd", vdd)]);
+```
+
+A name the cell has no signal of maps nothing, and the check notes it. Helpers that place instances for you, such as [`mirror_pair`](#mirror-pair), take no `nets`, so place an instance whose ports you map with `inst`.
 
 </ApiItem>
 
@@ -270,6 +281,8 @@ cell bank() {
     row([a, b, c], 200.);
 }
 ```
+
+A list holds one type, and instances of different cells have different types, so bind each such instance as `Any` to put them in one list: `let a: Any = inst(unit(), x=0., y=0.);`. The same goes for mixing instances and rectangles in [`bbox_of`](#bbox-of).
 
 ### `row` {#row}
 
@@ -354,7 +367,7 @@ Each net's first pin is routed to each of its other pins in turn, joining the ne
 
 For each pair of adjacent layers, [`max_via_array`](/language/builtins/vias#max_via_array) picks the cut array for two wires crossing, with each long enclosure along its layer's wires. Every via between the pair uses that array, centered on the crossing.
 
-The router works in units of the technology's grid: widths, spacings, cut sizes, and enclosures must be multiples of it, and rectangle coordinates are snapped to it as drawn geometry is. Like an [`extern`](/language/extern-functions) call, it waits until every coordinate in its arguments is solved. The grid may have at most 4,000,000 points, summed over the layers.
+The router works in units of the technology's grid: widths, spacings, cut sizes, and enclosures must be multiples of it, and it reads rectangle coordinates, which are solved onto the grid, in grid units. Like an [`extern`](/language/extern-functions) call, it waits until every coordinate in its arguments is solved. The grid may have at most 4,000,000 points, summed over the layers.
 
 Errors name the net and the pins: ``routing failed: net `b` has no route from pin 0 to pin 2`` when no attempt finds a route, and ``routing failed: pin 1 of net `b` has no free grid point nearby`` when everything around a pin is blocked. Invalid layers, vias, and pins are reported too, such as layers that do not alternate direction.
 
@@ -521,7 +534,7 @@ The technology file's via from `bot`'s layer to `top`'s gives the cut layer, siz
 
 <Returns type="[Rect]" href="/language/types/collections#sequences">The bounds of each via's cuts and each pad, from the bottom.</Returns>
 
-The vias and pads stay within the shapes' overlap, except that a pad grows about its center to its layer's minimum width and area (`<layer>.width`, `<layer>.area`). Every via must fit in the overlap, so to start from a narrow shape, such as a 170-wide li1 column, draw a landing pad on the next layer and stack from that.
+Every cut is centered on the shapes' overlap, and `bot` and `top` enclose their vias as the rules require. A pad covers the overlap, and grows past it where a via's enclosure needs more room, such as on a 170-wide li1 column, and to its layer's minimum width and area (`<layer>.width`, `<layer>.area`). A via that fits nowhere in the overlap gets one cut at its center. A grown pad can reach neighboring shapes, so check its spacing.
 
 </ApiItem>
 
@@ -579,7 +592,7 @@ If the rectangles don't overlap, the result is inverted rather than empty: this 
   {name: 'ypitch', type: 'Float', typeHref: '/language/types/scalars#float', requirement: 'Required', description: 'y pitch between copies.'},
 ]} />
 
-<Returns type="Rect" href="/language/types/rect">A construction rectangle around the row.</Returns>
+<Returns type="Rect" href="/language/types/rect">A construction rectangle around the row, or the one drawn rectangle when <code>n</code> is 1.</Returns>
 
 </ApiItem>
 

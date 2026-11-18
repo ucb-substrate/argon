@@ -1198,6 +1198,33 @@ cell top() {
     }
 
     #[test]
+    fn eager_errors_in_a_function_name_the_call_that_led_to_them() {
+        let source = temp_source(
+            "eager-call-site",
+            "fn flipped() {\n    std::layout::rect(\"met1\", x0=10., y0=0., x1=0., y1=1.);\n}\n\
+             fn turned() {\n    std::layout::inst(inner(), x=0., y=0., angle=45);\n}\n\
+             fn unknown() {\n    std::layout::rect(\"nowhere\", x0=0., y0=0., x1=1., y1=1.);\n}\n\
+             cell inner() {\n    std::layout::rect(\"met1\", x0=0., y0=0., x1=1., y1=1.);\n}\n\
+             cell top() {\n    flipped();\n    turned();\n    unknown();\n}\n",
+        );
+        let path = source.display().to_string();
+        let diagnostics = render_failed(failed(execution_args(source, "top()", basic_tech())));
+        for expected in [
+            // A rect whose edges are in the wrong order.
+            format!("{path}:2:5\n"),
+            format!("note: in this call\n  --> {path}:14:5\n"),
+            // A rotation that isn't a multiple of 90.
+            format!("{path}:5:50\n"),
+            format!("note: in this call\n  --> {path}:15:5\n"),
+            // A layer the technology doesn't define.
+            format!("{path}:8:5\n"),
+            format!("note: in this call\n  --> {path}:16:5\n"),
+        ] {
+            assert!(diagnostics.contains(&expected), "{expected}\n{diagnostics}");
+        }
+    }
+
+    #[test]
     fn errors_say_how_to_fix_them() {
         let inconsistent = temp_source(
             "inconsistent",

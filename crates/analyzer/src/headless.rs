@@ -2162,11 +2162,11 @@ mod tests {
             "li.1 (1.75, 1.5) to (1.8, 1.6) µm in inv:\n".to_owned(),
             "  li1.drawing (1700, 1400) to (1870, 2250): lib.ar:51:19\n".to_owned(),
             format!(
-                "(0.6, 1) to (0.7, 1.1) µm in inv: (no layer in the technology matches `COREID`)\n  diff.drawing (-285, 130) to (1725, 1130): {}:16:16; in nmos (lib.ar:5:20)\n",
+                "(0.6, 1) to (0.7, 1.1) µm in inv: (no layer in the technology matches `COREID`)\n  diff.drawing (-285, 130) to (1725, 1130): {}:17:16; in nmos (lib.ar:5:20)\n",
                 pdk.display()
             ),
             format!(
-                "(0.6, 1) to (0.7, 1.1) µm in sky130__fet1v8:\n  diff.drawing (-285, 130) to (1725, 1130): {}:16:16\n",
+                "(0.6, 1) to (0.7, 1.1) µm in sky130__fet1v8:\n  diff.drawing (-285, 130) to (1725, 1130): {}:17:16\n",
                 pdk.display()
             ),
             "no GDS cell named `missing`".to_owned(),

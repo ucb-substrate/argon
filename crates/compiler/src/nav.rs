@@ -882,6 +882,11 @@ fn builtin_signature(name: &str) -> Option<SignatureInfo> {
         ),
         "max_num" => signature("fn max_num(a: T, b: T) -> T", &["a: T", "b: T"], &[]),
         "min_num" => signature("fn min_num(a: T, b: T) -> T", &["a: T", "b: T"], &[]),
+        "format_string" => signature(
+            "fn format_string<T>(template: String, values: [T]) -> String",
+            &["template: String", "values: [T]"],
+            &[],
+        ),
         "int_to_string" => signature(
             "fn int_to_string(value: Int) -> String",
             &["value: Int"],
@@ -933,14 +938,15 @@ fn native_signature(native: Native) -> SignatureInfo {
             )
         }
         Native::Polygon => signature(
-            "fn polygon(layer: String, points: Int, *, xN/yN: Float) -> Polygon",
+            "fn polygon(layer: String, points: Int, *, xN/yN: Float, net: Signal) -> Polygon",
             &["layer: String", "points: Int"],
-            &[],
+            &["net: Signal"],
         ),
         Native::Path => signature(
-            "fn path(layer: String, points: Int, *, coordinates...) -> Path",
+            "fn path(layer: String, points: Int, *, coordinates..., net: Signal) -> Path",
             &["layer: String", "points: Int"],
             &[
+                "net: Signal",
                 "width: Float",
                 "widthi: Float",
                 "begin_extension: Float",
@@ -978,6 +984,7 @@ fn native_signature(native: Native) -> SignatureInfo {
                 "xi: Float",
                 "yi: Float",
                 "construction: Bool",
+                "nets: [(String, Signal)]",
             ],
         ),
         Native::Bbox => signature(

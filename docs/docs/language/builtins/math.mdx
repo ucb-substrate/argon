@@ -75,7 +75,7 @@ Like a comparison, it compares exact values, with values within floating-point n
 
 <Returns type="T">b if a is less than b, otherwise a, as `max_float` or `max_int` would return.</Returns>
 
-A generic function may call it with its own type parameter. Any type but `Int` or `Float` is an error when the call runs.
+A generic function may call it with its own type parameter. Any other type is a type error, or, through a type parameter, an error when the call runs.
 
 </ApiItem>
 
@@ -90,6 +90,8 @@ A generic function may call it with its own type parameter. Any type but `Int` o
 
 <Returns type="T">a if a is less than b, otherwise b.</Returns>
 
+A generic function may call it with its own type parameter. Any other type is a type error, or, through a type parameter, an error when the call runs.
+
 </ApiItem>
 
 ## `int_to_string`
@@ -100,6 +102,19 @@ A generic function may call it with its own type parameter. Any type but `Int` o
   {name: 'value', type: 'Int', typeHref: '/language/types/scalars#int', requirement: 'Required, positional', description: 'The integer to write.'},
 ]} />
 
-<Returns type="String" href="/language/types/scalars#string">The digits, with a leading `-` for a negative value. [`std::to_string`](/language/std#to-string) wraps it.</Returns>
+<Returns type="String" href="/language/types/scalars#string">The digits, with a leading `-` for a negative value.</Returns>
+
+</ApiItem>
+
+## `format_string`
+
+<ApiItem id="format-string" name="format_string" signature={'format_string<T>(template: String, values: [T]) -> String'} summary={<>Replaces each <code>{'{}'}</code> in a template with one of a list of values.</>}>
+
+<ParameterTable rows={[
+  {name: 'template', type: 'String', typeHref: '/language/types/scalars#string', requirement: 'Required, positional', description: <>Text with one <code>{'{}'}</code> per value, and <code>{'{{'}</code> or <code>{'}}'}</code> for a single brace.</>},
+  {name: 'values', type: '[T]', typeHref: '/language/types/collections#sequences', requirement: 'Required, positional', description: 'Ints, Floats, Bools, or Strings.'},
+]} />
+
+<Returns type="String" href="/language/types/scalars#string">The template with its <code>{'{}'}</code>s replaced. [`std::format`](/language/std#format) and [`std::to_string`](/language/std#to-string) wrap it.</Returns>
 
 </ApiItem>

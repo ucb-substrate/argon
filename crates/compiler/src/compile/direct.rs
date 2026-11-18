@@ -336,6 +336,9 @@ impl<'a> ExecPass<'a> {
                     ops::min_max(solver, builtin.is_max(), refs.first()?, refs.get(1)?).ok()
                 }
                 Builtin::IntToString => ops::int_to_string(refs.first()?).ok(),
+                Builtin::FormatString => {
+                    ops::format_string(solver, refs.first()?, refs.get(1)?).ok()
+                }
                 Builtin::SeqLen
                 | Builtin::SeqConcat
                 | Builtin::SeqFlatten
@@ -564,6 +567,7 @@ impl Builtin {
                 | Builtin::MaxNum
                 | Builtin::MinNum
                 | Builtin::IntToString
+                | Builtin::FormatString
                 | Builtin::MaxViaArray
         )
     }
