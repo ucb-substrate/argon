@@ -129,6 +129,23 @@ pub(super) fn unary(op: UnaryOp, value: &Value) -> OpResult {
     }
 }
 
+/// Relative difference below which two floats compare equal. It absorbs
+/// floating-point noise such as `0.1 + 0.2` against `0.3`, and nothing more.
+const FLOAT_TOLERANCE: f64 = 1e-9;
+
+/// How `a` orders against `b`, with values within floating-point noise of
+/// each other equal. Values are compared exactly, not on the grid: a
+/// coordinate is already on the grid once solved, and other values are not
+/// coordinates.
+fn compare_floats(a: f64, b: f64) -> Option<std::cmp::Ordering> {
+    let scale = 1f64.max(a.abs()).max(b.abs());
+    if (a - b).abs() <= FLOAT_TOLERANCE * scale {
+        Some(std::cmp::Ordering::Equal)
+    } else {
+        a.partial_cmp(&b)
+    }
+}
+
 pub(super) fn compare(
     solver: &Solver,
     op: ComparisonOp,
@@ -153,14 +170,15 @@ pub(super) fn compare(
     // an operator that those checks would have rejected can still arrive here.
     let res = match (left, right) {
         (Value::Linear(vl), Value::Linear(vr)) => {
-            let (Some(el), Some(er)) = (solver.eval_expr(vl), solver.eval_expr(vr)) else {
+            let (Some(el), Some(er)) = (solver.eval_expr_exact(vl), solver.eval_expr_exact(vr))
+            else {
                 return Err(wait([vl, vr]));
             };
             match op {
                 // Float equality is meaningless against a solved value, and
                 // is rejected statically whenever the type is known.
                 ComparisonOp::Eq | ComparisonOp::Ne => None,
-                _ => el.partial_cmp(&er).and_then(ordered),
+                _ => compare_floats(el, er).and_then(ordered),
             }
         }
         (Value::Int(vl), Value::Int(vr)) => ordered(vl.cmp(vr)),
@@ -258,7 +276,6 @@ pub(super) fn field(base: &Value, field: &str) -> OpResult {
         // The base may have arrived as `Any`, so the field was never checked
         // against the struct.
         Value::Struct(value) => value
-            .fields
             .get(field)
             .cloned()
             .ok_or_else(|| error(ExecErrorKind::InvalidType)),
@@ -295,6 +312,7 @@ pub(super) fn index(base: &Value, index: &Value) -> OpResult {
 /// gives the value of each field the literal names; the rest come from `base`.
 pub(super) fn struct_lit<'v>(
     defs: &TypeDefs,
+    layouts: &StructLayouts,
     target: &StructLitTarget,
     explicit: impl Fn(&str) -> Option<&'v Value>,
     base: Option<&Value>,
@@ -303,47 +321,52 @@ pub(super) fn struct_lit<'v>(
     // `Any`. A variant literal has no base.
     let base = match (base, target) {
         (None, _) => None,
-        (Some(Value::Struct(value)), StructLitTarget::Struct(ty)) if value.name == ty.name => {
-            Some(&value.fields)
+        (Some(Value::Struct(value)), StructLitTarget::Struct(ty)) if value.name() == ty.name => {
+            Some(value)
         }
         (Some(_), _) => return Err(OpFailure::Error(ExecErrorKind::InvalidType, ErrorAt::Base)),
     };
     // Declaration order, whatever order the literal used: `CellArg::Struct`
     // fields are matched pairwise against the type's.
-    let declared = match target {
-        StructLitTarget::Struct(ty) => defs
-            .get(&ty.def)
-            .and_then(AdtDef::as_struct)
-            .map(|def| Either::Left(def.fields.keys())),
-        StructLitTarget::Variant { ty, variant } => defs
-            .get(&ty.def)
-            .and_then(AdtDef::as_enum)
-            .and_then(|def| def.variants.get(variant))
-            .and_then(|variant| match &variant.payload {
-                VariantTys::Struct(fields) => Some(Either::Right(fields.keys())),
-                VariantTys::Tuple(_) => None,
-            }),
-    }
-    .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
-    let fields = Iterator::map(declared, |name| {
-        let value = match explicit(name) {
-            Some(value) => Some(value.clone()),
-            None => base.and_then(|base| base.get(name).cloned()),
-        };
-        value.map(|value| (name.clone(), value))
-    })
-    .collect::<Option<FxIndexMap<_, _>>>()
-    .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
-    Ok(match target {
-        StructLitTarget::Struct(ty) => Value::Struct(Arc::new(StructValue {
-            name: ty.name.clone(),
-            fields,
-        })),
-        StructLitTarget::Variant { variant, .. } => Value::Enum(Arc::new(EnumValue {
-            variant: variant.clone(),
-            payload: VariantValues::Struct(fields),
-        })),
-    })
+    let (ty, variant) = match target {
+        StructLitTarget::Struct(ty) => {
+            let layout = layouts
+                .get(defs, ty)
+                .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
+            let values = layout
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, name)| match explicit(name) {
+                    Some(value) => Some(value.clone()),
+                    None => base.and_then(|base| match Arc::ptr_eq(&base.layout, &layout) {
+                        true => Some(base.values[index].clone()),
+                        false => base.get(name).cloned(),
+                    }),
+                })
+                .collect::<Option<SmallVec<_>>>()
+                .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
+            return Ok(Value::Struct(Arc::new(StructValue::new(layout, values))));
+        }
+        StructLitTarget::Variant { ty, variant } => (ty, variant),
+    };
+    let declared = defs
+        .get(&ty.def)
+        .and_then(AdtDef::as_enum)
+        .and_then(|def| def.variants.get(variant))
+        .and_then(|variant| match &variant.payload {
+            VariantTys::Struct(fields) => Some(fields.keys()),
+            VariantTys::Tuple(_) => None,
+        })
+        .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
+    let fields = declared
+        .map(|name| explicit(name).map(|value| (name.clone(), value.clone())))
+        .collect::<Option<FxIndexMap<_, _>>>()
+        .ok_or_else(|| error(ExecErrorKind::InvalidType))?;
+    Ok(Value::Enum(Arc::new(EnumValue {
+        variant: variant.clone(),
+        payload: VariantValues::Struct(fields),
+    })))
 }
 
 pub(super) fn cons(head: &Value, tail: &Value) -> OpResult {
@@ -415,10 +438,10 @@ pub(super) fn min_max(solver: &Solver, max: bool, a: &Value, b: &Value) -> OpRes
     let less = match (a, b) {
         (Value::Int(x), Value::Int(y)) => x < y,
         (Value::Linear(x), Value::Linear(y)) => {
-            let (Some(x), Some(y)) = (solver.eval_expr(x), solver.eval_expr(y)) else {
+            let (Some(x), Some(y)) = (solver.eval_expr_exact(x), solver.eval_expr_exact(y)) else {
                 return Err(wait([x, y]));
             };
-            x.partial_cmp(&y)
+            compare_floats(x, y)
                 .ok_or_else(|| error(ExecErrorKind::InvalidType))?
                 .is_lt()
         }

@@ -1,3 +1,5 @@
+// arc-fmt: no-wrap
+
 use std::layout::rect;
 
 cell sky130_fd_sc_hs__dfrbp_2() {

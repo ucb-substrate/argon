@@ -20,11 +20,23 @@ cell fet1v8(nfet: Bool, w: Float, nf: Int) {
         y0 = poly_bbox.y0 + 130.,
         y1 = poly_bbox.y1 - 130.
     )!;
-    let li1 = crect(layer="li1.drawing", x1=poly_bbox.x0 - 55., y0=diff.y0 - 100., w=170., y1=diff.y1 + 100.);
+    let li1 = crect(
+        layer="li1.drawing",
+        x1=poly_bbox.x0 - 55.,
+        y0=diff.y0 - 100.,
+        w=170.,
+        y1=diff.y1 + 100.,
+    );
     pub let li1_bbox = std::layout::array(li1, nf + 1, 430., 0.);
     eq(li1_bbox.x0, li1.x0);
     eq(li1_bbox.y0, li1.y0);
-    pub let sdm = rect(if nfet { "nsdm.drawing" } else { "psdm.drawing" }, x0 = diff.x0 - 130., x1=diff.x1 + 130., y0=diff.y0 - 130., y1=diff.y1+130.);
+    pub let sdm = rect(
+        if nfet { "nsdm.drawing" } else { "psdm.drawing" },
+        x0 = diff.x0 - 130.,
+        x1=diff.x1 + 130.,
+        y0=diff.y0 - 130.,
+        y1=diff.y1+130.,
+    );
 
     let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
     let ny = (diff.h + 170. - 80.) as Int / 340. as Int;
@@ -41,8 +53,20 @@ cell fet1v8(nfet: Bool, w: Float, nf: Int) {
 /// - `h`: height of the tap diffusion.
 cell tap(ntap: Bool, w: Float, h: Float) {
     pub let tap = rect("tap.drawing", x0=0., y0=0., w=w, h=h);
-    pub let li1 = rect("li1.drawing", x0=tap.x0 + 40., y0=tap.y0 + 40., x1 = tap.x1 - 40., y1 = tap.y1 - 40.);
-    pub let sdm = rect(if ntap { "nsdm.drawing" } else { "psdm.drawing" }, x0=tap.x0 - 130., x1=tap.x1 + 130., y0=tap.y0 - 130., y1=tap.y1 + 130.);
+    pub let li1 = rect(
+        "li1.drawing",
+        x0=tap.x0 + 40.,
+        y0=tap.y0 + 40.,
+        x1 = tap.x1 - 40.,
+        y1 = tap.y1 - 40.,
+    );
+    pub let sdm = rect(
+        if ntap { "nsdm.drawing" } else { "psdm.drawing" },
+        x0=tap.x0 - 130.,
+        x1=tap.x1 + 130.,
+        y0=tap.y0 - 130.,
+        y1=tap.y1 + 130.,
+    );
     let licon = crect(layer="licon1.drawing", x0=0., x1=170., y0=0., y1=170.);
     let cons = crect(x0=li1.x0, x1=li1.x1, y0=li1.y0+80., y1=li1.y1-80.);
     std::layout::center_rects(cons, std::layout::max_array(licon, cons.w, cons.h, 340., 340.));
@@ -127,8 +151,20 @@ cell mos(
     let far_y = cols.y1 - 170.;
     let near_y = if away { cols.y1 - 615. } else { cols.y0 };
     let near_below = if away { 75. } else { 90. };
-    pub let s = strap(cols.x0, if swap { far_y } else { near_y }, nf / 2 + 1, if swap { 60. } else { near_below }, straps);
-    pub let d = strap(cols.x0 + 430., if swap { near_y } else { far_y }, (nf + 1) / 2, if swap { near_below } else { 60. }, straps);
+    pub let s = strap(
+        cols.x0,
+        if swap { far_y } else { near_y },
+        nf / 2 + 1,
+        if swap { 60. } else { near_below },
+        straps,
+    );
+    pub let d = strap(
+        cols.x0 + 430.,
+        if swap { near_y } else { far_y },
+        (nf + 1) / 2,
+        if swap { near_below } else { 60. },
+        straps,
+    );
 
     // Gate contacts sit in rows 540 apart below the diffusion. A row past the
     // first reaches the fingers through extensions of them.
@@ -211,11 +247,22 @@ cell cmos(nw: Float, pw: Float, nf: Int, rows: Int = 1, gate_row: Int = 0, gate_
     pub let p_d = strap(cols.x0 + 430., p_cols.y0, (nf + 1) / 2, 90., true);
     pub let p_s = strap(cols.x0, p_cols.y1 - 170., nf / 2 + 1, 60., true);
 
-    let finger = crect(layer="poly.drawing", x0=0., y0=0., w=150., h=p.poly_bbox.y0 - n.poly_bbox.y1);
+    let finger = crect(
+        layer="poly.drawing",
+        x0=0.,
+        y0=0.,
+        w=150.,
+        h=p.poly_bbox.y0 - n.poly_bbox.y1,
+    );
     let fingers = array(finger, nf, 430., 0.);
     eq(fingers.x0, n.poly_bbox.x0);
     eq(fingers.y0, n.poly_bbox.y1);
-    pub let poly = crect(x0=n.poly_bbox.x0, x1=n.poly_bbox.x1, y0=n.poly_bbox.y0, y1=p.poly_bbox.y1);
+    pub let poly = crect(
+        x0=n.poly_bbox.x0,
+        x1=n.poly_bbox.x1,
+        y0=n.poly_bbox.y0,
+        y1=p.poly_bbox.y1,
+    );
     let li_y0 = li0 + 540. * (gate_row as Float);
     pub let g = gate_contact(poly, li_y0, li_y0 + 250., gate_side, li0 - 100., top + 270.);
 
@@ -233,10 +280,23 @@ cell cmos(nw: Float, pw: Float, nf: Int, rows: Int = 1, gate_row: Int = 0, gate_
 /// below `li_y0` to `pad_y1`, li1 170 tall from `li_y0`, the nitride cut from
 /// `npc_y0` to `npc_y1`, and the met1 bar 320 tall that it returns. A lone
 /// finger's pad widens to 270 toward `side`: -1 left, 1 right, or 0 both.
-fn gate_contact(fingers: Rect, li_y0: Float, pad_y1: Float, side: Int, npc_y0: Float, npc_y1: Float) -> Rect {
+fn gate_contact(
+    fingers: Rect,
+    li_y0: Float,
+    pad_y1: Float,
+    side: Int,
+    npc_y0: Float,
+    npc_y1: Float,
+) -> Rect {
     let ext = std::max(0., 270. - fingers.w);
     let left = if side < 0 { ext } else if side > 0 { 0. } else { ext / 2. };
-    let pad = rect("poly.drawing", x0=fingers.x0 - left, x1=fingers.x1 + ext - left, y0=li_y0 - 80., y1=pad_y1);
+    let pad = rect(
+        "poly.drawing",
+        x0=fingers.x0 - left,
+        x1=fingers.x1 + ext - left,
+        y0=li_y0 - 80.,
+        y1=pad_y1,
+    );
     let licon = crect(layer="licon1.drawing", x0=0., y0=0., w=170., h=170.);
     let licons = max_array(licon, pad.w - 100., 170., 340., 340.);
     center_rects(crect(x0=pad.x0, x1=pad.x1, y0=li_y0, h=170.), licons);
@@ -244,7 +304,13 @@ fn gate_contact(fingers: Rect, li_y0: Float, pad_y1: Float, side: Int, npc_y0: F
     let mcon = crect(layer="mcon.drawing", x0=0., y0=0., w=170., h=170.);
     let mcons = max_array(mcon, li.w - 120., 170., 360., 360.);
     center_rects(li, mcons);
-    rect("npc.drawing", x0=std::min(fingers.x0 - 140., pad.x0 - 50.), x1=std::max(fingers.x1 + 140., pad.x1 + 50.), y0=npc_y0, y1=npc_y1);
+    rect(
+        "npc.drawing",
+        x0=std::min(fingers.x0 - 140., pad.x0 - 50.),
+        x1=std::max(fingers.x1 + 140., pad.x1 + 50.),
+        y0=npc_y0,
+        y1=npc_y1,
+    );
     rect("met1.drawing", x0=mcons.x0 - 60., x1=mcons.x1 + 60., y0=li.y0 - 75., h=320.)
 }
 
@@ -293,43 +359,112 @@ cell inv(nw: Float, pw: Float, nf: Int) {
     eq(pmos.li1_bbox.y1 + 100., ntap.sdm.y0);
     eq(ntap.sdm.x0, pmos.sdm.x0);
 
-    pub let nwell = rect("nwell.drawing", x0=pmos.sdm.x0-180., x1=pmos.sdm.x1+180., y0=pmos.sdm.y0-180., y1=ntap.sdm.y1+180.);
+    pub let nwell = rect(
+        "nwell.drawing",
+        x0=pmos.sdm.x0-180.,
+        x1=pmos.sdm.x1+180.,
+        y0=pmos.sdm.y0-180.,
+        y1=ntap.sdm.y1+180.,
+    );
 
     // Draw horizontal LI1 rails.
-    let o_li_bot = rect("li1.drawing", x0=nmos.li1_bbox.x0 + 430., y0=nmos.li1_bbox.y1 + 170., h=170.);
-    pub let a_li_mid = rect("li1.drawing", x0=nmos.poly_bbox.x0 - 90., x1=nmos.poly_bbox.x1 + 90., y0=o_li_bot.y1 + 170., h=170.)!;
-    let o_li_top = rect("li1.drawing", x0=nmos.li1_bbox.x0 + 430., x1=o_li_bot.x1, y0=a_li_mid.y1 + 170., h=170.)!;
+    let o_li_bot = rect(
+        "li1.drawing",
+        x0=nmos.li1_bbox.x0 + 430.,
+        y0=nmos.li1_bbox.y1 + 170.,
+        h=170.,
+    );
+    pub let a_li_mid = rect(
+        "li1.drawing",
+        x0=nmos.poly_bbox.x0 - 90.,
+        x1=nmos.poly_bbox.x1 + 90.,
+        y0=o_li_bot.y1 + 170.,
+        h=170.,
+    )!;
+    let o_li_top = rect(
+        "li1.drawing",
+        x0=nmos.li1_bbox.x0 + 430.,
+        x1=o_li_bot.x1,
+        y0=a_li_mid.y1 + 170.,
+        h=170.,
+    )!;
     eq(o_li_top.y1 + 170., pmos.li1_bbox.y0);
 
     // Connect output LI1 rectangles.
-    pub let o_li_right = rect("li1.drawing", x0=a_li_mid.x1 + 170., w=170., y0=o_li_bot.y0, y1=o_li_top.y1);
+    pub let o_li_right = rect(
+        "li1.drawing",
+        x0=a_li_mid.x1 + 170.,
+        w=170.,
+        y0=o_li_bot.y0,
+        y1=o_li_top.y1,
+    );
     eq(o_li_bot.x1, o_li_right.x1);
-    let li1 = crect(layer="li1.drawing", x1=o_li_bot.x0, w=170., y0=nmos.li1_bbox.y0, y1=o_li_bot.y1);
+    let li1 = crect(
+        layer="li1.drawing",
+        x1=o_li_bot.x0,
+        w=170.,
+        y0=nmos.li1_bbox.y0,
+        y1=o_li_bot.y1,
+    );
     let li1_bbox_bot = std::layout::array(li1, (nf + 1) / 2, 860., 0.);
     eq(li1_bbox_bot.x0, o_li_bot.x0);
     eq(li1_bbox_bot.y1, o_li_bot.y1);
-    let li1 = crect(layer="li1.drawing", x1=o_li_bot.x0, w=170., y1=pmos.li1_bbox.y1, y0=o_li_top.y0);
+    let li1 = crect(
+        layer="li1.drawing",
+        x1=o_li_bot.x0,
+        w=170.,
+        y1=pmos.li1_bbox.y1,
+        y0=o_li_top.y0,
+    );
     let li1_bbox_top = std::layout::array(li1, (nf + 1) / 2, 860., 0.);
     eq(li1_bbox_top.x0, o_li_top.x0);
     eq(li1_bbox_top.y0, o_li_top.y0);
 
     // Connect sources to taps.
-    let li1 = crect(layer="li1.drawing", x1=o_li_bot.x0, w=170., y0=ptap.li1.y0, y1=nmos.li1_bbox.y1);
+    let li1 = crect(
+        layer="li1.drawing",
+        x1=o_li_bot.x0,
+        w=170.,
+        y0=ptap.li1.y0,
+        y1=nmos.li1_bbox.y1,
+    );
     let li1_bbox_bot = std::layout::array(li1, nf + 1 - (nf + 1) / 2, 860., 0.);
     eq(li1_bbox_bot.x0, nmos.li1_bbox.x0);
     eq(li1_bbox_bot.y0, ptap.li1.y0);
-    let li1 = crect(layer="li1.drawing", x1=o_li_bot.x0, w=170., y1=ntap.li1.y1, y0=pmos.li1_bbox.y0);
+    let li1 = crect(
+        layer="li1.drawing",
+        x1=o_li_bot.x0,
+        w=170.,
+        y1=ntap.li1.y1,
+        y0=pmos.li1_bbox.y0,
+    );
     let li1_bbox_top = std::layout::array(li1, nf + 1 - (nf + 1) / 2, 860., 0.);
     eq(li1_bbox_top.x0, pmos.li1_bbox.x0);
     eq(li1_bbox_top.y1, ntap.li1.y1);
 
     // Connect gates to input LI1 rectangle.
-    let a_poly_mid = rect("poly.drawing", x0=nmos.poly_bbox.x0 - 90., x1=nmos.poly_bbox.x1 + 90., h=270.)!;
+    let a_poly_mid = rect(
+        "poly.drawing",
+        x0=nmos.poly_bbox.x0 - 90.,
+        x1=nmos.poly_bbox.x1 + 90.,
+        h=270.,
+    )!;
     eq(a_poly_mid.y0 + a_poly_mid.y1, a_li_mid.y0 + a_li_mid.y1);
-    let a_npc_mid = rect("npc.drawing", x0=nmos.poly_bbox.x0 - 110., x1=nmos.poly_bbox.x1 + 110., h=370.)!;
+    let a_npc_mid = rect(
+        "npc.drawing",
+        x0=nmos.poly_bbox.x0 - 110.,
+        x1=nmos.poly_bbox.x1 + 110.,
+        h=370.,
+    )!;
     eq(a_poly_mid.y0 + a_poly_mid.y1, a_npc_mid.y0 + a_npc_mid.y1);
 
-    let poly = crect(layer="poly.drawing", x0=0., y0=nmos.poly_bbox.y0, y1=pmos.poly_bbox.y1, w=150.);
+    let poly = crect(
+        layer="poly.drawing",
+        x0=0.,
+        y0=nmos.poly_bbox.y0,
+        y1=pmos.poly_bbox.y1,
+        w=150.,
+    );
     let poly_bbox = std::layout::array(poly, nf, 430., 0.);
     eq(poly_bbox.x0, nmos.poly_bbox.x0);
     eq(poly_bbox.y0, nmos.poly_bbox.y0);

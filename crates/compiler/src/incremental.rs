@@ -19,7 +19,7 @@ use crate::{
     ast::ModPath,
     cellcache::{CellCache, CellCacheStats},
     compile::{
-        self, CellArg, CompileInput, CompileOutput, CompiledData, StaticAnalysis,
+        self, CellArg, CompileInput, CompileOutput, CompiledData, RootScope, StaticAnalysis,
         StaticErrorCompileOutput,
     },
     fingerprint::ItemIndex,
@@ -82,6 +82,9 @@ struct StaticCache {
     key: u64,
     disk_revisions: Vec<TrackedFileRevision>,
     analysis: StaticAnalysis,
+    /// What the analysis's typing ended with, from which an invocation's entry
+    /// cell is typed without typing the workspace again.
+    scope: Option<Arc<RootScope>>,
     /// Built lazily, because only editor sessions ask for it.
     ///
     /// The outer `Option` records whether the build has been attempted, so an
@@ -281,6 +284,11 @@ impl IncrementalCompiler {
     /// one revision build it once.
     fn ensure_items(&mut self, config: &WorkspaceConfig) -> Option<Arc<ItemIndex>> {
         self.ensure_analysis(config);
+        self.current_items()
+    }
+
+    /// [`Self::ensure_items`] for an analysis already known to be current.
+    fn current_items(&mut self) -> Option<Arc<ItemIndex>> {
         let cache = self.static_cache.as_mut().expect("analysis cache");
         if let Some(items) = &cache.items {
             return Some(items.clone());
@@ -291,6 +299,8 @@ impl IncrementalCompiler {
         Some(items)
     }
 
+    /// The static analysis of the current sources. Its trees are shared with
+    /// the session rather than copied.
     pub fn analyze_workspace(&mut self, config: &WorkspaceConfig) -> StaticAnalysis {
         self.ensure_analysis(config);
         self.static_cache
@@ -314,12 +324,16 @@ impl IncrementalCompiler {
         self.execution_cache.clear();
         let parse_hits = self.parse_cache.hits();
         let parse_misses = self.parse_cache.misses();
-        let analysis =
-            compile::analyze_workspace(parse::parse_workspace_with_config_sources_and_cache(
+        // Evaluation and the navigation and item indexes are all that read the
+        // typed AST, and none of them reads its span indexes.
+        let (analysis, scope) = compile::analyze_workspace_with(
+            parse::parse_workspace_with_config_sources_and_cache(
                 config,
                 &self.sources,
                 &mut self.parse_cache,
-            ));
+            ),
+            false,
+        );
         self.stats.parse_cache_hits += self.parse_cache.hits() - parse_hits;
         self.stats.files_reparsed += self.parse_cache.misses() - parse_misses;
         let disk_revisions = self.tracked_file_revisions(config, &analysis);
@@ -327,6 +341,7 @@ impl IncrementalCompiler {
             key,
             disk_revisions,
             analysis,
+            scope: scope.map(Arc::new),
             nav: None,
             items: None,
         });
@@ -394,6 +409,7 @@ impl IncrementalCompiler {
             &mut self.external_digests,
             config.tech.as_deref(),
             &config.gds_imports,
+            &config.wasm_modules,
         );
         if self.execution_environment != Some(environment) {
             self.execution_cache.clear();
@@ -467,7 +483,9 @@ impl IncrementalCompiler {
                 None,
             )
         });
-        self.execution_cache.insert(key, output.clone());
+        if !output.was_cancelled() {
+            self.execution_cache.insert(key, output.clone());
+        }
         if !preserve_previous_graph {
             self.previous_revision_live.clear();
         }
@@ -475,8 +493,8 @@ impl IncrementalCompiler {
         output
     }
 
-    /// Analyzes and executes a source-level cell invocation. The invocation is
-    /// spliced into a clone of the current snapshot so arbitrary argument
+    /// Analyzes and executes a source-level cell invocation. The invocation
+    /// becomes an entry cell of the root module, so arbitrary argument
     /// expressions are resolved and type-checked without polluting the cached
     /// editor AST.
     pub fn compile_invocation(
@@ -520,6 +538,7 @@ impl IncrementalCompiler {
             &mut self.external_digests,
             config.tech.as_deref(),
             &config.gds_imports,
+            &config.wasm_modules,
         );
         if self.execution_environment != Some(environment) {
             self.execution_cache.clear();
@@ -549,9 +568,95 @@ impl IncrementalCompiler {
         }
 
         self.stats.execution_cache_misses += 1;
-        let mut ast = analysis.ast.clone();
+        let output = match self.compile_appended_invocation(config, source)? {
+            Some(output) => output,
+            None => self.compile_spliced_invocation(config, source)?,
+        };
+        if !output.was_cancelled() {
+            self.execution_cache.insert(key, output.clone());
+        }
+        if !preserve_previous_graph {
+            self.previous_revision_live.clear();
+        }
+        self.prune_execution_caches();
+        Ok(output)
+    }
+
+    /// Executes `source` against the cached analysis, typing only its entry
+    /// cell, whose ids follow the analysis's own. `None` when the entry cell
+    /// needs the whole workspace typed again; see [`RootScope::type_cell`].
+    fn compile_appended_invocation(
+        &mut self,
+        config: &WorkspaceConfig,
+        source: &str,
+    ) -> Result<Option<CompileOutput>, anyhow::Error> {
+        let cache = self
+            .static_cache
+            .as_ref()
+            .expect("analysis cache was populated");
+        let ast = cache.analysis.ast.clone();
+        let (Some(typed), Some(scope)) = (cache.analysis.typed_ast.clone(), cache.scope.clone())
+        else {
+            return Ok(None);
+        };
+        let Some((entry, invocation)) = parse::parse_cell_invocation(&ast, source)? else {
+            return Ok(None);
+        };
+        let decl = match scope.type_cell(&ast, &typed, &entry) {
+            None => return Ok(None),
+            Some(Err(errors)) => {
+                return Ok(Some(CompileOutput::StaticErrors(
+                    StaticErrorCompileOutput { errors },
+                )));
+            }
+            Some(Ok(decl)) => decl,
+        };
+        let Some(items) = self.current_items() else {
+            return Ok(None);
+        };
+        let items = Arc::new(items.with_appended_cell(&typed, &entry.path, &entry.text, &decl));
+        let tech = self.ensure_tech(config).cloned();
+        let output = compile::execute_appended_invocation_cached(
+            &typed,
+            &decl,
+            &invocation,
+            config,
+            Some(compile::SessionCaches {
+                items: &items,
+                gds: &mut self.gds_cache,
+                cells: &mut self.cell_cache,
+                checks: &mut self.check_cache,
+                tech: tech.as_ref(),
+            }),
+        );
+        self.stats.gds_cache = self.gds_cache.stats();
+        self.stats.cell_cache = self.cell_cache.stats();
+        self.verify_against_uncached(&output, || {
+            compile::execute_appended_invocation_cached(&typed, &decl, &invocation, config, None)
+        });
+        Ok(Some(output))
+    }
+
+    /// Splices `source` into a copy of the cached parse and types and executes
+    /// the whole copy.
+    fn compile_spliced_invocation(
+        &mut self,
+        config: &WorkspaceConfig,
+        source: &str,
+    ) -> Result<CompileOutput, anyhow::Error> {
+        let analysis = &self
+            .static_cache
+            .as_ref()
+            .expect("analysis cache was populated")
+            .analysis;
+        // Execution reads no span indexes, so the copy leaves them out.
+        let mut ast = analysis
+            .ast
+            .iter()
+            .map(|(path, module)| (path.clone(), module.clone_without_span_indexes()))
+            .collect::<parse::WorkspaceParseAst>();
         let invocation = parse::splice_cell_invocation(&mut ast, source)?;
-        let Some((typed_ast, static_output)) = compile::static_compile(&ast) else {
+        let Some((typed_ast, static_output)) = compile::static_compile_with(&ast, false) else {
             return Ok(CompileOutput::FatalParseErrors);
         };
         // Built from the spliced AST rather than from `StaticCache`: that
@@ -577,14 +682,14 @@ impl IncrementalCompiler {
         };
         self.stats.gds_cache = self.gds_cache.stats();
         self.stats.cell_cache = self.cell_cache.stats();
-        self.verify_against_uncached(&output, || {
-            compile::execute_cell_invocation_cached(&typed_ast, &invocation, config, None)
-        });
-        self.execution_cache.insert(key, output.clone());
-        if !preserve_previous_graph {
-            self.previous_revision_live.clear();
+        // A tree that did not type-check is not executed, so there is nothing
+        // to verify.
+        if !matches!(output, CompileOutput::StaticErrors(_)) {
+            self.verify_against_uncached(&output, || {
+                compile::execute_cell_invocation_cached(&typed_ast, &invocation, config, None)
+            });
         }
-        self.prune_execution_caches();
+        drop_in_background((typed_ast, ast));
         Ok(output)
     }
 
@@ -644,7 +749,9 @@ impl IncrementalCompiler {
     fn invalidate(&mut self) {
         self.revision = self.revision.saturating_add(1);
         self.stats.revision = self.revision;
-        self.static_cache = None;
+        // The analysis holds whole-workspace trees; freeing them would hold up
+        // the edit that replaced them.
+        drop_in_background(self.static_cache.take());
         let current_live = self
             .execution_cache
             .values()
@@ -728,6 +835,15 @@ impl IncrementalCompiler {
             })
             .collect()
     }
+}
+
+/// Drops `value` on a short-lived thread, or here if none can start.
+fn drop_in_background<T: Send + 'static>(value: T) {
+    let _ = std::thread::Builder::new()
+        .name("argon-drop".to_owned())
+        // Dropping a deeply nested tree recurses as deeply as building it did.
+        .stack_size(crate::COMPILE_STACK_SIZE)
+        .spawn(move || drop(value));
 }
 
 /// Splits a workspace module key into the library whose files back it and the
@@ -842,13 +958,14 @@ fn execution_environment_key(
     digests: &mut ExternalDigests,
     tech_file: Option<&Path>,
     gds_imports: &[(String, PathBuf)],
+    wasm_modules: &[(String, PathBuf)],
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
     tech_file.hash(&mut hasher);
     tech_file
         .map(|path| digests.revision(path))
         .hash(&mut hasher);
-    for (name, path) in gds_imports {
+    for (name, path) in gds_imports.iter().chain(wasm_modules) {
         name.hash(&mut hasher);
         path.hash(&mut hasher);
         digests.revision(path).hash(&mut hasher);
@@ -859,7 +976,10 @@ fn execution_environment_key(
 fn hash_cell_args(args: &[CellArg], hasher: &mut impl Hasher) {
     args.len().hash(hasher);
     for arg in args {
-        match arg {
+        // A shared argument hashes as its unshared form.
+        let unshared = arg.unshared();
+        match unshared.as_ref().unwrap_or(arg) {
+            CellArg::Plain(_) => unreachable!("unshared above"),
             CellArg::Float(value) => {
                 0_u8.hash(hasher);
                 value.to_bits().hash(hasher);
@@ -1245,6 +1365,174 @@ mod tests {
             postcard::to_stdvec(&incremental).unwrap(),
             postcard::to_stdvec(&fresh).unwrap()
         );
+    }
+
+    /// A compile's serialized output, or its error.
+    type Serialized = Result<Vec<u8>, String>;
+
+    /// `invocation` compiled against the session's analysis, `None` where that
+    /// declines, and compiled by typing the spliced workspace, each serialized.
+    fn appended_and_spliced(
+        config: &WorkspaceConfig,
+        invocation: &str,
+    ) -> (Option<Serialized>, Serialized) {
+        let serialize = |output: Result<CompileOutput, anyhow::Error>| {
+            output
+                .map(|output| postcard::to_stdvec(&output).unwrap())
+                .map_err(|error| error.to_string())
+        };
+        let mut session = IncrementalCompiler::new();
+        session.ensure_analysis(config);
+        assert!(
+            session
+                .static_cache
+                .as_ref()
+                .unwrap()
+                .analysis
+                .errors
+                .is_empty(),
+            "{:?}",
+            session.static_cache.as_ref().unwrap().analysis.errors
+        );
+        let appended = session
+            .compile_appended_invocation(config, invocation)
+            .transpose()
+            .map(serialize);
+        let mut session = IncrementalCompiler::new();
+        session.ensure_analysis(config);
+        let spliced = serialize(session.compile_spliced_invocation(config, invocation));
+        (appended, spliced)
+    }
+
+    #[test]
+    fn an_appended_invocation_matches_a_spliced_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib.ar");
+        std::fs::write(
+            &lib,
+            r#"mod m;
+mod n;
+use std::layout::{inst, rect};
+enum Mode {
+    Fast,
+    Slow(Float),
+}
+struct Dims {
+    w: Float,
+    h: Float,
+}
+fn double(x: Float) -> Float { 2. * x }
+cell top() { let r = rect("met1", x0=0., y0=0., x1=m::width(), y1=1.); }
+cell sized(w: Float) { let r = rect("met1", x0=0., y0=0., x1=w, y1=1.); pub let width = w; }
+cell boxed(d: Dims) { let r = rect("met1", x0=0., y0=0., x1=d.w, y1=d.h); }
+cell choose(mode: Mode) {
+    let w = match mode {
+        Mode::Fast => 1.,
+        Mode::Slow(w) => w,
+    };
+    let r = rect("met1", x0=0., y0=0., x1=w, y1=1.);
+}
+cell maybe(w: Option<Float>) { let r = rect("met1", x0=0., y0=0., x1=std::unwrap_or(w, 1.), y1=1.); }
+cell takes_rect(r: Rect) { let copy = rect("met2", x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1); }
+cell parent() { let child = inst(sized(3.), x=1., y=2.); }
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("m.ar"), "fn width() -> Float { 4. }\n").unwrap();
+        // Naming `n` from the root module closes a module cycle.
+        std::fs::write(
+            dir.path().join("n.ar"),
+            "use lib::double;\nfn width() -> Float { double(2.5) }\n",
+        )
+        .unwrap();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = WorkspaceConfig::new(lib).with_tech(Some(tech));
+
+        for (invocation, appended_path) in [
+            ("top()", true),
+            ("sized(double(25.))", true),
+            ("sized(m::width())", true),
+            ("boxed(Dims { w: 1., h: 2. })", true),
+            ("choose(Mode::Fast)", true),
+            ("choose(Mode::Slow(3.))", true),
+            ("maybe(Some(2.))", true),
+            ("maybe(None)", true),
+            (
+                "takes_rect(rect(\"met1\", x0=0., y0=0., x1=1., y1=1.))",
+                true,
+            ),
+            ("parent()", true),
+            ("sized(inst(sized(2.), x=0., y=0.).width)", true),
+            ("sized(1)", true),
+            ("sized()", true),
+            ("double(2.)", true),
+            ("missing()", true),
+            ("sized(n::width())", false),
+            ("sized(o::width())", false),
+            ("sized(", true),
+        ] {
+            let (appended, spliced) = appended_and_spliced(&config, invocation);
+            assert_eq!(appended.is_some(), appended_path, "{invocation}");
+            if let Some(appended) = appended {
+                assert_eq!(appended, spliced, "{invocation}");
+            }
+        }
+    }
+
+    #[test]
+    fn appended_invocations_match_spliced_ones_across_the_examples() {
+        let examples = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let tech = examples.join("tech/basic.tech.toml");
+        let mut compared = 0;
+        for entry in std::fs::read_dir(&examples).unwrap() {
+            let dir = entry.unwrap().path();
+            let root = dir.join("lib.ar");
+            // The SRAM is too large for a unit test, and the WASM routines need
+            // built modules.
+            let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+            if !root.is_file() || name == "sram" || name == "wasm_routines" {
+                continue;
+            }
+            let config = WorkspaceConfig::new(&root).with_tech(Some(tech.clone()));
+            let mut session = IncrementalCompiler::new();
+            let analysis = session.analyze_workspace(&config);
+            if !analysis.errors.is_empty() {
+                continue;
+            }
+            let cells = analysis.ast[&ModPath::new()]
+                .ast
+                .decls
+                .iter()
+                .filter_map(|decl| match decl {
+                    crate::ast::Decl::Cell(cell) if cell.args.is_empty() => {
+                        Some(format!("{}()", cell.name.name))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for invocation in cells {
+                let (appended, spliced) = appended_and_spliced(&config, &invocation);
+                assert_eq!(
+                    appended.expect(&invocation),
+                    spliced,
+                    "{name}: {invocation}"
+                );
+                compared += 1;
+            }
+        }
+        assert!(compared > 50, "compared {compared} invocations");
+    }
+
+    #[test]
+    fn an_appended_invocation_of_a_gds_backed_workspace_matches_a_spliced_one() {
+        let (_dir, config, _) = scratch_gds_workspace(
+            "use std::layout::inst;\ncell top() { let c = inst(child(), x=0., y=0.); }\n",
+        );
+        for invocation in ["top()", "child()"] {
+            let (appended, spliced) = appended_and_spliced(&config, invocation);
+            assert_eq!(appended.expect(invocation), spliced, "{invocation}");
+        }
     }
 
     #[test]
@@ -1870,6 +2158,38 @@ mod tests {
         assert_eq!(spans_of(&second), spans_of(&uncached));
     }
 
+    /// A reused cell that nothing else holds is translated in place, which
+    /// must still count only the cells whose spans moved and translate them as
+    /// a fresh compile places them.
+    #[test]
+    fn in_place_reuse_counts_and_translates_only_moved_cells() {
+        let source = "use std::layout::{inst, rect};\n\
+                      cell before() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+                      cell parent() {\n    let a = inst(before(), x = 0., y = 0.);\n    \
+                      let b = inst(after(), x = 10., y = 0.);\n}\n\
+                      cell after() { let r = rect(\"met1\", x0 = 2., y0 = 0., x1 = 3., y1 = 1.); }\n";
+        let (_dir, config) = scratch_workspace(source);
+        let root = config.root_lib().to_path_buf();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = config.with_tech(Some(tech));
+        let cell = vec!["parent".to_owned()];
+
+        let mut session = IncrementalCompiler::new();
+        session.set_source_text(root.clone(), source);
+        drop(session.compile_cell(&config, &cell, Vec::new()));
+        let edited = source.replace("x = 10., y = 0.", "x = 100., y = 0.");
+        session.set_source_text(root.clone(), edited.clone());
+        let second = session.compile_cell(&config, &cell, Vec::new());
+        assert_eq!(session.stats().cell_cache.hits, 2);
+        assert_eq!(session.stats().cell_cache.rebased, 1, "only `after` moved");
+
+        let mut fresh = IncrementalCompiler::new();
+        fresh.set_source_text(root, edited);
+        let uncached = fresh.compile_cell(&config, &cell, Vec::new());
+        assert_eq!(spans_of(&second), spans_of(&uncached));
+    }
+
     /// Every cell's schematic, with instances naming their cell, sorted.
     fn schematics(output: &CompileOutput) -> Vec<String> {
         let CompileOutput::Valid(data) = output else {
@@ -1971,6 +2291,44 @@ mod tests {
             geometry(&second),
             geometry(&fresh.compile_cell(&config, &cell, Vec::new()))
         );
+    }
+
+    /// A reused cell brings along a cell it only measured, since a fresh
+    /// compile emits that cell too.
+    #[test]
+    fn reusing_a_cell_reinstates_the_cells_it_only_measured() {
+        let source = "use std::layout::{bbox, inst, rect};\n\
+                      cell leaf() { let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = 1., y1 = 1.); }\n\
+                      cell measured() {\n    let b = bbox(leaf());\n    \
+                      let r = rect(\"met1\", x0 = 0., y0 = 0., x1 = b.x1, y1 = 1.);\n}\n\
+                      cell parent() {\n    let m = inst(measured(), x = 0., y = 0.);\n    \
+                      let r = rect(\"met2\", x0 = 0., y0 = 0., x1 = 10., y1 = 1.);\n}\n";
+        let (_dir, config) = scratch_workspace(source);
+        let root = config.root_lib().to_path_buf();
+        let tech =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml");
+        let config = config.with_tech(Some(tech));
+        let cell = vec!["parent".to_owned()];
+        let names = |out: &CompileOutput| match out {
+            CompileOutput::Valid(d) => d.cells.values().map(|c| c.name.clone()).collect::<Vec<_>>(),
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        let mut session = IncrementalCompiler::new();
+        session.set_source_text(root.clone(), source);
+        session.compile_cell(&config, &cell, Vec::new());
+
+        let edited = source.replace("x1 = 10.", "x1 = 20.");
+        assert_ne!(edited, source);
+        session.set_source_text(root.clone(), edited.clone());
+        let second = session.compile_cell(&config, &cell, Vec::new());
+        assert!(session.stats().cell_cache.hits > 0, "`measured` is reused");
+
+        let mut fresh = IncrementalCompiler::new();
+        fresh.set_source_text(root, edited);
+        let uncached = fresh.compile_cell(&config, &cell, Vec::new());
+        assert_eq!(names(&second), names(&uncached));
+        assert_eq!(geometry(&second), geometry(&uncached));
     }
 
     /// A reused cell still tells a private field from a missing one, so a read
@@ -2343,19 +2701,25 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "SRAM parent-edit timing benchmark; run in release with --nocapture"]
+    #[ignore = "SRAM parent-edit timing benchmark; build argon-sram-routing-wasm for wasm32-unknown-unknown, then run in release with --nocapture"]
     fn bench_sram_parent_rectangle_edit() {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/sram");
         let root = workspace.join("lib.ar");
         let source = std::fs::read_to_string(&root).unwrap();
         let config = WorkspaceConfig::new(&root)
-            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")));
+            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")))
+            .with_wasm_modules([(
+                "routing".to_owned(),
+                workspace.join(
+                    "../../target/wasm32-unknown-unknown/release/argon_sram_routing_wasm.wasm",
+                ),
+            )]);
         let cell = vec!["benchmark_parent".to_owned()];
         let initial = format!(
             "{source}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); }}\n"
         );
         let edited = format!(
-            "{source}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); let r = rect(\"met1.drawing\", x0=0., y0=0., x1=100., y1=100.)!; }}\n"
+            "{source}\ncell benchmark_parent() {{ let s = inst(example_no_control_logic(), x=0., y=0.); let r = std::layout::rect(\"met1.drawing\", x0=0., y0=0., x1=100., y1=100.)!; }}\n"
         );
         let mut compiler = IncrementalCompiler::new();
         compiler.set_source_text(root.clone(), initial);
@@ -2386,19 +2750,25 @@ mod tests {
     /// Deletes unconstrained rectangles one at a time from the SRAM top cell,
     /// compiling through the same entry point the language server uses.
     #[test]
-    #[ignore = "SRAM unconstrained-rectangle timing benchmark; run in release with --nocapture"]
+    #[ignore = "SRAM unconstrained-rectangle timing benchmark; build argon-sram-routing-wasm for wasm32-unknown-unknown, then run in release with --nocapture"]
     fn bench_sram_unconstrained_rect_delete() {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/sram");
         let root = workspace.join("lib.ar");
         let source = std::fs::read_to_string(&root).unwrap();
         let config = WorkspaceConfig::new(&root)
-            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")));
+            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")))
+            .with_wasm_modules([(
+                "routing".to_owned(),
+                workspace.join(
+                    "../../target/wasm32-unknown-unknown/release/argon_sram_routing_wasm.wasm",
+                ),
+            )]);
         let rects = |count: usize| {
             (0..count)
                 .map(|i| {
                     let x = 1000. * i as f64;
                     format!(
-                        "let bench_rect{i} = rect(\"met1.drawing\", x0i = {x}., y0i = 0., x1i = {}., y1i = 500.)!;\n",
+                        "let bench_rect{i} = std::layout::rect(\"met1.drawing\", x0i = {x}., y0i = 0., x1i = {}., y1i = 500.)!;\n",
                         x + 500.
                     )
                 })
@@ -2582,7 +2952,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "SRAM subcell timing benchmark; run in release with --nocapture"]
+    #[ignore = "SRAM subcell timing benchmark; build argon-sram-routing-wasm for wasm32-unknown-unknown, then run in release with --nocapture"]
     fn bench_sram_subcell_edit() {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/sram");
         let root = workspace.join("lib.ar");
@@ -2590,12 +2960,18 @@ mod tests {
         let original = std::fs::read_to_string(&macro_source).unwrap();
         let edited = original.replacen(
             "cell sp_cell() {",
-            "cell sp_cell() { let debug_rect = rect(\"met1.drawing\", x0=-100., y0=-100., x1=-90., y1=-90.);",
+            "cell sp_cell() { let debug_rect = std::layout::rect(\"met1.drawing\", x0=-100., y0=-100., x1=-90., y1=-90.);",
             1,
         );
         assert_ne!(original, edited);
         let config = WorkspaceConfig::new(&root)
-            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")));
+            .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")))
+            .with_wasm_modules([(
+                "routing".to_owned(),
+                workspace.join(
+                    "../../target/wasm32-unknown-unknown/release/argon_sram_routing_wasm.wasm",
+                ),
+            )]);
         let mut compiler = IncrementalCompiler::new();
         let top = vec!["example_no_control_logic".to_owned()];
         let cold_started = std::time::Instant::now();

@@ -1,57 +1,48 @@
-// Replica-timed control logic. Standard cells sit in fixed rows, and all
-// interconnect between them is hand-routed on a fixed track grid.
+// Replica-timed control logic. Standard cells sit in fixed rows, and a greedy
+// router connects them on met1 and met2 tracks.
 
 mod cells;
 mod blocks;
-mod tracks;
 mod rails;
 
-use std::layout::{inst, rect};
-use lib::logic::control::tracks::m1_h;
-use lib::logic::control::tracks::m2_v;
-use lib::logic::control::tracks::m2_v_to_pin;
-use lib::logic::control::tracks::li1_access;
-use lib::logic::control::tracks::m1_access;
-use lib::logic::control::tracks::m1_pin;
-use lib::logic::control::tracks::m2_pin;
-use lib::logic::control::tracks::m1_v;
-use lib::logic::control::tracks::pin_col;
-use lib::logic::control::tracks::pin_col_left;
-use lib::logic::control::tracks::pin_col_right;
-use lib::logic::control::tracks::col_starting_after;
-use lib::logic::control::tracks::free_col;
-use lib::logic::control::rails::concat;
-use lib::logic::control::rails::inv_chain_gaps;
-use lib::logic::control::rails::sr_latch_gaps;
-use lib::logic::control::rails::row_spans;
-use lib::logic::control::rails::shared_spans;
-use lib::logic::control::rails::rail_pins;
+use std::layout::{bbox, crect, inst, rect, union};
+use lib::logic::router::{
+    access, access_right, all_ops, block, blockages, control_grid, corner_ll, corner_lr, corner_ul,
+    corner_ur, draw_m1, draw_m2, draw_routes, ends_before, expand, fan_out, m1, m1_access, m2,
+    minimum, nearest, occupy, pin, rect_from, rects, route, route_req, s_jog, side_right, snap_to,
+    starts_after, track, union_all, via01, RouterJob,
+};
+use lib::logic::control::rails::{
+    concat, inv_chain_gaps, rail_pins, row_spans, shared_spans, sr_latch_gaps,
+};
 use lib::params::ControlLogicParams;
+use lib::columns::util;
+use lib::logic::router;
 
 // Fixed clock-path delay-chain lengths.
 fn clk_delay_invs() -> Int { 12 }
 fn clkp_delay_invs() -> Int { 3 }
 
-fn tap(x: Float, y: Float, flip: Bool) {
-    inst(lib::logic::control::cells::sky130_fd_sc_hs__tap_2(), x=x, y=y, reflect=flip);
+fn tap(x: Float, y: Float, flip: Bool) -> Any {
+    inst(cells::sky130_fd_sc_hs__tap_2(), x=x, y=y, reflect=flip)
 }
 
 // Instance y for the cells of row r (0 = top), which occupies y in
 // [-3330 (r + 1), -3330 r]. Odd rows are mirrored so adjacent rows share rails.
 // A supply rail at height y, spanning the block.
 fn rail_rect(y: Float, right: Float) -> Rect {
-    lib::columns::util::cbox(0., y - 245., right, y + 245.)
+    crect(x0=0., y0=y - 245., x1=right, y1=y + 245.)
 }
 
 fn row_y(r: Int) -> Float {
-    if r % 2 == 0 { -lib::logic::control::blocks::row_h() * (r + 1) as Float } else { -lib::logic::control::blocks::row_h() * r as Float }
+    if r % 2 == 0 { -blocks::row_h() * (r + 1) as Float } else { -blocks::row_h() * r as Float }
 }
 
 // Joins abutting li1 pins across the tap between them with a 180 nm band
 // centered on the destination pin and snapped to a 10 nm grid.
 fn li1_jumper(src: Rect, dst: Rect) {
     let cy = (dst.y0 + dst.y1) / 2.;
-    let y0 = lib::columns::util::snap5((cy - 90.) / 2.) * 2.;
+    let y0 = util::snap5((cy - 90.) / 2.) * 2.;
     rect("li1.drawing", x0=src.x1, y0=y0, x1=dst.x0, y1=y0 + 180.);
 }
 
@@ -69,109 +60,154 @@ cell control_logic_replica_v2(p: ControlLogicParams) {
     at_least(p.wlen_pulse_invs, 9);
     at_least(p.pc_set_delay_invs, 2);
     at_least(p.wrdrven_set_delay_invs, 2);
-    let t = lib::logic::control::blocks::tap_w();
+    let t = blocks::tap_w();
 
     // Row 0: reset buffer, clock gate, and clock pulse generation.
     let y0 = row_y(0);
-    tap(0., y0, false);
-    let reset_inv = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_16(), x=t, y=y0);
+    let tap0 = tap(0., y0, false);
+    let reset_inv = inst(cells::sky130_fd_sc_hs__inv_16(), x=t, y=y0);
     let clk_delay_x = t + 8160. + t;
-    tap(clk_delay_x - t, y0, false);
-    let clk_delay = inst(lib::logic::control::blocks::inv_chain(clk_delay_invs(), false), x=clk_delay_x, y=y0);
-    let clk_gate_x = clk_delay_x + lib::logic::control::blocks::inv_chain_w(clk_delay_invs()) + t;
-    tap(clk_gate_x - t, y0, false);
-    let clk_gate = inst(lib::logic::control::cells::sky130_fd_sc_hs__and2_2(), x=clk_gate_x, y=y0);
+    let tap1 = tap(clk_delay_x - t, y0, false);
+    let clk_delay = inst(blocks::inv_chain(clk_delay_invs(), false), x=clk_delay_x, y=y0);
+    let clk_gate_x = clk_delay_x + blocks::inv_chain_w(clk_delay_invs()) + t;
+    let tap2 = tap(clk_gate_x - t, y0, false);
+    let clk_gate = inst(cells::sky130_fd_sc_hs__and2_2(), x=clk_gate_x, y=y0);
     let clk_pulse_x = clk_gate_x + 2400. + t;
-    tap(clk_pulse_x - t, y0, false);
-    let clk_pulse = inst(lib::logic::control::blocks::edge_detector(), x=clk_pulse_x, y=y0);
-    let clk_pulse_buf_x = clk_pulse_x + lib::logic::control::blocks::edge_detector_w() + t;
-    tap(clk_pulse_buf_x - t, y0, false);
-    let clk_pulse_buf = inst(lib::logic::control::cells::sky130_fd_sc_hs__buf_16(), x=clk_pulse_buf_x + 10560., y=y0, reflect=true, angle=180);
+    let tap3 = tap(clk_pulse_x - t, y0, false);
+    let clk_pulse = inst(blocks::edge_detector(), x=clk_pulse_x, y=y0);
+    let clk_pulse_buf_x = clk_pulse_x + blocks::edge_detector_w() + t;
+    let tap4 = tap(clk_pulse_buf_x - t, y0, false);
+    let clk_pulse_buf = inst(
+        cells::sky130_fd_sc_hs__buf_16(),
+        x=clk_pulse_buf_x + 10560.,
+        y=y0,
+        reflect=true,
+        angle=180,
+    );
     let clk_pulse_inv_x = clk_pulse_buf_x + 10560. + t;
-    tap(clk_pulse_inv_x - t, y0, false);
-    let clk_pulse_inv = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_16(), x=clk_pulse_inv_x, y=y0);
+    let tap5 = tap(clk_pulse_inv_x - t, y0, false);
+    let clk_pulse_inv = inst(cells::sky130_fd_sc_hs__inv_16(), x=clk_pulse_inv_x, y=y0);
     let inv_rbl_x = clk_pulse_inv_x + 8160. + t;
-    tap(inv_rbl_x - t, y0, false);
-    let inv_rbl = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_2(), x=inv_rbl_x + 1440., y=y0, reflect=true, angle=180);
-    tap(inv_rbl_x + 1440., y0, false);
+    let tap6 = tap(inv_rbl_x - t, y0, false);
+    let inv_rbl = inst(
+        cells::sky130_fd_sc_hs__inv_2(),
+        x=inv_rbl_x + 1440.,
+        y=y0,
+        reflect=true,
+        angle=180,
+    );
+    let tap7 = tap(inv_rbl_x + 1440., y0, false);
 
     // Row 1: pulse delays, write/read reset select, and the wordline latch.
     let y1 = row_y(1);
-    tap(0., y1, true);
-    let clkp_delay = inst(lib::logic::control::blocks::inv_chain(clkp_delay_invs(), false), x=t, y=y1, reflect=true);
-    let clkpd_inv_x = t + lib::logic::control::blocks::inv_chain_w(clkp_delay_invs()) + t;
-    tap(clkpd_inv_x - t, y1, true);
-    let clkpd_inv = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_2(), x=clkpd_inv_x, y=y1, reflect=true);
+    let tap8 = tap(0., y1, true);
+    let clkp_delay = inst(blocks::inv_chain(clkp_delay_invs(), false), x=t, y=y1, reflect=true);
+    let clkpd_inv_x = t + blocks::inv_chain_w(clkp_delay_invs()) + t;
+    let tap9 = tap(clkpd_inv_x - t, y1, true);
+    let clkpd_inv = inst(cells::sky130_fd_sc_hs__inv_2(), x=clkpd_inv_x, y=y1, reflect=true);
     let clkpd_delay_x = clkpd_inv_x + 1440. + t;
-    tap(clkpd_delay_x - t, y1, true);
-    let clkpd_delay = inst(lib::logic::control::blocks::inv_chain(p.wlen_pulse_invs, false), x=clkpd_delay_x, y=y1, reflect=true);
-    let mux_x = clkpd_delay_x + lib::logic::control::blocks::inv_chain_w(p.wlen_pulse_invs) + t;
-    tap(mux_x - t, y1, true);
-    let mux_wlen_rst = inst(lib::logic::control::cells::sky130_fd_sc_hs__mux2_4(), x=mux_x + 8640., y=y1, angle=180);
+    let tap10 = tap(clkpd_delay_x - t, y1, true);
+    let clkpd_delay = inst(
+        blocks::inv_chain(p.wlen_pulse_invs, false),
+        x=clkpd_delay_x,
+        y=y1,
+        reflect=true,
+    );
+    let mux_x = clkpd_delay_x + blocks::inv_chain_w(p.wlen_pulse_invs) + t;
+    let tap11 = tap(mux_x - t, y1, true);
+    let mux_wlen_rst = inst(cells::sky130_fd_sc_hs__mux2_4(), x=mux_x + 8640., y=y1, angle=180);
     let rep_delay_x = mux_x + 8640. + t;
-    tap(rep_delay_x - t, y1, true);
-    let decoder_replica_delay = inst(lib::logic::control::blocks::inv_chain(p.pc_set_delay_invs, false), x=rep_delay_x, y=y1, reflect=true);
-    let wl_ctl_x = rep_delay_x + lib::logic::control::blocks::inv_chain_w(p.pc_set_delay_invs) + t;
-    tap(wl_ctl_x - t, y1, true);
-    let wl_ctl = inst(lib::logic::control::blocks::sr_latch(), x=wl_ctl_x, y=y1, reflect=true);
-    tap(wl_ctl_x + lib::logic::control::blocks::sr_latch_w(), y1, true);
+    let tap12 = tap(rep_delay_x - t, y1, true);
+    let decoder_replica_delay = inst(
+        blocks::inv_chain(p.pc_set_delay_invs, false),
+        x=rep_delay_x,
+        y=y1,
+        reflect=true,
+    );
+    let wl_ctl_x = rep_delay_x + blocks::inv_chain_w(p.pc_set_delay_invs) + t;
+    let tap13 = tap(wl_ctl_x - t, y1, true);
+    let wl_ctl = inst(blocks::sr_latch(), x=wl_ctl_x, y=y1, reflect=true);
+    let tap14 = tap(wl_ctl_x + blocks::sr_latch_w(), y1, true);
 
     // Row 2: reset gating and wordline/sense enable logic.
     let y2 = row_y(2);
-    tap(0., y2, false);
-    let inv_we = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_2(), x=t, y=y2);
+    let tap15 = tap(0., y2, false);
+    let inv_we = inst(cells::sky130_fd_sc_hs__inv_2(), x=t, y=y2);
     let wlen_grst_x = t + 1440. + t;
-    tap(wlen_grst_x - t, y2, false);
-    let wlen_grst = inst(lib::logic::control::cells::sky130_fd_sc_hs__nor2_4(), x=wlen_grst_x, y=y2);
+    let tap16 = tap(wlen_grst_x - t, y2, false);
+    let wlen_grst = inst(cells::sky130_fd_sc_hs__nor2_4(), x=wlen_grst_x, y=y2);
     let pc_set_x = wlen_grst_x + 4320. + t;
-    tap(pc_set_x - t, y2, false);
-    let pc_set = inst(lib::logic::control::cells::sky130_fd_sc_hs__nor2_4(), x=pc_set_x, y=y2);
+    let tap17 = tap(pc_set_x - t, y2, false);
+    let pc_set = inst(cells::sky130_fd_sc_hs__nor2_4(), x=pc_set_x, y=y2);
     let wrdrven_grst_x = pc_set_x + 4320. + t;
-    tap(wrdrven_grst_x - t, y2, false);
-    let wrdrven_grst = inst(lib::logic::control::cells::sky130_fd_sc_hs__nor2_4(), x=wrdrven_grst_x, y=y2);
+    let tap18 = tap(wrdrven_grst_x - t, y2, false);
+    let wrdrven_grst = inst(cells::sky130_fd_sc_hs__nor2_4(), x=wrdrven_grst_x, y=y2);
     let clkp_grst_x = wrdrven_grst_x + 4320. + t;
-    tap(clkp_grst_x - t, y2, false);
-    let clkp_grst = inst(lib::logic::control::cells::sky130_fd_sc_hs__nor2_4(), x=clkp_grst_x, y=y2);
+    let tap19 = tap(clkp_grst_x - t, y2, false);
+    let clkp_grst = inst(cells::sky130_fd_sc_hs__nor2_4(), x=clkp_grst_x, y=y2);
     let nand_sense_en_x = clkp_grst_x + 4320. + t;
-    tap(nand_sense_en_x - t, y2, false);
-    let nand_sense_en = inst(lib::logic::control::cells::sky130_fd_sc_hs__nand2_4(), x=nand_sense_en_x, y=y2);
+    let tap20 = tap(nand_sense_en_x - t, y2, false);
+    let nand_sense_en = inst(cells::sky130_fd_sc_hs__nand2_4(), x=nand_sense_en_x, y=y2);
     let nand_wlendb_web_x = nand_sense_en_x + 4320. + t;
-    tap(nand_wlendb_web_x - t, y2, false);
-    let nand_wlendb_web = inst(lib::logic::control::cells::sky130_fd_sc_hs__nand2_4(), x=nand_wlendb_web_x, y=y2);
+    let tap21 = tap(nand_wlendb_web_x - t, y2, false);
+    let nand_wlendb_web = inst(cells::sky130_fd_sc_hs__nand2_4(), x=nand_wlendb_web_x, y=y2);
     let and_wlen_x = nand_wlendb_web_x + 4320. + t;
-    tap(and_wlen_x - t, y2, false);
-    let and_wlen = inst(lib::logic::control::cells::sky130_fd_sc_hs__and2_4(), x=and_wlen_x + 4320., y=y2, reflect=true, angle=180);
+    let tap22 = tap(and_wlen_x - t, y2, false);
+    let and_wlen = inst(
+        cells::sky130_fd_sc_hs__and2_4(),
+        x=and_wlen_x + 4320.,
+        y=y2,
+        reflect=true,
+        angle=180,
+    );
     let rwl_buf_x = and_wlen_x + 4320. + t;
-    tap(rwl_buf_x - t, y2, false);
-    let rwl_buf = inst(lib::logic::control::cells::sky130_fd_sc_hs__buf_16(), x=rwl_buf_x + 10560., y=y2, reflect=true, angle=180);
-    tap(rwl_buf_x + 10560., y2, false);
+    let tap23 = tap(rwl_buf_x - t, y2, false);
+    let rwl_buf = inst(
+        cells::sky130_fd_sc_hs__buf_16(),
+        x=rwl_buf_x + 10560.,
+        y=y2,
+        reflect=true,
+        angle=180,
+    );
+    let tap24 = tap(rwl_buf_x + 10560., y2, false);
 
     // Row 3: sense-enable and write-driver-enable latches.
     let y3 = row_y(3);
-    tap(0., y3, true);
-    let saen_ctl = inst(lib::logic::control::blocks::sr_latch(), x=t, y=y3, reflect=true);
-    let wrdrven_set_x = t + lib::logic::control::blocks::sr_latch_w() + t;
-    tap(wrdrven_set_x - t, y3, true);
-    let wrdrven_set = inst(lib::logic::control::cells::sky130_fd_sc_hs__nand2_4(), x=wrdrven_set_x, y=y3, reflect=true);
+    let tap25 = tap(0., y3, true);
+    let saen_ctl = inst(blocks::sr_latch(), x=t, y=y3, reflect=true);
+    let wrdrven_set_x = t + blocks::sr_latch_w() + t;
+    let tap26 = tap(wrdrven_set_x - t, y3, true);
+    let wrdrven_set = inst(cells::sky130_fd_sc_hs__nand2_4(), x=wrdrven_set_x, y=y3, reflect=true);
     let wrdrven_set_delay_x = wrdrven_set_x + 4320. + t;
-    tap(wrdrven_set_delay_x - t, y3, true);
-    let wrdrven_set_delay = inst(lib::logic::control::blocks::inv_chain(p.wrdrven_set_delay_invs, false), x=wrdrven_set_delay_x, y=y3, reflect=true);
-    let wrdrven_ctl_x = wrdrven_set_delay_x + lib::logic::control::blocks::inv_chain_w(p.wrdrven_set_delay_invs) + t;
-    tap(wrdrven_ctl_x - t, y3, true);
-    let wrdrven_ctl = inst(lib::logic::control::blocks::sr_latch(), x=wrdrven_ctl_x, y=y3, reflect=true);
-    tap(wrdrven_ctl_x + lib::logic::control::blocks::sr_latch_w(), y3, true);
+    let tap27 = tap(wrdrven_set_delay_x - t, y3, true);
+    let wrdrven_set_delay = inst(
+        blocks::inv_chain(p.wrdrven_set_delay_invs, false),
+        x=wrdrven_set_delay_x,
+        y=y3,
+        reflect=true,
+    );
+    let wrdrven_ctl_x = wrdrven_set_delay_x + blocks::inv_chain_w(p.wrdrven_set_delay_invs) + t;
+    let tap28 = tap(wrdrven_ctl_x - t, y3, true);
+    let wrdrven_ctl = inst(blocks::sr_latch(), x=wrdrven_ctl_x, y=y3, reflect=true);
+    let tap29 = tap(wrdrven_ctl_x + blocks::sr_latch_w(), y3, true);
 
     // Row 4: decoder replica and the precharge latch.
     let y4 = row_y(4);
-    tap(0., y4, false);
-    let decoder_replica = inst(lib::logic::control::blocks::inv_chain(p.decoder_delay_invs, true), x=t, y=y4);
-    let pc_ctl_x = t + lib::logic::control::blocks::inv_chain_w(p.decoder_delay_invs) + t;
-    tap(pc_ctl_x - t, y4, false);
-    let pc_ctl = inst(lib::logic::control::blocks::sr_latch(), x=pc_ctl_x, y=y4);
-    let pc_b_buf_x = pc_ctl_x + lib::logic::control::blocks::sr_latch_w() + t;
-    tap(pc_b_buf_x - t, y4, false);
-    let pc_b_buf = inst(lib::logic::control::cells::sky130_fd_sc_hs__buf_16(), x=pc_b_buf_x + 10560., y=y4, reflect=true, angle=180);
-    tap(pc_b_buf_x + 10560., y4, false);
+    let tap30 = tap(0., y4, false);
+    let decoder_replica = inst(blocks::inv_chain(p.decoder_delay_invs, true), x=t, y=y4);
+    let pc_ctl_x = t + blocks::inv_chain_w(p.decoder_delay_invs) + t;
+    let tap31 = tap(pc_ctl_x - t, y4, false);
+    let pc_ctl = inst(blocks::sr_latch(), x=pc_ctl_x, y=y4);
+    let pc_b_buf_x = pc_ctl_x + blocks::sr_latch_w() + t;
+    let tap32 = tap(pc_b_buf_x - t, y4, false);
+    let pc_b_buf = inst(
+        cells::sky130_fd_sc_hs__buf_16(),
+        x=pc_b_buf_x + 10560.,
+        y=y4,
+        reflect=true,
+        angle=180,
+    );
+    let tap33 = tap(pc_b_buf_x + 10560., y4, false);
 
     // Abutting li1 connections.
     li1_jumper(clk_delay.dout, clk_gate.a);
@@ -183,238 +219,577 @@ cell control_logic_replica_v2(p: ControlLogicParams) {
 
     // Supply pins on the six row rails. Rails of the same supply are joined
     // outside the block.
-    let spans0 = row_spans(concat(inv_chain_gaps(clk_delay_x, clk_delay_invs(), 1), inv_chain_gaps(clk_pulse_x, lib::logic::control::blocks::edge_detector_invs(), 1)), 0., inv_rbl_x + 1440. + t);
-    let spans1 = row_spans(concat(inv_chain_gaps(t, clkp_delay_invs(), 1), concat(inv_chain_gaps(clkpd_delay_x, p.wlen_pulse_invs, 1), concat(inv_chain_gaps(rep_delay_x, p.pc_set_delay_invs, 1), sr_latch_gaps(wl_ctl_x)))), 0., wl_ctl_x + lib::logic::control::blocks::sr_latch_w() + t);
+    let spans0 = row_spans(
+        concat(
+            inv_chain_gaps(clk_delay_x, clk_delay_invs(), 1),
+            inv_chain_gaps(clk_pulse_x, blocks::edge_detector_invs(), 1),
+        ),
+        0.,
+        inv_rbl_x + 1440. + t,
+    );
+    let spans1 = row_spans(
+        concat(
+            inv_chain_gaps(t, clkp_delay_invs(), 1),
+            concat(
+                inv_chain_gaps(clkpd_delay_x, p.wlen_pulse_invs, 1),
+                concat(
+                    inv_chain_gaps(rep_delay_x, p.pc_set_delay_invs, 1),
+                    sr_latch_gaps(wl_ctl_x),
+                ),
+            ),
+        ),
+        0.,
+        wl_ctl_x + blocks::sr_latch_w() + t,
+    );
     let spans2 = row_spans([], 0., rwl_buf_x + 10560. + t);
-    let spans3 = row_spans(concat(sr_latch_gaps(t), concat(inv_chain_gaps(wrdrven_set_delay_x, p.wrdrven_set_delay_invs, 1), sr_latch_gaps(wrdrven_ctl_x))), 0., wrdrven_ctl_x + lib::logic::control::blocks::sr_latch_w() + t);
-    let spans4 = row_spans(concat(inv_chain_gaps(t, p.decoder_delay_invs, 1), sr_latch_gaps(pc_ctl_x)), 0., pc_b_buf_x + 10560. + t);
+    let spans3 = row_spans(
+        concat(
+            sr_latch_gaps(t),
+            concat(
+                inv_chain_gaps(wrdrven_set_delay_x, p.wrdrven_set_delay_invs, 1),
+                sr_latch_gaps(wrdrven_ctl_x),
+            ),
+        ),
+        0.,
+        wrdrven_ctl_x + blocks::sr_latch_w() + t,
+    );
+    let spans4 = row_spans(
+        concat(inv_chain_gaps(t, p.decoder_delay_invs, 1), sr_latch_gaps(pc_ctl_x)),
+        0.,
+        pc_b_buf_x + 10560. + t,
+    );
     rail_pins("vdd", 0., spans0);
     rail_pins("vss", y0, shared_spans(spans0, spans1));
-    rail_pins("vdd", y2 + lib::logic::control::blocks::row_h(), shared_spans(spans1, spans2));
+    rail_pins("vdd", y2 + blocks::row_h(), shared_spans(spans1, spans2));
     rail_pins("vss", y2, shared_spans(spans2, spans3));
-    rail_pins("vdd", y4 + lib::logic::control::blocks::row_h(), shared_spans(spans3, spans4));
+    rail_pins("vdd", y4 + blocks::row_h(), shared_spans(spans3, spans4));
     rail_pins("vss", y4, spans4);
+    // Supply ports: each row merges its cells' rails in order, then the rows
+    // merge top to bottom.
+    pub let vdd_pins_m1 = router::merge_rects([
+        router::merge_rects([
+            tap0.vpwr,
+            reset_inv.vpwr,
+            tap1.vpwr,
+            clk_delay.vdd_port,
+            tap2.vpwr,
+            clk_gate.vpwr,
+            tap3.vpwr,
+            clk_pulse.vdd_port,
+            tap4.vpwr,
+            clk_pulse_buf.vpwr,
+            tap5.vpwr,
+            clk_pulse_inv.vpwr,
+            tap6.vpwr,
+            inv_rbl.vpwr,
+            tap7.vpwr,
+        ]),
+        router::merge_rects([
+            tap8.vpwr,
+            clkp_delay.vdd_port,
+            tap9.vpwr,
+            clkpd_inv.vpwr,
+            tap10.vpwr,
+            clkpd_delay.vdd_port,
+            tap11.vpwr,
+            mux_wlen_rst.vpwr,
+            tap12.vpwr,
+            decoder_replica_delay.vdd_port,
+            tap13.vpwr,
+            wl_ctl.vdd_port,
+            tap14.vpwr,
+        ]),
+        router::merge_rects([
+            tap15.vpwr,
+            inv_we.vpwr,
+            tap16.vpwr,
+            wlen_grst.vpwr,
+            tap17.vpwr,
+            pc_set.vpwr,
+            tap18.vpwr,
+            wrdrven_grst.vpwr,
+            tap19.vpwr,
+            clkp_grst.vpwr,
+            tap20.vpwr,
+            nand_sense_en.vpwr,
+            tap21.vpwr,
+            nand_wlendb_web.vpwr,
+            tap22.vpwr,
+            and_wlen.vpwr,
+            tap23.vpwr,
+            rwl_buf.vpwr,
+            tap24.vpwr,
+        ]),
+        router::merge_rects([
+            tap25.vpwr,
+            saen_ctl.vdd_port,
+            tap26.vpwr,
+            wrdrven_set.vpwr,
+            tap27.vpwr,
+            wrdrven_set_delay.vdd_port,
+            tap28.vpwr,
+            wrdrven_ctl.vdd_port,
+            tap29.vpwr,
+        ]),
+        router::merge_rects([
+            tap30.vpwr,
+            decoder_replica.vdd_port,
+            tap31.vpwr,
+            pc_ctl.vdd_port,
+            tap32.vpwr,
+            pc_b_buf.vpwr,
+            tap33.vpwr,
+        ]),
+    ]);
+    pub let vss_pins_m1 = router::merge_rects([
+        router::merge_rects([
+            tap0.vgnd,
+            reset_inv.vgnd,
+            tap1.vgnd,
+            clk_delay.vss_port,
+            tap2.vgnd,
+            clk_gate.vgnd,
+            tap3.vgnd,
+            clk_pulse.vss_port,
+            tap4.vgnd,
+            clk_pulse_buf.vgnd,
+            tap5.vgnd,
+            clk_pulse_inv.vgnd,
+            tap6.vgnd,
+            inv_rbl.vgnd,
+            tap7.vgnd,
+        ]),
+        router::merge_rects([
+            tap8.vgnd,
+            clkp_delay.vss_port,
+            tap9.vgnd,
+            clkpd_inv.vgnd,
+            tap10.vgnd,
+            clkpd_delay.vss_port,
+            tap11.vgnd,
+            mux_wlen_rst.vgnd,
+            tap12.vgnd,
+            decoder_replica_delay.vss_port,
+            tap13.vgnd,
+            wl_ctl.vss_port,
+            tap14.vgnd,
+        ]),
+        router::merge_rects([
+            tap15.vgnd,
+            inv_we.vgnd,
+            tap16.vgnd,
+            wlen_grst.vgnd,
+            tap17.vgnd,
+            pc_set.vgnd,
+            tap18.vgnd,
+            wrdrven_grst.vgnd,
+            tap19.vgnd,
+            clkp_grst.vgnd,
+            tap20.vgnd,
+            nand_sense_en.vgnd,
+            tap21.vgnd,
+            nand_wlendb_web.vgnd,
+            tap22.vgnd,
+            and_wlen.vgnd,
+            tap23.vgnd,
+            rwl_buf.vgnd,
+            tap24.vgnd,
+        ]),
+        router::merge_rects([
+            tap25.vgnd,
+            saen_ctl.vss_port,
+            tap26.vgnd,
+            wrdrven_set.vgnd,
+            tap27.vgnd,
+            wrdrven_set_delay.vss_port,
+            tap28.vgnd,
+            wrdrven_ctl.vss_port,
+            tap29.vgnd,
+        ]),
+        router::merge_rects([
+            tap30.vgnd,
+            decoder_replica.vss_port,
+            tap31.vgnd,
+            pc_ctl.vss_port,
+            tap32.vgnd,
+            pc_b_buf.vgnd,
+            tap33.vgnd,
+        ]),
+    ]);
 
-    // Signal routes. Rows 0 and 2 are fixed; the delay chains move the
-    // cells after them in rows 1, 3, and 4. Moving pins pick their columns
-    // from their own positions and step past columns that other nets cross
-    // there. Met2 columns 0, 1, and 13 through 15 stay empty; the SRAM runs
-    // supply feeders across the block there.
-    let right = max_float(max_float(inv_rbl_x + 1440. + t, wl_ctl_x + lib::logic::control::blocks::sr_latch_w() + t), max_float(wrdrven_ctl_x + lib::logic::control::blocks::sr_latch_w() + t, pc_b_buf_x + 10560. + t));
-    let rh = lib::logic::control::blocks::row_h();
-    pub let vdd_rails = [rail_rect(0., right), rail_rect(y2 + rh, right), rail_rect(y4 + rh, right)];
+    let right = max_float(
+        max_float(inv_rbl_x + 1440. + t, wl_ctl_x + blocks::sr_latch_w() + t),
+        max_float(wrdrven_ctl_x + blocks::sr_latch_w() + t, pc_b_buf_x + 10560. + t),
+    );
+    let rh = blocks::row_h();
+    pub let vdd_rails = [
+        rail_rect(0., right),
+        rail_rect(y2 + rh, right),
+        rail_rect(y4 + rh, right),
+    ];
     pub let vss_rails = [rail_rect(y0, right), rail_rect(y2, right), rail_rect(y4, right)];
-    // The right pins go on the first column that starts 3.2 um past the cell
-    // bbox, whose nwell extends 190 nm past the last row.
-    let pin_j = col_starting_after(right + 190. + 3200.);
-    // Right-pin feeders run on the column before the pins, clear of the
-    // SRAM's met2 routes from the pins.
-    let feed_j = pin_j - 1;
-    // Fixed met2 columns crossing row 1 (rbl_b, wlen, rwl), and those crossing
-    // row 0, which also include clkp_b's and rbl_b's risers there.
-    let row1_cross = [71, 83, 101];
-    let row0_cross = [71, 83, 101, 146, 162];
 
-    // rstb
-    pub let rstb = m1_pin("rstb", -9, -9);
-    m1_h(-9, -9, -1);
-    m2_v(-1, -9, -5);
-    m1_h(-5, -1, 5);
-    m1_access(reset_inv.a, 5, -5);
-    // clk
-    pub let clk = m1_pin("clk", -9, -3);
-    m1_h(-3, -9, -2);
-    m2_v(-2, -3, -2);
-    m1_h(-2, -2, 22);
-    li1_access(clk_delay.din, 22, -2);
-    // ce
-    pub let ce = m1_pin("ce", -9, -5);
-    m1_h(-5, -9, -3);
-    m2_v(-3, -5, -6);
-    m1_h(-6, -3, 67);
-    li1_access(clk_gate.b, 67, -6);
-    // reset
-    m1_access(reset_inv.out, 16, -3);
-    m2_v(16, -3, -11);
-    m1_h(-11, 16, 49);
-    m2_v(16, -11, -19);
-    li1_access(wlen_grst.b, 16, -19);
-    m2_v(26, -11, -19);
-    li1_access(pc_set.b, 26, -19);
-    m2_v(37, -11, -19);
-    li1_access(wrdrven_grst.b, 37, -19);
-    m2_v(49, -11, -19);
-    li1_access(clkp_grst.b, 49, -19);
-    // clkp
-    m1_access(clk_pulse_buf.out, 136, -2);
-    m1_h(-2, 43, 140);
-    m1_v(140, -2, -5);
-    m1_h(-5, 140, 150);
-    m1_access(clk_pulse_inv.a, 150, -5);
-    m2_v(43, -2, -19);
-    li1_access(clkp_grst.a, 43, -19);
-    // rbl
-    li1_access(inv_rbl.a, 164, -5);
-    m1_h(-5, 164, pin_j);
-    pub let rbl = m1_pin("rbl", pin_j, -5);
-    // we
-    pub let we = m1_pin("we", -9, -7);
-    m1_h(-7, -9, -4);
-    m2_v(-4, -19, -7);
-    m1_h(-19, -4, 2);
-    li1_access(inv_we.a, 2, -19);
-    let we_j = free_col(pin_col(mux_wlen_rst.s), 1, row0_cross);
-    m2_v(-4, -7, 2);
-    m1_h(2, -4, we_j);
-    m2_v(we_j, 2, -11);
-    li1_access(mux_wlen_rst.s, we_j, -11);
-    m2_v(54, 2, -26);
-    li1_access(wrdrven_set.b, 54, -26);
-    // clkp_b
-    m1_access(clk_pulse_inv.out, 146, -2);
-    m2_v(146, -2, 1);
-    m1_h(1, -6, 146);
-    m2_v(-6, 1, -11);
-    m1_h(-11, -6, 2);
-    li1_access(clkp_delay.din, 2, -11);
-    let clkp_b_j = free_col(pin_col(pc_ctl.rb), 1, [31, 35, 43, 48, 50, pin_col(wrdrven_ctl.rb), pin_col_right(wrdrven_ctl.q)]);
-    m2_v(-6, -11, -41);
-    m1_h(-41, -6, clkp_b_j);
-    m2_v(clkp_b_j, -41, -33);
-    li1_access(pc_ctl.rb, clkp_b_j, -33);
-    // rbl_b
-    li1_access(inv_rbl.out, 162, -2);
-    m2_v(162, -2, 6);
-    let rbl_b_j = free_col(pin_col_right(mux_wlen_rst.a0), 1, [83, 101, 146, 162]);
-    m1_h(6, min_int(71, rbl_b_j), max_int(162, rbl_b_j));
-    m2_v(71, 6, -18);
-    li1_access(nand_wlendb_web.a, 71, -18);
-    m2_v(rbl_b_j, 6, -11);
-    li1_access(mux_wlen_rst.a0, rbl_b_j, -11);
-    // clkpd_b
-    li1_access(clkpd_inv.out, 16, -10);
-    m1_h(-10, 16, pin_col(wl_ctl.sb));
-    li1_access(wl_ctl.sb, pin_col(wl_ctl.sb), -10);
-    // clkpdd
-    li1_access(clkpd_delay.dout, pin_col(clkpd_delay.dout), -12);
-    m1_h(-12, pin_col(clkpd_delay.dout), pin_col_left(mux_wlen_rst.a1));
-    li1_access(mux_wlen_rst.a1, pin_col_left(mux_wlen_rst.a1), -12);
-    // decrepstart
-    let decrepstart_j = free_col(pin_col(mux_wlen_rst.out) - 1, -1, row1_cross);
-    li1_access(mux_wlen_rst.out, decrepstart_j, -11);
-    m2_v(decrepstart_j, -11, -9);
-    m1_h(-9, 7, decrepstart_j);
-    m2_v(7, -9, -19);
-    li1_access(wlen_grst.a, 7, -19);
-    m2_v(7, -19, -33);
-    m1_h(-33, 2, 7);
-    li1_access(decoder_replica.din, 2, -33);
-    // decrepend
-    let decrepend_j = free_col(pin_col(decoder_replica_delay.din), 1, row0_cross);
-    li1_access(decoder_replica_delay.din, decrepend_j, -11);
-    m2_v(decrepend_j, -11, 4);
-    m1_h(4, 31, decrepend_j);
-    m2_v(31, 4, -19);
-    li1_access(wrdrven_grst.a, 31, -19);
-    m2_v(57, 4, -19);
-    li1_access(nand_sense_en.b, 57, -19);
-    m2_v(31, -19, -35);
-    m1_h(-35, 31, pin_col(decoder_replica.dout));
-    li1_access(decoder_replica.dout, pin_col(decoder_replica.dout), -35);
-    // wlen_rst_decoderd
-    li1_access(decoder_replica_delay.dout, pin_col(decoder_replica_delay.dout), -13);
-    m1_h(-13, 20, pin_col(decoder_replica_delay.dout));
-    m2_v(20, -13, -19);
-    li1_access(pc_set.a, 20, -19);
-    // wlen_grst_b
-    let wlen_grst_b_j = free_col(pin_col(wl_ctl.rb), 1, row0_cross);
-    li1_access(wl_ctl.rb, wlen_grst_b_j, -11);
-    m2_v(wlen_grst_b_j, -11, 3);
-    m1_h(3, 12, wlen_grst_b_j);
-    m2_v(12, 3, -20);
-    li1_access(wlen_grst.out, 12, -20);
-    // clkpd
-    li1_access(clkp_delay.dout, 11, -11);
-    m2_v(11, -11, 5);
-    m1_h(5, 11, 56);
-    m2_v(56, 5, -27);
-    li1_access(wrdrven_set.a, 56, -27);
-    // we_b
-    li1_access(inv_we.out, 4, -17);
-    m1_h(-17, 4, 69);
-    m2_v(60, -17, -19);
-    li1_access(nand_sense_en.a, 60, -19);
-    m2_v(69, -17, -19);
-    li1_access(nand_wlendb_web.b, 69, -19);
-    // saen_set_b
-    li1_access(nand_sense_en.out, 62, -19);
-    m2_v(62, -19, -28);
-    m1_h(-28, 8, 62);
-    m2_v(8, -28, -26);
-    li1_access(saen_ctl.sb, 8, -26);
-    // pc_set_b
-    li1_access(pc_set.out, 24, -20);
-    m2_v(24, -20, -31);
-    m1_h(-31, 24, pin_col(pc_ctl.sb));
-    li1_access(pc_ctl.sb, pin_col(pc_ctl.sb), -31);
-    // clkp_grst_b
-    li1_access(clkp_grst.out, 47, -18);
-    m1_h(-18, 32, 47);
-    m2_v(32, -18, -25);
-    li1_access(saen_ctl.rb, 32, -25);
-    // wrdrven_grst_b
-    li1_access(wrdrven_grst.out, 35, -19);
-    m2_v(35, -19, -39);
-    m1_h(-39, 35, pin_col(wrdrven_ctl.rb));
-    m2_v(pin_col(wrdrven_ctl.rb), -39, -25);
-    li1_access(wrdrven_ctl.rb, pin_col(wrdrven_ctl.rb), -25);
-    // wlend
-    li1_access(nand_wlendb_web.out, 73, -20);
-    m2_v(73, -20, -24);
-    m1_h(-24, 73, 80);
-    m2_v(80, -24, -18);
-    li1_access(and_wlen.b, 80, -18);
-    // wlen_q
-    li1_access(wl_ctl.q, pin_col_right(wl_ctl.q), -13);
-    m2_v(pin_col_right(wl_ctl.q), -13, -20);
-    m1_h(-20, 77, pin_col_right(wl_ctl.q));
-    li1_access(and_wlen.a, 77, -20);
-    li1_access(rwl_buf.a, 90, -20);
-    // wlen
-    li1_access(and_wlen.out, 83, -18);
-    m2_v(83, -18, 5);
-    m1_h(5, 83, feed_j);
-    m2_v(feed_j, 5, -3);
-    m1_h(-3, feed_j, pin_j);
-    pub let wlen = m1_pin("wlen", pin_j, -3);
-    // rwl
-    m1_access(rwl_buf.out, 101, -17);
-    m2_v_to_pin(101, -17, 9);
-    pub let rwl = m2_pin("rwl", 101, 9);
-    // saen
-    li1_access(saen_ctl.q, 43, -27);
-    m2_v(43, -27, -38);
-    m1_h(-38, 43, 50);
-    m2_v_to_pin(50, -38, -46);
-    pub let saen = m2_pin("saen", 50, -46);
-    // wrdrven
-    li1_access(wrdrven_ctl.q, pin_col_right(wrdrven_ctl.q), -28);
-    m2_v(pin_col_right(wrdrven_ctl.q), -28, -40);
-    m1_h(-40, 48, pin_col_right(wrdrven_ctl.q));
-    m2_v_to_pin(48, -40, -46);
-    pub let wrdrven = m2_pin("wrdrven", 48, -46);
-    // wrdrven_set_b
-    li1_access(wrdrven_set_delay.dout, pin_col(wrdrven_set_delay.dout), -25);
-    m1_h(-25, pin_col(wrdrven_set_delay.dout), pin_col(wrdrven_ctl.sb));
-    li1_access(wrdrven_ctl.sb, pin_col(wrdrven_ctl.sb), -25);
-    // pc_b0
-    li1_access(pc_ctl.qb, pin_col_right(pc_ctl.qb), -33);
-    m1_h(-33, pin_col_right(pc_ctl.qb), pin_col(pc_b_buf.a));
-    li1_access(pc_b_buf.a, pin_col(pc_b_buf.a), -33);
-    // pc_b
-    m1_access(pc_b_buf.out, pin_col(pc_b_buf.out), -31);
-    m1_h(-31, pin_col(pc_b_buf.out), feed_j);
-    m2_v(feed_j, -31, -7);
-    m1_h(-7, feed_j, pin_j);
-    pub let pc_b = m1_pin("pc_b", pin_j, -7);
+    // Signal routes. The greedy router routes every net on met1 and met2
+    // tracks over the placed cells, whose metal blocks it.
+    let gb = union_all([
+        bbox(tap0),
+        bbox(reset_inv),
+        bbox(tap1),
+        bbox(clk_delay),
+        bbox(tap2),
+        bbox(clk_gate),
+        bbox(tap3),
+        bbox(clk_pulse),
+        bbox(tap4),
+        bbox(clk_pulse_buf),
+        bbox(tap5),
+        bbox(clk_pulse_inv),
+        bbox(tap6),
+        bbox(inv_rbl),
+        bbox(tap7),
+        bbox(tap8),
+        bbox(clkp_delay),
+        bbox(tap9),
+        bbox(clkpd_inv),
+        bbox(tap10),
+        bbox(clkpd_delay),
+        bbox(tap11),
+        bbox(mux_wlen_rst),
+        bbox(tap12),
+        bbox(decoder_replica_delay),
+        bbox(tap13),
+        bbox(wl_ctl),
+        bbox(tap14),
+        bbox(tap15),
+        bbox(inv_we),
+        bbox(tap16),
+        bbox(wlen_grst),
+        bbox(tap17),
+        bbox(pc_set),
+        bbox(tap18),
+        bbox(wrdrven_grst),
+        bbox(tap19),
+        bbox(clkp_grst),
+        bbox(tap20),
+        bbox(nand_sense_en),
+        bbox(tap21),
+        bbox(nand_wlendb_web),
+        bbox(tap22),
+        bbox(and_wlen),
+        bbox(tap23),
+        bbox(rwl_buf),
+        bbox(tap24),
+        bbox(tap25),
+        bbox(saen_ctl),
+        bbox(tap26),
+        bbox(wrdrven_set),
+        bbox(tap27),
+        bbox(wrdrven_set_delay),
+        bbox(tap28),
+        bbox(wrdrven_ctl),
+        bbox(tap29),
+        bbox(tap30),
+        bbox(decoder_replica),
+        bbox(tap31),
+        bbox(pc_ctl),
+        bbox(tap32),
+        bbox(pc_b_buf),
+        bbox(tap33),
+    ]);
+    let area = expand(gb, 5440.);
+    let g = control_grid(area);
+    // Starts of the met1 (horizontal) and met2 (vertical) tracks.
+    let hs = area.y0 - 160.;
+    let vs = area.x0 - 160.;
+
+    // A met1 stub on the right end of the first exposed span of the top VSS rail.
+    let vss_end = head(shared_spans(spans0, spans1)).1;
+    let vss_stub = snap_to(
+        g,
+        crect(x0=vss_end - 200., y0=y0 - 245., x1=vss_end, y1=y0 + 245.),
+        minimum(),
+    );
+    rect("met1.drawing", x0=vss_stub.x0, y0=vss_stub.y0, x1=vss_stub.x1, y1=vss_stub.y1);
+
+    // Boundary pins: four on the left, two below, three on the right, and
+    // one above, with met2 kept clear beside the side pins.
+    let h0 = ends_before(hs, gb.y1);
+    let v0 = ends_before(vs, gb.x0);
+    let left_col = track(vs, ends_before(vs, gb.x0 - 3200.));
+    let right_col = track(vs, starts_after(vs, gb.x1 + 3200.));
+    let bot_row = track(hs, ends_before(hs, gb.y0) - 8);
+    let top_row = track(hs, starts_after(hs, gb.y1) + 8);
+    let side_pins = [for i in std::range(4) {
+        let row = track(hs, h0 - 2 * i - 2);
+        (rect_from(left_col, row), rect_from(right_col, row),)
+    }];
+    let clk_pin = draw_m1(side_pins[0].0);
+    let ce_pin = draw_m1(side_pins[1].0);
+    let we_pin = draw_m1(side_pins[2].0);
+    let rstb_pin = draw_m1(side_pins[3].0);
+    let wrdrven_pin = draw_m2(rect_from(track(vs, v0 + 50), bot_row));
+    let saen_pin = draw_m2(rect_from(track(vs, v0 + 52), bot_row));
+    let wlen_pin = draw_m1(side_pins[0].1);
+    let rbl_pin = draw_m1(side_pins[1].1);
+    let pc_b_pin = draw_m1(side_pins[2].1);
+    let rwl_pin = draw_m2(rect_from(track(vs, nearest(vs, util::cx_i(rwl_buf.out))), top_row));
+    let pin_ops = std::flatten([
+        [
+            block(m2(), crect(x0=left_col.0 - 2000., y0=gb.y0, x1=left_col.1 + 140., y1=gb.y1)),
+            block(m1(), crect(x0=gb.x0, y0=bot_row.0 - 2000., x1=gb.x1, y1=bot_row.1 + 140.)),
+            block(m2(), crect(x0=right_col.0 - 140., y0=gb.y0, x1=right_col.1 + 2000., y1=gb.y1)),
+            block(m1(), crect(x0=gb.x0, y0=top_row.0 - 2000., x1=gb.x1, y1=top_row.1 + 140.)),
+        ],
+        occupy(m1(), clk_pin, "clk"),
+        occupy(m1(), ce_pin, "ce"),
+        occupy(m1(), we_pin, "we"),
+        occupy(m1(), rstb_pin, "rstb"),
+        occupy(m2(), rwl_pin, "rwl"),
+        occupy(m2(), wrdrven_pin, "wrdrven"),
+        occupy(m2(), saen_pin, "saen"),
+        occupy(m1(), wlen_pin, "wlen"),
+        occupy(m1(), rbl_pin, "rbl"),
+        occupy(m1(), pc_b_pin, "pc_b"),
+    ]);
+
+    // Cell pins brought onto the grid, in the order the router claims them.
+    let rstb_in = m1_access(g, reset_inv.a, corner_ll(), "rstb");
+    let clk_in = access(g, clk_delay.din, corner_ul(), "clk");
+    let ce_in = access(g, clk_gate.b, corner_ur(), "ce");
+    let rbl_in = access(g, inv_rbl.a, corner_lr(), "rbl");
+    let reset_out = m1_access(g, reset_inv.out, corner_ur(), "reset");
+    let rbl_b_in2 = access(g, nand_wlendb_web.a, corner_ll(), "rbl_b");
+    let wlend_out = access(g, nand_wlendb_web.out, corner_ll(), "wlend");
+    let wlend_in = access_right(g, and_wlen.b, corner_lr(), "wlend");
+    let wlen_q_in = access(g, and_wlen.a, corner_ul(), "wlen_q");
+    let clkp_b_out = m1_access(g, clk_pulse_inv.out, corner_ur(), "clkp_b");
+    let clkp_b_in = access(g, clkp_delay.din, corner_ur(), "clkp_b");
+    let decrepend_out = access(g, decoder_replica.dout, corner_ur(), "decrepend");
+    let clkp_b_in_1 = access(g, pc_ctl.rb, side_right(), "clkp_b");
+    let clkpd_out = access(g, clkp_delay.dout, corner_ur(), "clkpd");
+    let clkpd_in = access(g, wrdrven_set.a, corner_ur(), "clkpd");
+    let wl_ctl_q_out = access(g, wl_ctl.q, corner_ur(), "wlen_q");
+    let we_b_ins = [
+        access(g, nand_sense_en.a, corner_ur(), "we_b"),
+        access(g, nand_wlendb_web.b, corner_ur(), "we_b"),
+    ];
+    let rwl_buf_a = access(g, rwl_buf.a, corner_ur(), "wlen_q");
+    let saen_set_bs = [
+        access(g, nand_sense_en.out, corner_ur(), "saen_set_b"),
+        access(g, saen_ctl.sb, corner_ur(), "saen_set_b"),
+    ];
+    let clkpd_bs = [
+        access(g, clkpd_inv.out, corner_ur(), "clkpd_b"),
+        access(g, wl_ctl.sb, corner_ur(), "clkpd_b"),
+    ];
+    let wrdrven_grst_bs = [
+        access(g, wrdrven_grst.out, corner_ur(), "wrdrven_grst_b"),
+        access(g, wrdrven_ctl.rb, corner_ur(), "wrdrven_grst_b"),
+    ];
+    let decrepstarts = [
+        access(g, mux_wlen_rst.out, corner_ur(), "decrepstart"),
+        access(g, decoder_replica.din, corner_ur(), "decrepstart"),
+        access(g, wlen_grst.a, corner_ur(), "decrepstart"),
+    ];
+    let decrepends = [
+        access(g, decoder_replica_delay.din, corner_ur(), "decrepend"),
+        access(g, wrdrven_grst.a, corner_ur(), "decrepend"),
+        access(g, nand_sense_en.b, corner_ur(), "decrepend"),
+    ];
+    let we_in_1 = access(g, wrdrven_set.b, corner_ur(), "we");
+    let wrdrven_set_out = access(g, wrdrven_set_delay.dout, corner_ur(), "wrdrven_set_b");
+    let wrdrven_set_in = access(g, wrdrven_ctl.sb, corner_ul(), "wrdrven_set_b");
+    let jog_ops = s_jog(clk_pulse_buf.out, clk_pulse_inv.a);
+    let clkpdd = draw_m1(union(via01(clkpd_delay.dout), via01(mux_wlen_rst.a1)));
+    let rwl_out = m1_access(g, rwl_buf.out, corner_ur(), "rwl");
+    let wlen_via = via01(and_wlen.out);
+    let wlen_out_upper = draw_m1(snap_to(g, wlen_via, corner_ur()));
+    let wlen_out = draw_m1(snap_to(g, wlen_via, corner_lr()));
+    let saen_out = access(g, saen_ctl.q, corner_ur(), "saen");
+    let wrdrven_out = access(g, wrdrven_ctl.q, corner_ur(), "wrdrven");
+    let pc_b0_out = access(g, pc_ctl.qb, corner_ur(), "pc_b0");
+    let pc_b_in_buf = access(g, pc_b_buf.a, corner_ll(), "pc_b0");
+    let pc_b_out = m1_access(g, pc_b_buf.out, corner_ur(), "pc_b");
+    let we_in_inv = access(g, inv_we.a, corner_ll(), "we");
+    let we_b_out = access(g, inv_we.out, corner_ur(), "we_b");
+    let we_in = access(g, mux_wlen_rst.s, corner_ur(), "we");
+    let rbl_b_out = access(g, inv_rbl.out, corner_ll(), "rbl_b");
+    let rbl_b_in = access(g, mux_wlen_rst.a0, corner_ur(), "rbl_b");
+    let wlen_grstb_out = access(g, wlen_grst.out, corner_ur(), "wlen_grst_b");
+    let wlen_grstb_in = access(g, wl_ctl.rb, corner_ur(), "wlen_grst_b");
+    let wlen_rst_decoderd_out = access(
+        g,
+        decoder_replica_delay.dout,
+        corner_ur(),
+        "wlen_rst_decoderd",
+    );
+    let wlen_rst_decoderd_in = access(g, pc_set.a, corner_ur(), "wlen_rst_decoderd");
+    let resets = [
+        access(g, wlen_grst.b, corner_ur(), "reset"),
+        access(g, pc_set.b, corner_ur(), "reset"),
+        access(g, wrdrven_grst.b, corner_ur(), "reset"),
+        access(g, clkp_grst.b, corner_ur(), "reset"),
+    ];
+    let clkp_out = m1_access(g, clk_pulse_buf.out, corner_ur(), "clkp");
+    let clkp_in = access(g, clkp_grst.a, corner_ur(), "clkp");
+    let clkp_grstb_out = access(g, clkp_grst.out, corner_ur(), "clkp_grst_b");
+    let clkp_grstb_in = access(g, saen_ctl.rb, corner_ur(), "clkp_grst_b");
+    let pc_setb_out = access(g, pc_set.out, corner_ur(), "pc_set_b");
+    let pc_setb_in = access(g, pc_ctl.sb, corner_ur(), "pc_set_b");
+    let access_ops = std::flatten([
+        rstb_in.ops, clk_in.ops, ce_in.ops, rbl_in.ops, reset_out.ops, rbl_b_in2.ops,
+        wlend_out.ops, wlend_in.ops, wlen_q_in.ops, clkp_b_out.ops, clkp_b_in.ops,
+        decrepend_out.ops, clkp_b_in_1.ops, clkpd_out.ops, clkpd_in.ops, wl_ctl_q_out.ops,
+        all_ops(we_b_ins), rwl_buf_a.ops, all_ops(saen_set_bs), all_ops(clkpd_bs),
+        all_ops(wrdrven_grst_bs), all_ops(decrepstarts), all_ops(decrepends), we_in_1.ops,
+        wrdrven_set_out.ops, wrdrven_set_in.ops, jog_ops, occupy(m1(), clkpdd, "clkpdd"),
+        rwl_out.ops, occupy(m1(), wlen_out_upper, "wlen"), occupy(m1(), wlen_out, "wlen"),
+        saen_out.ops, wrdrven_out.ops, pc_b0_out.ops, pc_b_in_buf.ops, pc_b_out.ops,
+        we_in_inv.ops, we_b_out.ops, we_in.ops, rbl_b_out.ops, rbl_b_in.ops,
+        wlen_grstb_out.ops, wlen_grstb_in.ops, wlen_rst_decoderd_out.ops,
+        wlen_rst_decoderd_in.ops, all_ops(resets), clkp_out.ops, clkp_in.ops,
+        clkp_grstb_out.ops, clkp_grstb_in.ops, pc_setb_out.ops, pc_setb_in.ops,
+    ]);
+
+    // One route per connection, from the first pin of a net to each other.
+    let decrepend_all = [
+        decrepend_out.rect,
+        decrepends[2].rect,
+        decrepends[1].rect,
+        decrepends[0].rect,
+    ];
+    let wlen_q_all = [rwl_buf_a.rect, wl_ctl_q_out.rect, wlen_q_in.rect];
+    let routes = std::flatten([
+        [
+            route_req(m1(), clk_pin, m1(), clk_in.rect, "clk"),
+            route_req(m1(), ce_pin, m1(), ce_in.rect, "ce"),
+            route_req(m1(), pc_b0_out.rect, m1(), pc_b_in_buf.rect, "pc_b0"),
+            route_req(m1(), pc_b_out.rect, m1(), pc_b_pin, "pc_b"),
+            route_req(m1(), rstb_pin, m1(), rstb_in.rect, "rstb"),
+            route_req(m1(), clkp_b_out.rect, m1(), clkp_b_in.rect, "clkp_b"),
+            route_req(m1(), clkp_b_out.rect, m1(), clkp_b_in_1.rect, "clkp_b"),
+            route_req(m1(), clkpd_out.rect, m1(), clkpd_in.rect, "clkpd"),
+            route_req(m1(), pc_setb_out.rect, m1(), pc_setb_in.rect, "pc_set_b"),
+        ],
+        [for r in resets { route_req(m1(), reset_out.rect, m1(), r.rect, "reset") }],
+        [for w in we_b_ins { route_req(m1(), we_b_out.rect, m1(), w.rect, "we_b") }],
+        fan_out(decrepend_all, "decrepend"),
+        fan_out(wlen_q_all, "wlen_q"),
+        fan_out(rects(decrepstarts), "decrepstart"),
+        fan_out(rects(wrdrven_grst_bs), "wrdrven_grst_b"),
+        fan_out(rects(clkpd_bs), "clkpd_b"),
+        fan_out(rects(saen_set_bs), "saen_set_b"),
+        [
+            route_req(m1(), we_pin, m1(), we_in.rect, "we"),
+            route_req(m1(), we_pin, m1(), we_in_1.rect, "we"),
+            route_req(m1(), we_pin, m1(), we_in_inv.rect, "we"),
+            route_req(m1(), rbl_b_out.rect, m1(), rbl_b_in.rect, "rbl_b"),
+            route_req(m1(), rbl_b_out.rect, m1(), rbl_b_in2.rect, "rbl_b"),
+            route_req(m1(), rwl_out.rect, m2(), rwl_pin, "rwl"),
+            route_req(m1(), wlen_grstb_out.rect, m1(), wlen_grstb_in.rect, "wlen_grst_b"),
+            route_req(m1(), clkp_out.rect, m1(), clkp_in.rect, "clkp"),
+            route_req(m1(), clkp_grstb_out.rect, m1(), clkp_grstb_in.rect, "clkp_grst_b"),
+            route_req(m1(), wlend_out.rect, m1(), wlend_in.rect, "wlend"),
+            route_req(m1(), wlen_out, m1(), wlen_pin, "wlen"),
+            route_req(m1(), saen_out.rect, m2(), saen_pin, "saen"),
+            route_req(m2(), wrdrven_pin, m1(), wrdrven_out.rect, "wrdrven"),
+            route_req(m1(), rbl_pin, m1(), rbl_in.rect, "rbl"),
+            route_req(m1(), wrdrven_set_out.rect, m1(), wrdrven_set_in.rect, "wrdrven_set_b"),
+            route_req(
+                m1(),
+                wlen_rst_decoderd_out.rect,
+                m1(),
+                wlen_rst_decoderd_in.rect,
+                "wlen_rst_decoderd",
+            ),
+        ],
+    ]);
+    let routed = route(RouterJob {
+        grid: g,
+        ops: std::flatten([
+            occupy(m1(), vss_stub, "vss"),
+            std::flatten([
+                blockages(tap0),
+                blockages(reset_inv),
+                blockages(tap1),
+                blockages(clk_delay),
+                blockages(tap2),
+                blockages(clk_gate),
+                blockages(tap3),
+                blockages(clk_pulse),
+                blockages(tap4),
+                blockages(clk_pulse_buf),
+                blockages(tap5),
+                blockages(clk_pulse_inv),
+                blockages(tap6),
+                blockages(inv_rbl),
+                blockages(tap7),
+                blockages(tap8),
+                blockages(clkp_delay),
+                blockages(tap9),
+                blockages(clkpd_inv),
+                blockages(tap10),
+                blockages(clkpd_delay),
+                blockages(tap11),
+                blockages(mux_wlen_rst),
+                blockages(tap12),
+                blockages(decoder_replica_delay),
+                blockages(tap13),
+                blockages(wl_ctl),
+                blockages(tap14),
+                blockages(tap15),
+                blockages(inv_we),
+                blockages(tap16),
+                blockages(wlen_grst),
+                blockages(tap17),
+                blockages(pc_set),
+                blockages(tap18),
+                blockages(wrdrven_grst),
+                blockages(tap19),
+                blockages(clkp_grst),
+                blockages(tap20),
+                blockages(nand_sense_en),
+                blockages(tap21),
+                blockages(nand_wlendb_web),
+                blockages(tap22),
+                blockages(and_wlen),
+                blockages(tap23),
+                blockages(rwl_buf),
+                blockages(tap24),
+                blockages(tap25),
+                blockages(saen_ctl),
+                blockages(tap26),
+                blockages(wrdrven_set),
+                blockages(tap27),
+                blockages(wrdrven_set_delay),
+                blockages(tap28),
+                blockages(wrdrven_ctl),
+                blockages(tap29),
+                blockages(tap30),
+                blockages(decoder_replica),
+                blockages(tap31),
+                blockages(pc_ctl),
+                blockages(tap32),
+                blockages(pc_b_buf),
+                blockages(tap33),
+            ]),
+            pin_ops,
+            access_ops,
+            routes,
+        ]),
+        pin_layer: m2(),
+        edge_nets: ["clk", "ce", "we", "rstb", "pc_b", "rbl", "wlen"],
+    });
+    draw_routes(routed);
+
+    pub let clk = pin("clk", "met1.pin", "met1.label", clk_pin);
+    pub let ce = pin("ce", "met1.pin", "met1.label", ce_pin);
+    pub let we = pin("we", "met1.pin", "met1.label", we_pin);
+    pub let rstb = pin("rstb", "met1.pin", "met1.label", rstb_pin);
+    pub let pc_b = pin("pc_b", "met1.pin", "met1.label", pc_b_pin);
+    pub let rbl = pin("rbl", "met1.pin", "met1.label", rbl_pin);
+    pub let wrdrven = pin("wrdrven", "met2.pin", "met2.label", wrdrven_pin);
+    pub let saen = pin("saen", "met2.pin", "met2.label", saen_pin);
+    pub let wlen = pin("wlen", "met1.pin", "met1.label", wlen_pin);
+    pub let rwl = pin("rwl", "met2.pin", "met2.label", rwl_pin);
 }

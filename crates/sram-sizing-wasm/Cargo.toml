@@ -1,0 +1,17 @@
+[package]
+name = "argon-sram-sizing-wasm"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+description = "The SRAM sizer as a WebAssembly module for examples/sram"
+
+[lib]
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+argon-guest = { path = "../guest" }
+argon-sram-sizing = { path = "../sram-sizing", features = ["serde"] }

@@ -61,7 +61,11 @@ cell strong_arm(
     let input = pair(mos(n, input_w, nf_low), middle(nf_low));
     eq(input[0].g.y0, t.d.y1 + 155.);
     implant(n, input);
-    let input_top = if fold { pair(mos(n, input_w, input_nf / 2), middle(input_nf / 2)) } else { input };
+    let input_top = if fold {
+        pair(mos(n, input_w, input_nf / 2), middle(input_nf / 2))
+    } else {
+        input
+    };
     if fold {
         eq(input_top[0].g.y0, input[0].d.y1 + 155.);
         implant(n, input_top);
@@ -82,7 +86,10 @@ cell strong_arm(
     implant(!n, rst_out);
     implant(!n, rst_mid);
 
-    let half = std::max(std::max(std::max(t.sdm.x1, input[1].sdm.x1), latch[1].sdm.x1), std::max(latch_rst[1].sdm.x1, rst_mid[1].sdm.x1));
+    let half = std::max(
+        std::max(std::max(t.sdm.x1, input[1].sdm.x1), latch[1].sdm.x1),
+        std::max(latch_rst[1].sdm.x1, rst_mid[1].sdm.x1),
+    );
     let ev_tap = inst(rail(!n, 2. * half - 260.), x=0.);
     eq(ev_tap.m1.y1 + 205., t.g.y0);
     let rs_tap = inst(rail(n, 2. * half - 260.), x=0.);
@@ -97,7 +104,13 @@ cell strong_arm(
     // gates in turn; then an input below and an output above; then the input
     // pair's drain.
     via1(t.g, 0.);
-    let clk_bar = rect("met1.drawing", x0=rst_out[0].g.x0, x1=rst_out[1].g.x1, y0=rst_out[0].g.y0, y1=rst_out[0].g.y1);
+    let clk_bar = rect(
+        "met1.drawing",
+        x0=rst_out[0].g.x0,
+        x1=rst_out[1].g.x1,
+        y0=rst_out[0].g.y0,
+        y1=rst_out[0].g.y1,
+    );
     via1(clk_bar, 0.);
     trunk(0., t.g, clk_bar);
     for i in [0, 1] {
@@ -188,7 +201,13 @@ fn flipped_pair(c: Any, x0: Float) -> [Any] {
 
 /// Fills the implant across a pair of devices.
 fn implant(nfet: Bool, p: [Any]) {
-    rect(if nfet { "nsdm.drawing" } else { "psdm.drawing" }, x0=p[0].sdm.x0, x1=p[1].sdm.x1, y0=p[0].sdm.y0, y1=p[0].sdm.y1);
+    rect(
+        if nfet { "nsdm.drawing" } else { "psdm.drawing" },
+        x0=p[0].sdm.x0,
+        x1=p[1].sdm.x1,
+        y0=p[0].sdm.y0,
+        y1=p[0].sdm.y1,
+    );
 }
 
 /// A tap `w` wide, centered on x = 0 and strapped with met1.
@@ -213,7 +232,13 @@ fn via1(bar: Rect, x: Float) {
 
 /// Extends `bar` on met1 to reach `x`, with a via1 up to a trunk there.
 fn hook(bar: Rect, x: Float) {
-    rect("met1.drawing", x0=std::min(bar.x0, x - 130.), x1=std::max(bar.x1, x + 130.), y0=bar.y0, y1=bar.y1);
+    rect(
+        "met1.drawing",
+        x0=std::min(bar.x0, x - 130.),
+        x1=std::max(bar.x1, x + 130.),
+        y0=bar.y0,
+        y1=bar.y1,
+    );
     via1(bar, x);
 }
 
@@ -228,7 +253,13 @@ fn cross(x0: Float, x1: Float, y: Float) -> Rect {
         rect("via2.drawing", x0=x - 100., y0=y - 100., w=200., h=200.);
         rect("met2.drawing", x0=x - 140., y0=y - 185., w=280., h=370.);
     }
-    rect("met3.drawing", x0=std::min(x0, x1) - 165., x1=std::max(x0, x1) + 165., y0=y - 165., h=330.)
+    rect(
+        "met3.drawing",
+        x0=std::min(x0, x1) - 165.,
+        x1=std::max(x0, x1) + 165.,
+        y0=y - 165.,
+        h=330.,
+    )
 }
 
 /// Labels a port with a pin at the center of a shape.

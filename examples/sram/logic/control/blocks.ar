@@ -3,6 +3,8 @@
 // VGND at y = 0 and exports its outline and signal pins.
 
 use std::layout::{crect, inst, rect};
+use lib::logic::router;
+use lib::logic::control::cells;
 
 fn row_h() -> Float { 3330. }
 fn tap_w() -> Float { 960. }
@@ -39,25 +41,25 @@ fn inv_chain_w(n: Int) -> Float {
 // Chain of `n` >= 2 inverters: 2x stages followed by one 4x stage, joined by li1.
 // SVT chains use SVT inverters, whose pins match the LVT cells.
 cell inv_chain(n: Int, svt: Bool) {
-    let inv2 = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_2(), x=0., y=0., construction=true);
-    let inv4 = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_4(), x=0., y=0., construction=true);
+    let inv2 = inst(cells::sky130_fd_sc_hs__inv_2(), x=0., y=0., construction=true);
+    let inv4 = inst(cells::sky130_fd_sc_hs__inv_4(), x=0., y=0., construction=true);
     for i in std::range(n) {
         let x = inv_chain_x(i);
         if i == n - 1 {
             if svt {
-                inst(lib::logic::control::cells::sramgen_svt_inv_4(), x=x, y=0.);
+                inst(cells::sramgen_svt_inv_4(), x=x, y=0.);
             } else {
-                inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_4(), x=x, y=0.);
+                inst(cells::sky130_fd_sc_hs__inv_4(), x=x, y=0.);
             }
         } else {
             if svt {
-                inst(lib::logic::control::cells::sramgen_svt_inv_2(), x=x, y=0.);
+                inst(cells::sramgen_svt_inv_2(), x=x, y=0.);
             } else {
-                inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_2(), x=x, y=0.);
+                inst(cells::sky130_fd_sc_hs__inv_2(), x=x, y=0.);
             }
         }
         if i % 7 == 6 && i < n - 1 {
-            inst(lib::logic::control::cells::sky130_fd_sc_hs__tap_2(), x=x + 1440., y=0.);
+            inst(cells::sky130_fd_sc_hs__tap_2(), x=x + 1440., y=0.);
         }
     }
     // Each jumper spans the driver output and the next input on a 170 nm band
@@ -67,12 +69,41 @@ cell inv_chain(n: Int, svt: Bool) {
         let a_x1 = if last { inv4.a.x1 } else { inv2.a.x1 };
         let a_cy = if last { (inv4.a.y0 + inv4.a.y1) / 2. } else { (inv2.a.y0 + inv2.a.y1) / 2. };
         let y0 = ((a_cy - 85.) / 10.) as Int as Float * 10.;
-        rect("li1.drawing", x0=inv_chain_x(i) + inv2.out.x0, y0=y0, x1=inv_chain_x(i + 1) + a_x1, y1=y0 + 170.);
+        rect(
+            "li1.drawing",
+            x0=inv_chain_x(i) + inv2.out.x0,
+            y0=y0,
+            x1=inv_chain_x(i + 1) + a_x1,
+            y1=y0 + 170.,
+        );
     }
     let x_last = inv_chain_x(n - 1);
-    pub let din = crect(layer="li1.drawing", x0=inv2.a.x0, y0=inv2.a.y0, x1=inv2.a.x1, y1=inv2.a.y1);
-    pub let dout = crect(layer="li1.drawing", x0=x_last + inv4.out.x0, y0=inv4.out.y0, x1=x_last + inv4.out.x1, y1=inv4.out.y1);
-    let outline = crect(x0=0., y0=0., x1=inv_chain_w(n), y1=row_h());
+    // Supply ports: every inverter's rail, merged in order; the taps' are not exposed.
+    pub let vdd_port = router::merge_rects([for i in std::range(n) {
+        shifted(if i == n - 1 { inv4.vpwr } else { inv2.vpwr }, inv_chain_x(i))
+    }]);
+    pub let vss_port = router::merge_rects([for i in std::range(n) {
+        shifted(if i == n - 1 { inv4.vgnd } else { inv2.vgnd }, inv_chain_x(i))
+    }]);
+    pub let din = crect(
+        layer="li1.drawing",
+        x0=inv2.a.x0,
+        y0=inv2.a.y0,
+        x1=inv2.a.x1,
+        y1=inv2.a.y1,
+    );
+    pub let dout = crect(
+        layer="li1.drawing",
+        x0=x_last + inv4.out.x0,
+        y0=inv4.out.y0,
+        x1=x_last + inv4.out.x1,
+        y1=inv4.out.y1,
+    );
+    crect(x0=0., y0=0., x1=inv_chain_w(n), y1=row_h());
+}
+
+fn shifted(l: [Rect], dx: Float) -> [Rect] {
+    [for r in l { crect(x0=r.x0 + dx, y0=r.y0, x1=r.x1 + dx, y1=r.y1) }]
 }
 
 fn edge_detector_invs() -> Int { 9 }
@@ -84,7 +115,13 @@ fn edge_detector_w() -> Float {
 // Rising-edge pulse generator: AND of the input and its delayed complement.
 cell edge_detector() {
     let chain = inst(inv_chain(edge_detector_invs(), false), x=0., y=0.);
-    let and2 = inst(lib::logic::control::cells::sky130_fd_sc_hs__and2_4(), x=edge_detector_w(), y=0., reflect=true, angle=180);
+    let and2 = inst(
+        cells::sky130_fd_sc_hs__and2_4(),
+        x=edge_detector_w(),
+        y=0.,
+        reflect=true,
+        angle=180,
+    );
 
     let din_cx = (chain.din.x0 + chain.din.x1) / 2.;
     let din_cy = (chain.din.y0 + chain.din.y1) / 2.;
@@ -98,7 +135,9 @@ cell edge_detector() {
 
     pub let din = chain.din;
     pub let out = and2.out;
-    let outline = crect(x0=0., y0=0., x1=edge_detector_w(), y1=row_h());
+    pub let vdd_port = router::merge_rects([chain.vdd_port, and2.vpwr]);
+    pub let vss_port = router::merge_rects([chain.vss_port, and2.vgnd]);
+    crect(x0=0., y0=0., x1=edge_detector_w(), y1=row_h());
 }
 
 fn sr_latch_w() -> Float { 21120. }
@@ -106,12 +145,31 @@ fn sr_latch_inverters_x() -> Float { 18240. }
 
 // Cross-coupled NAND2 SR latch with active-low set and reset and buffered outputs.
 cell sr_latch() {
-    let nand_set = inst(lib::logic::control::cells::sky130_fd_sc_hs__nand2_8(), x=0., y=0.);
-    inst(lib::logic::control::cells::sky130_fd_sc_hs__tap_2(), x=8160., y=0.);
-    let nand_reset = inst(lib::logic::control::cells::sky130_fd_sc_hs__nand2_8(), x=17280., y=0., reflect=true, angle=180);
-    inst(lib::logic::control::cells::sky130_fd_sc_hs__tap_2(), x=17280., y=0.);
-    let q_inv = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_2(), x=sr_latch_inverters_x(), y=0.);
-    let qb_inv = inst(lib::logic::control::cells::sky130_fd_sc_hs__inv_2(), x=sr_latch_inverters_x() + 1440., y=0.);
+    let nand_set = inst(cells::sky130_fd_sc_hs__nand2_8(), x=0., y=0.);
+    let tap_a = inst(cells::sky130_fd_sc_hs__tap_2(), x=8160., y=0.);
+    let nand_reset = inst(
+        cells::sky130_fd_sc_hs__nand2_8(),
+        x=17280.,
+        y=0.,
+        reflect=true,
+        angle=180,
+    );
+    let tap_b = inst(cells::sky130_fd_sc_hs__tap_2(), x=17280., y=0.);
+    // The output inverters' rails are not part of the supply ports.
+    pub let vdd_port = router::merge_rects([
+        nand_set.vpwr,
+        tap_a.vpwr,
+        nand_reset.vpwr,
+        tap_b.vpwr,
+    ]);
+    pub let vss_port = router::merge_rects([
+        nand_set.vgnd,
+        tap_a.vgnd,
+        nand_reset.vgnd,
+        tap_b.vgnd,
+    ]);
+    let q_inv = inst(cells::sky130_fd_sc_hs__inv_2(), x=sr_latch_inverters_x(), y=0.);
+    let qb_inv = inst(cells::sky130_fd_sc_hs__inv_2(), x=sr_latch_inverters_x() + 1440., y=0.);
 
     // q0 drives the reset NAND and the qb inverter.
     let q0 = li_m1_contact((nand_set.out.x0 + nand_set.out.x1) / 2., nand_set.out.y0 - 245., true);
@@ -121,7 +179,11 @@ cell sr_latch() {
     m1_elbow(q0, q0.x1, (q0_inv.x0 + q0_inv.x1) / 2., (q0_inv.y0 + q0_inv.y1) / 2.);
 
     // q0b drives the set NAND and the q inverter.
-    let q0b = li_m1_contact((nand_reset.out.x0 + nand_reset.out.x1) / 2., nand_reset.out.y1 - 15., true);
+    let q0b = li_m1_contact(
+        (nand_reset.out.x0 + nand_reset.out.x1) / 2.,
+        nand_reset.out.y1 - 15.,
+        true,
+    );
     let q0b_set = li_m1_contact(nand_set.a.x0 + 145., nand_set.a.y1 - 115., true);
     let q0b_inv = li_m1_contact(q_inv.a.x0 + 145., q_inv.a.y1 - 155., true);
     m1_elbow(q0b, q0b.x0, (q0b_set.x0 + q0b_set.x1) / 2., (q0b_set.y0 + q0b_set.y1) / 2.);
@@ -131,5 +193,5 @@ cell sr_latch() {
     pub let rb = nand_reset.b;
     pub let q = q_inv.out;
     pub let qb = qb_inv.out;
-    let outline = crect(x0=0., y0=0., x1=sr_latch_w(), y1=row_h());
+    crect(x0=0., y0=0., x1=sr_latch_w(), y1=row_h());
 }

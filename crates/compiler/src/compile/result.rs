@@ -57,6 +57,12 @@ pub enum StaticErrorKind {
     /// A native item was used as a value rather than called.
     #[error("`{name}` can only be called")]
     NativeNotCallable { name: String },
+    /// An `extern` function's parameter or result has a type that cannot be
+    /// passed to or from WebAssembly.
+    #[error(
+        "an extern function cannot take or return `{ty}`; use `Int`, `Float`, `Bool`, `String`, `()`, or sequences, tuples, and non-generic structs of them"
+    )]
+    UnsupportedExternType { ty: String },
     /// A field that holds a function was read through an instance.
     #[error(
         "field `{field}` of cell `{cell}` holds a {kind}, which cannot be read through an instance"
@@ -312,8 +318,8 @@ pub enum StaticErrorKind {
     /// A referenced module does not exist in the loaded workspace.
     #[error("module `{module}` does not exist or could not be loaded")]
     InvalidMod { module: String },
-    /// A `use` path names an item that does not exist in the target module.
-    #[error("unresolved import `{path}`")]
+    /// A `use` path names neither a module nor an item of its module.
+    #[error("unresolved import `{path}`: no module or item has this path")]
     UnresolvedImport { path: String },
     /// Module references form a dependency cycle.
     #[error("cyclic module dependency: {cycle}")]
@@ -510,6 +516,13 @@ pub enum ExecErrorKind {
     /// A float computation produced a NaN or an infinity.
     #[error("expression is not a finite number (check for division by zero)")]
     NonFiniteValue,
+    /// An `extern` function failed or returned a value of the wrong type.
+    #[error("extern function `{function}` failed: {message}")]
+    ExternCall { function: String, message: String },
+    /// An `extern` function call was stopped, because a later compile
+    /// replaced this one.
+    #[error("extern function `{function}` was cancelled")]
+    ExternCallCancelled { function: String },
     /// An integer division or remainder had a zero divisor.
     #[error("integer {0} by zero")]
     DivideByZero(String),
@@ -549,6 +562,9 @@ pub enum ExecErrorKind {
     /// A placeholder read through an instance was used.
     #[error("{0}")]
     DetachedValue(Arc<Detached>),
+    /// `std::layout::route_tracks` could not route its nets.
+    #[error("routing failed: {0}")]
+    Routing(String),
 }
 
 /// The message of [`StaticErrorKind::SignalCellParam`].
@@ -740,6 +756,16 @@ pub enum CompileOutput {
     StaticErrors(StaticErrorCompileOutput),
     ExecErrors(ExecErrorCompileOutput),
     Valid(CompiledData),
+}
+
+impl CompileOutput {
+    /// Whether an `extern` call was cancelled, so the output says nothing
+    /// about the program.
+    pub fn was_cancelled(&self) -> bool {
+        matches!(self, Self::ExecErrors(output) if output.errors.iter().any(|error| {
+            matches!(error.kind, ExecErrorKind::ExternCallCancelled { .. })
+        }))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

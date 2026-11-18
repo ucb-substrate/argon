@@ -64,6 +64,7 @@ const sidebars: SidebarsConfig = {
     'language/schematic',
     'language/schematic-drawing',
     'language/modules-manifests',
+    'language/extern-functions',
     'language/technology',
     {
       type: 'category',

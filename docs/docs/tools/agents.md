@@ -155,14 +155,14 @@ A connectivity problem names the shapes on each side, and for a short, the chain
 latch(1000., 2, 2000., 2): 3.41 × 4.99 µm = 17.02 µm², (-1705, -545) to (1705, 4445); 13 shapes, 2 instances in the top cell
   nets: 1 connectivity problem (warnings; LVS would fail):
     short in latch: `outp`, `outn` are one net
-      outp: met1.drawing (-575, 1000) to (-285, 1900): lib.ar:118:5, called from lib.ar:39:5
-      outn: met1.drawing (285, 1000) to (575, 1900): lib.ar:118:5, called from lib.ar:40:5
+      outp: met1.drawing (-575, 1000) to (-285, 1900): lib.ar:142:5, called from lib.ar:45:5
+      outn: met1.drawing (285, 1000) to (575, 1900): lib.ar:142:5, called from lib.ar:46:5
       joined by, from `outp` to `outn`:
-        met1.drawing (-575, 1000) to (-285, 1900): lib.ar:61:19 in halves[1]
-        via.drawing (-505, 1085) to (-355, 1235): <argon-std>/layout.ar:20:30, called from lib.ar:36:5
-        met2.drawing (-930, 1090) to (500, 1230): lib.ar:105:5, called from lib.ar:35:5
-        via.drawing (355, 1085) to (505, 1235): <argon-std>/layout.ar:20:30, called from lib.ar:34:5
-        met1.drawing (285, 1000) to (575, 1900): lib.ar:61:19 in halves[0]
+        met1.drawing (-575, 1000) to (-285, 1900): lib.ar:67:19 in halves[1]
+        via.drawing (-505, 1085) to (-355, 1235): <argon-std>/layout.ar:20:30, called from lib.ar:42:5
+        met2.drawing (-930, 1090) to (500, 1230): lib.ar:117:5, called from lib.ar:41:5
+        via.drawing (355, 1085) to (505, 1235): <argon-std>/layout.ar:20:30, called from lib.ar:40:5
+        met1.drawing (285, 1000) to (575, 1900): lib.ar:67:19 in halves[0]
 ```
 
 In a summary of several cells, a cell with connectivity problems is listed in full.

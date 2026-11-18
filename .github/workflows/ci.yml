@@ -63,11 +63,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install protoc
-        uses: taiki-e/install-action@v2
-        with:
-          tool: protoc
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -97,15 +92,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install protoc
-        uses: taiki-e/install-action@v2
-        with:
-          tool: protoc
-
+      # The SRAM sizer test builds a WebAssembly module.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
+          targets: wasm32-unknown-unknown
 
       - name: Install Neovim
         uses: rhysd/action-setup-vim@v1
@@ -138,11 +130,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install protoc
-        uses: taiki-e/install-action@v2
-        with:
-          tool: protoc
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -211,11 +198,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
-      - name: Install protoc
-        uses: taiki-e/install-action@v2
-        with:
-          tool: protoc
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

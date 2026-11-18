@@ -89,8 +89,11 @@ fn pin(name: String, r: Rect) {
 - `inst(cell: Cell, reflect?, angle?, x?, y?, xi?, yi?, construction?) -> Inst`: Places a cell in the current scope.
 - `bbox(value: Cell | Inst | Rect) -> Rect`: Returns the bounding box of a cell, a placed instance, or a rectangle, as a construction rectangle.
 - `bbox_of(items: [Any]) -> Rect`: Returns the bounding box of a non-empty sequence of instances or rectangles.
+- `shapes(value: Cell | Inst, layer: String) -> [Rect]`: Returns the bounding rectangle of every shape on one layer of a cell or a placed instance, through all of its instances.
 - `row(insts: [Any], gap: Float) -> ()`: Places each instance <code>gap</code> right of the one before.
 - `column(insts: [Any], gap: Float) -> ()`: Places each instance <code>gap</code> above the one before.
+- `autoroute(area: Rect, layers: [RouteLayer], vias: [RouteVia], obstacles: [[Rect]], nets: [RouteNet]) -> [RoutedNet]`: Routes nets between their pins and draws the wires, pin stubs, and vias.
+- `route_tracks(area: Rect, layers: [(Float, Float, Bool)], vias: [(Float, Float, (Float, Float), (Float, Float))], obstacles: [(Int, Rect)], nets: [(String, [(Int, Rect)])]) -> [([(Int, Rect)], [(Int, [Rect], Rect, Rect)], [(Int, Rect)])]`: Routes nets as <code>autoroute</code> does and returns the geometry without drawing it.
 - `dimension(p: Float, n: Float, value: Float, coord: Float, pstop: Float, nstop: Float, horizontal: Bool) -> ()`: Adds an equality constraint together with the dimension label the GUI draws for it.
 - `rule(name: String) -> Float`: Reads a design rule's value, such as <code>"met1.space"</code>, from the technology file.
 - `via(bot: Rect, top: Rect) -> Rect`: Draws the largest array of cuts that fits where two shapes on adjacent layers overlap, with the enclosures the technology file requires.

@@ -56,6 +56,7 @@ Arithmetic: `+`, `-`, `*`, `/`, and `%`. Comparison: `==`, `!=`, `<`, `<=`, `>`,
 - `%` takes `Int`s. `Int` division and `%` truncate toward zero, so `-7 / 2` is `-3` and `-7 % 2` is `-1`.
 - `as Int` truncates toward zero too, so `-0.5 as Int` is `0`.
 - `==` and `!=` reject `Float`s, with the error `cannot compare equality or inequality of floating point numbers`. Compare floats with `<`, `<=`, `>`, and `>=`.
+- A `Float` comparison uses exact values, not values snapped to the grid, and waits until the solver has fixed both sides. Values within floating-point noise of each other compare equal, so `0.1 + 0.2 >= 0.3` holds.
 - [`String`s](/language/types/scalars#string) compare with `==` and `!=` only, and `+` joins two of them.
 
 ```argon

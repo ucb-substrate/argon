@@ -603,7 +603,7 @@ impl State {
             .gui_connection()
             .await
             .ok_or("The GUI is not connected.")?;
-        let snapshot = connection.snapshot.lock().await.clone();
+        let snapshot = connection.snapshot.lock().await.snapshot.clone();
         match snapshot {
             Some(snapshot) if snapshot.revision == base_revision => Ok((workspace_ast, snapshot)),
             _ => Err(STALE_SNAPSHOT_MESSAGE),
@@ -2022,6 +2022,71 @@ cell top() { let a = inst(leaf(), x=0., y=0.); }
             received.data().unwrap().geometry_digest(),
             edited.data().unwrap().geometry_digest()
         );
+    }
+
+    #[test]
+    fn decoded_spans_share_their_source_paths() {
+        use super::{CompilationSnapshot, CompilationUpdate, CompressedCompilationUpdate};
+        use argonc::compile::SolvedValue;
+        use std::sync::Arc;
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.ar");
+        std::fs::write(
+            &source,
+            r#"
+use std::layout::{inst, rect};
+cell leaf() { let r = rect("met1", x0=0., y0=0., x1=10., y1=5.); }
+cell top() {
+    let a = inst(leaf(), x=0., y=0.);
+    let b = rect("met2", x0=0., y0=0., x1=3., y1=3.);
+}
+"#,
+        )
+        .unwrap();
+        let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/tech/basic.tech.toml"),
+        ));
+        let mut compiler = argonc::incremental::IncrementalCompiler::new();
+        let sent = CompilationSnapshot {
+            revision: 1,
+            output: compiler.compile_cell(&config, &["top".into()], vec![]),
+        };
+        let update = CompilationUpdate::new(sent.clone(), None);
+        let received = CompressedCompilationUpdate::encode(&update)
+            .unwrap()
+            .decode()
+            .unwrap()
+            .materialize(None)
+            .unwrap();
+        let spans = |snapshot: &CompilationSnapshot| {
+            let data = snapshot.data().unwrap();
+            data.cells
+                .values()
+                .flat_map(|cell| {
+                    let emits = cell
+                        .scopes
+                        .values()
+                        .flat_map(|scope| scope.emit.iter().map(|(_, emit)| emit.span.clone()));
+                    let objects = cell.objects.values().filter_map(|object| match object {
+                        SolvedValue::Rect(rect) => rect.span.clone(),
+                        SolvedValue::Instance(instance) => Some(instance.span.clone()),
+                        _ => None,
+                    });
+                    emits.chain(objects).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let received_spans = spans(&received);
+        assert_eq!(received_spans, spans(&sent));
+        assert!(received_spans.len() >= 4);
+        for span in &received_spans {
+            let first = received_spans
+                .iter()
+                .find(|other| other.path == span.path)
+                .unwrap();
+            assert!(Arc::ptr_eq(&span.path, &first.path));
+        }
     }
 
     #[test]

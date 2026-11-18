@@ -1724,6 +1724,7 @@ fn format_field(data: &CompiledData, cell: &CompiledCell, value: &FieldValue) ->
         FieldValue::SchematicInst { .. } => "a schematic instance".to_owned(),
         FieldValue::Device { kind, .. } => format!("a {kind:?} device"),
         FieldValue::Detached(_) => "a detached value".to_owned(),
+        FieldValue::Plain(plain) => format_field(data, cell, &plain.to_field()),
         FieldValue::Poison => "no value; its error is reported above".to_owned(),
         FieldValue::Unreadable(kind) => format!("a {kind}"),
     }
@@ -2159,7 +2160,7 @@ mod tests {
         .unwrap();
         for expected in [
             "li.1 (1.75, 1.5) to (1.8, 1.6) µm in inv:\n".to_owned(),
-            "  li1.drawing (1700, 1400) to (1870, 2250): lib.ar:33:19\n".to_owned(),
+            "  li1.drawing (1700, 1400) to (1870, 2250): lib.ar:51:19\n".to_owned(),
             format!(
                 "(0.6, 1) to (0.7, 1.1) µm in inv: (no layer in the technology matches `COREID`)\n  diff.drawing (-285, 130) to (1725, 1130): {}:16:16; in nmos (lib.ar:5:20)\n",
                 pdk.display()

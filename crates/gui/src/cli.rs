@@ -82,6 +82,10 @@ struct SshArgs {
 struct GuiArgs {
     /// Analyzer RPC address to connect to.
     lang_server_addr: SocketAddr,
+
+    /// Run the scripted GUI benchmark described by this JSON file, then exit.
+    #[arg(long, value_name = "CONFIG")]
+    bench: Option<PathBuf>,
 }
 
 pub fn run() -> ExitCode {
@@ -134,7 +138,12 @@ fn session_token(lang_server_addr: SocketAddr) -> Result<SessionToken> {
 
 fn run_gui(args: GuiArgs) -> Result<ExitStatus> {
     let token = session_token(args.lang_server_addr)?;
-    crate::run_gui(args.lang_server_addr, token);
+    let bench = args
+        .bench
+        .as_deref()
+        .map(crate::bench::BenchConfig::load)
+        .transpose()?;
+    crate::run_gui(args.lang_server_addr, token, bench);
     Ok(success_status())
 }
 

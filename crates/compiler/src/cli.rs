@@ -42,6 +42,10 @@ struct Args {
     #[arg(long = "gds-import", value_parser = parse_gds_import)]
     gds_imports: Vec<(String, PathBuf)>,
 
+    /// WASM module for `extern` functions in NAME=PATH form.
+    #[arg(long = "wasm-module", value_parser = parse_dependency)]
+    wasm_modules: Vec<(String, PathBuf)>,
+
     /// Binary compiler-output path. Defaults to lib.bin beside the root lib.ar.
     #[arg(short, long, requires = "cell")]
     output: Option<PathBuf>,
@@ -153,11 +157,18 @@ fn execute(args: Args) -> Result<(), Failed> {
             return Err(fail(format, format!("duplicate GDS import `{name}`")));
         }
     }
+    names.clear();
+    for (name, _) in &args.wasm_modules {
+        if !names.insert(name) {
+            return Err(fail(format, format!("duplicate WASM module `{name}`")));
+        }
+    }
 
     let workspace = WorkspaceConfig::new(&root)
         .with_dependencies(args.dependencies.clone())
         .with_tech(args.tech.clone())
-        .with_gds_imports(args.gds_imports.clone());
+        .with_gds_imports(args.gds_imports.clone())
+        .with_wasm_modules(args.wasm_modules.clone());
     let sources = driver::Sources::new();
     if args.check {
         let diagnostics = driver::check(&workspace, &sources);
@@ -377,6 +388,7 @@ mod tests {
             tech: None,
             dependencies: Vec::new(),
             gds_imports: Vec::new(),
+            wasm_modules: Vec::new(),
             output: None,
             gds: None,
             gds_only: false,
@@ -395,6 +407,7 @@ mod tests {
             tech: Some(tech),
             dependencies: Vec::new(),
             gds_imports: Vec::new(),
+            wasm_modules: Vec::new(),
             output: None,
             gds: None,
             gds_only: false,
@@ -645,9 +658,10 @@ cell device(enabled: Bool, w: Float, count: Int) {
 }
 "#,
         );
+        let output = source.with_extension("bin");
         let mut args = execution_args(source, "devices::device(true, 150., 5)", basic_tech());
         args.dependencies.push(("devices".to_owned(), dependency));
-        args.output = Some(std::env::temp_dir().join("argonc-bool.bin"));
+        args.output = Some(output);
         assert!(execute(args).is_ok());
     }
 
@@ -1061,9 +1075,10 @@ cell device(enabled: Bool, w: Float, count: Int) {
             "invalid-argument-dependency",
             "cell device(enabled: Bool, w: Float, count: Int) {}\n",
         );
+        let output = source.with_extension("bin");
         let mut args = execution_args(source, "devices::device(1, 150., 5)", basic_tech());
         args.dependencies.push(("devices".to_owned(), dependency));
-        args.output = Some(std::env::temp_dir().join("argonc-invalid-argument.bin"));
+        args.output = Some(output);
         let diagnostic = render_failed(failed(args));
         assert!(
             diagnostic.contains("expected type Bool, found Int"),

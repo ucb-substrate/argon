@@ -27,5 +27,11 @@ fn is_round(s: Shape) -> Bool {
 cell top() {
     let shapes = cons(Shape::Circle(50.), cons(Shape::Box(300., 20.), cons(Shape::Empty, [])));
     let layer = if is_round(head(shapes)) { "met1" } else { "met2" };
-    let r = rect(layer, x0=0., y0=0., w=width(head(shapes)) + width(std::last(tail(shapes))), h=width(head(tail(shapes))));
+    let r = rect(
+        layer,
+        x0=0.,
+        y0=0.,
+        w=width(head(shapes)) + width(std::last(tail(shapes))),
+        h=width(head(tail(shapes))),
+    );
 }

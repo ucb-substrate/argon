@@ -17,6 +17,7 @@ mod parser;
 pub mod solver;
 pub mod tech;
 mod via_array;
+pub mod wasm;
 pub mod workspace;
 
 pub use workspace::WorkspaceConfig;
@@ -500,15 +501,22 @@ mod tests {
         BENCH_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Runs `f` `reps` times, returning the minimum wall-clock time (robust to
-    /// noise on a shared machine), the maximum peak heap growth observed during
-    /// a run, and the result of the final run.
+    /// Runs `f` once untimed, then at least `max(reps, 5)` times and until the
+    /// timed runs total 50 ms, returning the minimum wall-clock time, the
+    /// maximum peak heap growth observed during a run, and the final result.
     fn measure<R>(reps: u32, f: impl Fn() -> R) -> (std::time::Duration, usize, R) {
+        const MIN_REPS: u32 = 5;
+        const MIN_TOTAL: std::time::Duration = std::time::Duration::from_millis(50);
+        const MAX_REPS: u32 = 1000;
         assert!(reps >= 1);
+        drop(f());
         let mut best = std::time::Duration::MAX;
         let mut peak = 0usize;
         let mut result = None;
-        for _ in 0..reps {
+        let mut total = std::time::Duration::ZERO;
+        let mut runs = 0;
+        while runs < reps.max(MIN_REPS) || (total < MIN_TOTAL && runs < MAX_REPS) {
+            runs += 1;
             // Free the previous run's result so each measurement starts from
             // the same baseline.
             drop(result.take());
@@ -516,7 +524,9 @@ mod tests {
             let base = crate::bench_alloc::live();
             let start = std::time::Instant::now();
             let r = f();
-            best = best.min(start.elapsed());
+            let elapsed = start.elapsed();
+            best = best.min(elapsed);
+            total += elapsed;
             peak = peak.max(crate::bench_alloc::peak().saturating_sub(base));
             result = Some(r);
         }
@@ -1946,6 +1956,30 @@ mod tests {
     }
 
     #[test]
+    fn typed_modules_have_span_indexes_only_when_parsed_ones_do() {
+        let source = "fn f(x: Float) -> Float { g(x) }\nfn g(x: Float) -> Float { x }";
+        let parse = || parse_source_text(source, PathBuf::from("/virtual/lib.ar")).unwrap();
+        let indexed = IndexMap::from([(Vec::new(), parse())]);
+        let mut bare = indexed.clone();
+        bare[&Vec::new()].drop_span_indexes();
+        assert!(bare[&Vec::new()].span2call.is_empty());
+
+        let (typed, output) = static_compile(&indexed).unwrap();
+        assert!(output.errors.is_empty(), "{:#?}", output.errors);
+        assert!(typed[&Vec::new()].has_span_indexes());
+        assert!(!typed[&Vec::new()].span2call.is_empty());
+        let (typed_bare, output) = static_compile(&bare).unwrap();
+        assert!(output.errors.is_empty(), "{:#?}", output.errors);
+        assert!(!typed_bare[&Vec::new()].has_span_indexes());
+        assert!(typed_bare[&Vec::new()].span2scope.is_empty());
+        assert!(typed_bare[&Vec::new()].span2call.is_empty());
+        assert_eq!(
+            format!("{:?}", typed_bare[&Vec::new()].ast),
+            format!("{:?}", typed[&Vec::new()].ast)
+        );
+    }
+
+    #[test]
     fn use_imports_functions_and_supports_aliases() {
         use crate::ast::{Decl, Expr};
 
@@ -2015,6 +2049,274 @@ mod tests {
             output.errors[0].kind.to_string(),
             "module `missing` does not exist or could not be loaded"
         );
+    }
+
+    /// A workspace of `modules`, each a module path and its source, plus the
+    /// standard library.
+    fn module_workspace(modules: &[(&[&str], &str)]) -> crate::parse::WorkspaceParseAst {
+        let mut ast: crate::parse::WorkspaceParseAst = modules
+            .iter()
+            .map(|(module, source)| {
+                let file = if module.is_empty() {
+                    "lib".to_owned()
+                } else {
+                    module.join("/")
+                };
+                let path = PathBuf::from(format!("/virtual/{file}.ar"));
+                (
+                    module.iter().map(|name| name.to_string()).collect(),
+                    parse_source_text(*source, path).unwrap(),
+                )
+            })
+            .collect();
+        ast.extend(crate::parse::parse_std());
+        ast
+    }
+
+    /// The static errors of a workspace of `modules`.
+    fn module_errors(modules: &[(&[&str], &str)]) -> Vec<crate::compile::StaticError> {
+        let (_, output) = static_compile(&module_workspace(modules)).unwrap();
+        output.errors
+    }
+
+    const SHAPES: &str = "mod inner;\n\
+         struct Size { w: Float, h: Float, }\n\
+         enum Kind { Wide, Tall, }\n\
+         fn area(s: Size) -> Float { s.w * s.h }\n";
+    const INNER: &str = "fn scale() -> Float { 2. }\n";
+
+    #[test]
+    fn a_module_import_resolves_paths_through_the_module() {
+        let blocks = "use std::layout;\n\
+             use lib::shapes;\n\
+             use lib::shapes::inner as deep;\n\
+             use lib::shapes::{inner, Size};\n\
+             struct Pair { a: Size, b: Size, }\n\
+             fn pick(wide: Bool) -> Float {\n\
+                 let k = if wide { shapes::Kind::Wide } else { shapes::Kind::Tall };\n\
+                 match k { shapes::Kind::Wide => 10., shapes::Kind::Tall => 1., }\n\
+             }\n\
+             cell top() {\n\
+                 let p = Pair { a: shapes::Size { w: 2., h: 3. }, b: Size { w: 1., h: 1. } };\n\
+                 let a = shapes::area(p.a) * shapes::inner::scale() * deep::scale();\n\
+                 let x1 = a + inner::scale() + pick(true);\n\
+                 layout::rect(\"met1\", x0=0., y0=0., x1=x1, y1=1.);\n\
+             }\n";
+        let ast = module_workspace(&[
+            (&[], "mod shapes;\nmod blocks;\ncell top() {}\n"),
+            (&["shapes"], SHAPES),
+            (&["shapes", "inner"], INNER),
+            (&["blocks"], blocks),
+        ]);
+        let (_, output) = static_compile(&ast).unwrap();
+        assert!(output.errors.is_empty(), "{:#?}", output.errors);
+        let data = compile(
+            &ast,
+            CompileInput {
+                cell: &["lib", "blocks", "top"],
+                args: Vec::new(),
+            },
+        )
+        .unwrap_valid();
+        let rect = data.cells[&data.top]
+            .objects
+            .values()
+            .find_map(|object| object.get_rect())
+            .expect("the cell draws a rect");
+        assert_relative_eq!(rect.x1.0, 6. * 2. * 2. + 2. + 10., epsilon = EPSILON);
+    }
+
+    /// A local is never a path's first segment, so one of an enum type does
+    /// not hide a module import of the same name.
+    #[test]
+    fn a_module_import_is_not_hidden_by_a_local() {
+        let errors = module_errors(&[
+            (&[], "mod shapes;\nmod blocks;\n"),
+            (&["shapes"], SHAPES),
+            (&["shapes", "inner"], INNER),
+            (
+                &["blocks"],
+                "use lib::shapes;\nuse lib::shapes::Kind;\n\
+                 fn f(k: Kind) -> Float {\n\
+                     let shapes = k;\n\
+                     shapes::area(shapes::Size { w: 1., h: 1. }) + shapes::inner::scale()\n\
+                 }\n",
+            ),
+        ]);
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    /// Importing a module from a child does not make the child depend on the
+    /// module's parent, which would close a cycle through the root here.
+    #[test]
+    fn a_module_import_depends_only_on_the_imported_module() {
+        let errors = module_errors(&[
+            (
+                &[],
+                "mod shapes;\nmod blocks;\nfn f() -> Float { blocks::g() }\n",
+            ),
+            (&["shapes"], SHAPES),
+            (&["shapes", "inner"], INNER),
+            (
+                &["blocks"],
+                "use lib::shapes;\nfn g() -> Float { shapes::inner::scale() }\n",
+            ),
+        ]);
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    /// A path names both a module and an item of the same name, and the import
+    /// binds both.
+    #[test]
+    fn a_module_import_also_imports_an_item_of_the_same_name() {
+        let errors = module_errors(&[
+            (&[], "mod parts;\nmod blocks;\n"),
+            (&["parts"], "mod size;\nfn size() -> Float { 1. }\n"),
+            (&["parts", "size"], "fn twice() -> Float { 2. }\n"),
+            (
+                &["blocks"],
+                "use lib::parts::size;\nfn g() -> Float { size() + size::twice() }\n",
+            ),
+        ]);
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn a_module_import_applies_only_to_its_own_module() {
+        let errors = module_errors(&[
+            (&[], "mod shapes;\nmod a;\nmod b;\n"),
+            (&["shapes"], SHAPES),
+            (&["shapes", "inner"], INNER),
+            (
+                &["a"],
+                "use lib::shapes;\nfn f() -> Float { shapes::inner::scale() }\n",
+            ),
+            (
+                &["b"],
+                "fn g() -> Float { lib::a::shapes::inner::scale() }\n",
+            ),
+        ]);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [error] if matches!(&error.kind, StaticErrorKind::InvalidMod { module } if module == "a::shapes::inner")
+            ),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn module_imports_collide_like_item_imports() {
+        let collides = |blocks: &str| {
+            let errors = module_errors(&[
+                (&[], "mod shapes;\nmod other;\nmod blocks;\n"),
+                (&["shapes"], SHAPES),
+                (&["shapes", "inner"], INNER),
+                (&["other"], "mod inner;\n"),
+                (&["other", "inner"], INNER),
+                (&["blocks"], blocks),
+                (&["blocks", "inner"], INNER),
+            ]);
+            errors
+                .iter()
+                .map(|error| error.kind.to_string())
+                .collect::<Vec<_>>()
+        };
+        let duplicate = ["duplicate name declaration"];
+        // With a declaration, another import, or a child module of the same
+        // name.
+        assert_eq!(collides("use lib::shapes;\nfn shapes() {}\n"), duplicate);
+        assert_eq!(
+            collides("use lib::shapes::inner;\nuse lib::other::inner;\n"),
+            duplicate
+        );
+        assert_eq!(
+            collides("use lib::shapes::inner;\nuse lib::shapes::area as inner;\n"),
+            duplicate
+        );
+        assert_eq!(collides("mod inner;\nuse lib::shapes::inner;\n"), duplicate);
+        // `lib` and `std` always start an absolute path.
+        assert_eq!(
+            collides("use lib::shapes as lib;\n"),
+            ["redeclaration of built-in object"]
+        );
+        // A child module imported under its own name is the same module.
+        assert!(collides("mod inner;\nuse lib::blocks::inner;\n").is_empty());
+    }
+
+    #[test]
+    fn an_unresolved_module_import_names_its_path() {
+        let errors = module_errors(&[
+            (&[], "mod shapes;\nmod blocks;\n"),
+            (&["shapes"], SHAPES),
+            (&["shapes", "inner"], INNER),
+            (&["blocks"], "use lib::shapes::innr;\n"),
+        ]);
+        assert_eq!(
+            errors
+                .iter()
+                .map(|error| error.kind.to_string())
+                .collect::<Vec<_>>(),
+            ["unresolved import `lib::shapes::innr`: no module or item has this path"]
+        );
+        let errors = module_errors(&[(&[], "use lib::shapez;\n")]);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [error] if matches!(&error.kind, StaticErrorKind::UnresolvedImport { path } if path == "lib::shapez")
+            ),
+            "{errors:#?}"
+        );
+        // Paths through the misspelled import name a missing module, which
+        // stops typing; the import is reported with them.
+        let errors = module_errors(&[
+            (&[], "mod shapes;\nmod blocks;\n"),
+            (&["shapes"], SHAPES),
+            (&["shapes", "inner"], INNER),
+            (
+                &["blocks"],
+                "use lib::shapes::innr;\nfn f() -> Float { inner::scale() }\n",
+            ),
+        ]);
+        assert_eq!(
+            errors
+                .iter()
+                .map(|error| error.kind.to_string())
+                .collect::<Vec<_>>(),
+            [
+                "module `blocks::inner` does not exist or could not be loaded",
+                "unresolved import `lib::shapes::innr`: no module or item has this path",
+            ]
+        );
+    }
+
+    /// A `use` path is read as written, never through a module import.
+    #[test]
+    fn a_use_path_does_not_start_with_a_module_import() {
+        let errors = module_errors(&[
+            (&[], "mod shapes;\nmod blocks;\n"),
+            (&["shapes"], SHAPES),
+            (&["shapes", "inner"], INNER),
+            (&["blocks"], "use lib::shapes;\nuse shapes::area;\n"),
+        ]);
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [error] if matches!(&error.kind, StaticErrorKind::UnresolvedImport { path } if path == "shapes::area")
+            ),
+            "{errors:#?}"
+        );
+    }
+
+    /// Calls through `std::layout` imported as a module.
+    #[test]
+    fn a_std_module_can_be_imported() {
+        let errors = module_errors(&[(
+            &[],
+            "use std::layout;\nuse std::layout as geo;\n\
+             cell top() { let r = layout::rect(\"met1\", x0=0., y0=0., x1=1., y1=1.); let s = geo::rect(\"met2\", x0=0., y0=0., x1=r.x1, y1=1.); }\n",
+        )]);
+        assert!(errors.is_empty(), "{errors:#?}");
     }
 
     #[test]
@@ -3771,7 +4073,64 @@ cell top() {
             .as_ref()
             .expect("off-grid error should point to its solver variable");
         let source = std::fs::read_to_string(&span.path).unwrap();
-        assert_eq!(&source[span.span.start()..span.span.end()], "float()");
+        assert!(source[span.span.start()..span.span.end()].starts_with("rect("));
+    }
+
+    #[test]
+    fn float_comparisons_are_exact_up_to_rounding_noise() {
+        // On this grid of 0.1, rounding both sides made `0.37 > 0.36` false,
+        // made a width of 0.1 not exceed 0.05 (which rounds up to 0.1), and
+        // made `max_float` see a tie and keep its first argument.
+        let output = compile_source(
+            "use std::layout::rect;
+             cell top(ratio: Float) {
+                 let w = rect(\"met1\", x0=100., y0=0., x1=100.1, y1=1.)!;
+                 if ratio > 0.36 { rect(\"met1\", x0=0., y0=0., x1=1., y1=1.)!; }
+                 if w.x1 - w.x0 > 0.05 { rect(\"met1\", x0=10., y0=0., x1=11., y1=1.)!; }
+                 if 0.1 + 0.2 >= 0.3 { rect(\"met1\", x0=20., y0=0., x1=21., y1=1.)!; }
+                 if 0.1 + 0.2 > 0.3 { rect(\"met1\", x0=40., y0=0., x1=41., y1=1.)!; }
+                 rect(\"met1\", x0=30., y0=0., x1=30. + 1000. * max_float(0.36, ratio), y1=1.)!;
+             }",
+            "top",
+            vec![CellArg::Float(0.37)],
+        );
+        let data = output.unwrap_valid();
+        let mut rects = data.cells[&data.top]
+            .objects
+            .values()
+            .filter_map(|object| match object {
+                SolvedValue::Rect(rect) if rect.x0.0 < 100. => Some((rect.x0.0, rect.x1.0)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        rects.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(rects, [(0., 1.), (10., 11.), (20., 21.), (30., 400.)]);
+    }
+
+    #[test]
+    fn float_variables_stay_exact_and_only_geometry_snaps() {
+        // A third of 1000 is off the grid, but three of them land on it again,
+        // which they would not if the third had been snapped first.
+        let output = compile_source(
+            "use std::layout::rect;
+             cell top() {
+                 let pitch = float();
+                 eq(pitch, 1000. / 3.);
+                 let r = rect(\"met1\", x0=0., y0=0., x1=3. * pitch, y1=10.)!;
+             }",
+            "top",
+            Vec::new(),
+        );
+        let data = output.unwrap_valid();
+        let x1 = data.cells[&data.top]
+            .objects
+            .values()
+            .find_map(|object| match object {
+                SolvedValue::Rect(rect) => Some(rect.x1.0),
+                _ => None,
+            })
+            .expect("the rectangle is drawn");
+        assert_eq!(x1, 1000.);
     }
 
     #[test]
@@ -6237,6 +6596,458 @@ cell top() {
         assert_relative_eq!(drawn.y0.0, 0., epsilon = EPSILON);
         assert_relative_eq!(drawn.x1.0, 10., epsilon = EPSILON);
         assert_relative_eq!(drawn.y1.0, 10., epsilon = EPSILON);
+    }
+
+    /// Centering an instance on its bounding box names its position twice, and
+    /// still solves it when the constraint runs, not in the cell-wide solve.
+    #[test]
+    fn centering_on_bbox_solves_at_once() {
+        let source = "use std::layout::{bbox, inst, rect};
+                      cell leaf() {
+                          pub let port = rect(\"met1\", x0=10., y0=0., x1=30., y1=20.)!;
+                      }
+                      cell top() {
+                          let g = inst(leaf(), y=0.);
+                          let b = bbox(g);
+                          eq(b.x0 + b.x1, 100.);
+                          rect(\"met2\", x0=max_float(g.port.x0, 0.), y0=0., x1=g.port.x1, y1=5.)!;
+                      }";
+        let (_dir, output) = scratch_workspace("center", source);
+        assert!(output.static_errors().is_empty());
+        crate::solver::solve_stats::reset();
+        let compiled = compile(
+            &output.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        );
+        let (_, solve_bodies, _) = crate::solver::solve_stats::read();
+        let data = compiled.unwrap_valid();
+        let top = &data.cells[&data.top];
+        let drawn = top
+            .objects
+            .values()
+            .find_map(|object| match object {
+                SolvedValue::Rect(rect) if !rect.construction => Some(rect),
+                _ => None,
+            })
+            .expect("top emits one drawn rectangle");
+        assert_relative_eq!(drawn.x0.0, 40., epsilon = EPSILON);
+        assert_relative_eq!(drawn.x1.0, 60., epsilon = EPSILON);
+        assert_eq!(solve_bodies, 0);
+    }
+
+    #[test]
+    fn shapes_flattens_placed_instances_on_one_layer() {
+        let source = "use std::layout::{crect, inst, rect, shapes};
+                      cell leaf() {
+                          rect(\"met1\", x0=0., y0=0., x1=10., y1=20.)!;
+                          rect(\"met2\", x0=0., y0=0., x1=5., y1=5.)!;
+                          crect(layer=\"met1\", x0=-100., y0=-100., x1=100., y1=100.);
+                      }
+                      cell mid() {
+                          inst(leaf(), x=100., y=0., angle=90);
+                      }
+                      cell top() {
+                          let px = float();
+                          eq(px, 1000.);
+                          let m = inst(mid(), x=px, y=0.);
+                          let copies = [for r in shapes(m, \"met1\") {
+                              rect(\"met3\", x0=r.x0, y0=r.y0, x1=r.x1, y1=r.y1)!
+                          }];
+                      }";
+        let (_dir, output) = scratch_workspace("shapes", source);
+        assert!(
+            output.static_errors().is_empty(),
+            "{:?}",
+            output.static_errors()
+        );
+        let compiled = compile(
+            &output.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        );
+        let data = compiled.unwrap_valid();
+        let copies = data.cells[&data.top]
+            .objects
+            .values()
+            .filter_map(|object| match object {
+                SolvedValue::Rect(rect) if rect.layer.as_deref() == Some("met3") => {
+                    Some((rect.x0.0, rect.y0.0, rect.x1.0, rect.y1.0))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // The met1 rectangle, rotated a quarter turn, then moved by both
+        // placements; the met2 rectangle and construction geometry are skipped.
+        assert_eq!(copies, [(1080., 0., 1100., 10.)]);
+    }
+
+    /// Routing layers, a via, and pin helpers shared by the `autoroute` tests:
+    /// 100-wide wires at a 200 pitch, and a via whose landings overhang the
+    /// wires by 10 across them.
+    const ROUTE_PRELUDE: &str = r#"
+use std::layout::{autoroute, crect, rect, RouteLayer, RouteNet, RoutePin, RouteVia};
+
+fn layers() -> [RouteLayer] {
+    [
+        RouteLayer { name: "met1", width: 100., space: 100., horizontal: true },
+        RouteLayer { name: "met2", width: 100., space: 100., horizontal: false },
+    ]
+}
+
+fn vias() -> [RouteVia] {
+    [RouteVia { cut: "via1", size: 80., space: 60., bot_enc: (20., 30.), top_enc: (20., 30.) }]
+}
+
+fn pin(layer: Int, x0: Float, y0: Float, x1: Float, y1: Float) -> RoutePin {
+    let name = if layer == 0 { "met1" } else { "met2" };
+    RoutePin { layer: layer, rect: rect(name, x0=x0, y0=y0, x1=x1, y1=y1) }
+}
+
+fn area() -> Rect {
+    crect(x0=0., y0=0., x1=2000., y1=2000.)
+}
+"#;
+
+    /// A rectangle as `(layer, [x0, y0, x1, y1])`.
+    type LayerBox = (&'static str, [f64; 4]);
+
+    /// Compiles `top()` in `body` after [`ROUTE_PRELUDE`].
+    fn compile_routed(body: &str) -> CompileOutput {
+        let source = format!("{ROUTE_PRELUDE}\n{body}");
+        let (_dir, output) = scratch_workspace("autoroute", &source);
+        assert!(
+            output.static_errors().is_empty(),
+            "{:?}",
+            output.static_errors()
+        );
+        compile(
+            &output.ast(),
+            CompileInput {
+                cell: &["top"],
+                args: Vec::new(),
+            },
+        )
+    }
+
+    /// The rectangles `top()` in `body` draws.
+    fn routed_rects(body: &str) -> Vec<(String, [f64; 4])> {
+        let compiled = compile_routed(body);
+        let CompileOutput::Valid(data) = &compiled else {
+            panic!("{compiled:#?}");
+        };
+        data.cells[&data.top]
+            .objects
+            .values()
+            .filter_map(|object| match object {
+                SolvedValue::Rect(r) if !r.construction => {
+                    Some((r.layer.clone()?, [r.x0.0, r.y0.0, r.x1.0, r.y1.0]))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Checks drawn metal without trusting the router: metal on one layer
+    /// that touches is joined, and a `via1` cut joins the `met1` and `met2`
+    /// metal it overlaps. Each net's pins must be joined, nets and obstacles
+    /// must not be, and metal that is not joined must be at least `space`
+    /// apart in x or y.
+    fn assert_routed(
+        rects: &[(String, [f64; 4])],
+        nets: &[&[LayerBox]],
+        obstacles: &[LayerBox],
+        space: f64,
+    ) {
+        let gap = |a: [f64; 4], b: [f64; 4]| {
+            let gx = (a[0] - b[2]).max(b[0] - a[2]);
+            let gy = (a[1] - b[3]).max(b[1] - a[3]);
+            (gx, gy)
+        };
+        let mut parent = (0..rects.len()).collect::<Vec<_>>();
+        fn find(parent: &mut [usize], x: usize) -> usize {
+            if parent[x] != x {
+                parent[x] = find(parent, parent[x]);
+            }
+            parent[x]
+        }
+        for i in 0..rects.len() {
+            for j in i + 1..rects.len() {
+                let (gx, gy) = gap(rects[i].1, rects[j].1);
+                let (li, lj) = (rects[i].0.as_str(), rects[j].0.as_str());
+                let same_layer = li == lj && gx <= 0. && gy <= 0.;
+                let through_cut = (li == "via1" && lj.starts_with("met")
+                    || lj == "via1" && li.starts_with("met"))
+                    && gx < 0.
+                    && gy < 0.;
+                if same_layer || through_cut {
+                    let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                    parent[ri] = rj;
+                }
+            }
+        }
+        let index = |shape: &LayerBox| {
+            rects
+                .iter()
+                .position(|(layer, r)| layer == shape.0 && *r == shape.1)
+                .unwrap_or_else(|| panic!("{shape:?} is not drawn"))
+        };
+        let mut roots = Vec::new();
+        for (n, pins) in nets.iter().enumerate() {
+            let root = find(&mut parent, index(&pins[0]));
+            for pin in &pins[1..] {
+                assert_eq!(
+                    find(&mut parent, index(pin)),
+                    root,
+                    "net {n}: {pin:?} is not connected to {:?}",
+                    pins[0]
+                );
+            }
+            assert!(!roots.contains(&root), "net {n} is shorted to another net");
+            roots.push(root);
+        }
+        for obstacle in obstacles {
+            let root = find(&mut parent, index(obstacle));
+            assert!(!roots.contains(&root), "{obstacle:?} touches a net");
+        }
+        for i in 0..rects.len() {
+            for j in i + 1..rects.len() {
+                if rects[i].0 != rects[j].0 || !rects[i].0.starts_with("met") {
+                    continue;
+                }
+                if find(&mut parent, i) == find(&mut parent, j) {
+                    continue;
+                }
+                let (gx, gy) = gap(rects[i].1, rects[j].1);
+                assert!(
+                    gx >= space || gy >= space,
+                    "{:?} and {:?} are only ({gx}, {gy}) apart",
+                    rects[i],
+                    rects[j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn autoroute_detours_around_an_obstacle() {
+        let rects = routed_rects(
+            r#"
+cell top() {
+    let wall = rect("met1", x0=900., y0=600., x1=1100., y1=1400.);
+    let routed = autoroute(area(), layers(), vias(), [[wall], []], [
+        RouteNet { name: "a", pins: [pin(0, 150., 950., 350., 1050.), pin(0, 1650., 950., 1850., 1050.)] },
+    ]);
+    // The returned cuts are the drawn ones.
+    for c in routed[0].cuts {
+        rect("met4", x0=c.x0, y0=c.y0, x1=c.x1, y1=c.y1);
+    }
+}
+"#,
+        );
+        assert_routed(
+            &rects,
+            &[&[
+                ("met1", [150., 950., 350., 1050.]),
+                ("met1", [1650., 950., 1850., 1050.]),
+            ]],
+            &[("met1", [900., 600., 1100., 1400.])],
+            100.,
+        );
+        let cuts = |layer: &str| {
+            rects
+                .iter()
+                .filter(|(l, _)| l == layer)
+                .map(|(_, r)| *r)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            !cuts("via1").is_empty(),
+            "the wall forces the route onto met2"
+        );
+        assert_eq!(cuts("via1"), cuts("met4"));
+    }
+
+    #[test]
+    fn autoroute_keeps_exact_spacing_to_an_off_grid_obstacle() {
+        // Pins on the met2 track whose wire spans x = 950..1050. A wall 100
+        // to its right leaves the track usable; a wall 99 to its right
+        // pushes the route off it.
+        let body = |wall_x0: f64| {
+            format!(
+                r#"
+cell top() {{
+    let wall = rect("met2", x0={wall_x0:?}, y0=500., x1=1300., y1=1500.);
+    let routed = autoroute(area(), layers(), vias(), [[], [wall]], [
+        RouteNet {{ name: "a", pins: [pin(1, 950., 150., 1050., 250.), pin(1, 950., 1750., 1050., 1850.)] }},
+    ]);
+}}
+"#
+            )
+        };
+        let pins: &[LayerBox] = &[
+            ("met2", [950., 150., 1050., 250.]),
+            ("met2", [950., 1750., 1050., 1850.]),
+        ];
+        let legal = routed_rects(&body(1150.));
+        assert_routed(
+            &legal,
+            &[pins],
+            &[("met2", [1150., 500., 1300., 1500.])],
+            100.,
+        );
+        assert!(
+            legal
+                .iter()
+                .any(|(l, r)| l == "met2" && *r == [950., 150., 1050., 1850.]),
+            "{legal:?}"
+        );
+        assert!(!legal.iter().any(|(l, _)| l == "via1"));
+
+        let tight = routed_rects(&body(1149.));
+        assert_routed(
+            &tight,
+            &[pins],
+            &[("met2", [1149., 500., 1300., 1500.])],
+            100.,
+        );
+        assert!(tight.iter().any(|(l, _)| l == "via1"), "{tight:?}");
+        for (layer, r) in &tight {
+            if layer == "met2" && r[0] < 1149. && r[3] > 400. && r[1] < 1600. {
+                assert!(r[2] <= 950., "{r:?} is on the track the wall blocks");
+            }
+        }
+    }
+
+    #[test]
+    fn autoroute_connects_multi_pin_nets_that_avoid_each_other() {
+        // `a` crosses the area left to right on met1 and `b` bottom to top
+        // through it, so `b` must hop over `a` on met2. `c` has three pins,
+        // one of them off the grid, which gets a stub.
+        let rects = routed_rects(
+            r#"
+cell top() {
+    let block = rect("met2", x0=1350., y0=350., x1=1450., y1=650.);
+    let routed = autoroute(area(), layers(), vias(), [[], [block]], [
+        RouteNet { name: "a", pins: [pin(0, 150., 950., 250., 1050.), pin(0, 1750., 950., 1850., 1050.)] },
+        RouteNet { name: "b", pins: [pin(0, 950., 150., 1050., 250.), pin(0, 950., 1750., 1050., 1850.)] },
+        RouteNet { name: "c", pins: [
+            pin(1, 150., 150., 250., 250.),
+            pin(1, 1750., 150., 1850., 250.),
+            pin(0, 1720., 1530., 1780., 1560.),
+        ] },
+    ]);
+}
+"#,
+        );
+        assert_routed(
+            &rects,
+            &[
+                &[
+                    ("met1", [150., 950., 250., 1050.]),
+                    ("met1", [1750., 950., 1850., 1050.]),
+                ],
+                &[
+                    ("met1", [950., 150., 1050., 250.]),
+                    ("met1", [950., 1750., 1050., 1850.]),
+                ],
+                &[
+                    ("met2", [150., 150., 250., 250.]),
+                    ("met2", [1750., 150., 1850., 250.]),
+                    ("met1", [1720., 1530., 1780., 1560.]),
+                ],
+            ],
+            &[("met2", [1350., 350., 1450., 650.])],
+            100.,
+        );
+    }
+
+    #[test]
+    fn autoroute_waits_for_solved_pins() {
+        let rects = routed_rects(
+            r#"
+cell top() {
+    let px = float();
+    let routed = autoroute(area(), layers(), vias(), [], [
+        RouteNet { name: "a", pins: [pin(0, px, 950., px + 100., 1050.), pin(0, 1750., 950., 1850., 1050.)] },
+    ]);
+    eq(px, 150.);
+}
+"#,
+        );
+        assert_routed(
+            &rects,
+            &[&[
+                ("met1", [150., 950., 250., 1050.]),
+                ("met1", [1750., 950., 1850., 1050.]),
+            ]],
+            &[],
+            100.,
+        );
+    }
+
+    #[test]
+    fn autoroute_reports_the_net_it_cannot_route() {
+        let body = r#"
+fn ring(layer: String) {
+    rect(layer, x0=500., y0=500., x1=1500., y1=600.);
+}
+
+cell top() {
+    let walls = [
+        crect(x0=500., y0=500., x1=1500., y1=600.),
+        crect(x0=500., y0=1400., x1=1500., y1=1500.),
+        crect(x0=500., y0=500., x1=600., y1=1500.),
+        crect(x0=1400., y0=500., x1=1500., y1=1500.),
+    ];
+    let lid = crect(x0=700., y0=700., x1=1300., y1=1300.);
+    let routed = autoroute(area(), layers(), vias(), [walls, std::concat(walls, [lid])], [
+        RouteNet { name: "free", pins: [pin(0, 150., 150., 250., 250.), pin(0, 150., 1750., 250., 1850.)] },
+        RouteNet { name: "trapped", pins: [pin(0, 950., 950., 1050., 1050.), pin(0, 1750., 150., 1850., 250.)] },
+    ]);
+}
+"#;
+        let compiled = compile_routed(body);
+        let CompileOutput::ExecErrors(errors) = &compiled else {
+            panic!("routing should fail: {compiled:?}");
+        };
+        let messages = errors
+            .errors
+            .iter()
+            .map(|error| error.kind.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m == "routing failed: net `trapped` has no route from pin 0 to pin 1"),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn autoroute_rejects_layers_that_do_not_alternate() {
+        let errors = run_source(&format!(
+            "{ROUTE_PRELUDE}\n{}",
+            r#"
+cell top() {
+    let same = [
+        RouteLayer { name: "met1", width: 100., space: 100., horizontal: true },
+        RouteLayer { name: "met2", width: 100., space: 100., horizontal: true },
+    ];
+    let routed = autoroute(area(), same, vias(), [], [
+        RouteNet { name: "a", pins: [pin(0, 150., 950., 250., 1050.), pin(0, 1750., 950., 1850., 1050.)] },
+    ]);
+}
+"#
+        ));
+        assert_reports(
+            &errors,
+            |error| matches!(error, ExecErrorKind::Routing(m) if m.contains("must alternate direction")),
+        );
     }
 
     /// Every layout object in `cell`, in the order the exporter would walk it.

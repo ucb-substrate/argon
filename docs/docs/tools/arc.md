@@ -42,6 +42,16 @@ arc fmt
 arc fmt --check
 ```
 
+`arc fmt` indents each line four spaces deeper than the line that opened the innermost bracket around it, and it collapses repeated blank lines. It breaks lines wider than 100 columns, rustfmt style. On such a line, the widest call, list, tuple, struct literal, parameter list, or `use` group is split. Its opening bracket ends the line, each element goes on its own line with a trailing comma, and the closing bracket starts a new line. This repeats until every line fits. A call whose only argument is a list, call, or struct literal keeps both openers on one line, as in `merge_rects([`. A block or `match` written on one line is split into one statement or arm per line. `use` groups, and lists of short literals and names, are packed several to a line. Line breaks you write are kept, comments stay where they are, and files with syntax errors are only re-indented. A file whose leading comments include the line `// arc-fmt: no-wrap` is only re-indented, which suits generated or transcribed geometry.
+
+```argon
+let pins = router::merge_rects([
+    tap0.vpwr,
+    clk_delay.vdd_port,
+    inv_rbl.vpwr,
+]);
+```
+
 ## `arc check`
 
 ```text

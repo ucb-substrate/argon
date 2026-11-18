@@ -27,7 +27,13 @@ cell latch(wn: Float, nfn: Int, wp: Float, nfp: Int) {
     let ground = rect("met1.drawing", x0=a.ptap.m1.x0, x1=b.ptap.m1.x1, y0=b.n.s.y0, y1=b.n.s.y1);
     let supply = rect("met1.drawing", x0=a.ntap.m1.x0, x1=b.ntap.m1.x1, y0=b.p.s.y0, y1=b.p.s.y1);
     // The n-well encloses p-diffusion and the n-taps by 180, and is at least 840 tall.
-    rect("nwell.drawing", x0=a.ntap.tap.x0 - 180., x1=b.ntap.tap.x1 + 180., y0=b.p.sdm.y0 - 50., y1=std::max(b.p.sdm.y1 + 50., b.p.sdm.y0 + 790.));
+    rect(
+        "nwell.drawing",
+        x0=a.ntap.tap.x0 - 180.,
+        x1=b.ntap.tap.x1 + 180.,
+        y0=b.p.sdm.y0 - 50.,
+        y1=std::max(b.p.sdm.y1 + 50., b.p.sdm.y0 + 790.),
+    );
 
     // Each output's via at x = ±430 runs on met2 to the other inverter's gate
     // trunk at x = ∓860, the two at different heights so that they cross.
@@ -58,7 +64,13 @@ cell inverter(wn: Float, nfn: Int, wp: Float, nfp: Int) {
     // row (nsd.2, psd.2).
     eq(p.d.y0, n.d.y1 + 260.);
     // One met1 block joins the drains and reaches the output's via at x = 430.
-    pub let out = rect("met1.drawing", x0=std::min(std::min(n.d.x0, p.d.x0), 430. - 130.), x1=std::max(n.d.x1, p.d.x1), y0=n.d.y0, y1=p.d.y1);
+    pub let out = rect(
+        "met1.drawing",
+        x0=std::min(std::min(n.d.x0, p.d.x0), 430. - 130.),
+        x1=std::max(n.d.x1, p.d.x1),
+        y0=n.d.y0,
+        y1=p.d.y1,
+    );
     // A met2 trunk at x = 860 joins the gates.
     hook(n.g, 860.);
     hook(p.g, 860.);
@@ -102,12 +114,24 @@ fn via1(bar: Rect, x: Float, y: Float) {
 /// A met2 wire 140 wide from (`x0`, `y0`) to (`x1`, `y1`), either horizontal
 /// or vertical.
 fn wire(x0: Float, y0: Float, x1: Float, y1: Float) {
-    rect("met2.drawing", x0=std::min(x0, x1) - 70., x1=std::max(x0, x1) + 70., y0=std::min(y0, y1) - 70., y1=std::max(y0, y1) + 70.);
+    rect(
+        "met2.drawing",
+        x0=std::min(x0, x1) - 70.,
+        x1=std::max(x0, x1) + 70.,
+        y0=std::min(y0, y1) - 70.,
+        y1=std::max(y0, y1) + 70.,
+    );
 }
 
 /// Extends the met1 `bar` to reach `x`, with a via1 there.
 fn hook(bar: Rect, x: Float) {
-    let ext = rect("met1.drawing", x0=std::min(bar.x0, x - 130.), x1=std::max(bar.x1, x + 130.), y0=bar.y0, y1=bar.y1);
+    let ext = rect(
+        "met1.drawing",
+        x0=std::min(bar.x0, x - 130.),
+        x1=std::max(bar.x1, x + 130.),
+        y0=bar.y0,
+        y1=bar.y1,
+    );
     via1(ext, x, mid_y(bar));
 }
 

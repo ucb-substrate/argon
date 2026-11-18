@@ -69,37 +69,15 @@ fn test_canvas(cx: &mut gpui::TestAppContext) -> Entity<LayoutCanvas> {
 #[gpui::test]
 fn minimap_keeps_its_previous_image_until_replacement_is_ready(cx: &mut gpui::TestAppContext) {
     let canvas = test_canvas(cx);
-    let directory = tempfile::tempdir().unwrap();
-    let source = directory.path().join("lib.ar");
-    std::fs::write(
-        &source,
-        "use std::layout::rect; cell top() { let r = rect(\"met1\", x0=0., y0=0., x1=10., y1=10.); }",
-    )
-    .unwrap();
-    let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/tech/basic.tech.toml"),
-    ));
-    let CompileOutput::Valid(data) = argonc::incremental::IncrementalCompiler::new().compile_cell(
-        &config,
-        &["top".into()],
-        vec![],
-    ) else {
-        panic!("test cell did not compile");
-    };
-    let object_id = *data.cells[&data.top].objects.keys().next().unwrap();
     canvas.update(cx, |canvas, _| {
         let size = Size::new(px(100.), px(100.));
         let image = image::RgbaImage::new(1, 1);
         canvas.screen_bounds = Bounds::new(Point::default(), size);
-        canvas.raster_layout_bbox = Some(Arc::new(compile::Rect {
-            layer: None,
+        canvas.raster_layout_bbox = Some(Arc::new(editor::hierarchy::ScopeBounds {
             x0: 0.,
             y0: 0.,
             x1: 10.,
             y1: 10.,
-            id: object_id,
-            construction: true,
-            span: None,
         }));
         canvas.raster_overview = Some(LayoutRasterCache {
             image: Arc::new(RenderImage::new(vec![image::Frame::new(image)])),
@@ -825,9 +803,9 @@ cell top() { let child = inst(branch(), x=0., y=0.); }
     };
     for hidden in [false, true] {
         if hidden {
-            let scopes = Arc::make_mut(&mut solved.state);
-            let (_, scope) = scopes
-                .iter_mut()
+            let (address, _) = solved
+                .state
+                .iter()
                 .find(|(address, _)| {
                     solved.output.cells[&address.cell]
                         .objects
@@ -835,7 +813,7 @@ cell top() { let child = inst(branch(), x=0., y=0.); }
                         .any(|value| matches!(value, SolvedValue::Rect(_)))
                 })
                 .unwrap();
-            scope.visible = false;
+            Arc::make_mut(&mut solved.state).set_visible(address, false);
         }
         let hierarchy_depth = if hidden { usize::MAX } else { 2 };
         let spatial_index = Arc::new(RasterSpatialIndex::for_presentation(
@@ -2757,20 +2735,25 @@ cell top() { for row in std::range(96) { for col in std::range(96) {
 /// Times how long the full editor takes to settle after deleting one of many
 /// unconstrained rectangles from the SRAM top cell.
 #[gpui::test]
-#[ignore = "SRAM unconstrained-rectangle editor benchmark; run in release with --nocapture"]
+#[ignore = "SRAM unconstrained-rectangle editor benchmark; build argon-sram-routing-wasm for wasm32-unknown-unknown, then run in release with --nocapture"]
 fn bench_sram_unconstrained_rect_delete_editor(cx: &mut gpui::TestAppContext) {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/sram");
     let source = workspace.join("lib.ar");
     let original = std::fs::read_to_string(&source).unwrap();
     let config = argonc::WorkspaceConfig::new(&source)
-        .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")));
+        .with_tech(Some(workspace.join("../../pdks/sky130/sky130.tech.toml")))
+        .with_wasm_modules([(
+            "routing".to_owned(),
+            workspace
+                .join("../../target/wasm32-unknown-unknown/release/argon_sram_routing_wasm.wasm"),
+        )]);
     let rects = |count: usize| {
         (0..count)
             .map(|i| {
                 let x = 30000. * (i % 9) as f64;
                 let y = 12000. * (i / 9) as f64;
                 format!(
-                    "let bench_rect{i} = rect(\"prBoundary.boundary\", x0i = {x}., y0i = {y}., x1i = {}., y1i = {}.)!;\n",
+                    "let bench_rect{i} = std::layout::rect(\"prBoundary.boundary\", x0i = {x}., y0i = {y}., x1i = {}., y1i = {}.)!;\n",
                     x + 20000.,
                     y + 8000.
                 )

@@ -29,9 +29,9 @@ use crate::{
         VariantPayload, WorkspaceAst,
     },
     compile::{
-        AdtDef, BUILTINS, CellTy, DeviceKind, Native, RESERVED_CELL_FIELDS, Ty, TyParamTy,
-        TypeDefs, TypedWorkspace, VarId, VarIdTyMetadata, VariantTys, module_prefix, param_map,
-        subst, typed_let_bindings,
+        AdtDef, BUILTINS, CellTy, DeviceKind, ModuleImports, Native, RESERVED_CELL_FIELDS, Ty,
+        TyParamTy, TypeDefs, TypedWorkspace, VarId, VarIdTyMetadata, VariantTys, imported_module,
+        module_prefix, param_map, subst, typed_let_bindings,
     },
 };
 
@@ -214,6 +214,8 @@ pub struct NavIndex {
     usages: HashMap<DefKey, Vec<crate::ast::Span>>,
     file_modules: HashMap<PathBuf, ModPath>,
     module_items: HashMap<ModPath, Vec<ModuleItem>>,
+    /// The modules each module imports with `use`.
+    module_imports: HashMap<ModPath, ModuleImports>,
     scope_bindings: HashMap<PathBuf, Vec<ScopeBinding>>,
     expression_types: HashMap<PathBuf, Vec<(cfgrammar::Span, Ty)>>,
     hover_details: HashMap<PathBuf, Vec<(cfgrammar::Span, String)>>,
@@ -323,6 +325,11 @@ impl NavIndex {
         }
     }
 
+    /// The modules `module` imports with `use`.
+    fn imports(&self, module: &ModPath) -> ModuleImports {
+        self.module_imports.get(module).cloned().unwrap_or_default()
+    }
+
     fn completion_for(&self, name: &str, key: &DefKey) -> Option<CompletionCandidate> {
         let definition = self.defs.get(key)?;
         Some(CompletionCandidate {
@@ -363,6 +370,11 @@ impl NavIndex {
             .collect();
         for candidate in self.module_completions(module, Some(offset)) {
             candidates.insert(candidate.label.clone(), candidate);
+        }
+        for (name, imported) in self.imports(module).iter() {
+            if let Some(candidate) = self.completion_for(name, &DefKey::Module(imported.clone())) {
+                candidates.insert(name.to_owned(), candidate);
+            }
         }
         for (label, key) in [
             ("lib", DefKey::Module(Vec::new())),
@@ -551,7 +563,8 @@ impl NavIndex {
         let Some(current) = self.file_modules.get(file) else {
             return Vec::new();
         };
-        let module = module_prefix(current, qualifier.iter().map(String::as_str), 0);
+        let imports = self.imports(current);
+        let module = imports.module_prefix(current, qualifier.iter().map(String::as_str), 0);
         if self.module_items.contains_key(&module) {
             let mut result = self.module_completions(&module, None);
             result.sort_by(|left, right| left.label.cmp(&right.label));
@@ -564,7 +577,7 @@ impl NavIndex {
         let module = if prefix.is_empty() {
             current.clone()
         } else {
-            module_prefix(current, prefix.iter().map(String::as_str), 0)
+            imports.module_prefix(current, prefix.iter().map(String::as_str), 0)
         };
         let Some(enum_key) = self
             .module_items
@@ -658,14 +671,12 @@ impl NavIndex {
         {
             return Some(signature);
         }
+        let current = self.file_modules.get(file)?;
         let module = if prefix.is_empty() {
-            self.file_modules.get(file)?.clone()
+            current.clone()
         } else {
-            module_prefix(
-                self.file_modules.get(file)?,
-                path.iter().map(String::as_str),
-                1,
-            )
+            self.imports(current)
+                .module_prefix(current, path.iter().map(String::as_str), 1)
         };
         self.module_items
             .get(&module)?
@@ -730,9 +741,9 @@ const PRIMITIVE_TYPES: [&str; 9] = [
     "Any", "Bool", "Float", "Int", "Path", "Point", "Polygon", "Rect", "String",
 ];
 
-const KEYWORDS: [&str; 17] = [
-    "_", "as", "cell", "else", "enum", "false", "fn", "for", "if", "in", "let", "match", "mod",
-    "pub", "true", "struct", "use",
+const KEYWORDS: [&str; 18] = [
+    "_", "as", "cell", "else", "enum", "extern", "false", "fn", "for", "if", "in", "let", "match",
+    "mod", "pub", "true", "struct", "use",
 ];
 
 fn completion_kind(kind: SymbolKind) -> CompletionKind {
@@ -944,15 +955,15 @@ fn native_signature(native: Native) -> SignatureInfo {
             &[],
         ),
         Native::Dimension => signature(
-            "fn dimension(x0: Float, y0: Float, x1: Float, y1: Float, offset: Float, label_offset: Float, flip: Bool)",
+            "fn dimension(p: Float, n: Float, value: Float, coord: Float, pstop: Float, nstop: Float, horizontal: Bool)",
             &[
-                "x0: Float",
-                "y0: Float",
-                "x1: Float",
-                "y1: Float",
-                "offset: Float",
-                "label_offset: Float",
-                "flip: Bool",
+                "p: Float",
+                "n: Float",
+                "value: Float",
+                "coord: Float",
+                "pstop: Float",
+                "nstop: Float",
+                "horizontal: Bool",
             ],
             &[],
         ),
@@ -972,6 +983,22 @@ fn native_signature(native: Native) -> SignatureInfo {
         Native::Bbox => signature(
             "fn bbox(value: Cell | Inst | Rect) -> Rect",
             &["value: Cell | Inst | Rect"],
+            &[],
+        ),
+        Native::Shapes => signature(
+            "fn shapes(value: Cell | Inst, layer: String) -> [Rect]",
+            &["value: Cell | Inst", "layer: String"],
+            &[],
+        ),
+        Native::RouteTracks => signature(
+            "fn route_tracks(area: Rect, layers: [(Float, Float, Bool)], vias: [(Float, Float, (Float, Float), (Float, Float))], obstacles: [(Int, Rect)], nets: [(String, [(Int, Rect)])]) -> [([(Int, Rect)], [(Int, [Rect], Rect, Rect)], [(Int, Rect)])]",
+            &[
+                "area: Rect",
+                "layers: [(Float, Float, Bool)]",
+                "vias: [(Float, Float, (Float, Float), (Float, Float))]",
+                "obstacles: [(Int, Rect)]",
+                "nets: [(String, [(Int, Rect)])]",
+            ],
             &[],
         ),
         Native::Signal => signature(
@@ -1123,6 +1150,8 @@ struct Builder<'a> {
     params: HashMap<VarId, HashMap<String, VarId>>,
     /// Module currently being walked.
     current: &'a ModPath,
+    /// The modules `current` imports with `use`.
+    imports: ModuleImports,
     path: Arc<Path>,
     /// Length of the file's editor-visible source. Generated declarations are
     /// appended past this point.
@@ -1187,6 +1216,7 @@ impl<'a> Builder<'a> {
             cell_fields: HashMap::new(),
             params: HashMap::new(),
             current: const { &Vec::new() },
+            imports: ModuleImports::default(),
             path: Path::new("").into(),
             visible: 0,
             use_prefix: None,
@@ -1310,6 +1340,10 @@ impl<'a> Builder<'a> {
                     .file_modules
                     .insert(ast.path.to_path_buf(), module.clone());
             }
+            let imports = ModuleImports::new(module, &ast.ast.decls, |module| {
+                self.ast.contains_key(module)
+            });
+            self.index.module_imports.insert(module.clone(), imports);
             self.index.defs.insert(
                 DefKey::Module(module.clone()),
                 Definition {
@@ -1455,6 +1489,7 @@ impl<'a> Builder<'a> {
                 continue;
             }
             self.current = module;
+            self.imports = self.index.imports(module);
             self.path = ast.path.clone();
             self.visible = ast.source_text.len();
             self.use_prefix = None;
@@ -1904,12 +1939,23 @@ impl<'a> Builder<'a> {
         let prefix_span = prefix.last().map(|ident| ident.span);
         let repeated = prefix_span.is_some() && self.use_prefix == prefix_span;
         self.use_prefix = prefix_span;
+        // `use module::submodule;` imports a module, unless `module` also
+        // exports an item of that name, which is the more specific target.
+        let imported = imported_module(self.current, decl, |module| self.ast.contains_key(module))
+            .map(|module| Target::Def(DefKey::Module(module)));
         let target = if self.ast.contains_key(&module) {
             if !repeated {
-                self.module_path(prefix);
+                self.use_module_path(prefix);
             }
             self.exported(&module, &item.name)
-                .map_or(Target::Unresolved, Target::Def)
+                .map(Target::Def)
+                .or(imported)
+                .unwrap_or(Target::Unresolved)
+        } else if let Some(imported) = imported {
+            if !repeated {
+                self.use_module_path(prefix);
+            }
+            imported
         } else {
             let (enum_ident, modules) = prefix.split_last().expect("use paths have two segments");
             let enum_module = module_prefix(
@@ -1922,7 +1968,7 @@ impl<'a> Builder<'a> {
                 _ => None,
             };
             if !repeated {
-                self.module_path(modules);
+                self.use_module_path(modules);
                 self.record(
                     enum_ident.span,
                     enum_id.map_or(Target::Unresolved, |id| Target::Def(DefKey::Var(id))),
@@ -1940,7 +1986,11 @@ impl<'a> Builder<'a> {
         if let Some(alias) = &decl.alias {
             self.record(alias.span, target.clone());
         }
-        if let Target::Def(key) = target {
+        // A module import is not an item of this module; `completions_at`
+        // offers it from `module_imports`.
+        if let Target::Def(key) = target
+            && !matches!(key, DefKey::Module(_))
+        {
             self.index
                 .module_items
                 .entry(self.current.clone())
@@ -2462,14 +2512,29 @@ impl<'a> Builder<'a> {
     /// Records each leading segment of a qualified path as the module it names.
     ///
     /// `prefix` is already only the module segments, so none of it names an
-    /// item to be dropped.
+    /// item to be dropped. Its first segment may name a module import unless
+    /// the path is that of a `use`.
     fn module_path(&mut self, prefix: &'a [Ident<arcstr::Substr, VarIdTyMetadata>]) {
+        self.module_segments(prefix, true);
+    }
+
+    /// [`Self::module_path`] for the path of a `use`.
+    fn use_module_path(&mut self, prefix: &'a [Ident<arcstr::Substr, VarIdTyMetadata>]) {
+        self.module_segments(prefix, false);
+    }
+
+    fn module_segments(
+        &mut self,
+        prefix: &'a [Ident<arcstr::Substr, VarIdTyMetadata>],
+        through_imports: bool,
+    ) {
         for length in 1..=prefix.len() {
-            let module = module_prefix(
-                self.current,
-                prefix[..length].iter().map(|ident| ident.name.as_str()),
-                0,
-            );
+            let names = prefix[..length].iter().map(|ident| ident.name.as_str());
+            let module = if through_imports {
+                self.imports.module_prefix(self.current, names, 0)
+            } else {
+                module_prefix(self.current, names, 0)
+            };
             let key = DefKey::Module(module);
             let target = if self.index.defs.contains_key(&key) {
                 Target::Def(key)
@@ -3090,6 +3155,148 @@ cell top() {
             panic!("expected a source location, got {:?}", definition.location);
         };
         assert_eq!(*span.path, *Path::new("/virtual/origin.ar"));
+    }
+
+    const BLOCKS: &str = "/virtual/blocks.ar";
+    const SHAPES: &str = "/virtual/shapes.ar";
+    const INNER: &str = "/virtual/shapes/inner.ar";
+
+    /// An index of a workspace whose `blocks` module is `blocks` and imports
+    /// the `shapes` module, which has an `inner` submodule.
+    fn module_import_index(blocks: &str) -> NavIndex {
+        let modules = [
+            (Vec::new(), "mod shapes;\nmod blocks;\n", ROOT),
+            (
+                vec!["shapes".to_owned()],
+                "mod inner;\nstruct Size { w: Float, h: Float, }\nenum Kind { Wide, Tall, }\n\
+                 fn area(s: Size) -> Float { s.w * s.h }\n",
+                SHAPES,
+            ),
+            (
+                vec!["shapes".to_owned(), "inner".to_owned()],
+                "fn scale() -> Float { 2. }\n",
+                INNER,
+            ),
+            (vec!["blocks".to_owned()], blocks, BLOCKS),
+        ];
+        let mut ast: IndexMap<_, _> = modules
+            .into_iter()
+            .map(|(module, text, path)| {
+                (
+                    module,
+                    parse_source_text(text.to_owned(), PathBuf::from(path)).unwrap(),
+                )
+            })
+            .collect();
+        ast.extend(parse_std());
+        let (typed, output) = static_compile(&ast).unwrap();
+        assert!(output.errors.is_empty(), "{:#?}", output.errors);
+        NavIndex::build(&typed)
+    }
+
+    const IMPORTING: &str = "use lib::sha$0pes;\n\
+         use lib::shapes::inner as de$0ep;\n\
+         fn f() -> Float {\n\
+             let s = sha$0pes::Si$0ze { w: 1., h: 2. };\n\
+             let a = shapes::ar$0ea(s) * deep::sc$0ale();\n\
+             let b = shapes::in$0ner::scale();\n\
+             match shapes::Kind::Wi$0de { shapes::Kind::Wide => a + b, shapes::Kind::Tall => 0., }\n\
+         }\n";
+
+    #[test]
+    fn a_module_import_resolves_to_the_module_and_its_items() {
+        let (source, offsets) = cursors(IMPORTING);
+        let index = module_import_index(&source);
+        let found = offsets
+            .iter()
+            .map(|offset| {
+                let definition = index
+                    .definition_at(Path::new(BLOCKS), *offset)
+                    .unwrap_or_else(|| panic!("the name at {offset} resolves"));
+                match &definition.location {
+                    DefLocation::Source(span) => {
+                        format!("{}:{}", span.path.display(), definition.name)
+                    }
+                    DefLocation::File(path) => format!("file:{}", path.display()),
+                    DefLocation::Generated => "generated".to_owned(),
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            [
+                format!("file:{SHAPES}"),
+                format!("file:{INNER}"),
+                format!("file:{SHAPES}"),
+                format!("{SHAPES}:Size"),
+                format!("{SHAPES}:area"),
+                format!("{INNER}:scale"),
+                format!("file:{INNER}"),
+                format!("{SHAPES}:Wide"),
+            ]
+        );
+        assert_eq!(
+            index
+                .hover_at(Path::new(BLOCKS), offsets[0])
+                .unwrap()
+                .contents,
+            "mod shapes"
+        );
+        assert_eq!(
+            index
+                .hover_at(Path::new(BLOCKS), offsets[4])
+                .unwrap()
+                .contents,
+            "fn area(s: shapes::Size) -> Float"
+        );
+        // Every `shapes` segment of `blocks`, in both imports and paths.
+        let in_blocks = index
+            .references(&DefKey::Module(vec!["shapes".to_owned()]), false)
+            .into_iter()
+            .filter(|span| *span.path == *Path::new(BLOCKS))
+            .count();
+        assert_eq!(in_blocks, 8);
+    }
+
+    #[test]
+    fn a_module_import_completes_and_has_signatures() {
+        let (source, offsets) = cursors(IMPORTING);
+        let index = module_import_index(&source);
+        let path = Path::new(BLOCKS);
+        let qualified = |qualifier: &[&str]| {
+            let qualifier = qualifier
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>();
+            labels(index.qualified_completions(path, &qualifier))
+        };
+        assert_eq!(
+            qualified(&["shapes"]),
+            ["Kind", "None", "Option", "Size", "Some", "area", "inner"]
+        );
+        assert_eq!(qualified(&["deep"]), ["None", "Option", "Some", "scale"]);
+        assert_eq!(qualified(&["shapes", "inner"]), qualified(&["deep"]));
+        assert_eq!(qualified(&["shapes", "Kind"]), ["Tall", "Wide"]);
+
+        let plain = index
+            .completions_at(path, offsets[4])
+            .into_iter()
+            .filter(|candidate| candidate.kind == CompletionKind::Module)
+            .map(|candidate| (candidate.label, candidate.detail.unwrap_or_default()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            plain,
+            [
+                ("deep".to_owned(), "mod inner".to_owned()),
+                ("lib".to_owned(), "workspace root".to_owned()),
+                ("shapes".to_owned(), "mod shapes".to_owned()),
+                ("std".to_owned(), "mod std".to_owned()),
+            ]
+        );
+        let signature = index
+            .signature_named_at(path, offsets[4], &["shapes".to_owned(), "area".to_owned()])
+            .expect("the call through the import has a signature");
+        assert_eq!(signature.label, "fn area(s: shapes::Size) -> Float");
     }
 
     /// A module made up entirely of GDS imports is recorded against the binary

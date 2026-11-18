@@ -392,6 +392,9 @@ pub(crate) struct PublishedState {
     /// sources its offsets are into, so a stale one stays readable without
     /// retaining the parse it came from.
     pub(crate) nav: Option<Arc<NavIndex>>,
+    /// Becomes true once the index of the latest committed result, which the
+    /// compiler builds after answering, is in `nav`.
+    pub(crate) nav_ready: Option<tokio::sync::watch::Receiver<bool>>,
     pub(crate) prev_diagnostics: IndexMap<Uri, Vec<Diagnostic>>,
     pub(crate) compiled_revision: u64,
     pub(crate) compiled_cell: Option<String>,
@@ -405,9 +408,104 @@ pub(crate) struct PublishedState {
 struct GuiConnection {
     id: u64,
     client: GuiClient,
-    snapshot: Arc<tokio::sync::Mutex<Option<CompilationSnapshot>>>,
+    snapshot: Arc<tokio::sync::Mutex<SentLayout>>,
     /// The library's cells as last sent to this GUI.
     cells: Arc<tokio::sync::Mutex<Option<Vec<rpc::CellEntry>>>>,
+}
+
+/// The layout a GUI last accepted, which the next update is a delta against.
+#[derive(Debug, Default)]
+struct SentLayout {
+    snapshot: Option<CompilationSnapshot>,
+    /// The cells each cell of `snapshot` refers to.
+    references: HashMap<compile::CellId, Arc<[compile::CellId]>>,
+}
+
+/// The cells `cell` refers to: those it instantiates, places in its
+/// schematic, or names in a field.
+fn referenced_cells(cell: &compile::CompiledCell) -> Arc<[compile::CellId]> {
+    fn field_cells(field: &compile::FieldValue, cells: &mut Vec<compile::CellId>) {
+        use compile::FieldValue;
+        match field {
+            FieldValue::Cell(cell) | FieldValue::SchematicInst { cell, .. } => cells.push(*cell),
+            FieldValue::Object(_)
+            | FieldValue::Float(_)
+            | FieldValue::Int(_)
+            | FieldValue::Bool(_)
+            | FieldValue::String(_)
+            | FieldValue::Point(..)
+            | FieldValue::Nil
+            | FieldValue::Signal(_)
+            | FieldValue::Detached(_)
+            | FieldValue::Plain(_)
+            | FieldValue::Poison
+            | FieldValue::Unreadable(_) => {}
+            FieldValue::Seq(items)
+            | FieldValue::Tuple(items)
+            | FieldValue::Enum { payload: items, .. }
+            | FieldValue::Device {
+                terminals: items, ..
+            } => items.iter().for_each(|item| field_cells(item, cells)),
+            FieldValue::Struct { fields, .. } | FieldValue::StructVariant { fields, .. } => fields
+                .iter()
+                .for_each(|(_, field)| field_cells(field, cells)),
+        }
+    }
+    let mut cells = cell
+        .objects
+        .values()
+        .filter_map(|object| match object {
+            compile::SolvedValue::Instance(instance) => Some(instance.cell),
+            _ => None,
+        })
+        .chain(
+            cell.schematic
+                .instances
+                .iter()
+                .map(|instance| instance.cell),
+        )
+        .collect::<Vec<_>>();
+    for field in cell.fields.values() {
+        field_cells(field, &mut cells);
+    }
+    cells.sort_unstable();
+    cells.dedup();
+    cells.into()
+}
+
+/// Removes the cells that the top cell does not reach, which the GUI never
+/// shows. Cells shared with `sent` reuse its references. Returns the
+/// references of every remaining cell.
+fn retain_reachable_cells(
+    data: &mut compile::CompiledData,
+    sent: &SentLayout,
+) -> HashMap<compile::CellId, Arc<[compile::CellId]>> {
+    let sent_cells = sent
+        .snapshot
+        .as_ref()
+        .and_then(CompilationSnapshot::data)
+        .map(|data| &data.cells);
+    let mut references = HashMap::new();
+    let mut stack = vec![data.top];
+    while let Some(id) = stack.pop() {
+        if references.contains_key(&id) {
+            continue;
+        }
+        let Some(cell) = data.cells.get(&id) else {
+            continue;
+        };
+        let children = sent_cells
+            .and_then(|cells| cells.get(&id))
+            .filter(|sent| Arc::ptr_eq(sent, cell))
+            .and_then(|_| sent.references.get(&id).cloned())
+            .unwrap_or_else(|| referenced_cells(cell));
+        stack.extend(children.iter().copied());
+        references.insert(id, children);
+    }
+    if data.cells.contains_key(&data.top) {
+        data.cells.retain(|id, _| references.contains_key(id));
+    }
+    references
 }
 
 #[derive(Debug, Default)]
@@ -491,6 +589,12 @@ fn workspace_config(root_lib: PathBuf, library: Option<&Library>) -> WorkspaceCo
         .with_gds_imports(
             library
                 .gds
+                .iter()
+                .map(|(name, path)| (name.clone(), path.clone())),
+        )
+        .with_wasm_modules(
+            library
+                .wasm
                 .iter()
                 .map(|(name, path)| (name.clone(), path.clone())),
         )
@@ -1133,6 +1237,7 @@ impl Backend {
         &self,
         identity: CompileIdentity,
         preview_cell: Option<compile::CellId>,
+        slow_calls: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Option<CompilationSnapshot> {
         let (preview, result) = {
             let source = self.state.source_state.lock().await;
@@ -1140,12 +1245,15 @@ impl Backend {
                 return None;
             }
             let root_dir = self.state.root_dir.get().cloned()?;
-            self.state.compiler.compile_streamed(CompileRequest {
-                identity: identity.clone(),
-                root_dir,
-                preview_cell,
-                publish: true,
-            })
+            self.state.compiler.compile_streamed(
+                CompileRequest {
+                    identity: identity.clone(),
+                    root_dir,
+                    preview_cell,
+                    publish: true,
+                },
+                Some(slow_calls),
+            )
         };
         if let Some(preview) = preview {
             let backend = self.clone();
@@ -1185,6 +1293,8 @@ impl Backend {
             revision: identity.revision,
             output,
         });
+        // Replaced values can be large; they are dropped off the async runtime.
+        let mut retired: Vec<Box<dyn Send>> = Vec::new();
         let recent = {
             // The freshness check and commit are atomic with respect to source
             // and cell changes because they take this same lock.
@@ -1199,7 +1309,7 @@ impl Backend {
                 current_diagnostics.entry(uri).or_default();
             }
             compiled.config = result.config;
-            compiled.ast = Arc::new(result.ast);
+            retired.push(Box::new(std::mem::replace(&mut compiled.ast, result.ast)));
             // The compiler only ever answers `None` before the workspace has
             // type-checked once, or on a path that never asked it (a manifest
             // that would not load, an internal compiler error). None of those
@@ -1207,10 +1317,26 @@ impl Backend {
             if let Some(nav) = result.nav {
                 compiled.nav = Some(nav);
             }
+            if let Some(nav) = result.nav_later.take() {
+                let published = self.state.published_state.clone();
+                let revision = identity.revision;
+                let (ready, ready_receiver) = tokio::sync::watch::channel(false);
+                compiled.nav_ready = Some(ready_receiver);
+                tokio::spawn(async move {
+                    if let Ok(Some(nav)) = nav.await {
+                        let mut compiled = published.lock().await;
+                        // A compile published since brings its own index.
+                        if compiled.compiled_revision == revision {
+                            compiled.nav = Some(nav);
+                        }
+                    }
+                    ready.send_replace(true);
+                });
+            }
             compiled.compiled_revision = identity.revision;
             compiled.compiled_cell = identity.cell.clone();
             compiled.messages = result.messages.clone();
-            compiled.latest = latest;
+            retired.push(Box::new(std::mem::replace(&mut compiled.latest, latest)));
             let drawable = snapshot
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.data().is_some());
@@ -1220,6 +1346,7 @@ impl Backend {
                 None
             }
         };
+        tokio::task::spawn_blocking(move || drop(retired));
         self.state
             .compiled_revisions
             .send_replace(identity.revision);
@@ -1268,12 +1395,18 @@ impl Backend {
         if !self.state.is_latest_compile_request(identity).await {
             return None;
         }
-        let geometry = match &snapshot.output {
-            CompileOutput::Valid(data) => Some(data),
-            CompileOutput::ExecErrors(output) => output.output.as_ref(),
-            CompileOutput::FatalParseErrors | CompileOutput::StaticErrors(_) => None,
-        };
-        let detail = geometry.map(|data| {
+        // Serialize updates per connection so each delta names an acknowledged
+        // base. Reconnection creates a fresh cache; IDs alone never prove reuse.
+        let mut previous = connection.snapshot.lock().await;
+        if !self.state.is_latest_compile_request(identity).await {
+            return None;
+        }
+        let mut snapshot = snapshot;
+        let references = snapshot
+            .data_mut()
+            .map(|data| retain_reachable_cells(data, &previous))
+            .unwrap_or_default();
+        let detail = snapshot.data().map(|data| {
             let scopes: usize = data.cells.values().map(|cell| cell.scopes.len()).sum();
             let objects: usize = data.cells.values().map(|cell| cell.objects.len()).sum();
             format!(" ({} scopes, {} objects)", scopes, objects)
@@ -1285,13 +1418,7 @@ impl Backend {
                 pipeline_started.elapsed().as_secs_f64(),
             ))
             .await;
-        // Serialize updates per connection so each delta names an acknowledged
-        // base. Reconnection creates a fresh cache; IDs alone never prove reuse.
-        let mut previous = connection.snapshot.lock().await;
-        if !self.state.is_latest_compile_request(identity).await {
-            return None;
-        }
-        let update = rpc::CompilationUpdate::new(snapshot.clone(), previous.as_ref());
+        let update = rpc::CompilationUpdate::new(snapshot.clone(), previous.snapshot.as_ref());
         let compression_started = Instant::now();
         let update = self.compress_gui_update(update).await?;
         // A rapid source burst may supersede this snapshot while its large
@@ -1358,7 +1485,10 @@ impl Backend {
                 ))
                 .await;
         }
-        *previous = Some(snapshot);
+        *previous = SentLayout {
+            snapshot: Some(snapshot),
+            references,
+        };
         drop(previous);
         Some(connection)
     }
@@ -1471,22 +1601,38 @@ impl Backend {
             // cells used to leave Neovim showing an undifferentiated spinner
             // for tens of seconds, making healthy evaluation indistinguishable
             // from a wedged worker.
-            let mut compilation = Box::pin(self.compile_snapshot(identity.clone(), preview_cell));
+            let (slow_calls, mut slow_call) = tokio::sync::mpsc::unbounded_channel();
+            let mut compilation =
+                Box::pin(self.compile_snapshot(identity.clone(), preview_cell, slow_calls));
             let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             // `interval`'s first tick is immediate; the begin notification
             // already describes that instant.
             heartbeat.tick().await;
+            // The `extern` function the compiler last reported as running long.
+            let mut running = None;
             let snapshot = loop {
-                tokio::select! {
+                let report = tokio::select! {
                     snapshot = &mut compilation => break snapshot?,
-                    _ = heartbeat.tick() => {
-                        activity.editor_progress.report(format!(
-                            "{} ({:.0}s elapsed)",
+                    Some(function) = slow_call.recv() => {
+                        running = Some(function);
+                        true
+                    }
+                    _ = heartbeat.tick() => true,
+                };
+                if report {
+                    let running = running
+                        .as_ref()
+                        .map(|function| format!("running extern function `{function}`, "))
+                        .unwrap_or_default();
+                    activity
+                        .editor_progress
+                        .report(format!(
+                            "{} ({running}{:.0}s elapsed)",
                             compilation_message(&identity),
                             pipeline_started.elapsed().as_secs_f64(),
-                        )).await;
-                    }
+                        ))
+                        .await;
                 }
             };
             self.send_cell_update(
@@ -1499,6 +1645,8 @@ impl Backend {
         }
         .await;
         self.state.finish_compilation(activity).await;
+        // Return what the compile and the transfer freed to the system.
+        tokio::task::spawn_blocking(protocol::release_free_memory);
         result
     }
 
@@ -1522,13 +1670,17 @@ impl Backend {
         // Cells the GUI already holds are sent by reference. The lock keeps an
         // in-flight update from replacing that base while the delta is built;
         // if one lands before the preview arrives, the GUI rejects the preview.
-        let update = rpc::CompilationUpdate::new(
-            CompilationSnapshot {
+        let update = {
+            let sent = connection.snapshot.lock().await;
+            let mut preview = CompilationSnapshot {
                 revision: preview.identity.revision,
                 output: preview.output,
-            },
-            connection.snapshot.lock().await.as_ref(),
-        );
+            };
+            if let Some(data) = preview.data_mut() {
+                retain_reachable_cells(data, &sent);
+            }
+            rpc::CompilationUpdate::new(preview, sent.snapshot.as_ref())
+        };
         let Some(update) = self.compress_gui_update(update).await else {
             return;
         };
@@ -2998,8 +3150,8 @@ mod tests {
 
     use super::{
         ArgonConfig, DEFAULT_LOG_LEVEL, DeviceKind, GuiConfig, SourceState, config_with_key,
-        is_gui_disconnected, parse_config, preview_instance_cell, read_unpoisoned, write_config,
-        write_unpoisoned,
+        is_gui_disconnected, parse_config, preview_instance_cell, read_unpoisoned, rpc,
+        write_config, write_unpoisoned,
     };
 
     #[test]
@@ -3210,6 +3362,68 @@ mod tests {
             .find_map(|object| object.get_rect())
             .expect("top should emit a rect");
         assert_eq!(rect.x1.0, 50.);
+    }
+
+    #[test]
+    fn gui_snapshots_keep_only_the_cells_the_top_cell_reaches() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("lib.ar");
+        std::fs::write(
+            &source,
+            r#"
+use std::layout::{inst, rect};
+cell unused() { let r = rect("met1", x0=0., y0=0., x1=1., y1=1.); }
+cell held() { let r = rect("met1", x0=0., y0=0., x1=2., y1=2.); }
+cell leaf() { let r = rect("met1", x0=0., y0=0., x1=10., y1=5.); }
+cell top() {
+    let skipped = unused();
+    pub let kept = held();
+    let a = inst(leaf(), x=0., y=0.);
+}
+"#,
+        )
+        .unwrap();
+        let config = argonc::WorkspaceConfig::new(&source).with_tech(Some(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/tech/basic.tech.toml"),
+        ));
+        let mut compiler = argonc::incremental::IncrementalCompiler::new();
+        let mut data = compiler
+            .compile_cell(&config, &["top".into()], vec![])
+            .unwrap_valid();
+        let names = |data: &compile::CompiledData| {
+            let mut names = data
+                .cells
+                .values()
+                .map(|cell| cell.name.clone())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        assert!(names(&data).contains(&"unused".to_owned()));
+        let order = data.cells.keys().copied().collect::<Vec<_>>();
+        let references = super::retain_reachable_cells(&mut data, &super::SentLayout::default());
+        assert_eq!(names(&data), ["held", "leaf", "top"]);
+        let kept = order
+            .iter()
+            .filter(|id| data.cells.contains_key(*id))
+            .collect::<Vec<_>>();
+        assert_eq!(kept, data.cells.keys().collect::<Vec<_>>());
+        assert_eq!(references.len(), data.cells.len());
+        assert_eq!(references[&data.top].len(), 2);
+
+        // Cells shared with the snapshot already sent reuse its references.
+        let sent = super::SentLayout {
+            snapshot: Some(rpc::CompilationSnapshot {
+                revision: 1,
+                output: CompileOutput::Valid(data.clone()),
+            }),
+            references,
+        };
+        let mut again = data.clone();
+        let reused = super::retain_reachable_cells(&mut again, &sent);
+        assert_eq!(names(&again), ["held", "leaf", "top"]);
+        assert!(Arc::ptr_eq(&reused[&data.top], &sent.references[&data.top]));
     }
 
     #[test]

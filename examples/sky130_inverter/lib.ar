@@ -15,11 +15,23 @@ cell inv(nw: Float, pw: Float, nf: Int) {
     eq(pmos.sdm.y0 - nmos.sdm.y1, 1130.);
     eq(ntap.sdm.y0 - pmos.sdm.y1, 70.);
 
-    rect("nwell.drawing", x0=pmos.sdm.x0 - 180., x1=pmos.sdm.x1 + 180., y0=pmos.sdm.y0 - 180., y1=ntap.sdm.y1 + 180.);
+    rect(
+        "nwell.drawing",
+        x0=pmos.sdm.x0 - 180.,
+        x1=pmos.sdm.x1 + 180.,
+        y0=pmos.sdm.y0 - 180.,
+        y1=ntap.sdm.y1 + 180.,
+    );
 
     pub let a = rect("li1.drawing", x0=nmos.poly_bbox.x0 - 90., x1=nmos.poly_bbox.x1 + 90., h=170.);
     eq(a.y0 - nmos.li1_bbox.y1, pmos.li1_bbox.y0 - a.y1);
-    let finger = crect(layer="poly.drawing", x0=0., y0=0., w=150., h=pmos.poly_bbox.y1 - nmos.poly_bbox.y0);
+    let finger = crect(
+        layer="poly.drawing",
+        x0=0.,
+        y0=0.,
+        w=150.,
+        h=pmos.poly_bbox.y1 - nmos.poly_bbox.y0,
+    );
     let fingers = array(finger, nf, 430., 0.);
     eq(fingers.x0, nmos.poly_bbox.x0);
     eq(fingers.y0, nmos.poly_bbox.y0);
@@ -28,7 +40,13 @@ cell inv(nw: Float, pw: Float, nf: Int) {
     let licon = crect(layer="licon1.drawing", x0=0., y0=0., w=170., h=170.);
     center_rects(array(licon, nf, 430., 0.), a);
 
-    let out_n = rect("li1.drawing", x0=nmos.li1_bbox.x0 + 430., x1=a.x1 + 340., y1=a.y0 - 170., h=170.);
+    let out_n = rect(
+        "li1.drawing",
+        x0=nmos.li1_bbox.x0 + 430.,
+        x1=a.x1 + 340.,
+        y1=a.y0 - 170.,
+        h=170.,
+    );
     let out_p = rect("li1.drawing", x0=out_n.x0, x1=out_n.x1, y0=a.y1 + 170., h=170.);
     pub let out = rect("li1.drawing", x1=out_n.x1, w=170., y0=out_n.y0, y1=out_p.y1);
     let drains = (nf + 1) / 2;

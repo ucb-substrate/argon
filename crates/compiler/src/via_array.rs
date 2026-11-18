@@ -1,9 +1,9 @@
 //! The search behind the `max_via_array` builtin: the via array that fits the
 //! most cuts between two overlapping shapes.
 //!
-//! Every comparison snaps both sides to the grid, exactly as an Argon
-//! comparison does, and every rectangle the search builds has its coordinates
-//! snapped, as a solved `crect` would.
+//! The search works on geometry, so every comparison snaps both sides to the
+//! grid and every rectangle it builds has its coordinates snapped, as a
+//! solved `crect` would.
 
 /// A rectangle as `(x0, y0, x1, y1)`.
 pub type Bounds = [f64; 4];

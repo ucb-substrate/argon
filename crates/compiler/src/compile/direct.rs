@@ -288,7 +288,14 @@ impl<'a> ExecPass<'a> {
                         .find(|(field, _)| field.name.name == *name)
                         .map(|(_, value)| value)
                 };
-                ops::struct_lit(self.defs, &target, explicit, base.as_ref()).ok()
+                ops::struct_lit(
+                    self.defs,
+                    &self.struct_layouts,
+                    &target,
+                    explicit,
+                    base.as_ref(),
+                )
+                .ok()
             }
         }
     }
@@ -433,7 +440,10 @@ impl<'a> ExecPass<'a> {
             Purity::Unknown => {}
         }
         self.purity[index.0 as usize] = Purity::Checking;
-        let pure = self.scope_is_pure(&self.fn_decls[index.0 as usize].scope);
+        let decl = self.fn_decls[index.0 as usize];
+        // An `extern` function's calls are left to ordinary evaluation, which
+        // waits for its arguments to be solved.
+        let pure = decl.foreign.is_none() && self.scope_is_pure(&decl.scope);
         // A function checked meanwhile assumed this one pure. If it is not,
         // the check `direct_call` makes before each call catches that.
         self.purity[index.0 as usize] = if pure { Purity::Pure } else { Purity::Impure };

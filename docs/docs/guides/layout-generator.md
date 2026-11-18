@@ -64,7 +64,13 @@ cell latch(wn: Float, nfn: Int, wp: Float, nfp: Int) {
     let ground = rect("met1.drawing", x0=a.ptap.m1.x0, x1=b.ptap.m1.x1, y0=b.n.s.y0, y1=b.n.s.y1);
     let supply = rect("met1.drawing", x0=a.ntap.m1.x0, x1=b.ntap.m1.x1, y0=b.p.s.y0, y1=b.p.s.y1);
     // The n-well encloses p-diffusion and the n-taps by 180, and is at least 840 tall.
-    rect("nwell.drawing", x0=a.ntap.tap.x0 - 180., x1=b.ntap.tap.x1 + 180., y0=b.p.sdm.y0 - 50., y1=std::max(b.p.sdm.y1 + 50., b.p.sdm.y0 + 790.));
+    rect(
+        "nwell.drawing",
+        x0=a.ntap.tap.x0 - 180.,
+        x1=b.ntap.tap.x1 + 180.,
+        y0=b.p.sdm.y0 - 50.,
+        y1=std::max(b.p.sdm.y1 + 50., b.p.sdm.y0 + 790.),
+    );
 
     // Each output's via at x = ±430 runs on met2 to the other inverter's gate
     // trunk at x = ∓860, the two at different heights so that they cross.
@@ -106,7 +112,13 @@ cell inverter(wn: Float, nfn: Int, wp: Float, nfp: Int) {
     // row (nsd.2, psd.2).
     eq(p.d.y0, n.d.y1 + 260.);
     // One met1 block joins the drains and reaches the output's via at x = 430.
-    pub let out = rect("met1.drawing", x0=std::min(std::min(n.d.x0, p.d.x0), 430. - 130.), x1=std::max(n.d.x1, p.d.x1), y0=n.d.y0, y1=p.d.y1);
+    pub let out = rect(
+        "met1.drawing",
+        x0=std::min(std::min(n.d.x0, p.d.x0), 430. - 130.),
+        x1=std::max(n.d.x1, p.d.x1),
+        y0=n.d.y0,
+        y1=p.d.y1,
+    );
     // A met2 trunk at x = 860 joins the gates.
     hook(n.g, 860.);
     hook(p.g, 860.);
@@ -186,12 +198,24 @@ fn via1(bar: Rect, x: Float, y: Float) {
 /// A met2 wire 140 wide from (`x0`, `y0`) to (`x1`, `y1`), either horizontal
 /// or vertical.
 fn wire(x0: Float, y0: Float, x1: Float, y1: Float) {
-    rect("met2.drawing", x0=std::min(x0, x1) - 70., x1=std::max(x0, x1) + 70., y0=std::min(y0, y1) - 70., y1=std::max(y0, y1) + 70.);
+    rect(
+        "met2.drawing",
+        x0=std::min(x0, x1) - 70.,
+        x1=std::max(x0, x1) + 70.,
+        y0=std::min(y0, y1) - 70.,
+        y1=std::max(y0, y1) + 70.,
+    );
 }
 
 /// Extends the met1 `bar` to reach `x`, with a via1 there.
 fn hook(bar: Rect, x: Float) {
-    let ext = rect("met1.drawing", x0=std::min(bar.x0, x - 130.), x1=std::max(bar.x1, x + 130.), y0=bar.y0, y1=bar.y1);
+    let ext = rect(
+        "met1.drawing",
+        x0=std::min(bar.x0, x - 130.),
+        x1=std::max(bar.x1, x + 130.),
+        y0=bar.y0,
+        y1=bar.y1,
+    );
     via1(ext, x, mid_y(bar));
 }
 ```
@@ -256,15 +280,15 @@ Pass them to `locate`, each with the cell the report names as `gds_cell`, since 
 
 ```text
 difftap.9 (-0.794, 1.13) to (0.794, 1.39) µm in latch:
-  diff.drawing (-145, 130) to (575, 1130): sky130/lib.ar:16:16; in halves[0] (<argon-std>/layout.ar:114:13, called from lib.ar:20:18) > n (lib.ar:52:17) > fet (sky130/lib.ar:121:15)
-  diff.drawing (-575, 130) to (145, 1130): sky130/lib.ar:16:16; in halves[1] (<argon-std>/layout.ar:115:13, called from lib.ar:20:18) > n (lib.ar:52:17) > fet (sky130/lib.ar:121:15)
+  diff.drawing (-145, 130) to (575, 1130): sky130/lib.ar:16:16; in halves[0] (<argon-std>/layout.ar:114:13, called from lib.ar:20:18) > n (lib.ar:58:17) > fet (sky130/lib.ar:145:15)
+  diff.drawing (-575, 130) to (145, 1130): sky130/lib.ar:16:16; in halves[1] (<argon-std>/layout.ar:115:13, called from lib.ar:20:18) > n (lib.ar:58:17) > fet (sky130/lib.ar:145:15)
   nwell.drawing (-1705, 1390) to (1705, 2750): lib.ar:30:5
 psd.2 (0.81, 1.06) to (1.47, 1.64) µm in inverter:
-  psdm.drawing (-275, 1440) to (1135, 2700): sky130/lib.ar:27:19; in p (lib.ar:53:17) > fet (sky130/lib.ar:121:15)
-  psdm.drawing (1145, 0) to (1655, 1260): sky130/lib.ar:45:19; in ptap (lib.ar:86:13, called from lib.ar:69:20) > t (sky130/lib.ar:62:13)
+  psdm.drawing (-275, 1440) to (1135, 2700): sky130/lib.ar:33:19; in p (lib.ar:59:17) > fet (sky130/lib.ar:145:15)
+  psdm.drawing (1145, 0) to (1655, 1260): sky130/lib.ar:63:19; in ptap (lib.ar:98:13, called from lib.ar:81:20) > t (sky130/lib.ar:86:13)
 poly.2 (0.14, 1.26) to (0.29, 1.44) µm in inverter:
-  poly.drawing (140, 0) to (290, 1260): <argon-std>/layout.ar:20:30, called from sky130/lib.ar:13:25; in n (lib.ar:52:17) > fet (sky130/lib.ar:121:15)
-  poly.drawing (140, 1440) to (290, 2700): <argon-std>/layout.ar:26:30, called from sky130/lib.ar:13:25; in p (lib.ar:53:17) > fet (sky130/lib.ar:121:15)
+  poly.drawing (140, 0) to (290, 1260): <argon-std>/layout.ar:20:30, called from sky130/lib.ar:13:25; in n (lib.ar:58:17) > fet (sky130/lib.ar:145:15)
+  poly.drawing (140, 1440) to (290, 2700): <argon-std>/layout.ar:26:30, called from sky130/lib.ar:13:25; in p (lib.ar:59:17) > fet (sky130/lib.ar:145:15)
 ```
 
 Paths into the SKY130 library are shortened here. Each shape comes with the line that drew it and the instances leading to it. All three violations involve the NMOS `n` or its tap column, the PMOS `p`, and the gap between them, so the fix is the constraint between the two rows, the drain gap. `locate` names the lines that drew the shapes, not the `eq` that placed them, so look for the constraint that sets the distance it reports.

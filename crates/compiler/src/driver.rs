@@ -46,11 +46,29 @@ pub fn compile_cell(
     };
     crate::tech::read_tech(tech).map_err(|error| fail(error.to_string()))?;
 
+    // Compiled while the workspace is parsed and analyzed.
+    crate::wasm::precompile(
+        workspace
+            .wasm_modules
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect(),
+    );
     // The invocation is spliced into the workspace before analysis, so its
     // arguments are resolved, type-checked, and evaluated like source.
-    let mut parse_output = parse::parse_workspace_with_config_and_sources(workspace, sources);
+    let mut parse_output = if sources.is_empty() {
+        parse::parse_workspace_without_span_indexes(workspace)
+    } else {
+        parse::parse_workspace_with_config_and_sources(workspace, sources)
+    };
     let invocation = parse::add_cell_invocation(&mut parse_output, cell)
         .map_err(|error| fail(format!("invalid cell invocation: {error}")))?;
+    // Neither analysis nor evaluation reads the span indexes, so neither the
+    // parsed nor the typed AST keeps them, including the modules the
+    // invocation re-parsed.
+    for (ast, _) in parse_output.asts.values_mut() {
+        ast.drop_span_indexes();
+    }
     let analysis = compile::analyze_workspace(parse_output);
     let Some(typed_ast) = analysis.typed_ast else {
         return Err(vec![unparsed_root(workspace)]);

@@ -372,7 +372,20 @@ pub fn parse_workspace_with_config_and_sources(
     config: &WorkspaceConfig,
     sources: &IndexMap<PathBuf, ArcStr>,
 ) -> ParseOutput {
-    parse_workspace_with_config_sources_and_cache(config, sources, &mut ParseCache::default())
+    parse_workspace_files(config, sources, Files::Fresh { span_indexes: true })
+}
+
+/// Like [`parse_workspace_with_config`], for a caller that reads no span
+/// indexes, such as a one-shot compile. See
+/// [`AnnotatedAst::drop_span_indexes`](crate::ast::annotated::AnnotatedAst::drop_span_indexes).
+pub fn parse_workspace_without_span_indexes(config: &WorkspaceConfig) -> ParseOutput {
+    parse_workspace_files(
+        config,
+        &IndexMap::new(),
+        Files::Fresh {
+            span_indexes: false,
+        },
+    )
 }
 
 /// Parses a workspace while taking the contents of open editor documents from
@@ -399,6 +412,42 @@ pub fn parse_workspace_with_config_sources_and_cache(
     sources: &IndexMap<PathBuf, ArcStr>,
     cache: &mut ParseCache,
 ) -> ParseOutput {
+    parse_workspace_files(config, sources, Files::Cached(cache))
+}
+
+/// How a workspace parse treats each file.
+enum Files<'c> {
+    /// Successful parses are kept in, and reused from, a cache.
+    Cached(&'c mut ParseCache),
+    /// Each file is parsed afresh, with span indexes when `span_indexes` is
+    /// set.
+    Fresh { span_indexes: bool },
+}
+
+impl Files<'_> {
+    fn reborrow(&mut self) -> Files<'_> {
+        match self {
+            Files::Cached(cache) => Files::Cached(cache),
+            Files::Fresh { span_indexes } => Files::Fresh {
+                span_indexes: *span_indexes,
+            },
+        }
+    }
+
+    fn span_indexes(&self) -> bool {
+        match self {
+            Files::Cached(_) => true,
+            Files::Fresh { span_indexes } => *span_indexes,
+        }
+    }
+}
+
+/// Overlay-aware workspace parsing.
+fn parse_workspace_files(
+    config: &WorkspaceConfig,
+    sources: &IndexMap<PathBuf, ArcStr>,
+    mut files: Files<'_>,
+) -> ParseOutput {
     let mut output = ParseOutput::default();
     for (name, path) in &config.dependencies {
         let dep_root = if path.is_dir() {
@@ -407,18 +456,20 @@ pub fn parse_workspace_with_config_sources_and_cache(
             path.clone()
         };
         output.merge(
-            parse_workspace_with_sources(dep_root, sources, cache),
+            parse_workspace_with_sources(dep_root, sources, files.reborrow()),
             Some(name),
         );
     }
+    let span_indexes = files.span_indexes();
     output.merge(
-        parse_workspace_with_sources(config.root_lib(), sources, cache),
+        parse_workspace_with_sources(config.root_lib(), sources, files),
         None,
     );
     add_gds_imports(&mut output, config.gds_imports.iter().cloned());
     for module in &STD_MODULES {
         let path = PathBuf::from(module.path);
-        let (ast, diagnostics) = parse_source(ArcStr::from(module.source), path.clone());
+        let (ast, diagnostics) =
+            parse_source_with(ArcStr::from(module.source), path.clone(), span_indexes);
         // TODO: fix std library overwriting user-defined std mods.
         output.asts.insert(module.mod_path(), ast);
         output.errs.insert(path, (diagnostics, Vec::new()));
@@ -594,6 +645,33 @@ pub fn splice_cell_invocation(
     Ok(invocation)
 }
 
+/// Parses the entry cell [`splice_cell_invocation`] would add to `asts`,
+/// leaving `asts` unchanged.
+///
+/// The returned module has the root module's path and its text with the
+/// declaration appended, so spans index it as they would the spliced module,
+/// but declares only the entry cell. `Ok(None)` when that text does not parse.
+pub(crate) fn parse_cell_invocation(
+    asts: &WorkspaceParseAst,
+    invocation: &str,
+) -> Result<Option<(AnnotatedParseAst, CellInvocation)>, anyhow::Error> {
+    let root = ModPath::new();
+    let Some(existing) = asts.get(&root) else {
+        bail!("workspace has no root module");
+    };
+    let entry = EntryCell::new(asts.values().map(|ast| &ast.text), existing, invocation)?;
+    let ((mut module, error), _) = parse_source_with(entry.text, entry.path, false);
+    if error.is_some() {
+        return Ok(None);
+    }
+    let Some(decl) = module.ast.decls.pop() else {
+        return Ok(None);
+    };
+    module.ast.decls = vec![decl];
+    module.source_text = entry.source_text;
+    Ok(Some((module, entry.invocation)))
+}
+
 /// A root module rewritten to declare the entry cell for an invocation.
 struct EntryCell {
     /// The module's text with the generated declaration appended.
@@ -669,13 +747,17 @@ fn generated_name(prefix: &str, unused: impl Fn(&str) -> bool) -> String {
 }
 
 pub fn parse_workspace(root_lib: impl AsRef<Path>) -> ParseOutput {
-    parse_workspace_with_sources(root_lib, &IndexMap::new(), &mut ParseCache::default())
+    parse_workspace_with_sources(
+        root_lib,
+        &IndexMap::new(),
+        Files::Fresh { span_indexes: true },
+    )
 }
 
 fn parse_workspace_with_sources(
     root_lib: impl AsRef<Path>,
     sources: &IndexMap<PathBuf, ArcStr>,
-    cache: &mut ParseCache,
+    mut files: Files<'_>,
 ) -> ParseOutput {
     let root_lib = root_lib.as_ref();
 
@@ -686,7 +768,7 @@ fn parse_workspace_with_sources(
     while let Some(path) = stack.pop() {
         match get_mod(root_lib, &path) {
             Ok(file_path) => {
-                let (ast, errs) = parse_cached(&file_path, sources, cache);
+                let (ast, errs) = parse_file(&file_path, sources, files.reborrow());
                 let mut mod_spans = Vec::new();
                 for decl in &ast.0.ast.decls {
                     if let Decl::Mod(decl) = decl {
@@ -718,14 +800,30 @@ fn parse_workspace_with_sources(
     }
 }
 
-fn parse_cached(
+/// Parses the file at `path` as `files` says.
+fn parse_file(
     path: &Path,
     sources: &IndexMap<PathBuf, ArcStr>,
-    cache: &mut ParseCache,
+    files: Files<'_>,
 ) -> (ParseResult, ParseDiagnostics) {
     let source = match sources.get(path).cloned() {
         Some(source) => Ok(source),
         None => std::fs::read_to_string(path).map(ArcStr::from),
+    };
+    let cache = match files {
+        Files::Cached(cache) => cache,
+        Files::Fresh { span_indexes } => {
+            return match source {
+                Ok(source) => parse_source_with(source, path.to_path_buf(), span_indexes),
+                Err(error) => (
+                    (
+                        make_backup_ast("".into(), path.to_path_buf()),
+                        Some(error.into()),
+                    ),
+                    Vec::new(),
+                ),
+            };
+        }
     };
     let source = match source {
         Ok(source) => source,
@@ -760,7 +858,17 @@ fn parse_cached(
 }
 
 fn parse_source(input: ArcStr, path: PathBuf) -> (ParseResult, ParseDiagnostics) {
-    match crate::parser::parse_ast(input.clone(), path.clone()) {
+    parse_source_with(input, path, true)
+}
+
+/// Like [`parse_source`], building span indexes only when `span_indexes` is
+/// set.
+fn parse_source_with(
+    input: ArcStr,
+    path: PathBuf,
+    span_indexes: bool,
+) -> (ParseResult, ParseDiagnostics) {
+    match crate::parser::parse_ast_with(input.clone(), path.clone(), span_indexes) {
         Ok(ast) => ((ast, None), Vec::new()),
         Err(errs) => parse_result_from_errors(input, path, diagnostics_from_errors(errs)),
     }

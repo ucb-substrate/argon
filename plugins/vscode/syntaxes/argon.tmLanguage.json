@@ -62,7 +62,7 @@
       "patterns": [
         { "match": "\\b(if|else|match|for|in)\\b", "name": "keyword.control.argon" },
         { "match": "\\b(let|pub|use|as)\\b", "name": "keyword.other.argon" },
-        { "match": "\\b(cell|fn|struct|enum|mod|const)\\b", "name": "keyword.declaration.argon" },
+        { "match": "\\b(cell|fn|extern|struct|enum|mod|const)\\b", "name": "keyword.declaration.argon" },
         { "match": "\\b(true|false)\\b", "name": "constant.language.boolean.argon" },
         { "match": "\\b(std|lib)\\b(?=::)", "name": "entity.name.namespace.argon" }
       ]

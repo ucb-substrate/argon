@@ -32,7 +32,7 @@ border = "#0080ff"
 | --- | --- |
 | `dbu` | Physical size of one GDS database unit |
 | `display_unit` | Size of one source-coordinate unit, in database units |
-| `grid` | Snap grid for the solver and the GUI |
+| `grid` | Grid that solved coordinates of shapes and instances, and the GUI, snap to |
 | `style_name` | Name given to the layer-style collection |
 
 ## Layers

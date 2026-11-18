@@ -1,0 +1,18 @@
+[package]
+name = "argon-greedy-router"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-3-Clause"
+publish = false
+description = "A greedy track router, run as WebAssembly by examples/sram"
+
+[dependencies]
+grid = "1"
+indexmap.workspace = true
+itertools.workspace = true
+pathfinding = "=4.14.0"
+rustc-hash.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

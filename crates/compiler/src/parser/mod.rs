@@ -166,6 +166,16 @@ fn cursor_is_suppressed(input: &str, cursor: usize) -> bool {
 /// by span, so spans must be byte-exact (they index the original, untrimmed
 /// input). On any syntax error, returns every collected diagnostic.
 pub fn parse_ast(input: ArcStr, path: PathBuf) -> Result<AnnotatedParseAst, Vec<ParseError>> {
+    parse_ast_with(input, path, true)
+}
+
+/// Like [`parse_ast`], building the span indexes only when `span_indexes` is
+/// set.
+pub(crate) fn parse_ast_with(
+    input: ArcStr,
+    path: PathBuf,
+    span_indexes: bool,
+) -> Result<AnnotatedParseAst, Vec<ParseError>> {
     let input_for_ast = input.clone();
     let normalized = input.trim_start_matches(char::is_whitespace);
     let offset_base = input.len() - normalized.len();
@@ -189,7 +199,11 @@ pub fn parse_ast(input: ArcStr, path: PathBuf) -> Result<AnnotatedParseAst, Vec<
     if !unsupported.is_empty() {
         return Err(unsupported);
     }
-    Ok(AnnotatedAst::new(input_for_ast, &ast, path))
+    Ok(if span_indexes {
+        AnnotatedAst::new(input_for_ast, &ast, path)
+    } else {
+        AnnotatedAst::new_without_span_indexes(input_for_ast, &ast, path)
+    })
 }
 
 /// Parse a single cell invocation (a `callExpr`) from raw input, as used by the
@@ -1169,7 +1183,7 @@ mod tests {
         assert!(
             error
                 .iter()
-                .any(|error| error.message.contains("must name an item in a module"))
+                .any(|error| error.message.contains("must name an item or module"))
         );
     }
 

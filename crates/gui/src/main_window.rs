@@ -183,6 +183,11 @@ impl MainWindow {
         cx.set_global(StandaloneWindow(main.clone()));
     }
 
+    /// The editor, once connected to an analyzer.
+    pub(crate) fn editor(&self) -> Option<&Entity<Editor>> {
+        self.editor.as_ref().map(|(editor, _)| editor)
+    }
+
     /// A window with the Neovim pane, which connects to each analyzer that
     /// `announcements` reports.
     pub(crate) fn embedded(
