@@ -10,7 +10,7 @@ description = "A greedy track router, run as WebAssembly by examples/sram"
 grid = "1"
 indexmap.workspace = true
 itertools.workspace = true
-pathfinding = "=4.14.0"
+pathfinding = "=4.16.0"
 rustc-hash.workspace = true
 thiserror.workspace = true
 
